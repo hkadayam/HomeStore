@@ -69,23 +69,24 @@ struct persistent_hdr_t {
 
     persistent_hdr_t() : nentries{0}, leaf{0}, node_deleted{0} {}
     std::string to_string() const {
-        auto snext = (next_node == empty_bnodeid) ? "" : "next_node="+ std::to_string(next_node);
-        auto sedge = (edge_info.m_bnodeid == empty_bnodeid) ? "" : "edge_nodeid="+ std::to_string(edge_info.m_bnodeid);
-        auto sedgelink = (edge_info.m_bnodeid == empty_bnodeid) ? "" : "edge_link_version="+ std::to_string(edge_info.m_link_version);
+        auto snext = (next_node == empty_bnodeid) ? "" : "next_node=" + std::to_string(next_node);
+        auto sedge = (edge_info.m_bnodeid == empty_bnodeid) ? "" : "edge_nodeid=" + std::to_string(edge_info.m_bnodeid);
+        auto sedgelink = (edge_info.m_bnodeid == empty_bnodeid)
+            ? ""
+            : "edge_link_version=" + std::to_string(edge_info.m_link_version);
         return fmt::format("magic={} version={} csum={} node_id={} {} nentries={} node_type={} is_leaf={} "
                            "node_deleted={} node_gen={} modified_cp_id={} link_version={} {}, "
                            "{} level={} ",
-                           magic, version, checksum, node_id, snext, nentries, node_type, leaf, node_deleted,
-                           node_gen, modified_cp_id, link_version, sedge, sedgelink,
-                           level);
+                           magic, version, checksum, node_id, snext, nentries, node_type, leaf, node_deleted, node_gen,
+                           modified_cp_id, link_version, sedge, sedgelink, level);
     }
 
     std::string to_compact_string() const {
-        auto snext = (next_node == empty_bnodeid) ? "" : "next="+ std::to_string(next_node);
-        auto sedge = (edge_info.m_bnodeid == empty_bnodeid) ? "" : "edge_nodeid="+ std::to_string(edge_info.m_bnodeid);
-        auto sleaf = leaf?"LEAF": "INTERIOR";
-        return fmt::format(" id={} {}{} {} nentries={} {} level={} modified_cp_id={}", node_id, snext,sedge, sleaf, nentries,
-                           (node_deleted == 0x1) ? "Deleted" : "", level, modified_cp_id);
+        auto snext = (next_node == empty_bnodeid) ? "" : "next=" + std::to_string(next_node);
+        auto sedge = (edge_info.m_bnodeid == empty_bnodeid) ? "" : "edge_nodeid=" + std::to_string(edge_info.m_bnodeid);
+        auto sleaf = leaf ? "LEAF" : "INTERIOR";
+        return fmt::format(" id={} {}{} {} nentries={} {} level={} modified_cp_id={}", node_id, snext, sedge, sleaf,
+                           nentries, (node_deleted == 0x1) ? "Deleted" : "", level, modified_cp_id);
     }
 };
 #pragma pack()

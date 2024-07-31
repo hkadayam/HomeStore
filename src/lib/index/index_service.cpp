@@ -72,7 +72,8 @@ void IndexService::itable_meta_blk_found(const sisl::byte_view& buf, void* meta_
     // IndexTable instance. This callback will be called twice, first time when it boots before IndexService starts and
     // once as part of IndexService start, will read all metablks and then call this. We process everything after
     // IndexService has been started, because writeback cache would have recovered all nodes by now.
-//  At this moment: m_wb_cache is nullptr but add_index_table to populate the table, ow, recovery path has no table to recover and repair_node does nothing
+    //  At this moment: m_wb_cache is nullptr but add_index_table to populate the table, ow, recovery path has no table
+    //  to recover and repair_node does nothing
     superblk< index_table_sb > sb;
     sb.load(buf, meta_cookie);
     add_index_table(m_svc_cbs->on_index_table_found(std::move(sb)));
@@ -119,11 +120,6 @@ void IndexService::repair_index_node(uint32_t ordinal, IndexBufferPtr const& nod
     if (tbl) { tbl->repair_node(node_buf); }
 }
 
-void IndexService::repair_index_root(uint32_t ordinal, IndexBufferPtr const& root_buf) {
-    auto tbl = get_index_table(ordinal);
-    if (tbl) { tbl->repair_root(root_buf); }
-}
-
 uint32_t IndexService::node_size() const { return m_vdev->atomic_page_size(); }
 
 uint64_t IndexService::used_size() const {
@@ -153,7 +149,7 @@ std::string IndexBuffer::to_string() const {
     } else {
         // store m_down_buffers in a string
 
-        std::string down_bufs="";
+        std::string down_bufs = "";
 #ifndef NDEBUG
         for (auto const& down_buf : m_down_buffers) {
             if (auto ptr = down_buf.lock()) {
@@ -162,10 +158,14 @@ std::string IndexBuffer::to_string() const {
         }
 #endif
 
-        return fmt::format("Buf={} index={} state={} create/dirty_cp={}/{} down_wait#={} {}  up_buffer={} node=[{}] down_buffers=[{}]",
-                           voidptr_cast(const_cast< IndexBuffer* >(this)), m_index_ordinal, int_cast(state()),
-                           m_created_cp_id, m_dirtied_cp_id, m_wait_for_down_buffers.get(), m_node_freed ? "Freed" : "",
-                           voidptr_cast(const_cast< IndexBuffer* >(m_up_buffer.get())), (m_bytes == nullptr) ? " not attached yet" :r_cast< persistent_hdr_t const* >(m_bytes)->to_compact_string(), down_bufs);
+        return fmt::format(
+            "Buf={} index={} state={} create/dirty_cp={}/{} down_wait#={} {}  up_buffer={} node=[{}] down_buffers=[{}]",
+            voidptr_cast(const_cast< IndexBuffer* >(this)), m_index_ordinal, int_cast(state()), m_created_cp_id,
+            m_dirtied_cp_id, m_wait_for_down_buffers.get(), m_node_freed ? "Freed" : "",
+            voidptr_cast(const_cast< IndexBuffer* >(m_up_buffer.get())),
+            (m_bytes == nullptr) ? " not attached yet"
+                                 : r_cast< persistent_hdr_t const* >(m_bytes)->to_compact_string(),
+            down_bufs);
     }
 }
 std::string IndexBuffer::to_string_dot() const {
@@ -173,12 +173,10 @@ std::string IndexBuffer::to_string_dot() const {
     if (m_bytes == nullptr) {
         fmt::format_to(std::back_inserter(str), " node_buf=nullptr ");
     } else {
-//        fmt::format_to(std::back_inserter(str), " node_buf={}", static_cast< void* >(m_node_buf->m_bytes));
         fmt::format_to(std::back_inserter(str), " node_buf={} {} created/dirtied={}/{} {}  down_wait#={}",
-               static_cast< void* >(m_bytes), m_is_meta_buf?"[META]":"", m_created_cp_id, m_dirtied_cp_id, m_node_freed?"FREED":"", m_wait_for_down_buffers.get());
+                       static_cast< void* >(m_bytes), m_is_meta_buf ? "[META]" : "", m_created_cp_id, m_dirtied_cp_id,
+                       m_node_freed ? "FREED" : "", m_wait_for_down_buffers.get());
     }
-    //        fmt::format_to(std::back_inserter(str), " <br/> next_buffer={}",
-    //                       m_next_buffer.lock() ? reinterpret_cast< void* >(m_next_buffer.lock().get()) : 0);
     return str;
 }
 

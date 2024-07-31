@@ -128,9 +128,8 @@ struct IndexCrashTest : public test_common::HSTestHelper, BtreeTestHelper< TestT
     void restart_homestore(uint32_t shutdown_delay_sec = 3) override {
         this->params(HS_SERVICE::INDEX).index_svc_cbs = new TestIndexServiceCallbacks(this);
         LOGINFO("\n\n\n\n\n\n shutdown homestore for index service Test\n\n\n\n\n");
-//        this->m_shadow_map.save(this->m_shadow_filename);
+        //        this->m_shadow_map.save(this->m_shadow_filename);
         test_common::HSTestHelper::restart_homestore(shutdown_delay_sec);
-
     }
 
     void reapply_after_crash() {
@@ -138,15 +137,15 @@ struct IndexCrashTest : public test_common::HSTestHelper, BtreeTestHelper< TestT
         snapshot_map.load(m_shadow_filename);
         LOGINFO("\t\t\t\tMehdi: snapshot before crash\n{}", snapshot_map.to_string());
         auto diff = this->m_shadow_map.diff(snapshot_map);
-        std::string dif_str="KEY \tADDITION\n";
+        std::string dif_str = "KEY \tADDITION\n";
         for (const auto& [k, addition] : diff) {
             dif_str += fmt::format(" {} \t{}\n", k.key(), addition);
         }
         // visualize tree after crash
-        std::string recovered_tree_filename = "tree_after_crash_" + to_string(rand()%100)+".dot";
+        std::string recovered_tree_filename = "tree_after_crash_" + to_string(rand() % 100) + ".dot";
         this->visualize_keys(recovered_tree_filename);
-        LOGINFO(" tree after recovered stored in {}", recovered_tree_filename );
-        test_common::HSTestHelper::trigger_cp(true);
+        LOGINFO(" tree after recovered stored in {}", recovered_tree_filename);
+        // test_common::HSTestHelper::trigger_cp(true);
         LOGINFO("Diff between shadow map and snapshot map\n{}\n", dif_str);
         for (const auto& [k, addition] : diff) {
             LOGINFO("\t\n\n reapply: before inserting key {}", k.key());
@@ -175,22 +174,20 @@ struct IndexCrashTest : public test_common::HSTestHelper, BtreeTestHelper< TestT
         BtreeTestHelper< TestType >::TearDown();
         this->shutdown_homestore(false);
     }
-    void crash_and_recover(uint32_t s_key, uint32_t e_key){
+    void crash_and_recover(uint32_t s_key, uint32_t e_key) {
         this->print_keys();
         test_common::HSTestHelper::trigger_cp(false);
         this->wait_for_crash_recovery();
-        this->visualize_keys("tree_after_crash_"+std::to_string(s_key)+"_"+std::to_string(e_key)+".dot");
+        this->visualize_keys("tree_after_crash_" + std::to_string(s_key) + "_" + std::to_string(e_key) + ".dot");
         this->print_keys();
         this->reapply_after_crash();
 
         this->get_all();
-        LOGINFO(" except to have [{},{}) in tree and it is actually{} ", s_key, e_key,tree_key_count());
+        LOGINFO(" except to have [{},{}) in tree and it is actually{} ", s_key, e_key, tree_key_count());
         ASSERT_EQ(this->m_shadow_map.size(), this->m_bt->count_keys(this->m_bt->root_node_id()))
             << "shadow map size and tree size mismatch";
     }
-    uint32_t tree_key_count(){
-        return this->m_bt->count_keys(this->m_bt->root_node_id());
-    }
+    uint32_t tree_key_count() { return this->m_bt->count_keys(this->m_bt->root_node_id()); }
 
 protected:
     const std::string m_shadow_filename = "/tmp/shadow_map_index_recovery.txt";
@@ -239,7 +236,6 @@ TYPED_TEST(IndexCrashTest, SplitOnLeftEdge) {
     LOGINFO("Step 4: Post crash we reapply the missing entries to tree");
     this->crash_and_recover(num_entries / 2, num_entries);
 
-
     // TODO: Uncomment this once we do a fix for the inconsistent query results
     LOGINFO("Step 5: Fill the 2nd quarter of the tree, to make sure left child is split and we crash on flush of the "
             "left child");
@@ -247,7 +243,7 @@ TYPED_TEST(IndexCrashTest, SplitOnLeftEdge) {
     this->visualize_keys("tree_before_insert.dot");
     for (auto k = num_entries / 4; k < num_entries / 2; ++k) {
         LOGINFO("inserting key {}", k);
-        this->visualize_keys("tree_before_"+to_string(k)+".dot");
+        this->visualize_keys("tree_before_" + to_string(k) + ".dot");
         this->put(k, btree_put_type::INSERT, true /* expect_success */);
     }
     this->visualize_keys("tree_before_crash.dot");
@@ -256,18 +252,16 @@ TYPED_TEST(IndexCrashTest, SplitOnLeftEdge) {
     LOGINFO("Step 6: Post crash we reapply the missing entries to tree");
     this->crash_and_recover(num_entries / 4, num_entries);
 
-
-//    LOGINFO("Step 7: Fill the 1st quarter of the tree, to make sure left child is split and we crash on flush of the "
-//            "parent node");
-//    this->set_basic_flip("crash_flush_on_split_at_parent");
-//    for (auto k = 0u; k <= num_entries / 4; ++k) {
-//        this->put(k, btree_put_type::INSERT, true /* expect_success */);
-//    }
-//    LOGINFO("Step 8: Post crash we reapply the missing entries to tree");
-//    this->crash_and_recover(0, num_entries);
+    LOGINFO("Step 7: Fill the 1st quarter of the tree, to make sure left child is split and we crash on flush of the "
+            "parent node");
+    this->set_basic_flip("crash_flush_on_split_at_parent");
+    for (auto k = 0u; k <= num_entries / 4; ++k) {
+        this->put(k, btree_put_type::INSERT, true /* expect_success */);
+    }
+    LOGINFO("Step 8: Post crash we reapply the missing entries to tree");
+    this->crash_and_recover(0, num_entries);
     LOGINFO("Step 9: Query all entries and validate with pagination of 80 entries");
     this->query_all_paginate(80);
-
 }
 
 int main(int argc, char* argv[]) {

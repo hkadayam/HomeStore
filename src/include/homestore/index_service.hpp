@@ -80,7 +80,6 @@ public:
     uint64_t used_size() const;
     uint32_t node_size() const;
     void repair_index_node(uint32_t ordinal, IndexBufferPtr const& node_buf);
-    void repair_index_root(uint32_t ordinal, IndexBufferPtr const& root_buf);
 
     IndexWBCacheBase& wb_cache() { return *m_wb_cache; }
 

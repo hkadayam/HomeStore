@@ -239,12 +239,6 @@ void CPManager::cp_start_flush(CP* cp) {
     }
 
     folly::collectAllUnsafe(futs).thenValue([this, cp](auto) {
-#ifdef _PRERELEASE
-        if (hs()->crash_simulator().is_in_crashing_phase()) {
-            on_cp_flush_done(cp);
-            return;
-        }
-#endif
         // Sync flushing replication svc at last as the cp_lsn updated here
         // other component should at least flushed to cp_lsn
         auto& repl_cp = m_cp_cb_table[(size_t)cp_consumer_t::REPLICATION_SVC];

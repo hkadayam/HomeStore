@@ -242,6 +242,7 @@ public:
             file << key.key() << " " << value << '\n';
         }
         file.close();
+        LOGINFO("Saved shadow map to file: {}", filename);
     }
 
     void load(const std::string& filename) {

@@ -94,6 +94,8 @@ class HomestoreConan(ConanFile):
                 tc.variables['BUILD_COVERAGE'] = 'ON'
             elif self.options.get_safe("sanitize"):
                 tc.variables['MEMORY_SANITIZER_ON'] = 'ON'
+        tc.variables["CONAN_PACKAGE_NAME"] = self.name
+        tc.variables["CONAN_PACKAGE_VERSION"] = self.version
         tc.generate()
 
         # This generates "boost-config.cmake" and "grpc-config.cmake" etc in self.generators_folder

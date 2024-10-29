@@ -364,6 +364,7 @@ public:
 
     template < typename K >
     K get_first_key() const {
+        if (total_entries() == 0) { return K{}; }
         return get_nth_key< K >(0, true);
     }
 
@@ -463,6 +464,12 @@ public:
             }
             fmt::format_to(std::back_inserter(str), "]");
         }
+
+        // Should not happen
+        if (this->is_node_deleted()) {
+            fmt::format_to(std::back_inserter(str), " **DELETED** ");
+        }
+
         return str;
     }
 

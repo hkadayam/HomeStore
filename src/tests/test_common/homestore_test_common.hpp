@@ -194,8 +194,8 @@ public:
         }
 
         homestore::HomeStore::instance()->shutdown();
+        iomanager.stop(); // Stop iomanager first in case any fiber is still referencing homestore resources
         homestore::HomeStore::reset_instance();
-        iomanager.stop();
 
         if (cleanup) {
             remove_files(m_generated_devs);
@@ -246,6 +246,11 @@ public:
         freq.set_percent(percent);
         m_fc.inject_delay_flip(flip_name, {null_cond}, freq, delay_usec);
         LOGDEBUG("Flip {} set", flip_name);
+    }
+
+    void remove_flip(const std::string flip_name) {
+        m_fc.remove_flip(flip_name);
+        LOGDEBUG("Flip {} removed", flip_name);
     }
 #endif
 

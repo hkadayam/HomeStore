@@ -235,7 +235,8 @@ void CPManager::cp_start_flush(CP* cp) {
     for (size_t svcid = 0; svcid < (size_t)cp_consumer_t::SENTINEL; svcid++) {
         if (svcid == (size_t)cp_consumer_t::REPLICATION_SVC) { continue; }
         auto& consumer = m_cp_cb_table[svcid];
-        if (consumer) { futs.emplace_back(std::move(consumer->cp_flush(cp))); }
+        bool participated = (cp->m_contexts[svcid] != nullptr);
+        if (consumer && participated) { futs.emplace_back(std::move(consumer->cp_flush(cp))); }
     }
 
     folly::collectAllUnsafe(futs).thenValue([this, cp](auto) {

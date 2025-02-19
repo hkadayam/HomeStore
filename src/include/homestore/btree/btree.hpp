@@ -43,6 +43,18 @@ using RemovePaginateCookie = unique< BtreeRangeRemoveRequest< K > >;
 template < typename K >
 using QueryPaginateCookie = unique< BtreeQueryRequest< K > >;
 
+class BtreeStore;
+class BtreeBase : public Index {
+public:
+    BtreeBase(BtreeConfig const& cfg, uuid_t uuid = uuid_t{}, uuid_t parent_uuid = uuid_t{}, uint32_t user_sb_size = 0);
+    BtreeBase(BtreeConfig const& cfg, superblk< index_table_sb >&& sb);
+    virtual StoreSpecificBtree* store_specific_btree() { return m_store_bt.get(); }
+
+private:
+    std::shared_ptr< BtreeStore > m_store;
+    std::unique_ptr< StoreSpecificBtree > m_store_bt;
+};
+
 template < typename K, typename V >
 class Btree : public BtreeBase {
 public:

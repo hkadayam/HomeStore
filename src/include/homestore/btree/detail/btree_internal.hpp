@@ -213,6 +213,8 @@ void intrusive_ptr_release(BtreeNode* node);
 
 ENUM(btree_event_t, uint8_t, READ, MUTATE, REMOVE, SPLIT, REPAIR, MERGE);
 
+ENUM(btree_store_t, uint8_t, MEM, COPY_ON_WRITE, INPLACE);
+
 struct trace_route_entry {
     bnodeid_t node_id{empty_bnodeid};
     BtreeNode* node{nullptr};

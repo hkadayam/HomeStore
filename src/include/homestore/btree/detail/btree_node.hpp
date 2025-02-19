@@ -36,6 +36,7 @@ struct transient_hdr_t {
 
     /* these variables are accessed without taking lock and are not expected to change after init */
     uint8_t leaf_node{0};
+    btree_store_t store_type{btree_store_t::COPY_ON_WRITE};
     uint64_t max_keys_in_node{0};
 
     bool is_leaf() const { return (leaf_node != 0); }
@@ -117,9 +118,11 @@ public:
 #ifdef _PRERELEASE
         m_trans_hdr.max_keys_in_node = cfg.m_max_keys_in_node;
 #endif
-
     }
-    virtual ~BtreeNode() = default;
+
+    virtual ~BtreeNode() { index_svc()->btree_store(m_trans_hdr.store_type)->on_node_freed(this); };
+
+    void set_store_type(btree_store_t store) { m_trans_hdr.store_type = store; }
 
     // Identify if a node is a leaf node or not, from raw buffer, by just reading persistent_hdr_t
     static bool identify_leaf_node(uint8_t* buf) { return (r_cast< persistent_hdr_t* >(buf))->leaf; }
@@ -469,6 +472,8 @@ protected:
 
 public:
     void update_phys_buf(uint8_t* buf) { m_phys_node_buf = buf; }
+    uint8_t* get_phys_buf() { return m_phys_node_buf; }
+
     persistent_hdr_t* get_persistent_header() { return r_cast< persistent_hdr_t* >(m_phys_node_buf); }
     const persistent_hdr_t* get_persistent_header_const() const {
         return r_cast< const persistent_hdr_t* >(m_phys_node_buf);

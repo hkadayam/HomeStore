@@ -43,7 +43,7 @@ public:
     std::string btree_store_type() const override { return "MEM_BTREE"; }
 
 private:
-    BtreeNodePtr alloc_node(bool is_leaf) override {
+    BtreeNodePtr create_node(bool is_leaf) override {
         std::shared_ptr< uint8_t[] > ptr(new uint8_t[this->m_bt_cfg.node_size()]);
         node_buf_ptr_vec.emplace_back(ptr);
 
@@ -76,7 +76,7 @@ private:
         this->write_node(parent_node, context);
 
         for (const auto& node : freed_nodes) {
-            this->free_node(node, locktype_t::WRITE, context);
+            this->remove_node(node, locktype_t::WRITE, context);
         }
         return btree_status_t::success;
     }

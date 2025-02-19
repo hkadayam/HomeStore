@@ -218,6 +218,7 @@ void CPManager::cp_start_flush(CP* cp) {
     std::vector< folly::Future< bool > > futs;
     HS_PERIODIC_LOG(INFO, cp, "Starting CP {} flush", cp->id());
     cp->m_cp_status = cp_status_t::cp_flushing;
+    m_cur_flushing_cp_id.store(cp->id());
 
     for (size_t svcid = 0; svcid < (size_t)cp_consumer_t::SENTINEL; svcid++) {
         if (svcid == (size_t)cp_consumer_t::REPLICATION_SVC) {
@@ -242,6 +243,8 @@ void CPManager::on_cp_flush_done(CP* cp) {
     cp->m_cp_status = cp_status_t::cp_flush_done;
 
     iomanager.run_on_forget(pick_blocking_io_fiber(), [this, cp]() {
+        m_cur_flushing_cp_id.store(-1);
+
         // Persist the superblock with this flushed cp information
         ++(m_sb->m_last_flushed_cp);
         m_sb.write();

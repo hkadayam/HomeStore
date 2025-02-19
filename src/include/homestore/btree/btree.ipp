@@ -36,8 +36,19 @@
 
 namespace homestore {
 template < typename K, typename V >
-Btree< K, V >::Btree(const BtreeConfig& cfg) :
-        m_metrics{cfg.name().c_str()}, m_node_size{cfg.node_size()}, m_bt_cfg{cfg} {
+Btree< K, V >::Btree(BtreeConfig const& cfg, uuid_t uuid, uuid_t parent_uuid, uint32_t user_sb_size) :
+        BtreeBase::BtreeBase(cfg, uuid, parent_uuid, user_sb_size),
+        m_metrics{cfg.name().c_str()},
+        m_node_size{cfg.node_size()},
+        m_bt_cfg{cfg} {
+    m_bt_cfg.set_node_data_size(cfg.node_size() - sizeof(persistent_hdr_t));
+}
+
+Btree< K, V >::Btree(BtreeConfig const& cfg, superblk< index_table_sb >&& sb) :
+        BtreeBase::BtreeBase(cfg, std::move(sb)),
+        m_metrics{cfg.name().c_str()},
+        m_node_size{cfg.node_size()},
+        m_bt_cfg{cfg} {
     m_bt_cfg.set_node_data_size(cfg.node_size() - sizeof(persistent_hdr_t));
 }
 

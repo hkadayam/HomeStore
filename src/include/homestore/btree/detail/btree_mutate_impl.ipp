@@ -214,7 +214,7 @@ btree_status_t Btree< K, V >::check_split_root(ReqT& req) {
         goto done;
     }
 
-    new_root = alloc_interior_node();
+    new_root = create_interior_node();
     if (new_root == nullptr) {
         ret = btree_status_t::space_not_avail;
         unlock_node(root, locktype_t::WRITE);
@@ -227,18 +227,18 @@ btree_status_t Btree< K, V >::check_split_root(ReqT& req) {
     root = std::move(new_root);
 
     // We need to notify about the root change, before splitting the node, so that correct dependencies are set
-    ret = on_root_changed(root, req.m_op_context);
+    ret = m_store->on_root_changed(root, req.m_op_context);
     if (ret != btree_status_t::success) {
-        free_node(root, locktype_t::WRITE, req.m_op_context);
+        remove_node(root, locktype_t::WRITE, req.m_op_context);
         unlock_node(child_node, locktype_t::WRITE);
         goto done;
     }
 
     ret = split_node(root, child_node, root->total_entries(), &split_key, req.m_op_context);
     if (ret != btree_status_t::success) {
-        free_node(root, locktype_t::WRITE, req.m_op_context);
+        remove_node(root, locktype_t::WRITE, req.m_op_context);
         root = std::move(child_node);
-        on_root_changed(root, req.m_op_context); // Revert it back
+        m_store->on_root_changed(root, req.m_op_context); // Revert it back
         unlock_node(root, locktype_t::WRITE);
     } else {
         if (req.route_tracing) { append_route_trace(req, child_node, btree_event_t::SPLIT); }
@@ -257,7 +257,7 @@ btree_status_t Btree< K, V >::split_node(const BtreeNodePtr& parent_node, const 
                                          uint32_t parent_ind, K* out_split_key, void* context) {
     BtreeNodePtr child_node1 = child_node;
     BtreeNodePtr child_node2;
-    child_node2.reset(child_node1->is_leaf() ? alloc_leaf_node().get() : alloc_interior_node().get());
+    child_node2.reset(child_node1->is_leaf() ? create_leaf_node().get() : create_interior_node().get());
 
     if (child_node2 == nullptr) { return (btree_status_t::space_not_avail); }
 
@@ -292,7 +292,7 @@ btree_status_t Btree< K, V >::split_node(const BtreeNodePtr& parent_node, const 
     BT_NODE_LOG(DEBUG, child_node1, "Left child");
     BT_NODE_LOG(DEBUG, child_node2, "Right child");
 
-    ret = transact_nodes({child_node2}, {}, child_node1, parent_node, context);
+    ret = m_store->transact_nodes({child_node2}, {}, child_node1, parent_node, context);
 
     // NOTE: Do not access parentInd after insert, since insert would have
     // shifted parentNode to the right.

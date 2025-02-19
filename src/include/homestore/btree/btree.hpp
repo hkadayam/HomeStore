@@ -26,6 +26,7 @@
 #include "btree_kv.hpp"
 #include <homestore/btree/detail/btree_internal.hpp>
 #include <homestore/btree/detail/btree_node.hpp>
+#include <homestore/index/index_base.hpp>
 
 SISL_LOGGING_DECL(btree)
 
@@ -71,8 +72,20 @@ struct BTREE_FLIPS {
     }
 };
 
+class BtreeStore;
+class BtreeBase : public Index {
+public:
+    BtreeBase(BtreeConfig const& cfg, uuid_t uuid = uuid_t{}, uuid_t parent_uuid = uuid_t{}, uint32_t user_sb_size = 0);
+    BtreeBase(BtreeConfig const& cfg, superblk< index_table_sb >&& sb);
+    virtual StoreSpecificBtree* store_specific_btree() { return m_store_bt.get(); }
+
+private:
+    std::shared_ptr< BtreeStore > m_store;
+    std::unique_ptr< StoreSpecificBtree > m_store_bt;
+};
+
 template < typename K, typename V >
-class Btree {
+class Btree : public BtreeBase {
 protected:
     mutable iomgr::FiberManagerLib::shared_mutex m_btree_lock;
     BtreeLinkInfo m_root_node_info;
@@ -102,7 +115,8 @@ protected:
 
 public:
     /////////////////////////////////////// All External APIs /////////////////////////////
-    Btree(const BtreeConfig& cfg);
+    Btree(BtreeConfig const& cfg, uuid_t uuid = uuid_t{}, uuid_t parent_uuid = uuid_t{}, uint32_t user_sb_size = 0);
+    Btree(BtreeConfig const& cfg, superblk< index_table_sb >&& sb);
     virtual ~Btree();
 
     template < typename ReqT >
@@ -144,18 +158,7 @@ public:
 #endif
 
 protected:
-    /////////////////////////// Methods the underlying store is expected to handle ///////////////////////////
-    virtual BtreeNodePtr alloc_node(bool is_leaf) = 0;
-    virtual BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf) const;
-    virtual btree_status_t read_node_impl(bnodeid_t id, BtreeNodePtr& node) const = 0;
-    virtual btree_status_t write_node_impl(const BtreeNodePtr& node, void* context) = 0;
-    virtual btree_status_t refresh_node(const BtreeNodePtr& node, bool for_read_modify_write, void* context) const = 0;
-    virtual void free_node_impl(const BtreeNodePtr& node, void* context) = 0;
-    virtual btree_status_t transact_nodes(const BtreeNodeList& new_nodes, const BtreeNodeList& freed_nodes,
-                                          const BtreeNodePtr& left_child_node, const BtreeNodePtr& parent_node,
-                                          void* context) = 0;
-    virtual btree_status_t on_root_changed(BtreeNodePtr const& root, void* context) = 0;
-    virtual std::string btree_store_type() const = 0;
+    BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf) override;
 
     /////////////////////////// Methods the application use case is expected to handle ///////////////////////////
 
@@ -167,9 +170,9 @@ protected:
                                       locktype_t leaf_lock_type, void* context) const;
     void read_node_or_fail(bnodeid_t id, BtreeNodePtr& node) const;
     btree_status_t write_node(const BtreeNodePtr& node, void* context);
-    void free_node(const BtreeNodePtr& node, locktype_t cur_lock, void* context);
-    BtreeNodePtr alloc_leaf_node();
-    BtreeNodePtr alloc_interior_node();
+    void remove_node(const BtreeNodePtr& node, locktype_t cur_lock, void* context);
+    BtreeNodePtr create_leaf_node();
+    BtreeNodePtr create_interior_node();
 
     btree_status_t get_child_and_lock_node(const BtreeNodePtr& node, uint32_t index, BtreeLinkInfo& child_info,
                                            BtreeNodePtr& child_node, locktype_t int_lock_type,

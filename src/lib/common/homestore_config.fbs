@@ -57,6 +57,9 @@ table Btree {
     max_nodes_to_rebalance: uint32 = 3;
 
     mem_btree_page_size: uint32 = 8192;
+
+    /* Maximum number of btree pages to persist per IO */
+    max_btree_write_size_per_io: uint64 = 16777216 /* 16 MB */
 }
 
 table Cache {

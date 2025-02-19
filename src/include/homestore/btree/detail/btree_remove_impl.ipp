@@ -199,7 +199,7 @@ btree_status_t Btree< K, V >::check_collapse_root(ReqT& req) {
         goto done;
     }
 
-    ret = on_root_changed(child, req.m_op_context);
+    ret = m_store->on_root_changed(child, req.m_op_context);
     if (ret != btree_status_t::success) {
         unlock_node(child, locktype_t::WRITE);
         unlock_node(root, locktype_t::WRITE);
@@ -208,7 +208,7 @@ btree_status_t Btree< K, V >::check_collapse_root(ReqT& req) {
 
     if (req.route_tracing) { append_route_trace(req, root, btree_event_t::MERGE); }
 
-    free_node(root, locktype_t::WRITE, req.m_op_context);
+    remove_node(root, locktype_t::WRITE, req.m_op_context);
     m_root_node_info = child->link_info();
     unlock_node(child, locktype_t::WRITE);
     COUNTER_DECREMENT(m_metrics, btree_depth, 1);
@@ -316,7 +316,7 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
     available_size = 0;
     while (src_cursor.ith_node < old_nodes.size()) {
         if (available_size == 0) {
-            new_node.reset(alloc_node(leftmost_node->is_leaf()).get());
+            new_node.reset(create_node(leftmost_node->is_leaf()).get());
             if (new_node == nullptr) {
                 ret = btree_status_t::merge_failed;
                 goto out;
@@ -477,7 +477,7 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
         }
 #endif
 
-        ret = transact_nodes(new_nodes, old_nodes, leftmost_node, parent_node, context);
+        ret = m_store->transact_nodes(new_nodes, old_nodes, leftmost_node, parent_node, context);
     }
 
 out:
@@ -489,7 +489,7 @@ out:
         }
         for (auto it = new_nodes.rbegin(); it != new_nodes.rend(); ++it) {
             BT_NODE_LOG(DEBUG, (*it).get(), "Freeing this new node as part of unsuccessful merge");
-            free_node(*it, locktype_t::NONE, context);
+            remove_node(*it, locktype_t::NONE, context);
         }
     }
     return ret;

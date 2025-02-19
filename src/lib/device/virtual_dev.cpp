@@ -526,6 +526,12 @@ std::error_code VirtualDev::sync_read(char* buf, uint32_t size, BlkId const& bid
     return chunk->physical_dev_mutable()->sync_read(buf, size, dev_offset);
 }
 
+std::pair< std::error_code, sisl::io_blob_safe > VirtualDev::alloc_buf_and_read(BlkId const& bid) {
+    auto blob = sisl::io_blob_safe(bid.blk_count() * block_size(), align_size(), sisl::buftag::common);
+    auto ec = sync_read(buf.bytes, buf.size, bid);
+    return std::pair(ec, std::move(blob));
+}
+
 std::error_code VirtualDev::sync_read(char* buf, uint32_t size, cshared< Chunk >& chunk, uint64_t offset_in_chunk) {
     if (sisl_unlikely(!is_chunk_available(chunk))) {
         return std::make_error_code(std::errc::resource_unavailable_try_again);

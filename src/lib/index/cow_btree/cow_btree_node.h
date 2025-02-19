@@ -1,0 +1,24 @@
+#pragma once
+
+#include <homestore/btree/detail/btree_node.hpp>
+
+namespace homestore {
+class COWBtreeCPContext;
+class COWBtree;
+
+struct COWBtreeNode {
+public:
+    uint8_t* m_prev_version_buf{nullptr};
+
+public:
+    COWBtreeNode() = default;
+    ~COWBtreeNode();
+
+    bool copy_buf_if_needed(COWBtree& bt, COWBtreeCPContext* ctx);
+    uint8_t* get_flush_version_buf(cp_id_t cp_id);
+    void reset_prev_version_buf(cp_id_t cp_id);
+
+private:
+    BtreeNode* to_btree_node();
+};
+} // namespace homestore

@@ -89,7 +89,7 @@ template < typename K, typename V >
 btree_status_t Btree< K, V >::do_destroy(uint64_t& n_freed_nodes, void* context) {
     return post_order_traversal(locktype_t::WRITE,
                                 [this, &n_freed_nodes, context](const auto& node, bool is_leaf) -> btree_status_t {
-                                    free_node(node, locktype_t::WRITE, context);
+                                    remove_node(node, locktype_t::WRITE, context);
                                     ++n_freed_nodes;
                                     return btree_status_t::node_freed;
                                 });
@@ -230,7 +230,7 @@ void Btree< K, V >::validate_sanity_child(const BtreeNodePtr& parent_node, uint3
 
     parent_node->get_nth_value(ind, &child_info, false /* copy */);
     BtreeNodePtr child_node = nullptr;
-    auto ret = read_node_impl(child_info.bnode_id(), child_node);
+    auto ret = m_store->read_node(child_info.bnode_id(), child_node);
     BT_REL_ASSERT_EQ(ret, btree_status_t::success, "read failed, reason: {}", ret);
     if (child_node->total_entries() == 0) {
         auto parent_entries = parent_node->total_entries();
@@ -277,7 +277,7 @@ void Btree< K, V >::validate_sanity_next_child(const BtreeNodePtr& parent_node, 
     parent_node->get_nth_value(ind + 1, &child_info, false /* copy */);
 
     BtreeNodePtr child_node = nullptr;
-    auto ret = read_node_impl(child_info.bnode_id(), child_node);
+    auto ret = m_store->read_node(child_info.bnode_id(), child_node);
     BT_REL_ASSERT_EQ(ret, btree_status_t::success, "read failed, reason: {}", ret);
 
     if (child_node->total_entries() == 0) {

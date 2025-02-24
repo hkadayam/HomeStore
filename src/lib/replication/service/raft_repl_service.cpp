@@ -179,8 +179,28 @@ void RaftReplService::start() {
 }
 
 void RaftReplService::stop() {
-    stop_reaper_thread();
-    GenericReplService::stop();
+    start_stopping();
+    while (true) {
+        auto pending_request_num = get_pending_request_num();
+        if (!pending_request_num) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+
+    // stop all repl_devs
+    {
+        std::unique_lock lg(m_rd_map_mtx);
+        for (auto it = m_rd_map.begin(); it != m_rd_map.end(); ++it) {
+            auto rdev = std::dynamic_pointer_cast< RaftReplDev >(it->second);
+            rdev->stop();
+        }
+    }
+
+    // this will stop and shutdown all the repl_dev and grpc server(data channel).
+    // for each raft_repl_dev:
+    // 1 Cancel snapshot requests if exist.
+    // 2 Terminate background commit thread.
+    // 3 Cancel all scheduler tasks.
+    // after m_msg_mgr is reset , no further data will hit data service and no futher log will hit log store.
     m_msg_mgr.reset();
     hs()->logstore_service().stop();
 }

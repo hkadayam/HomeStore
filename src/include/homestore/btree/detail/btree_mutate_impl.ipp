@@ -257,7 +257,7 @@ btree_status_t Btree< K, V >::split_node(const BtreeNodePtr& parent_node, const 
                                          uint32_t parent_ind, K* out_split_key, void* context) {
     BtreeNodePtr child_node1 = child_node;
     BtreeNodePtr child_node2;
-    child_node2.reset(child_node1->is_leaf() ? create_leaf_node().get() : create_interior_node().get());
+    child_node2.reset(child_node1->is_leaf() ? create_leaf_node(context).get() : create_interior_node(context).get());
 
     if (child_node2 == nullptr) { return (btree_status_t::space_not_avail); }
 

@@ -39,8 +39,7 @@ template < typename K, typename V >
 Btree< K, V >::Btree(BtreeConfig const& cfg, uuid_t uuid, uuid_t parent_uuid, uint32_t user_sb_size) :
         BtreeBase::BtreeBase(cfg, uuid, parent_uuid, user_sb_size),
         m_metrics{cfg.name().c_str()},
-        m_node_size{cfg.node_size()},
-        m_bt_cfg{cfg} {
+        m_node_size{cfg.node_size()} {
     m_bt_cfg.set_node_data_size(cfg.node_size() - sizeof(persistent_hdr_t));
 }
 
@@ -67,12 +66,13 @@ std::pair< btree_status_t, uint64_t > Btree< K, V >::destroy_btree(void* context
 
     bool expected = false;
     if (!m_destroyed.compare_exchange_strong(expected, true)) {
-        BT_LOG(DEBUG, "Btree is already being destroyed, ignorining this request");
+        BT_LOG(DEBUG, "Btree is already being destroyed, ignoring this request");
         return std::make_pair(btree_status_t::not_found, 0);
     }
     ret = do_destroy(n_freed_nodes, context);
     if (ret == btree_status_t::success) {
         BT_LOG(DEBUG, "btree(root: {}) {} nodes destroyed successfully", m_root_node_info.bnode_id(), n_freed_nodes);
+        m_store->on_btree_destroyed(*this);
     } else {
         m_destroyed = false;
         BT_LOG(ERROR, "btree(root: {}) nodes destroyed failed, ret: {}", m_root_node_info.bnode_id(), ret);

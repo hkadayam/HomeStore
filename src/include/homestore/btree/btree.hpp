@@ -26,7 +26,7 @@
 #include "btree_kv.hpp"
 #include <homestore/btree/detail/btree_internal.hpp>
 #include <homestore/btree/detail/btree_node.hpp>
-#include <homestore/index/index_base.hpp>
+#include <homestore/index/index_service.hpp>
 
 SISL_LOGGING_DECL(btree)
 
@@ -73,15 +73,23 @@ struct BTREE_FLIPS {
 };
 
 class BtreeStore;
+
+class UnderlyingBtree {
+    virtual ~UnderlyingBtree() = default;
+};
+
 class BtreeBase : public Index {
 public:
     BtreeBase(BtreeConfig const& cfg, uuid_t uuid = uuid_t{}, uuid_t parent_uuid = uuid_t{}, uint32_t user_sb_size = 0);
-    BtreeBase(BtreeConfig const& cfg, superblk< index_table_sb >&& sb);
-    virtual StoreSpecificBtree* store_specific_btree() { return m_store_bt.get(); }
+    BtreeBase(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb);
+    virtual UnderlyingBtree* underlying_btree() { return m_bt_private.get(); }
+    virtual uint32_t node_size() const;
+    uint32_t ordinal() const;
 
-private:
-    std::shared_ptr< BtreeStore > m_store;
-    std::unique_ptr< StoreSpecificBtree > m_store_bt;
+protected:
+    shared< BtreeStore > m_store;
+    unique< UnderlyingBtree > m_bt_private;
+    BtreeConfig m_bt_cfg;
 };
 
 template < typename K, typename V >
@@ -93,7 +101,6 @@ protected:
     BtreeMetrics m_metrics;
     std::atomic< bool > m_destroyed{false};
     std::atomic< uint64_t > m_total_nodes{0};
-    uint32_t m_node_size{4096};
 #ifndef NDEBUG
     std::atomic< uint64_t > m_req_id{0};
 #endif
@@ -116,7 +123,7 @@ protected:
 public:
     /////////////////////////////////////// All External APIs /////////////////////////////
     Btree(BtreeConfig const& cfg, uuid_t uuid = uuid_t{}, uuid_t parent_uuid = uuid_t{}, uint32_t user_sb_size = 0);
-    Btree(BtreeConfig const& cfg, superblk< index_table_sb >&& sb);
+    Btree(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb);
     virtual ~Btree();
 
     template < typename ReqT >

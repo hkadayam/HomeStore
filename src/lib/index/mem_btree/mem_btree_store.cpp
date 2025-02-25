@@ -1,14 +1,19 @@
 #pragma once
 
-#include <memory>
-
-#include <homestore/btree/mem_btree_store.h>
+#include "index/mem_btree/mem_btree_store.h"
 
 namespace homestore {
-MemBtreeStore::MemBtreeStore(uint32_t node_size) : m_node_size{node_size} {}
+MemBtreeStore::MemBtreeStore() {}
+
+unique< UnderlyingBtree > MemBtreeStore::on_btree_created(BtreeBase& btree, bool load_existing) {
+    // We don't need any mem specific btree portion, everything can be accomplished from common store class
+    return nullptr;
+}
+
+void MemBtreeStore::on_btree_destroyed(BtreeBase& btree) {}
 
 BtreeNodePtr MemBtreeStore::create_node(BtreeBase& btree, bool is_leaf) override {
-    std::shared_ptr< uint8_t[] > ptr(new uint8_t[m_node_size()]);
+    std::shared_ptr< uint8_t[] > ptr(new uint8_t[btree->node_size()]);
     node_buf_ptr_vec.emplace_back(ptr);
 
     auto new_node = btree.init_node(ptr.get(), bnodeid_t{0}, true, is_leaf, 0 /* context_size */);
@@ -54,6 +59,8 @@ btree_status_t MemBtreeStore::on_root_changed(BtreeBase&, BtreeNodePtr const&, v
     return btree_status_t::success;
 }
 
-void MemBtreeStore::on_node_freed(BtreeNode* node) {}
+void MemBtreeStore::on_node_freed(BtreeNode* node) {
+    // We don't add any context about the node for every btree, so nothing to be done here.
+}
 
 } // namespace homestore

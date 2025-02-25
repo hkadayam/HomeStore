@@ -42,6 +42,17 @@ private:
 
 struct COWBtreeCPContext : public VDevCPContext {
 public:
+    sisl::atomic_counter< int64_t > dirty_node_count_{0};
+    sisl::atomic_counter< int64_t > removed_node_count_{0};
+    std::unique_ptr< COWBtreeJournal > journal_;
+
+public:
+    COWBtreeCPContext(CP* cp) : VDevCPContext(cp) {}
+    virtual ~COWBtreeCPContext() = default;
+};
+
+struct COWBtreeCPContext : public VDevCPContext {
+public:
 #pragma pack(1)
     using compact_blkid_t = std::pair< blk_num_t, chunk_num_t >;
     enum class op_t : uint8_t { child_new, child_freed, parent_inplace, child_inplace };

@@ -52,7 +52,7 @@ class IndexStoreBase;
 // This class represents base abstract class of an Index. At present btree is the only implementation of Index
 class Index {
 private:
-    superblk< index_table_sb > m_sb;
+    superblk< IndexSuperBlock > m_sb;
     bool const m_is_ephemeral;
 
 public:

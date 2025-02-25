@@ -51,27 +51,33 @@ public:
     }
 };
 
-class COWBtreeStore : public BtreeStoreBase {
-private:
+class COWBtreeStore : public BtreeStore {
+public:
 #pragma pack(1)
-    struct btree_blk_id {
-        blk_num_t blk_num;
-        chunk_num_t chunk_num;
-        uint16_t modified_cp_id;
+    struct Journal : public IndexStoreSuperBlock {
+    public:
+        cp_id_t cp_id;                   // CP Id for this journal, we have one meta blk which contains journal per CP
+        uint32_t size;                   // Total journal size
+        uint32_t num_btrees{0};          // Total number of btrees updated in this
+        uint32_t total_written_nodes{0}; // Total number of nodes written in this journal
+        uint32_t total_removed_nodes{0}; // Total number of nodes removed in this journal
 
-        btree_blk_id(BlkId const& bid, cp_id_t cp_id) :
-                blk_num{bid.blk_num()}, chunk_num{bid.chunk_num()}, modified_cp_id{cp_id % sizeof(uint16_t)} {}
+        // Followed by multiple cowbtree journals
     };
 #pragma pack()
 
 private:
     sisl::SimpleCache< bnodeid_t, BtreeNodePtr > m_cache;
-    folly::ConcurrentHashMap< bnodeid_t, btree_blk_id > m_bnode_map;
     std::shared_ptr< VirtualDev > m_vdev;
     std::atomic< uint64_t > m_next_bnode_id{0};
-    uint32_t m_max_nodes_per_flush;
-    void* m_bnode_map_base_mblk;
+    meta_blk* m_btree_journal_mblk;
     uint32_t const m_vdev_blks_per_node;
+
+    // All loaded journals arranged by the btree ordinals
+    std::unordered_map< uint32_t, std::vector< sisl::byte_view > > m_journals_by_btree;
+
+    // All journals maintained (sorted) by its cp_id
+    std::vector< superblk< IndexStoreSuperBlock > > m_journals_by_cpid;
 
 public:
     COWBtreeStore(shared< VirtualDev > vdev, std::pair< meta_blk*, sisl::byte_view > sb,
@@ -99,4 +105,31 @@ public:
     btree_status_t on_root_changed(BtreeBase& btree, BtreeNodePtr const& root, void* context) override;
 };
 
+struct COWBtreeJournal {
+public:
+private:
+    sisl::io_blob_safe base_buf_;
+    uint8_t* cur_ptr_;
+    uint32_t used_size_;
+
+#pragma pack(1)
+    struct Header {
+        cp_id_t cp_id;                   // btree journal is one per cp, this uniquely identifies this journal
+        uint32_t num_btrees{0};          // Total number of btrees updated in this
+        uint32_t total_written_nodes{0}; // Total number of nodes written in this journal
+        uint32_t total_removed_nodes{0}; // Total number of nodes removed in this journal
+        uint32_t size{sizeof(Header)};   // Total size of this journal
+    };
+#pragma pack()
+
+public:
+    COWBtreeJournal(uint32_t initial_size);
+    uint8_t* make_room(uint32_t num_bytes);
+    void one_btree_filled(uint32_t num_bytes, uint32_t n_nodes_written, uint32_t n_nodes_removed);
+
+private:
+    Header* header() { return r_cast< Header* >(base_buf_.bytes_); }
+    uint32_t occupied_size() const { return header()->size; }
+    uint32_t available_space() const { return (base_buf_.size - occupied_size()); }
+};
 } // namespace homestore

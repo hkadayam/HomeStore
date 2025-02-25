@@ -31,7 +31,7 @@ namespace homestore {
 template < typename K, typename V >
 btree_status_t Btree< K, V >::create_root_node(void* op_context) {
     // Assign one node as root node and also create a child leaf node and set it as edge
-    BtreeNodePtr root = create_leaf_node();
+    BtreeNodePtr root = create_leaf_node(op_context);
     if (root == nullptr) { return btree_status_t::space_not_avail; }
 
     root->set_level(0u);
@@ -228,8 +228,8 @@ void Btree< K, V >::unlock_node(const BtreeNodePtr& node, locktype_t type) const
 }
 
 template < typename K, typename V >
-BtreeNodePtr Btree< K, V >::create_leaf_node() {
-    BtreeNodePtr n = m_store->create_node(true /* is_leaf */, bind_this(init_node, 4));
+BtreeNodePtr Btree< K, V >::create_leaf_node(void* context) {
+    BtreeNodePtr n = m_store->create_node(*this, true /* is_leaf */, context);
     if (n) {
         COUNTER_INCREMENT(m_metrics, btree_leaf_node_count, 1);
         ++m_total_nodes;
@@ -238,8 +238,8 @@ BtreeNodePtr Btree< K, V >::create_leaf_node() {
 }
 
 template < typename K, typename V >
-BtreeNodePtr Btree< K, V >::create_interior_node() {
-    BtreeNodePtr n = m_store->create_node(false /* is_leaf */, bind_this(init_node, 4));
+BtreeNodePtr Btree< K, V >::create_interior_node(void* context) {
+    BtreeNodePtr n = m_store->create_node(*this, false /* is_leaf */, context);
     if (n) {
         COUNTER_INCREMENT(m_metrics, btree_int_node_count, 1);
         ++m_total_nodes;

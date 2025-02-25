@@ -220,8 +220,6 @@ using to_string_cb_t = std::function< std::string(std::vector< std::pair< K, V >
 
 ENUM(btree_event_t, uint8_t, READ, MUTATE, REMOVE, SPLIT, REPAIR, MERGE);
 
-ENUM(btree_store_t, uint8_t, MEM, COPY_ON_WRITE, INPLACE);
-
 struct trace_route_entry {
     bnodeid_t node_id{empty_bnodeid};
     BtreeNode* node{nullptr};
@@ -254,7 +252,7 @@ struct BtreeConfig {
 
     btree_node_type m_leaf_node_type{btree_node_type::VAR_OBJECT};
     btree_node_type m_int_node_type{btree_node_type::VAR_KEY};
-    btree_store_t m_store_type{btree_store_t::COPY_ON_WRITE};
+    IndexStore::Type m_store_type{IndexStore::Type::COPY_ON_WRITE_BTREE};
     std::string m_btree_name; // Unique name for the btree
 
 private:
@@ -296,6 +294,7 @@ public:
     const std::string& name() const { return m_btree_name; }
     btree_node_type leaf_node_type() const { return m_leaf_node_type; }
     btree_node_type interior_node_type() const { return m_int_node_type; }
+    IndexStore::Type store_type() const { return m_store_type; }
 };
 
 class BtreeMetrics : public sisl::MetricsGroup {

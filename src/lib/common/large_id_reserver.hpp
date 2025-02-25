@@ -18,8 +18,15 @@ public:
 
     static constexpr uint64_t out_of_bounds = std::numeric_limits< uint64_t >::max();
     uint64_t reserve() {
-        uint64_t next = find_next();
-        return next >= m_max ? out_of_bounds : next;
+        uint64_t id = find_next();
+        if (id >= m_max) { return out_of_bound; }
+        m_iset.insert(id);
+        return id;
+    }
+
+    uint64_t reserve(uint64_t id) {
+        HS_DBG_ASSERT(!is_reserved(id), "Reserving an already reserved id={}", id);
+        m_iset.insert(id);
     }
 
     void unreserve(uint64_t id) {

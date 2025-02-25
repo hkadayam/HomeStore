@@ -44,15 +44,23 @@ template < typename K >
 using QueryPaginateCookie = unique< BtreeQueryRequest< K > >;
 
 class BtreeStore;
+
+class UnderlyingBtree {
+    virtual ~UnderlyingBtree() = default;
+};
+
 class BtreeBase : public Index {
 public:
     BtreeBase(BtreeConfig const& cfg, uuid_t uuid = uuid_t{}, uuid_t parent_uuid = uuid_t{}, uint32_t user_sb_size = 0);
-    BtreeBase(BtreeConfig const& cfg, superblk< index_table_sb >&& sb);
-    virtual StoreSpecificBtree* store_specific_btree() { return m_store_bt.get(); }
+    BtreeBase(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb);
+    virtual UnderlyingBtree* underlying_btree() { return m_bt_private.get(); }
+    virtual uint32_t node_size() const;
+    uint32_t ordinal() const;
 
-private:
-    std::shared_ptr< BtreeStore > m_store;
-    std::unique_ptr< StoreSpecificBtree > m_store_bt;
+protected:
+    shared< BtreeStore > m_store;
+    unique< UnderlyingBtree > m_bt_private;
+    BtreeConfig m_bt_cfg;
 };
 
 template < typename K, typename V >

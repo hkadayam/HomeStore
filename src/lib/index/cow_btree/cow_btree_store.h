@@ -48,6 +48,12 @@ private:
     // Total number of incremental cp flushes since last full flushes
     uint32_t m_num_incremental_flushes{0};
 
+    // All loaded journals arranged by the btree ordinals
+    std::unordered_map< uint32_t, std::vector< sisl::byte_view > > m_journals_by_btree;
+
+    // All journals maintained (sorted) by its cp_id
+    std::vector< superblk< IndexStoreSuperBlock > > m_journals_by_cpid;
+
 public:
     COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< IndexStoreSuperBlock > > store_sbs);
     virtual ~COWBtreeStore() = default;

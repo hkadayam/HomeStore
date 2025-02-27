@@ -234,6 +234,12 @@ public:
         size_t m_pending_map_entries_to_flush{0};
         std::vector< std::vector< BlkId > > m_location_chains;
 
+        /////////////// Map and SB flush related entities ///////////////////////
+        BNodeIdMap::iterator next_full_map_it_;
+        uint32_t parallel_flush_range_{0};
+        std::vector< std::vector< MapLocation > > loc_array_list_;
+        bool sb_persist_needed_{false};
+
     public:
         CPSession(COWBtree& bt) : m_bt{bt} {}
         bool prepare_to_flush_nodes(COWBtreeCPContext* cp_ctx);

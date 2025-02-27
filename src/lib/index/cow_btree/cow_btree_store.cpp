@@ -208,7 +208,7 @@ folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
 
 #ifdef _PRERELEASE
     if (hs()->crash_simulator().is_crashed()) {
-        LOGINFOMOD(wbcache, "crash simulation is ongoing, so skip the cp flush");
+        LOGINFOMOD(wbcache, "crash simulation is ongoing, so skip the cp flush");]]
         return folly::makeFuture< bool >(true);
     }
 #endif

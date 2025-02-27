@@ -10,6 +10,8 @@ class Flusher;
 class COWBtree : public UnderlyingBtree {
 public:
     using CompactNodeId = uin32_t;
+    using MapLocation = BlkId;
+    using NodeLocation = CompactBlkId;
 
 #pragma pack(1)
     struct CompactBlkId {
@@ -24,6 +26,15 @@ public:
 
         BlkId to_blkid() const { return is_valid ? BlkId{blk_num, 1u, chunk_num} : BlkId{}; };
     };
+#pragma pack()
+
+#pragma pack(1)
+    struct SuperBlock {
+        cp_id_t cp_id;            // CPID when this superblock was written
+        uint16_t num_map_heads;   // Total number of map heads
+        MapLocation map_heads[1]; // Array of heads of chain which contains the blkid map data
+    };
+    static_assert(sizeof(SuperBlock) < 512, "Expected superblk to be within the btree superblk underlying btree size");
 #pragma pack()
 
     struct Journal {
@@ -83,29 +94,41 @@ public:
         uint32_t available_space() const { return (base_buf_.size - occupied_size()); }
     };
 
+    using BNodeIDMap = std::map< CompactNodeId, NodeLocation >;
+
     struct FullBNodeIdMap {
         //
-        // Why std::map with mutex instead of undrdered_map or
-        // concurrenthashmap?
+        // Why std::map with mutex instead of undrdered_map or concurrenthashmap?
         //
-        // We persist this map in sorted by nodeid fashion, so as to pack
-        // consecutive nodes together. Given that we try to allocate node ids in
-        // consective manner, such structure would result in significant savings
-        // in persisting data size and thus performance.
-        std::map< CompactNodeId, CompactBlkId > map_;
+        // We persist this map in sorted by nodeid fashion, so as to pack consecutive nodes together. Given that we try
+        // to allocate node ids in consective manner, such structure would result in significant savings in persisting
+        // data size and thus performance.
+        BNodeIDMap map_;
         iomgr::FiberManagerLib::shared_mutex mtx_;
 
         // Why persisting as a chain instead of meta_blks
         //
-        // Metablk as of now expects the entire map to be created in one large
-        // memory area and then persist them in pieces synchronously. For such a
-        // large map, this could be very slow, since only 1 thread will be doing
-        // IO for large map. The approach here uses link of the blkid (similar
-        // to metablk_mgr), but we persist it everytime we need to find a
-        // fragment or break in chain (every link) and also concurrently. This
-        // should speed up the persistence of the map.
-        std::vector< BlkId > chain_locations_; // List of locations where bnodeid
-                                               // maps are chained together
+        // Metablk as of now expects the entire map to be created in one large memory area and then persist them in
+        // pieces synchronously. For such a large map, this could be very slow, since only 1 thread will be doing IO for
+        // large map. The approach here uses link of the blkid (similar to metablk_mgr), but we persist it everytime we
+        // need to find a fragment or break in chain (every link) and also concurrently. This should speed up the
+        // persistence of the map.   // List of locations where bnodeid maps are chained together
+        //
+        std::vector< MapLocation > map_locations_;
+
+        // Keeping track of number of updates since last full map flush. This prevents unnecessary full flush on dormant
+        // btrees
+        std::atomic< uint64_t > updates_since_last_flush_{0};
+
+#pragma pack(1)
+        struct IndirectLocationSB {
+            uint32_t num_locations_head;
+            uint32_t checksum;
+            BlkId location_heads[1];
+
+            static uint32_t header_size() { return (sizeof(IndirectLocationSB) - sizeof(BlkId)); }
+        };
+#pragma pack()
     };
 
     using DirtyNodeList = sisl::ConcurrentInsertVector< BtreeNodePtr >;
@@ -113,6 +136,8 @@ public:
 
     struct CPSession {
     public:
+        /////////////// All Dirtying operation related ///////////////////////
+        COWBtree& bt_;
         cp_id_t cp_id_{-1};
         DirtyNodeList modified_nodes_;
         DeletedNodeList deleted_nodes_;
@@ -120,27 +145,30 @@ public:
         std::atomic< int64_t > node_count_changes_{0};
         // unique< Flusher > flusher_;
 
-        // State of the flushing entities
-        ENUM(FlushState, uint8_t, DIRTYING, FLUSHING, FLUSHED);
+        /////////////// Common flushing related entitites ///////////////////////
+        ENUM(FlushState, uint8_t, DIRTYING, NODES_FLUSHING, NODES_FLUSHED, MAP_FLUSHING, MAP_FLUSHED, ALL_DONE);
         iomgr::FiberManagerLib::mutex flush_mtx_;
         FlushState state_;
         int32_t flushing_req_count_{0};
 
-        std::vector< BlkId > locations_;
+        /////////////// Node flush related entities ///////////////////////
+        std::vector< BlkId > node_locations_;
         size_t next_location_idx_; // Next blkid to pick for next unit
-        DirtyNodeList::iterator modified_it_;
-        DeletedNodeList::iterator deleted_it_;
+        DirtyNodeList::iterator modified_it_;  // Iterator of the dirtied nodes
+        DeletedNodeList::iterator deleted_it_; // Iterator of the deleted nodes
+        uint32_t modified_count_;
         uint32_t deleted_count_; // Cache them since deleted_nodes_.size() is an expensive operation
-        std::map< CompactNodeId, CompactBlkId >::iterator full_map_it_;
-        bool sb_persist_needed_{false};
         unique< Journal > journal_;
+
+        /////////////// Map and SB flush related entities ///////////////////////
+        BNodeIdMap::iterator next_full_map_it_;
+        uint32_t parallel_flush_range_{0};
+        std::vector< std::vector< MapLocation > > loc_array_list_;
+        bool sb_persist_needed_{false};
 
     public:
         cp_id_t cp_id() const { return cp_id_; }
-        DirtyNodeList& modified_nodes() { return modified_nodes_; }
-        DeletedNodeList& deleted_nodes() { return deleted_nodes_; }
-        std::atomic< bool >& new_root() { return new_root_id_; }
-        std::atomic< int64_t >& count_changes() { return node_count_changes_; }
+
         Journal* journal() { return journal_.get(); }
 
         void start(COWBtree& bt, cp_id_t cp_id);
@@ -154,8 +182,13 @@ public:
             node_count_changes_.store(0);
         }
 
+        bool prepare_to_flush_nodes(COWbtree& btree, COWBtreeCPContext* cp_ctx);
         std::tuple< BlkId, DirtyNodeList::iterator, sisl::blob > next_dirty();
         std::tuple< DeletedNodeList::iterator, DeletedNodeList::iterator, sisl::blob > next_deleted();
+        std::pair< bnodeid_t, int64_t > next_sb_updates();
+        bool done_flushing_nodes();
+
+        bool prepare_to_flush_map(COWBtreeCPContext* cp_ctx);
 
     private:
         FullBNodeIdMap m_bnodeid_map;
@@ -183,12 +216,24 @@ public:
         sisl::io_blob_safe cp_flush(COWBtreeCPContext* cp_ctx);
 
     private:
-        void update_bnode_map(CompactNodeId nodeid, CompactBlkId blkid);
+        void update_bnode_map(CompactNodeId nodeid, NodeLocation blkid);
         void delete_from_bnode_map(CompactNodeId nodeid);
         void recover_full_bnode_map(BlkId const& map_loc);
         void apply_incremental_map(sisl::byte_view const& journal_buf);
 
         CPSession* cp_session(cp_id_t cp_id) { return &m_cp_sessions[cp_id % MAX_CONCURRENT_CPS]; }
         DirtyList& dirtylist(CPContext* cp_ctx) { return m_dirty_list[cp_ctx->id() % MAX_CONCURRENT_CPS]; }
+
+        BtreeSuperBlock const& bt_super_blk() const { return super_blk()->btree_sb; }
+        BtreeSuperBlock& bt_super_blk() {
+            return const_cast< BtreeSuperBlock& >(s_cast< const COWBtree* >(this)->bt_super_blk());
+        }
+
+        COWBtreeSuperBlock const& cow_bt_super_blk() const {
+            return *(r_cast< COWBtreeSuperBlock const* >(bt_super_blk().underlying_btree_sb));
+        }
+        COWBtreeSuperBlock& cow_bt_super_blk() {
+            return const_cast< COWBtreeSuperBlock& >(s_cast< const COWBtree* >(this)->cow_bt_super_blk());
+        }
     };
 } // namespace homestore

@@ -45,27 +45,18 @@ struct IndexSuperBlock {
     uint32_t version{indx_sb_version};
     uuid_t uuid;                       // UUID of the index
     uuid_t parent_uuid;                // UUID of the parent container of index (controlled by user)
-    IndexStore::Type index_store_type; // Underlying store type for this index
     uint32_t ordinal;                  // Ordinal of the Index (unique within the homestore instance)
+    IndexStore::Type index_store_type; // Underlying store type for this index
 
     // Btree based implementations superblock area
     struct BtreeSuperBlock {
+        static constexpr size_t underlying_btree_sb_size = 512;
+
         bnodeid_t root_node{empty_bnodeid}; // Btree Root Node ID
         int64_t index_size{0};              // Size of the Index
-
-        union {
-            struct COWBtreeSuperBlock {
-                BlkId full_map_location; // Location of any btree map (applicable for COWBtree only so far)
-            };
-
-            struct InPlaceBtreeSuperBlock {
-                uint64_t root_link_version{0}; // Link version to btree root node
-            }
-
-            COWBtreeSuperBlock cow_sb;
-            InPlaceBtreeSuperBlock ip_sb;
-        } u;
+        uint8_t underlying_btree_sb[underlying_btree_sb_size];
     };
+
     BtreeSuperBlock btree_sb;
 
     // User area of the superblock, which can be updated with cp guard.
@@ -108,8 +99,11 @@ public:
     // Getters
     uuid_t uuid() const override { return m_sb->uuid; }
     uint64_t used_size() const override { return m_sb->index_size; }
-    superblk< IndexSuperBlock >& mutable_super_blk() { return m_sb; }
-    const superblk< IndexSuperBlock >& mutable_super_blk() const { return m_sb; }
+
+    superblk< IndexSuperBlock > const& super_blk() const { return m_sb; }
+    superblk< IndexSuperBlock >& super_blk() {
+        return const_cast< superblk< IndexSuperBlock& > >(s_cast< const Index* >(this)->super_blk());
+    }
 };
 
 struct IndexMetaInfo {

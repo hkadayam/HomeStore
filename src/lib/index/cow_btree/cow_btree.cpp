@@ -648,6 +648,7 @@ void COWBtree::update_bnode_map(CompactNodeId nodeid, CompactBlkId cblkid, bool 
         std::unique_lock< iomgr::FiberManagerLib::shared_mutex > lg(m_bnodeid_map.m_mtx);
         do_update(nodeid, cblkid);
     }
+    m_bnodeid_map.m_updates_since_last_flush.store(0); // Reset the count, as we just flushed the full map
 }
 
 void COWBtree::delete_from_bnode_map(CompactNodeId nodeid, bool in_recovery) {

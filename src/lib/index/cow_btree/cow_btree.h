@@ -235,10 +235,10 @@ public:
         std::vector< std::vector< BlkId > > m_location_chains;
 
         /////////////// Map and SB flush related entities ///////////////////////
-        BNodeIdMap::iterator next_full_map_it_;
-        uint32_t parallel_flush_range_{0};
-        std::vector< std::vector< MapLocation > > loc_array_list_;
-        bool sb_persist_needed_{false};
+        BNodeIdMap::iterator m_next_full_map_it;
+        uint32_t m_parallel_flush_range{0};
+        std::vector< std::vector< BlkId > > m_location_chains;
+        bool m_sb_persist_needed{false};
 
     public:
         CPSession(COWBtree& bt) : m_bt{bt} {}

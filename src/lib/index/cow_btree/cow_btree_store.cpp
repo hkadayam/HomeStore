@@ -69,7 +69,7 @@ unique< COWBtree > COWBtreeStore::on_btree_created(BtreeBase& btree) {
     if (it == m_journals_by_btree.end()) {
         cbtree = std::make_unique< COWBtree >(&btree, m_vdev, {});
     } else {
-        cbtree = std::make_unique< COWBtree >(&btree, m_vdev, std::move(journals));
+        cbtree = std::make_unique< COWBtree >(&btree, m_vdev, std::move(it->second));
         m_journals_by_btree.erase(it); // We no longer need btree specific journal records after it is created.
     }
     return std::move(cbtree);
@@ -216,39 +216,55 @@ folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
     // Get all the current btrees in the system.
     cp_ctx->all_btrees = std::move(hs()->index_service()->get_all_index_tables());
 
-    if (!cp_ctx->full_bnode_map_flush()) { cp_ctx->create_flush_journal(); }
-
     for (auto& fiber : m_cp_flush_fibers) {
         iomanager.run_on_forget(fiber, [this, cp_ctx]() {
             cp_ctx->fiber_start_flushing();
 
-            do {
-                COWBtree* cow_btree = cp_ctx->next_flushing_btree();
-                if (cow_btree == nullptr) { break; }
+            // Each thread will walk through all btrees created and alive at the point of CP flush and try to flush
+            // their dirty nodes. We take this approach as against marking the dirtied btree seperately while dirtying
+            // is that, we keep the code path of dirtying as waitfree as possible. It is more critical code path.
+            // However, we pay the cost during the flushing by walking across all btrees and then check if they are
+            // dirty. I feel this is much lower cost than doing in critical IO path.
+            for (auto const& btree : cp_ctx->all_btrees) {
+                COWBtree* cow_btree = r_cast< COWBtree* > btree.get();
+                if (cow_btree->flush_nodes(cp_ctx)) {
+                    // This btree was dirtied in this cp, add it to the list to help persist their map/journal
+                    cp_ctx->add_to_flushed_btree_list(cow_btree);
+                }
+            }
 
-                sisl::io_blob_safe journal = cow_btree->cp_flush(cp_ctx);
-                if (journal.size_) { cp_ctx->append_btree_journal(std::move(journal)); }
-            } while (true);
-
-            if (cp_ctx->dec_check_any_fiber_flushing()) { process_node_flush_done(cp_ctx); }
+            if (cp_ctx->fiber_done_flushing()) { process_node_flush_done(cp_ctx); }
         });
     }
     return std::move(cp_ctx->get_future());
 }
 
 void COWBtreeStore::process_node_flush_done(COWBtreeCPContext* cp_ctx) {
-    if (cp_ctx->full_bnode_map_flush()) {
-        // We just flushed the full bnode map of all btrees, we can remove all previous journal superblks
-        for (auto const& journal : m_journals_by_cpid) {
-            journal.destroy();
+    if (cp_ctx->need_full_map_flush()) {
+        for (auto& fiber : m_cp_flush_fibers) {
+            iomanager.run_on_forget(fiber, [this, cp_ctx]() {
+                cp_ctx->fiber_start_flushing();
+                for (auto cow_btree : cp_ctx->flushed_btree_list()) {
+                    cow_btree->flush_map_and_sb(cp_ctx);
+                }
+                if (cp_ctx->fiber_done_flushing()) { // We just flushed the full bnode map of all btrees, we can remove
+                                                     // all previous journal superblks
+                    for (auto const& journal : m_journals_by_cpid) {
+                        journal.destroy();
+                    }
+                }
+                cp_ctx->complete(true);
+            });
         }
     } else {
+        for (auto cow_btree : cp_ctx->flushed_btree_list()) {
+            cow_btree->flush_sb(cp_ctx);
+        }
         auto sb = superblk< IndexStoreSuperBlock >{"index_store"};
         sb.load(cp_ctx->journal_buf(), nullptr);        // Load an empty meta_blk but with given buffer
         sb.write();                                     // Write the metablk
         m_journals_by_cpid.emplace_back(std::move(sb)); // Append to the end in the journal
     }
-    cp_ctx->complete(true);
 }
 
 void COWBtreeStore::load_journal(superblk< IndexStoreSuperBlock > const& store_journal) {

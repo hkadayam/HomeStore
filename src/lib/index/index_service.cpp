@@ -162,7 +162,7 @@ shared< Index > IndexService::get_index_table(uint32_t ordinal) const {
     return (it != m_ordinal_index_map.cend()) ? it->second : nullptr;
 }
 
-std::vector< Index > IndexService::get_all_index_tables() const {
+std::vector< shared< Index > > IndexService::get_all_index_tables() const {
     std::shared_lock lg(m_index_map_mtx);
     std::vector< shared< Index > > v;
     std::transform(m_index_map.begin(), m_index_map.end(), std::back_inserter(v),

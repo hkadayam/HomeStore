@@ -1,10 +1,10 @@
 #pragma once
-
-#include <homestore/btree/detail/btree_node.hpp>
+#include <homestore/checkpoint/cp.hpp>
 
 namespace homestore {
 class COWBtreeCPContext;
 class COWBtree;
+class BtreeNode;
 
 struct COWBtreeNode {
 public:

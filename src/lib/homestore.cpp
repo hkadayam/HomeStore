@@ -65,27 +65,28 @@ HomeStore* HomeStore::instance() {
 }
 
 HomeStore& HomeStore::with_data_service(cshared< ChunkSelector >& custom_chunk_selector) {
-    m_services.svcs |= HS_SERVICE::DATA;
-    m_services.svcs &= ~HS_SERVICE::REPLICATION; // ReplicationDataSvc or DataSvc are mutually exclusive
+    m_services.svcs.type |= SVC_GENRE::DATA;
+    m_services.svcs.type &= ~SVC_GENRE::REPLICATION; // ReplicationDataSvc or DataSvc are mutually exclusive
     s_custom_chunk_selector = std::move(custom_chunk_selector);
     return *this;
 }
 
-HomeStore& HomeStore::with_index_service(std::unique_ptr< IndexServiceCallbacks > cbs) {
-    m_services.svcs |= HS_SERVICE::INDEX;
+HomeStore& HomeStore::with_index_service(std::unique_ptr< IndexServiceCallbacks > cbs, SVC_SUB_GENRE sub_types) {
+    m_services.svcs.type |= SVC_GENRE::INDEX;
+    m_services.svcs.sub_type = sub_types;
     s_index_cbs = std::move(cbs);
     return *this;
 }
 
 HomeStore& HomeStore::with_log_service() {
-    m_services.svcs |= HS_SERVICE::LOG;
+    m_services.svcs.type |= SVC_GENRE::LOG;
     return *this;
 }
 
 HomeStore& HomeStore::with_repl_data_service(cshared< ReplApplication >& repl_app,
                                              cshared< ChunkSelector >& custom_chunk_selector) {
-    m_services.svcs |= HS_SERVICE::REPLICATION | HS_SERVICE::LOG;
-    m_services.svcs &= ~HS_SERVICE::DATA; // ReplicationDataSvc or DataSvc are mutually exclusive
+    m_services.svcs.type |= SVC_GENRE::REPLICATION | SVC_GENRE::LOG;
+    m_services.svcs.type &= ~SVC_GENRE::DATA; // ReplicationDataSvc or DataSvc are mutually exclusive
     s_repl_app = repl_app;
     s_custom_chunk_selector = std::move(custom_chunk_selector);
     return *this;
@@ -164,10 +165,10 @@ bool HomeStore::start(const hs_input_params& input, hs_before_services_starting_
     }
 }
 
-void HomeStore::format_and_start(std::map< uint32_t, hs_format_params >&& format_opts) {
+void HomeStore::format_and_start(std::map< ServiceId, hs_format_params >&& format_opts) {
     std::map< HSDevType, float > total_pct_by_type = {{HSDevType::Fast, 0.0f}, {HSDevType::Data, 0.0f}};
     // Accumulate total percentage of services on each device type
-    for (const auto& [svc_type, fparams] : format_opts) {
+    for (const auto& [_, fparams] : format_opts) {
         total_pct_by_type[fparams.dev_type] += fparams.size_pct;
     }
 
@@ -202,24 +203,24 @@ void HomeStore::format_and_start(std::map< uint32_t, hs_format_params >&& format
     }
 
     std::vector< folly::Future< std::error_code > > futs;
-    for (const auto& [svc_type, fparams] : format_opts) {
+    for (const auto& [svc_td, fparams] : format_opts) {
         if (fparams.size_pct == 0) { continue; }
 
-        if ((svc_type & HS_SERVICE::META) && has_meta_service()) {
+        if ((svc_id.type & SVC_GENRE::META) && has_meta_service()) {
             m_meta_service->create_vdev(pct_to_size(fparams.size_pct, fparams.dev_type), fparams.dev_type,
                                         fparams.num_chunks);
 
-        } else if ((svc_type & HS_SERVICE::LOG) && has_log_service()) {
+        } else if ((svc_id.type & SVC_GENRE::LOG) && has_log_service()) {
             futs.emplace_back(m_log_service->create_vdev(pct_to_size(fparams.size_pct, fparams.dev_type),
                                                          fparams.dev_type, fparams.chunk_size));
-        } else if ((svc_type & HS_SERVICE::INDEX) && has_index_service()) {
-            m_index_service->create_vdev(pct_to_size(fparams.size_pct, fparams.dev_type), fparams.dev_type,
-                                         fparams.num_chunks);
-        } else if ((svc_type & HS_SERVICE::DATA) && has_data_service()) {
+        } else if ((svc_id.type & SVC_GENRE::INDEX) && has_index_service()) {
+            m_index_service->create_vdev(svc_id.sub_type, pct_to_size(fparams.size_pct, fparams.dev_type),
+                                         fparams.dev_type, fparams.num_chunks);
+        } else if ((svc_id.type & SVC_GENRE::DATA) && has_data_service()) {
             m_data_service->create_vdev(pct_to_size(fparams.size_pct, fparams.dev_type), fparams.dev_type,
                                         fparams.block_size, fparams.alloc_type, fparams.chunk_sel_type,
                                         fparams.num_chunks);
-        } else if ((svc_type & HS_SERVICE::REPLICATION) && has_repl_data_service()) {
+        } else if ((SVC_GENRE & SVC_GENRE::REPLICATION) && has_repl_data_service()) {
             m_data_service->create_vdev(pct_to_size(fparams.size_pct, fparams.dev_type), fparams.dev_type,
                                         fparams.block_size, fparams.alloc_type, fparams.chunk_sel_type,
                                         fparams.num_chunks);
@@ -352,13 +353,13 @@ cap_attrs HomeStore::get_system_capacity() const {
 
 bool HomeStore::is_first_time_boot() const { return m_dev_mgr->is_first_time_boot(); }
 
-bool HomeStore::has_index_service() const { return m_services.svcs & HS_SERVICE::INDEX; }
-bool HomeStore::has_data_service() const { return m_services.svcs & HS_SERVICE::DATA; }
-bool HomeStore::has_repl_data_service() const { return m_services.svcs & HS_SERVICE::REPLICATION; }
-bool HomeStore::has_meta_service() const { return m_services.svcs & HS_SERVICE::META; }
+bool HomeStore::has_index_service() const { return m_services.svcs.type & SVC_GENRE::INDEX; }
+bool HomeStore::has_data_service() const { return m_services.svcs.type & SVC_GENRE::DATA; }
+bool HomeStore::has_repl_data_service() const { return m_services.svcs.type & SVC_GENRE::REPLICATION; }
+bool HomeStore::has_meta_service() const { return m_services.svcs.type & SVC_GENRE::META; }
 bool HomeStore::has_log_service() const {
-    auto const s = m_services.svcs;
-    return (s & HS_SERVICE::LOG);
+    auto const s = m_services.svcs.type;
+    return (s & SVC_GENRE::LOG);
 }
 
 #if 0
@@ -404,7 +405,9 @@ shared< VirtualDev > HomeStore::create_vdev_cb(const vdev_info& vinfo, bool load
         break;
 
     case hs_vdev_type_t::INDEX_VDEV:
-        if (has_index_service()) { ret_vdev = m_index_service->open_vdev(vinfo, load_existing); }
+        if (has_index_service()) {
+            ret_vdev = m_index_service->open_vdev(vdev_context->sub_type, vinfo, load_existing);
+        }
         break;
 
     case hs_vdev_type_t::DATA_VDEV:

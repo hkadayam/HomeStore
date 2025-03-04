@@ -25,5 +25,12 @@ public:
     // Called whenever a particular btree node has been freed. The underlying implementation could use this oppurtunity
     // to free any contexts stored for this node.
     virtual void on_node_freed(BtreeNode* node) = 0;
+
+    // When a particular btree is to be destroyed, some stores can support fast destroy mechanism, where all the btree
+    // nodes can be freed in one go (in a single Checkpoint) without merging the tree and collapsing the tree. This
+    // saves lots of IOs while destroying a btree. The requirement from the store is that it should be able to destroy
+    // and free all nodes within single checkpoint. If store doesn't support, then btree library itself will keep
+    // merging entities and collapsing the tree.
+    virtual bool is_fast_destroy_supported() const = 0;
 };
 } // namespace homestore

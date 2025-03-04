@@ -451,26 +451,26 @@ private:
         if (need_format) {
             auto svc_params = m_token.svc_params_;
             hsi->format_and_start(
-                {{HS_SERVICE::META,
+                {{{SVC_GENRE::META},
                   {.dev_type = homestore::HSDevType::Fast, .size_pct = svc_params[HS_SERVICE::META].size_pct}},
-                 {HS_SERVICE::LOG,
+                 {{SVC_GENRE::LOG},
                   {.dev_type = homestore::HSDevType::Fast,
-                   .size_pct = svc_params[HS_SERVICE::LOG].size_pct,
-                   .chunk_size = svc_params[HS_SERVICE::LOG].chunk_size,
-                   .vdev_size_type = svc_params[HS_SERVICE::LOG].vdev_size_type}},
-                 {HS_SERVICE::DATA,
-                  {.size_pct = svc_params[HS_SERVICE::DATA].size_pct,
-                   .num_chunks = svc_params[HS_SERVICE::DATA].num_chunks,
-                   .alloc_type = svc_params[HS_SERVICE::DATA].blkalloc_type,
-                   .chunk_sel_type = svc_params[HS_SERVICE::DATA].custom_chunk_selector
+                   .size_pct = svc_params[SVC_GENRE::LOG].size_pct,
+                   .chunk_size = svc_params[SVC_GENRE::LOG].chunk_size,
+                   .vdev_size_type = svc_params[SVC_GENRE::LOG].vdev_size_type}},
+                 {{SVC_GENRE::DATA},
+                  {.size_pct = svc_params[SVC_GENRE::DATA].size_pct,
+                   .num_chunks = svc_params[SVC_GENRE::DATA].num_chunks,
+                   .alloc_type = svc_params[SVC_GENRE::DATA].blkalloc_type,
+                   .chunk_sel_type = svc_params[SVC_GENRE::DATA].custom_chunk_selector
                        ? chunk_selector_type_t::CUSTOM
                        : chunk_selector_type_t::ROUND_ROBIN}},
-                 {HS_SERVICE::INDEX,
-                  {.dev_type = homestore::HSDevType::Fast, .size_pct = svc_params[HS_SERVICE::INDEX].size_pct}},
-                 {HS_SERVICE::REPLICATION,
-                  {.size_pct = svc_params[HS_SERVICE::REPLICATION].size_pct,
-                   .alloc_type = svc_params[HS_SERVICE::REPLICATION].blkalloc_type,
-                   .chunk_sel_type = svc_params[HS_SERVICE::REPLICATION].custom_chunk_selector
+                 {{SVC_GENRE::INDEX, SVC_SUB_GENRE::INDEX_BTREE_COPY_ON_WRITE},
+                  {.dev_type = homestore::HSDevType::Fast, .size_pct = svc_params[SVC_GENRE::INDEX].size_pct}},
+                 {{SVC_GENRE::REPLICATION},
+                  {.size_pct = svc_params[SVC_GENRE::REPLICATION].size_pct,
+                   .alloc_type = svc_params[SVC_GENRE::REPLICATION].blkalloc_type,
+                   .chunk_sel_type = svc_params[SVC_GENRE::REPLICATION].custom_chunk_selector
                        ? chunk_selector_type_t::CUSTOM
                        : chunk_selector_type_t::ROUND_ROBIN}}});
         }

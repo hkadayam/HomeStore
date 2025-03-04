@@ -60,16 +60,6 @@ class CrashSimulator;
 
 using HomeStoreSafePtr = std::shared_ptr< HomeStore >;
 
-VENUM(hs_vdev_type_t, uint32_t, DATA_VDEV = 1, INDEX_VDEV = 2, META_VDEV = 3, LOGDEV_VDEV = 4);
-
-#pragma pack(1)
-struct hs_vdev_context {
-    enum hs_vdev_type_t type;
-
-    sisl::blob to_blob() { return sisl::blob{uintptr_cast(this), sizeof(*this)}; }
-};
-#pragma pack()
-
 using hs_before_services_starting_cb_t = std::function< void(void) >;
 
 struct hs_stats {
@@ -77,6 +67,66 @@ struct hs_stats {
     uint64_t used_capacity{0ul};
 };
 
+struct SVC_GENRE {
+    using type_t = uint32_t;
+
+    static constexpr type_t META = 1 << 0;
+    static constexpr type_t LOG = 1 << 1;
+    static constexpr type_t DATA = 1 << 2;
+    static constexpr type_t INDEX = 1 << 3;
+    static constexpr type_t REPLICATION = 1 << 4;
+};
+
+using HS_SERVICE = SVC_GENRE; // Alias for easier porting of code
+
+struct SVC_SUB_GENRE {
+    using type_t = uint32_t;
+
+    static constexpr type_t INDEX_BTREE_COPY_ON_WRITE = 1 << 0;
+    static constexpr type_t INDEX_BTREE_INPLACE = 1 << 1;
+    static constexpr type_t INDEX_BTREE_MEMORY = 1 << 2;
+};
+
+VENUM(hs_vdev_type_t, uint32_t, DATA_VDEV = 1, INDEX_VDEV = 2, META_VDEV = 3, LOGDEV_VDEV = 4);
+
+#pragma pack(1)
+struct hs_vdev_context {
+    enum hs_vdev_type_t type;
+    SVC_SUB_GENRE::type_t sub_type{0};
+
+    sisl::blob to_blob() { return sisl::blob{uintptr_cast(this), sizeof(*this)}; }
+};
+#pragma pack()
+
+struct ServiceId {
+    SVC_GENRE::type_t type;
+    SVC_SUB_GENRE::type_t sub_type;
+
+    ServiceId(SVC_GENRE::type_t st, SVC_SUB_GENRE::type_t sst) : type{st}, sub_type{sst} {}
+    ServiceId(SVC_GENRE::type_t st) : type{st}, sub_type{0} {}
+};
+
+struct ServiceList {
+    ServiceId svcs;
+
+    ServiceList(ServiceId s) : svcs{s} {}
+
+    std::string list() const {
+        std::string str;
+        if (svcs.type & SVC_GENRE::META) { str += "meta,"; }
+        if (svcs.type & SVC_GENRE::DATA) { str += "data,"; }
+        if (svcs.type & SVC_GENRE::INDEX) {
+            if (svcs.sub_type & SVC_SUB_GENRE::INDEX_BTREE_COPY_ON_WRITE) { str += "index_copy_on_write_btree,"; }
+            if (svcs.sub_type & SVC_SUB_GENRE::INDEX_BTREE_INPLACE) { str += "index_inplace_btree,"; }
+            if (svcs.sub_type & SVC_SUB_GENRE::INDEX_BTREE_MEMORY) { str += "index_mem_btree,"; }
+        }
+        if (svcs.type & SVC_GENRE::LOG) { str += "log,"; }
+        if (svcs.type & SVC_GENRE::REPLICATION) { str += "replication,"; }
+        return str;
+    }
+};
+
+#if 0
 struct HS_SERVICE {
     static constexpr uint32_t META = 1 << 0;
     static constexpr uint32_t LOG = 1 << 1;
@@ -85,19 +135,25 @@ struct HS_SERVICE {
     static constexpr uint32_t REPLICATION = 1 << 4;
 
     uint32_t svcs;
+    uint32_t sub_type{0};
 
-    HS_SERVICE() : svcs{META} {}
+    HS_SERVICE(uint32_t s = META, uint32_t t = 0) : svcs{s}, sub_type{t} {}
 
     std::string list() const {
         std::string str;
         if (svcs & META) { str += "meta,"; }
         if (svcs & DATA) { str += "data,"; }
-        if (svcs & INDEX) { str += "index,"; }
+        if (svcs & INDEX) {
+            if (sub_type & INDEX_BTREE_COPY_ON_WRITE) { str += "index_copy_on_write_btree,"; }
+            if (sub_type & INDEX_BTREE_INPLACE) { str += "index_inplace_btree,"; }
+            if (sub_type & INDEX_BTREE_MEM) { str += "index_mem_btree,"; }
+        }
         if (svcs & LOG) { str += "log,"; }
         if (svcs & REPLICATION) { str += "replication,"; }
         return str;
     }
 };
+#endif
 
 /*
  * IO errors handling by homestore.
@@ -124,7 +180,7 @@ private:
     std::unique_ptr< CPManager > m_cp_mgr;
     shared< sisl::Evictor > m_evictor;
 
-    HS_SERVICE m_services; // Services homestore is starting with
+    ServiceList m_services; // Services homestore is starting with
     hs_before_services_starting_cb_t m_before_services_starting_cb{nullptr};
     std::atomic< bool > m_init_done{false};
 

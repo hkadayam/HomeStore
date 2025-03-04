@@ -29,7 +29,8 @@
 namespace homestore {
 IndexService& index_service() { return hs()->index_service(); }
 
-IndexService::IndexService(std::unique_ptr< IndexServiceCallbacks > cbs) : m_svc_cbs{std::move(cbs)} {
+IndexService::IndexService(std::unique_ptr< IndexServiceCallbacks > cbs, SVC_SUB_GENRE sub_types) :
+        m_svc_cbs{std::move(cbs)} {
     m_ordinal_reserver = std::make_unique< sisl::IDReserver >();
     meta_service().register_handler(
         "index_table",
@@ -46,10 +47,11 @@ IndexService::IndexService(std::unique_ptr< IndexServiceCallbacks > cbs) : m_svc
         nullptr);
 }
 
-void IndexService::create_vdev(uint64_t size, HSDevType devType, uint32_t num_chunks) {
+void IndexService::create_vdev(SVC_SUB_GENRE::type_t sub_type, uint64_t size, HSDevType devType, uint32_t num_chunks) {
     auto const atomic_page_size = hs()->device_mgr()->atomic_page_size(devType);
     hs_vdev_context vdev_ctx;
     vdev_ctx.type = hs_vdev_type_t::INDEX_VDEV;
+    vdev_ctx.sub_type = sub_type;
 
     hs()->device_mgr()->create_vdev(vdev_parameters{.vdev_name = "index",
                                                     .vdev_size = size,
@@ -62,10 +64,12 @@ void IndexService::create_vdev(uint64_t size, HSDevType devType, uint32_t num_ch
                                                     .context_data = vdev_ctx.to_blob()});
 }
 
-shared< VirtualDev > IndexService::open_vdev(const vdev_info& vinfo, bool load_existing) {
-    m_vdev =
+shared< VirtualDev > IndexService::open_vdev(SVC_SUB_GENRE::type_id sub_type, const vdev_info& vinfo,
+                                             bool load_existing) {
+    auto const vdev =
         std::make_shared< VirtualDev >(*(hs()->device_mgr()), vinfo, nullptr /* event_cb */, false /* auto_recovery */);
-    return m_vdev;
+    m_vdevs.insert(sub_type, vdev);
+    return vdev;
 }
 
 void IndexService::start() {
@@ -101,6 +105,12 @@ void IndexService::stop() {
     }
 }
 
+shared< VirtualDev > get_vdev(SVC_SUB_GENRE::type_t sub_type) {
+    auto it = m_vdevs.find(sub_type);
+    HS_REL_ASSERT(it != m_vdevs.end(), "Vdev not found for sub_type={}, vdev not created/opened?", sub_type);
+    return it->second;
+}
+
 shared< IndexStore > IndexService::lookup_or_create_store(IndexStore::Type store_type,
                                                           std::vector< IndexMetaInfo > sbs) {
     std::unique_lock lg(m_index_map_mtx);
@@ -111,12 +121,14 @@ shared< IndexStore > IndexService::lookup_or_create_store(IndexStore::Type store
 
     switch (store_type) {
     case IndexStore::Type::COPY_ON_WRITE_BTREE:
-        store = std::make_shared< COWBtreeStore >(m_vdev, std::move(sbs), hs()->evictor(),
-                                                  hs()->device_mgr()->atomic_page_size(HSDevType::Fast));
+        store =
+            std::make_shared< COWBtreeStore >(get_vdev(SVC_SUB_GENRE::INDEX_BTREE_COPY_ON_WRITE), std::move(sbs),
+                                              hs()->evictor(), hs()->device_mgr()->atomic_page_size(HSDevType::Fast));
         break;
 
     case IndexStore::Type::INPLACE_BTREE:
-        store = std::make_shared< InPlaceBtreeStore >(m_vdev, std::move(sbs), hs()->evictor(),
+        store = std::make_shared< InPlaceBtreeStore >(get_vdev(SVC_SUB_GENRE::INDEX_BTREE_INPLACE), std::move(sbs),
+                                                      hs()->evictor(),
                                                       hs()->device_mgr()->atomic_page_size(HSDevType::Fast));
         break;
 

@@ -75,6 +75,7 @@ public:
     blk_count_t blk_count() const { return s.m_nblks; }
     chunk_num_t chunk_num() const { return s.m_chunk_num; }
     bool is_multi() const { return s.m_is_multi; }
+    std::pair< BlkId, BlkId > split(blk_count_t count) const;
 
     void invalidate();
     uint64_t to_integer() const;
@@ -117,6 +118,7 @@ public:
     void add(blk_num_t blk_num, blk_count_t nblks, chunk_num_t chunk_num);
     void add(BlkId const&);
 
+    std::pair< MultiBlkId, MultiBlkId > split(blk_count_t count) const;
     uint16_t num_pieces() const;
     blk_count_t blk_count() const;
     std::string to_string() const;

@@ -116,8 +116,8 @@ public:
         //
         std::vector< BlkId > m_locations;
 
-        // Keeping track of number of updates since last full map flush. This prevents unnecessary full flush on dormant
-        // btrees
+        // Keeping track of number of updates in the map since last full map flush. This prevents unnecessary full flush
+        // on dormant btrees
         std::atomic< uint64_t > m_updates_since_last_flush{0};
     };
 
@@ -132,7 +132,6 @@ public:
         DirtyNodeList m_modified_nodes;
         DeletedNodeList m_deleted_nodes;
         std::atomic< bnodeid_t > m_new_root_id{empty_bnodeid};
-        std::atomic< int64_t > m_node_count_changes{0};
 
         /////////////// Common flushing related entitites ///////////////////////
         ENUM(FlushState, uint8_t, DIRTYING, NODES_FLUSHING, NODES_FLUSHED, MAP_FLUSHING, MAP_FLUSHED, ALL_DONE);
@@ -153,12 +152,19 @@ public:
         BNodeIdMap::iterator m_next_full_map_it;
         uint32_t m_parallel_flush_range{0};
         std::vector< std::vector< BlkId > > m_location_chains;
-        bool m_sb_persist_needed{false};
 
     public:
-        cp_id_t cp_id() const { return cp_id_; }
-        Journal* journal() { return journal_.get(); }
-        void reset();
+        bool prepare_to_flush_nodes(COWBtreeCPContext* cp_ctx);
+        std::tuple< BlkId, DirtyNodeList::iterator, sisl::blob > next_dirty();
+        std::tuple< DeletedNodeList::iterator, uint32_t, sisl::blob > next_deleted();
+        bnodeid_t new_root();
+        bool done_flushing_nodes();
+
+        std::pair< BNodeIDMap::iterator, uint32_t > prepare_to_flush_map(COWBtreeCPContext* cp_ctx);
+        std::pair< bool, std::vector< std::vector< BlkId > > > done_flushing_map(std::vector< BlkId > map_locations);
+
+        bool flush_sb(COWBtreeCPContext* cp_ctx);
+        void finish();
     };
 
     private:
@@ -183,7 +189,8 @@ public:
         bnodeid_t generate_node_id();
         void add_to_dirty_list(BtreeNodePtr const& node, COWBtreeCPContext* cp_ctx);
         void add_to_remove_list(bnodeid_t node_id, COWBtreeCPContext* cp_ctx);
-
+        void on_root_changed(BtreeNodePtr const& new_root, COWBtreeCPContext* cp_ctx);
+        void on_btree_destroyed();
         sisl::io_blob_safe cp_flush(COWBtreeCPContext* cp_ctx);
 
     private:
@@ -192,10 +199,18 @@ public:
         void recover_full_bnode_map(BlkId const& map_loc);
         void apply_incremental_map(sisl::byte_view const& journal_buf);
 
-        CPSession* cp_session(cp_id_t cp_id) { return &m_cp_sessions[cp_id % MAX_CONCURRENT_CPS]; }
+        CPSession* cp_session(cp_id_t cp_id) {
+            CPSession* session = &m_cp_sessions[cp_id % MAX_CONCURRENT_CPS];
+            if (sisl::unlikely(session->m_cp_id != cp_id)) { session->m_cp_id = cp_id; }
+            return session;
+        }
+
         DirtyList& dirtylist(CPContext* cp_ctx) { return m_dirty_list[cp_ctx->id() % MAX_CONCURRENT_CPS]; }
 
-        BtreeSuperBlock const& bt_super_blk() const { return super_blk()->btree_sb; }
+        BtreeSuperBlock const& bt_super_blk() const {
+            return *(r_cast< BtreeSuperBlock const* >(super_blk()->underlying_index_sb));
+        }
+
         BtreeSuperBlock& bt_super_blk() {
             return const_cast< BtreeSuperBlock& >(s_cast< const COWBtree* >(this)->bt_super_blk());
         }
@@ -203,6 +218,7 @@ public:
         SuperBlock const& cow_bt_super_blk() const {
             return *(r_cast< SuperBlock const* >(bt_super_blk().underlying_btree_sb));
         }
+
         SuperBlock& cow_bt_super_blk() {
             return const_cast< SuperBlock& >(s_cast< const COWBtree* >(this)->cow_bt_super_blk());
         }

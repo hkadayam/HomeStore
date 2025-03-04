@@ -17,12 +17,16 @@
 
 #include <vector>
 #include <atomic>
-#include <folly/concurrency/ConcurrentHashMap.h>
+#include <unordered_map>
 #include <sisl/cache/simple_cache.hpp>
 
-#include <homestore/btree/btree_store.hpp>
+#include <homestore/blk.h>
+#include <homestore/btree/btree_store.h>
+#include <homestore/btree/detail/btree_internal.hpp>
 #include <homestore/superblk_handler.hpp>
 #include <homestore/checkpoint/cp_mgr.hpp>
+
+#include "common/homestore_utils.hpp"
 
 namespace homestore {
 #pragma pack(1)
@@ -103,6 +107,8 @@ public:
     void remove_node(BtreeBase& btree, const BtreeNodePtr& node, void* context) override;
 
     btree_status_t on_root_changed(BtreeBase& btree, BtreeNodePtr const& root, void* context) override;
+
+    int64_t used_size(BtreeBase& btree) override;
 };
 
 struct COWBtreeJournal {

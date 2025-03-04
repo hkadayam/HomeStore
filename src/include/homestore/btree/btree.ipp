@@ -60,16 +60,15 @@ void Btree< K, V >::set_root_node_info(const BtreeLinkInfo& info) {
 }
 
 template < typename K, typename V >
-std::pair< btree_status_t, uint64_t > Btree< K, V >::destroy_btree(void* context) {
+btree_status_t Btree< K, V >::destroy_btree(std::function< void(BtreeKey const&, BtreeValue const&) > cb) {
     btree_status_t ret{btree_status_t::success};
-    uint64_t n_freed_nodes{0};
 
     bool expected = false;
     if (!m_destroyed.compare_exchange_strong(expected, true)) {
         BT_LOG(DEBUG, "Btree is already being destroyed, ignoring this request");
-        return std::make_pair(btree_status_t::not_found, 0);
+        return btree_status_t::not_found;
     }
-    ret = do_destroy(n_freed_nodes, context);
+    auto const ret = do_destroy(std::move(cb));
     if (ret == btree_status_t::success) {
         BT_LOG(DEBUG, "btree(root: {}) {} nodes destroyed successfully", m_root_node_info.bnode_id(), n_freed_nodes);
         m_store->on_btree_destroyed(*this);
@@ -78,7 +77,7 @@ std::pair< btree_status_t, uint64_t > Btree< K, V >::destroy_btree(void* context
         BT_LOG(ERROR, "btree(root: {}) nodes destroyed failed, ret: {}", m_root_node_info.bnode_id(), ret);
     }
 
-    return std::make_pair(ret, n_freed_nodes);
+    return ret;
 }
 
 template < typename K, typename V >

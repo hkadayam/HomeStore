@@ -15,6 +15,7 @@
  *********************************************************************************/
 #pragma once
 
+#include <homestore/index_service.hpp>
 #include <boost/preprocessor/control/if.hpp>
 #include <boost/preprocessor/facilities/empty.hpp>
 #include <boost/preprocessor/facilities/identity.hpp>
@@ -211,6 +212,14 @@ ENUM(btree_status_t, uint32_t, success, not_found, retry, has_more, node_read_fa
      after_shift       // Node write after a structure change, but this node has its keys shifted to other node.
 );*/
 
+// Btree based implementations superblock area
+struct BtreeSuperBlock {
+    static constexpr size_t underlying_btree_sb_size = IndexSuperBlock::store_index_sb_size - sizeof(bnodeid_t);
+
+    bnodeid_t root_node{empty_bnodeid}; // Btree Root Node ID
+    std::array< uint8_t, underlying_btree_sb_size > underlying_btree_sb;
+};
+
 class BtreeNode;
 void intrusive_ptr_add_ref(BtreeNode* node);
 void intrusive_ptr_release(BtreeNode* node);
@@ -268,7 +277,7 @@ public:
     virtual ~BtreeConfig() = default;
     uint32_t node_size() const { return m_node_size; };
 
-    void set_store_type(btree_store_t store_type) { m_store_type = store_type; }
+    void set_store_type(IndexStore::Type store_type) { m_store_type = store_type; }
 
     void set_node_data_size(uint32_t data_size) {
         m_node_data_size = data_size;

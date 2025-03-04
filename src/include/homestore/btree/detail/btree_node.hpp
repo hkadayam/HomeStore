@@ -24,6 +24,7 @@
 #include <sisl/utility/obj_life_counter.hpp>
 #include "btree_internal.hpp"
 #include <homestore/btree/btree_kv.hpp>
+#include <homestore/btree/btree_store.h>
 #include <homestore/crc.h>
 
 namespace homestore {
@@ -36,7 +37,7 @@ struct transient_hdr_t {
 
     /* these variables are accessed without taking lock and are not expected to change after init */
     uint8_t leaf_node{0};
-    btree_store_t store_type{btree_store_t::COPY_ON_WRITE};
+    IndexStore::Type store_type{IndexStore::Type::COPY_ON_WRITE_BTREE};
     uint64_t max_keys_in_node{0};
 
     bool is_leaf() const { return (leaf_node != 0); }
@@ -120,9 +121,11 @@ public:
 #endif
     }
 
-    virtual ~BtreeNode() { index_svc()->btree_store(m_trans_hdr.store_type)->on_node_freed(this); };
+    virtual ~BtreeNode() {
+        s_cast< BtreeStore* >(index_service().lookup_store(m_trans_hdr.store_type))->on_node_freed(this);
+    }
 
-    void set_store_type(btree_store_t store) { m_trans_hdr.store_type = store; }
+    void set_store_type(IndexStore::Type store) { m_trans_hdr.store_type = store; }
 
     // Identify if a node is a leaf node or not, from raw buffer, by just reading persistent_hdr_t
     static bool identify_leaf_node(uint8_t* buf) { return (r_cast< persistent_hdr_t* >(buf))->leaf; }
@@ -303,6 +306,15 @@ public:
     template < typename K >
     K get_first_key() const {
         return get_nth_key< K >(0, true);
+    }
+
+    template < typename K, typename V >
+    void get_all_kvs(std::vector< std::pair< K, V > >& kvs) const {
+        for (uint32_t i{0}; i < total_entries(); ++i) {
+            V v;
+            get_nth_value(i, &v, true);
+            kvs.emplace_back(std::make_pair(get_nth_key< K >(i, true), v));
+        }
     }
 
     template < typename K >

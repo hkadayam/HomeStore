@@ -47,18 +47,50 @@ COWBtree::COWBtree(BtreeBase* bt, shared< VirtualDev > vdev, std::vector< sisl::
 
 bnodeid_t COWBtree::generate_node_id() { return (m_ordinal_shifted | m_nodeid_generator.reserve()); }
 
-void COWBtree::add_to_dirty_list(BtreeNodePtr const& node, cp_id_t cp_id) {
-    dirty_list(cp_ctx).added().insert(node);
-    cp_ctx->dirty_buf_count_.increment(1);
+void COWBtree::add_to_dirty_list(BtreeNodePtr const& node, COWBtreeCPContext* cp_ctx) {
+    cp_session(cp_ctx->id())->m_modified_nodes.insert(node);
+    cp_ctx->m_dirty_node_count.increment(1);
 }
 
 void COWBtree::add_to_remove_list(bnodeid_t node_id, cp_id_t cp_id) {
-    dirty_list(cp_ctx).deleted().insert(node);
-    cp_ctx->removed_node_count_.increment(1);
+    cp_session(cp_ctx->id())->m_deleted_nodes.insert(node);
+    cp_ctx->m_removed_node_count.increment(1);
 }
 
-void COWBtree::node_count_update(int64_t changes, cp_id_t cp_id) {
-    dirty_list(cp_ctx).count_changes().fetch_add(changes);
+void COWBtree::on_root_changed(BtreeNodePtr const& new_root, COWBtreeCPContext* cp_ctx) {
+    cp_session(cp_ctx->id())->m_new_root_id.store(new_root->node_id());
+}
+
+void COWBtree::on_btree_destroyed() {
+    // Walk through the entire map and free all the node blks and then free the map blks. This whole operation needs to
+    // be done under a lock CPGuard, because during this process a CP should not be taken.
+    CPGuard cpg;
+
+    {
+        // Free all the blks allocated for the nodes
+        std::unique_lock< iomgr::FiberManagerLib::shared_mutex > lg(m_bnodeid_map.m_mtx);
+        for (auto const [nodeid, blkid] : m_bnode_map.m_map) {
+            m_vdev->free_blk(blkid.to_blkid());
+        }
+
+        // Free all the blks allocated for the map
+        for (auto const& locs : m_bnodeid_map.m_locations) {
+            m_vdev->free_blk(blkid.to_blkid());
+        }
+
+        // Reset the map, cp_session etc.
+        m_bnode_map.m_map.clear();
+        m_updates_since_last_flush = 0;
+        m_bnode_map.m_locations.clear();
+    }
+
+    // Reset all the dirty nodes, deleted nodes etc.
+    for (auto& cp_session : m_cp_sessions) {
+        cp_session.reset();
+    }
+
+    // Destroy this btree's superblk, so that it can be re-initialized again.
+    m_base_btree->super_blk().destroy();
 }
 
 // FlushUnit represents one contiguous block where all btree nodes that can be packed are done and written at once
@@ -92,7 +124,7 @@ struct NodeFlushUnit {
 
     void add(COWBtreeNode* cow_node) {
         HS_DBG_ASSERT_LT(m_nodes_count, m_nodes_location.blk_count(), "Adding more nodes than node allocated for");
-        iovs_.emplace_back(iovec{.iov_base = cow_node->get_flush_version_buf(m_cp_ctx_->cp_id()),
+        iovs_.emplace_back(iovec{.iov_base = cow_node->get_flush_version_buf(m_cp_ctx_->id()),
                                  .iov_len = cow_node->to_btree_node()->node_size()});
         ++m_nodes_count;
         if (m_jentry) { m_jentry->nodes[m_jentry->n_nodes++] = get_compact_nodeid(cow_node); }
@@ -237,15 +269,15 @@ private:
     }
 };
 
-bool COWBtree::flush_nodes(COWBtreeCPContext* cp_ctx) {
-    CPSession* session = cp_session(cp_ctx->cp_id());
+std::tuple< bool, sisl::io_blob_safe, bool > COWBtree::flush_nodes(COWBtreeCPContext* cp_ctx) {
+    CPSession* session = cp_session(cp_ctx->id());
 
     // We prepare to flush nodes, by allocating blks in vdev to accomodate all the dirty blks. Its obviously not
     // possible to put all nodes in a single huge contiguous blk. However, it tries to allocate as big as possible and
     // then pack nodes inside these blks.
     if (!session->prepare_to_flush_nodes(*this, cp_ctx)) {
         // Already flushed the cp and moved on.
-        return false;
+        return {false, nullptr, false};
     }
 
     // 3 steps on per btree CP node flush
@@ -279,36 +311,53 @@ bool COWBtree::flush_nodes(COWBtreeCPContext* cp_ctx) {
         HS_REL_ASSERT(!err, "Flush of nodes failed during cp, best is to crash the system and retry on reboot");
     } while (true);
 
-    //
-    // Step 2: During cp io phase, all deleted nodes are tracked, we delete them from in-memory map and also
-    // build the journal with this delete operation.
-    //
-    auto [it, end_it, journal_area] = session->next_deleted();
-    uint8_t* delete_jentries = r_cast< CompactNodeId* >(journal_area.bytes_);
-    uint32_t deleted_count = 0;
-    while (it != end_it) {
-        auto nodeid = *it;
-        delete_from_bnode_map(nodeid, false /* in_recovery */);
-        if (delete_jentries) { delete_jentries[m_deleted_count++] = nodeid; }
-        ++it;
-    }
-
-    //
-    // Step 3: Check if there are any changes that needs changes in superblock of the btree. If so modify them. We do
-    // not persist them yet, because we need all fibers to finish flushing, write journal etc before committing to
-    // superblock to disk. In this step, we just updated the superblk based on what has been dirtied earlier.
-    //
-    auto [new_root, new_node_counts] = session->next_sb_updates();
-    if (new_root != empty_bnodeid) { bt_super_blk()->btree_sb.root_node = new_root; }
-    if (new_node_counts != 0) { bt_super_blk()->btree_sb.index_size += (vdev->block_size() * new_node_counts); }
-
     if (session->done_flushing_nodes()) {
-        CP_PERIODIC_LOG(DEBUG, cp_ctx->id(), "Btree={} has flushed {} dirty_nodes and deleted {} nodes", ordinal(),
+        //
+        // Step 2: During cp io phase, all deleted nodes are tracked, we delete them from in-memory map and also
+        // build the journal with this delete operation.
+        //
+        auto [it, end_it, journal_area] = session->next_deleted();
+        uint8_t* delete_jentries = r_cast< CompactNodeId* >(journal_area.bytes_);
+        uint32_t deleted_count = 0;
+        while (it != end_it) {
+            auto nodeid = *it;
+            delete_from_bnode_map(nodeid, false /* in_recovery */);
+            if (delete_jentries) { delete_jentries[m_deleted_count++] = nodeid; }
+            ++it;
+        }
+
+        //
+        // Step 3: Check if there are any changes that needs changes in superblock of the btree. If so modify them. We
+        // do not persist them yet, because we need all fibers to finish flushing, write journal etc before committing
+        // to superblock to disk. In this step, we just updated the superblk based on what has been dirtied earlier.
+        //
+        auto const new_root = session->new_root();
+        bool sb_changed{false};
+        if (new_root != empty_bnodeid) {
+            bt_super_blk()->root_node = new_root;
+            sb_changed = true
+        }
+
+        CP_PERIODIC_LOG(DEBUG, cp_ctx->id(), "Btree={} has flushed {} dirty nodes and deleted {} nodes", ordinal(),
                         session->modified_node_count(), session->deleted_node_count());
         m_bnodeid_map.m_updates_since_last_flush.fetch_add(session->modified_node_count() +
                                                            session->deleted_node_count());
+
+        // If either map has to be updated or sb is changed, we need to hold onto the session and it will be completed
+        // after that is done. Otherwise, we can complete the session now (which means all dirty node list, deleted node
+        // list, journal and everything has been cleaned)
+        if (sb_changed || cp_ctx->need_full_map_flush()) {
+            return std::make_tuple(session->modified_node_count() || session->deleted_node_count(),
+                                   std::move(session->m_journal), true);
+        } else {
+            auto const ret = std::make_tuple(session->modified_node_count() || session->deleted_node_count(),
+                                             std::move(session->m_journal), sb_changed);
+            session->finish();
+            return ret;
+        }
+    } else {
+        return std::make_tuple(false, nullptr, false);
     }
-    return true;
 }
 
 void COWBtree::flush_map_and_sb(COWBtreeCPContext* cp_ctx) {
@@ -319,7 +368,7 @@ void COWBtree::flush_map_and_sb(COWBtreeCPContext* cp_ctx) {
         return;
     }
 
-    CPSession* session = cp_session(cp_ctx->cp_id());
+    CPSession* session = cp_session(cp_ctx->id());
     auto const [it, count] = session->prepare_to_flush_map(*this, cp_ctx);
 
     std::vector< BlkId > map_locations;
@@ -362,7 +411,7 @@ void COWBtree::flush_map_and_sb(COWBtreeCPContext* cp_ctx) {
     // flush the superblk and free up old map blks.
     SuperBlock* sb = cow_bt_super_blk().get();
     sb->num_map_heads = 0;
-    sb->cp_id = cp_ctx->cp_id;
+    sb->cp_id = cp_ctx->id();
     for (auto const& map_locs : all_map_locations) {
         sb->map_heads[sb->num_map_heads++] = map_locs[0]; // Pick head of each map locs from different fibers
     }
@@ -370,12 +419,12 @@ void COWBtree::flush_map_and_sb(COWBtreeCPContext* cp_ctx) {
     // Persist the superblk now
     flush_sb(cp_ctx);
 
-    // We have completed the flush of map and now we can free up the old location blks.
+    // We have completed the flush of map and now we can free up the old map blks
     for (auto const& loc : m_bnodeid_map.m_locations) {
         m_vdev->free_blks(loc);
     }
 
-    // We need to replace the previous map_locations in-memory with this new set of locations.
+    // We need to replace the previous map_locations in-memory with this new set of locations where map is written
     m_bnodeid_map.m_locations.clear();
     for (auto const& loc_array : all_map_locations) {
         m_bnodeid_map.m_locations.insert(m_bnodeid_map.m_locations.end(), loc_array.begin(), loc_array.end());
@@ -384,14 +433,20 @@ void COWBtree::flush_map_and_sb(COWBtreeCPContext* cp_ctx) {
 }
 
 void COWBtree::flush_sb(COWBtreeCPContext* cp_ctx) {
-    CPSession* session = cp_session(cp_ctx->cp_id());
-    session->flush_sb(cp_ctx);
+    CPSession* session = cp_session(cp_ctx->id());
+    bt.mutable_superblk().write();
+    session->finish();
 }
 
 void COWBtree::update_bnode_map(CompactNodeId nodeid, CompactBlkId cblkid, bool in_recovery) {
     auto do_update = [this](CompactNodeId nodeid, CompactBlkId cblkid) {
-        auto const [it, happened] = m_bnode_map.m_map.insert_or_assign(nodeid, blkid);
-        if (!happened) { HS_LOG_ASSERT(!happened, "Updating node_id {} to bnode map failed", nodeid); }
+        auto it = m_bnode_map.m_map.find(nodeid);
+        if (it != m_bnode_map.m_map.end()) {
+            m_vdev->free_blk(it->second.to_blkid());
+            it->second = cblkid;
+        } else {
+            m_bnode_map.m_map.emplace(nodeid, cblkid);
+        }
     };
 
     if (in_recovery) {
@@ -430,7 +485,7 @@ void COWBtree::recover_bnode_map(BlkId const& map_loc) {
 
     BlkId next_loc = map_loc;
     do {
-        auto [ec, buf] = m_vdev->alloc_buf_and_read(next_loc);
+        auto [ec, buf] = m_vdev->sync_read(next_loc);
         HS_REL_ASSERT(!ec, "Error while reading bnodeid map, cannot proceed further");
 
         m_vdev->commit_blk(next_loc);
@@ -445,6 +500,11 @@ void COWBtree::recover_bnode_map(BlkId const& map_loc) {
         }
         next_loc = munit.header()->next_unit_location.to_blkid();
     } while (next_loc.is_valid());
+}
+
+void COWBtree::used_size() const {
+    std::shared_lock< iomgr::FiberManagerLib::shared_mutex > lg(m_bnodeid_map.m_mtx);
+    return m_bnodeid_map.m_map.size() * m_vdev->block_size();
 }
 
 void COWBtree::apply_incremental_map(sisl::byte_view const& journal_buf) {
@@ -562,16 +622,7 @@ std::tuple< DeletedNodeList::iterator, uint32_t, sisl::blob > COWBtree::CPSessio
     return std::make_tuple(std::move(ret_it), m_deleted_nodes.end(), std::move(ret_blob));
 }
 
-std::pair< bnodeid_t, int64_t > COWBtree::CPSession::next_sb_updates() {
-    std::lock_guard lg{m_flush_mtx};
-    auto new_root = session->new_root_id.exchange(empty_bnodeid);
-    if (new_root != empty_bnodeid) { m_sb_persist_needed = true; }
-
-    auto new_count = node_count_changes.exchange(0));
-    if (new_count != 0) { m_sb_persist_needed = true; }
-
-    return std::pair(new_root, new_count);
-}
+bnodeid_t COWBtree::CPSession::new_root() { return session->new_root_id.exchange(empty_bnodeid); }
 
 bool COWBtree::CPSession::done_flushing_nodes() {
     std::lock_guard lg{m_flush_mtx};
@@ -603,8 +654,8 @@ std::pair< BNodeIDMap::iterator, uint32_t > COWBtree::CPSession::prepare_to_flus
 
         // First fiber to flush the full map in this session. All fibers get equal portion to flush except the first
         // one which gets additional
-        m_parallel_flush_range = m.size() / cp_ctx->parallel_flushers_count();
-        auto this_count = m_parallel_flush_range + (m.size() % cp_ctx->parallel_flushers_count());
+        m_parallel_flush_range = m.size() / cp_ctx->m_parallel_flushers_count;
+        auto this_count = m_parallel_flush_range + (m.size() % cp_ctx->m_parallel_flushers_count);
         m_next_full_map_it = m.begin() + this_count;
 
         m_state = FlushState::MAP_FLUSHING;
@@ -625,12 +676,24 @@ COWBtree::CPSession::done_flushing_map(std::vector< BlkId > map_locations) {
     return std::pair(true, std::move(m_location_chains));
 }
 
-bool COWBtree::CPSession::flush_sb(COWBtreeCPContext* cp_ctx) {
+void COWBtree::CPSession::finish() {
     std::lock_guard lg{m_flush_mtx};
-    if (cp_ctx->need_full_map_flush() || m_sb_persist_needed) {
-        bt.mutable_superblk().write();
-        m_sb_persist_needed = false;
-    }
+    m_modified_nodes.clear();
+    m_deleted_nodes.clear();
+    m_new_root_id.store(empty_bnodeid);
     m_state = FlushState::ALL_DONE;
+    m_flushing_req_count = 0;
+
+    m_node_locations.reset();
+    m_next_location_idx = 0;
+    m_modified_it = m_modified_nodes.end();
+    m_deleted_it = m_deleted_nodes.end();
+    m_modified_count = 0;
+    m_deleted_count = 0;
+    m_journal.reset();
+
+    m_next_full_map_it = m_bt.m_bnodeid_map.m_map.end();
+    m_parallel_flush_range = 0;
+    m_location_chains.clear();
 }
 } // namespace homestore

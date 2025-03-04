@@ -20,9 +20,10 @@
 
 #include <iomgr/iomgr.hpp>
 #include <sisl/fds/id_reserver.hpp>
+#include <sisl/utility/enum.hpp>
 #include <homestore/homestore_decl.hpp>
-#include <homestore/btree/details/btree_internal.hpp>
 #include <homestore/superblk_handler.hpp>
+#include <homestore/homestore.hpp>
 
 namespace homestore {
 
@@ -31,14 +32,16 @@ class VirtualDev;
 
 class IndexStore {
 public:
-    ENUM(Type, uint8_t, MEM_BTREE, COPY_ON_WRITE_BTREE, INPLACE_BTREE);
+    SCOPED_ENUM_DECL(Type, uint8_t);
     virtual std::string store_type() const = 0;
 };
 
+SCOPED_ENUM_DEF(IndexStore, Type, uint8_t, MEM_BTREE, COPY_ON_WRITE_BTREE, INPLACE_BTREE);
+
 #pragma pack(1)
 struct IndexSuperBlock {
-    static constexpr uint64_t magic{0xbedabb1e};
-    static constexpr uint32_t version{0x3};
+    static constexpr uint64_t indx_sb_magic{0xbedabb1e};
+    static constexpr uint32_t indx_sb_version{0x3};
 
     // Common Area for all index implementations
     uint64_t magic{indx_sb_magic};
@@ -48,16 +51,8 @@ struct IndexSuperBlock {
     uint32_t ordinal;                  // Ordinal of the Index (unique within the homestore instance)
     IndexStore::Type index_store_type; // Underlying store type for this index
 
-    // Btree based implementations superblock area
-    struct BtreeSuperBlock {
-        static constexpr size_t underlying_btree_sb_size = 512;
-
-        bnodeid_t root_node{empty_bnodeid}; // Btree Root Node ID
-        int64_t index_size{0};              // Size of the Index
-        uint8_t underlying_btree_sb[underlying_btree_sb_size];
-    };
-
-    BtreeSuperBlock btree_sb;
+    static constexpr size_t store_index_sb_size = 512;
+    uint8_t underlying_index_sb[store_index_sb_size];
 
     // User area of the superblock, which can be updated with cp guard.
     uint32_t user_sb_size;    // Size of the user superblk
@@ -94,15 +89,14 @@ public:
     // potentially takes place in subsequent checkpoints. Hence caller should not assume that destroy is completed
     // instantly. This is an idempotent call and the implementer of this method needs to support that.
     virtual void destroy() = 0;
-    bool is_destroy_pending() const = 0;
 
     // Getters
-    uuid_t uuid() const override { return m_sb->uuid; }
-    uint64_t used_size() const override { return m_sb->index_size; }
+    uuid_t uuid() const { return m_sb->uuid; }
+    virtual uint64_t used_size() = 0;
 
     superblk< IndexSuperBlock > const& super_blk() const { return m_sb; }
     superblk< IndexSuperBlock >& super_blk() {
-        return const_cast< superblk< IndexSuperBlock& > >(s_cast< const Index* >(this)->super_blk());
+        return const_cast< superblk< IndexSuperBlock >& >(s_cast< const Index* >(this)->super_blk());
     }
 };
 
@@ -111,15 +105,14 @@ struct IndexMetaInfo {
     sisl::byte_view mbuf;
 
     IndexMetaInfo(meta_blk* blk, sisl::byte_view b) : mblk{blk}, mbuf{std::move(b)} {}
-    uint8_t* raw_buf() { return mbuf.bytes(); }
+    uint8_t const* raw_buf() { return mbuf.bytes(); }
     sisl::byte_view& buf() { return mbuf; }
 };
 
 class IndexService {
 private:
     unique< IndexServiceCallbacks > m_svc_cbs;
-    unique< IndexWBCacheBase > m_wb_cache;
-    shared< VirtualDev > m_vdev;
+    std::unordered_map< SVC_SUB_GENRE::type_t, shared< VirtualDev > > m_vdevs;
     std::vector< IndexMetaInfo > m_index_sbs;
     std::vector< IndexMetaInfo > m_store_sbs;
     unique< sisl::IDReserver > m_ordinal_reserver;
@@ -133,10 +126,10 @@ public:
     IndexService(unique< IndexServiceCallbacks > cbs);
 
     // Creates the vdev that is needed to initialize the device
-    void create_vdev(uint64_t size, HSDevType devType, uint32_t num_chunks);
+    void create_vdev(SVC_SUB_GENRE::type_t sub_type, uint64_t size, HSDevType devType, uint32_t num_chunks);
 
     // Open the existing vdev which is represnted by the vdev_info_block
-    shared< VirtualDev > open_vdev(const vdev_info& vb, bool load_existing);
+    shared< VirtualDev > open_vdev(SVC_SUB_GENRE::type_t sub_type, const vdev_info& vb, bool load_existing);
 
     // Start the Index Service
     void start();
@@ -154,6 +147,10 @@ public:
     IndexStore* lookup_store(IndexStore::Type store_type);
     uint64_t used_size() const;
     uint32_t node_size() const;
+
+private:
+    shared< Index > lookup_or_create_store(IndexStore::Type store_type, IndexMetaInfo& imeta_info);
+    shared< VirtualDev > get_vdev(SVC_SUB_GENRE::type_t sub_type);
 };
 
 extern IndexService& index_service();

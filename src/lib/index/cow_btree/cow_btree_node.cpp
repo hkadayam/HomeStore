@@ -1,6 +1,6 @@
-#include <homestore/btree/store_variant/cow_btree_node.h>
-#include <homestore/btree/detail/btree_internal.hpp>
+#include <homestore/btree/detail/btree_node.hpp>
 #include "index/cow_btree_cp.h"
+#include "index/cow_btree/cow_btree_node.h"
 #include "common/homestore_utils.hpp"
 
 namespace homestore {

@@ -245,6 +245,8 @@ public:
     // TODO: This needs to be removed once Journal starting to use AppendBlkAllocator
     std::error_code sync_read(char* buf, uint32_t size, cshared< Chunk >& chunk, uint64_t offset_in_chunk);
 
+    std::pair< std::error_code, sisl::io_blob_safe > sync_read(BlkId const& bid);
+
     /// @brief Synchronously read the data for a given BlkId to vector of buffers
     /// @param iov : Vector of buffer to write read to
     /// @param iovcnt : Count of buffer

@@ -28,7 +28,9 @@ BtreeBase::~BtreeBase() {
     if (is_ephemeral()) { this->destroy(); }
 }
 
-virtual StoreSpecificBtree* BtreeBase::store_specific_btree() { return m_bt_private.get(); }
-virtual uint32_t BtreeBase::node_size() const { return m_bt_cfg->node_size; };
-virtual uint32_t BtreeBase::ordinal() const { return m_sb->ordinal; };
+StoreSpecificBtree* BtreeBase::store_specific_btree() { return m_bt_private.get(); }
+uint32_t BtreeBase::node_size() const { return m_bt_cfg->node_size; };
+uint32_t BtreeBase::ordinal() const { return m_sb->ordinal; };
+uint64_t used_size() const { return m_store->used_size(*this); }
+
 } // namespace homestore

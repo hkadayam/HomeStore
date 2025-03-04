@@ -60,7 +60,6 @@ public:
     bool is_ephemeral() const { return m_is_ephemeral; }
 
     uuid_t uuid() const override { return m_sb->uuid; }
-    uint64_t used_size() const override { return m_sb->index_size; }
     superblk< index_table_sb >& mutable_super_blk() { return m_sb; }
     const superblk< index_table_sb >& mutable_super_blk() const { return m_sb; }
 };

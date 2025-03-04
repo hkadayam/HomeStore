@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <array>
+#include <queue>
 
 #include <boost/intrusive_ptr.hpp>
 #include <folly/small_vector.h>
@@ -26,7 +27,7 @@
 #include "btree_kv.hpp"
 #include <homestore/btree/detail/btree_internal.hpp>
 #include <homestore/btree/detail/btree_node.hpp>
-#include <homestore/index/index_service.hpp>
+#include <homestore/index_service.hpp>
 
 SISL_LOGGING_DECL(btree)
 
@@ -84,6 +85,7 @@ public:
     BtreeBase(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb);
     virtual UnderlyingBtree* underlying_btree() { return m_bt_private.get(); }
     virtual uint32_t node_size() const;
+    virtual uint64_t used_size();
     uint32_t ordinal() const;
 
 protected:

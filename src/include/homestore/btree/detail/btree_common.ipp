@@ -86,14 +86,60 @@ void Btree< K, V >::get_all_kvs(std::vector< std::pair< K, V > >& kvs) const {
 }
 
 template < typename K, typename V >
-btree_status_t Btree< K, V >::do_destroy(uint64_t& n_freed_nodes, void* context) {
-    return post_order_traversal(locktype_t::WRITE,
-                                [this, &n_freed_nodes, context](const auto& node, bool is_leaf) -> btree_status_t {
-                                    remove_node(node, locktype_t::WRITE, context);
-                                    ++n_freed_nodes;
-                                    return btree_status_t::node_freed;
-                                });
+btree_status_t Btree< K, V >::do_destroy() {
+    if (m_store->is_ephemeral()) {
+        return post_order_traversal(locktype_t::WRITE, [this, &cb](const auto& node, bool is_leaf) -> btree_status_t {
+            // On ephemeral btree, we can directly remove the node, however on non-ephemeral btree, we need to do so
+            // only at checkpoint time, which should be handled by the store themselves.
+            remove_node(node, locktype_t::WRITE, context);
+            return btree_status_t::success;
+        });
+    } else if (!m_store->is_fast_destroy_supported()) {
+        // TODO: Need to be implemented. We need to create a BtreeRangeRemoveRequest and put the entire range in the
+        // request, which should naturally collapse the tree and remove all the nodes. To generate the entire range we
+        // have 2 choices:
+        // a) Do a traversal to the left most and right most and implement a btree node method to get first and last key
+        // from leaf node and put that in range and traverse again.
+        // b) Generate a magical BtreeKey called "min" and "max" and put that in the range. However the user of the
+        // Btree should understand this and should handle in their compare function.
+    } else {
+        // Let the store handle the fast delete of btree as part of the on_btree_destroyed() call.
+    }
+    return btree_status_t::success;
 }
+
+#if 0
+template < typename K, typename V >
+btree_status_t Btree< K, V >::do_destroy(std::function< void(BtreeKey const&, BtreeValue const&) > cb) {
+    if (m_store->is_fast_destroy_supported()) {
+        return post_order_traversal(locktype_t::WRITE, [this, &cb](const auto& node, bool is_leaf) -> btree_status_t {
+            // If callback is defined, then call it for each key-value pair before deleting. It is typically used in
+            // case the index stores some indirect data and that needs to be freed.
+            if (cb != nullptr) {
+                std::vector< std::pair< K, V > > kvs;
+                node->get_all_kvs([this, &cb](const auto& kvs) {
+                    for (const auto& kv : kvs) {
+                        cb(kv.first, kv.second);
+                    }
+                });
+            }
+
+            // On ephemeral btree, we can directly remove the node, however on non-ephemeral btree, we need to do so
+            // only at checkpoint time, which should be handled by the store themselves.
+            if (m_store->is_ephemeral()) { remove_node(node, locktype_t::WRITE, context); }
+            return btree_status_t::success;
+        });
+    } else {
+        // TODO: Need to be implemented. We need to create a BtreeRangeRemoveRequest and put the entire range in the
+        // request, which should naturally collapse the tree and remove all the nodes. To generate the entire range we
+        // have 2 choices:
+        // a) Do a traversal to the left most and right most and implement a btree node method to get first and last key
+        // from leaf node and put that in range and traverse again.
+        // b) Generate a magical BtreeKey called "min" and "max" and put that in the range. However the user of the
+        // Btree should understand this and should handle in their compare function.
+    }
+}
+#endif
 
 template < typename K, typename V >
 uint64_t Btree< K, V >::get_btree_node_cnt() const {

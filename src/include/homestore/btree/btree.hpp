@@ -55,6 +55,7 @@ public:
     BtreeBase(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb);
     virtual UnderlyingBtree* underlying_btree() { return m_bt_private.get(); }
     virtual uint32_t node_size() const;
+    virtual uint64_t used_size();
     uint32_t ordinal() const;
 
 protected:

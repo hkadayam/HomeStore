@@ -238,7 +238,6 @@ public:
         BNodeIdMap::iterator m_next_full_map_it;
         uint32_t m_parallel_flush_range{0};
         std::vector< std::vector< BlkId > > m_location_chains;
-        bool m_sb_persist_needed{false};
 
     public:
         CPSession(COWBtree& bt) : m_bt{bt} {}

@@ -24,6 +24,7 @@
 #include <sisl/utility/obj_life_counter.hpp>
 #include <homestore/btree/detail/btree_internal.hpp>
 #include <homestore/btree/btree_kv.hpp>
+#include <homestore/btree/btree_store.h>
 #include <homestore/crc.h>
 
 #ifndef TEST_BNODE_ONLY

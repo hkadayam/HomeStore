@@ -14,6 +14,8 @@
 #include "common/homestore_utils.hpp"
 #include "index/cow_btree/cow_btree.h"
 
+#include "common/homestore_utils.hpp"
+
 namespace homestore {
 class COWBtreeCPContext;
 class VirtualDev;

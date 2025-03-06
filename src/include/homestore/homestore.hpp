@@ -67,7 +67,8 @@ struct hs_stats {
     uint64_t used_capacity{0ul};
 };
 
-struct SVC_GENRE {
+#if 0
+struct ServiceType {
     using type_t = uint32_t;
 
     static constexpr type_t META = 1 << 0;
@@ -77,35 +78,51 @@ struct SVC_GENRE {
     static constexpr type_t REPLICATION = 1 << 4;
 };
 
-using HS_SERVICE = SVC_GENRE; // Alias for easier porting of code
-
-struct SVC_SUB_GENRE {
+struct ServiceSubType {
     using type_t = uint32_t;
 
     static constexpr type_t INDEX_BTREE_COPY_ON_WRITE = 1 << 0;
     static constexpr type_t INDEX_BTREE_INPLACE = 1 << 1;
     static constexpr type_t INDEX_BTREE_MEMORY = 1 << 2;
 };
+#endif
+
+ENUM(ServiceType, uint32_t, // List of all services we support
+     META = 0,              // Meta Service
+     LOG = 1,               // Log Service
+     DATA = 2,              // Data Service
+     INDEX = 3,             // Index Service
+     REPLICATION = 4        // Replication Service
+);
+using HS_SERVICE = ServiceType; // Alias for easier porting of code
+
+ENUM(ServiceSubType, uint32_t,      // All sub types within services. At this point it is a global list for all services
+     DEFAULT = 0,                   // No sub type
+     INDEX_BTREE_COPY_ON_WRITE = 1, // Copy on Write btree index
+     INDEX_BTREE_INPLACE = 2,       // LInplace Btree based index
+     MEMORY = 3,                    // Memory based index
+);
 
 VENUM(hs_vdev_type_t, uint32_t, DATA_VDEV = 1, INDEX_VDEV = 2, META_VDEV = 3, LOGDEV_VDEV = 4);
 
 #pragma pack(1)
 struct hs_vdev_context {
     enum hs_vdev_type_t type;
-    SVC_SUB_GENRE::type_t sub_type{0};
+    ServiceSubType sub_type{ServiceSubType::DEFAULT};
 
     sisl::blob to_blob() { return sisl::blob{uintptr_cast(this), sizeof(*this)}; }
 };
 #pragma pack()
 
 struct ServiceId {
-    SVC_GENRE::type_t type;
-    SVC_SUB_GENRE::type_t sub_type;
+    ServiceType type;
+    ServiceSubType sub_type;
 
-    ServiceId(SVC_GENRE::type_t st, SVC_SUB_GENRE::type_t sst) : type{st}, sub_type{sst} {}
-    ServiceId(SVC_GENRE::type_t st) : type{st}, sub_type{0} {}
+    ServiceId(ServiceType st, ServiceSubType sst) : type{st}, sub_type{sst} {}
+    ServiceId(ServiceType st) : type{st}, sub_type{ServiceSubType::DEFAULT} {}
 };
 
+#if 0
 struct ServiceList {
     ServiceId svcs;
 
@@ -113,20 +130,19 @@ struct ServiceList {
 
     std::string list() const {
         std::string str;
-        if (svcs.type & SVC_GENRE::META) { str += "meta,"; }
-        if (svcs.type & SVC_GENRE::DATA) { str += "data,"; }
-        if (svcs.type & SVC_GENRE::INDEX) {
-            if (svcs.sub_type & SVC_SUB_GENRE::INDEX_BTREE_COPY_ON_WRITE) { str += "index_copy_on_write_btree,"; }
-            if (svcs.sub_type & SVC_SUB_GENRE::INDEX_BTREE_INPLACE) { str += "index_inplace_btree,"; }
-            if (svcs.sub_type & SVC_SUB_GENRE::INDEX_BTREE_MEMORY) { str += "index_mem_btree,"; }
+        if (svcs.type & ServiceType::META) { str += "meta,"; }
+        if (svcs.type & ServiceType::DATA) { str += "data,"; }
+        if (svcs.type & ServiceType::INDEX) {
+            if (svcs.sub_type & ServiceSubType::INDEX_BTREE_COPY_ON_WRITE) { str += "index_copy_on_write_btree,"; }
+            if (svcs.sub_type & ServiceSubType::INDEX_BTREE_INPLACE) { str += "index_inplace_btree,"; }
+            if (svcs.sub_type & ServiceSubType::INDEX_BTREE_MEMORY) { str += "index_mem_btree,"; }
         }
-        if (svcs.type & SVC_GENRE::LOG) { str += "log,"; }
-        if (svcs.type & SVC_GENRE::REPLICATION) { str += "replication,"; }
+        if (svcs.type & ServiceType::LOG) { str += "log,"; }
+        if (svcs.type & ServiceType::REPLICATION) { str += "replication,"; }
         return str;
     }
 };
 
-#if 0
 struct HS_SERVICE {
     static constexpr uint32_t META = 1 << 0;
     static constexpr uint32_t LOG = 1 << 1;
@@ -180,12 +196,12 @@ private:
     std::unique_ptr< CPManager > m_cp_mgr;
     shared< sisl::Evictor > m_evictor;
 
-    ServiceList m_services; // Services homestore is starting with
+    std::vector< std::vector< ServiceSubType > > m_services; // Services homestore is starting with
     hs_before_services_starting_cb_t m_before_services_starting_cb{nullptr};
     std::atomic< bool > m_init_done{false};
 
 public:
-    HomeStore() = default;
+    HomeStore();
     virtual ~HomeStore() = default;
 
     /////////////////////////////////////////// static HomeStore member functions /////////////////////////////////
@@ -240,10 +256,10 @@ public:
 #endif
 
 private:
-    void init_cache();
     shared< VirtualDev > create_vdev_cb(const vdev_info& vinfo, bool load_existing);
     uint64_t pct_to_size(float pct, HSDevType dev_type) const;
     void do_start();
+    std::string services_list() const;
 };
 
 static HomeStore* hs() { return HomeStore::instance(); }

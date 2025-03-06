@@ -57,11 +57,10 @@ private:
 
 public:
     Index(bool is_ephermal) : m_is_ephemeral{is_ephermal} {}
-    bool is_ephemeral() const { return m_is_ephemeral; }
-
-    uuid_t uuid() const override { return m_sb->uuid; }
-    superblk< index_table_sb >& mutable_super_blk() { return m_sb; }
-    const superblk< index_table_sb >& mutable_super_blk() const { return m_sb; }
+    virtual bool is_ephemeral() const { return m_is_ephemeral; }
+    virtual uuid_t uuid() const override { return m_sb->uuid; }
+    virtual superblk< index_table_sb >& mutable_super_blk() { return m_sb; }
+    virtual const superblk< index_table_sb >& mutable_super_blk() const { return m_sb; }
 };
 
 } // namespace homestore

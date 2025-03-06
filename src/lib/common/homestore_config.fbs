@@ -126,8 +126,9 @@ table Generic {
     // cp timer in us
     cp_timer_us: uint64 = 60000000 (hotswap);
 
-    // writeback cache flush threads
-    cache_flush_threads : int32 = 1;
+    // Btree CP flush threads and fibers per thread. So effectively it will be threads * fibers concurrent IOs
+    btree_cp_flush_threads : uint32 = 2;
+    btree_cp_flush_fibers_per_thread : uint32 = 8; 
 
     cp_watchdog_timer_sec : uint32 = 10; // it checks if cp stuck every 10 seconds
 

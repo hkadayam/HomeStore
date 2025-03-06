@@ -14,17 +14,23 @@
  *
  *********************************************************************************/
 #pragma once
-#include <atomic>
+#include <string>
+#include <memory>
+#include <vector>
+
+#include <folly/futures/Future.h>
 #include <sisl/fds/concurrent_insert_vector.hpp>
-#include <homestore/blk.h>
+#include <sisl/utility/atomic_counter.hpp>
 #include <homestore/checkpoint/cp_mgr.hpp>
 #include <homestore/checkpoint/cp.hpp>
+#include <iomgr/fiber_lib.hpp>
 #include "device/virtual_dev.hpp"
 
 namespace homestore {
-class BtreeNode;
-
+class Index;
+class COWBtree;
 class COWBtreeStore;
+
 class COWBtreeCPCallbacks : public CPCallbacks {
 public:
     COWBtreeCPCallbacks(COWBtreeStore* store);
@@ -44,7 +50,7 @@ struct COWBtreeCPContext : public VDevCPContext {
 public:
     sisl::atomic_counter< int64_t > m_dirty_node_count{0};
     sisl::atomic_counter< int64_t > m_removed_node_count{0};
-    sisl::atomic_count< int64_t > m_flushing_fibers_count{0};
+    sisl::atomic_counter< int64_t > m_flushing_fibers_count{0};
     uint32_t const m_parallel_flushers_count;
 
     iomgr::FiberManagerLib::shared_mutex m_bt_list_mtx;
@@ -57,6 +63,7 @@ public:
             VDevCPContext(cp), m_parallel_flushers_count{parallel_flushers_count} {}
     virtual ~COWBtreeCPContext() = default;
     bool need_full_map_flush() const;
-    bool any_dirty_nodes() const { return (m_dirty_node_count.load() > 0) || (m_removed_node_count.load() > 0); }
+    bool any_dirty_nodes() const { return (!m_dirty_node_count.testz() || !m_removed_node_count.testz()); }
+    std::string to_string() const;
 };
 } // namespace homestore

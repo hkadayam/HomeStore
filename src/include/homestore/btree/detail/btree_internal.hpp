@@ -15,13 +15,13 @@
  *********************************************************************************/
 #pragma once
 
-#include <homestore/index_service.hpp>
 #include <boost/preprocessor/control/if.hpp>
 #include <boost/preprocessor/facilities/empty.hpp>
 #include <boost/preprocessor/facilities/identity.hpp>
 #include <boost/vmd/is_empty.hpp>
 #include <sisl/fds/utils.hpp>
 #include <sisl/metrics/metrics.hpp>
+#include <homestore/index_service.hpp>
 
 namespace homestore {
 
@@ -198,29 +198,12 @@ static constexpr uint16_t bt_init_crc_16 = 0x8005;
 
 VENUM(btree_node_type, uint32_t, FIXED = 0, VAR_VALUE = 1, VAR_KEY = 2, VAR_OBJECT = 3, PREFIX = 4, COMPACT = 5)
 
-#ifdef USE_STORE_TYPE
-VENUM(btree_store_type, uint8_t, MEM = 0, SSD = 1)
-#endif
-
 ENUM(btree_status_t, uint32_t, success, not_found, retry, has_more, node_read_failed, put_failed, space_not_avail,
      cp_mismatch, merge_not_required, merge_failed, crc_mismatch, not_supported, node_freed)
 
-/*ENUM(btree_node_write_type, uint8_t,
-     new_node,     // Node write whenever a new node is created.
-     inplace_leaf, // Node write after an entry is updated/added in leaf without changing btree structure, most common
-     inplace_interior, // Node write after a structure change, but this interior node is changed in-place only.
-     after_shift       // Node write after a structure change, but this node has its keys shifted to other node.
-);*/
-
-// Btree based implementations superblock area
-struct BtreeSuperBlock {
-    static constexpr size_t underlying_btree_sb_size = IndexSuperBlock::store_index_sb_size - sizeof(bnodeid_t);
-
-    bnodeid_t root_node{empty_bnodeid}; // Btree Root Node ID
-    std::array< uint8_t, underlying_btree_sb_size > underlying_btree_sb;
-};
-
 class BtreeNode;
+using BtreeNodePtr = boost::intrusive_ptr< BtreeNode >;
+using BtreeNodeList = folly::small_vector< BtreeNodePtr, 3 >;
 void intrusive_ptr_add_ref(BtreeNode* node);
 void intrusive_ptr_release(BtreeNode* node);
 

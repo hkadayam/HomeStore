@@ -22,7 +22,7 @@
 #include <sisl/utility/atomic_counter.hpp>
 #include <sisl/utility/enum.hpp>
 #include <sisl/utility/obj_life_counter.hpp>
-#include "btree_internal.hpp"
+#include <homestore/btree/detail/btree_internal.hpp>
 #include <homestore/btree/btree_kv.hpp>
 #include <homestore/btree/btree_store.h>
 #include <homestore/crc.h>
@@ -152,10 +152,22 @@ public:
         phdr->node_deleted = 0x0;
     }
 
-    static int64_t get_modified_cp_id(uint8_t* buf) {
+    static void set_modified_cp_id(uint8_t* buf, int64_t cp_id) {
+        auto phdr = r_cast< persistent_hdr_t* >(buf);
+        phdr->modified_cp_id = cp_id;
+    }
+
+    static int64_t get_modified_cp_id(uint8_t const* buf) {
         auto phdr = r_cast< persistent_hdr_t const* >(buf);
         return phdr->modified_cp_id;
     }
+
+    static bool is_node_deleted(uint8_t const* buf) {
+        auto phdr = r_cast< persistent_hdr_t const* >(buf);
+        return phdr->node_deleted == 0x1;
+    }
+
+    int64_t get_modified_cp_id() const { return get_persistent_header_const()->modified_cp_id; }
 
     /// @brief Finds the index of the entry with the specified key in the node.
     ///
@@ -485,6 +497,8 @@ protected:
 public:
     void update_phys_buf(uint8_t* buf) { m_phys_node_buf = buf; }
     uint8_t* get_phys_buf() { return m_phys_node_buf; }
+
+    void set_phys_buf(uint8_t* buf) { m_phys_node_buf = buf; }
 
     persistent_hdr_t* get_persistent_header() { return r_cast< persistent_hdr_t* >(m_phys_node_buf); }
     const persistent_hdr_t* get_persistent_header_const() const {

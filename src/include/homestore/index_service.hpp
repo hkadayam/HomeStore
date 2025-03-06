@@ -17,6 +17,7 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#include <array>
 
 #include <iomgr/iomgr.hpp>
 #include <sisl/fds/id_reserver.hpp>
@@ -34,6 +35,7 @@ class IndexStore {
 public:
     SCOPED_ENUM_DECL(Type, uint8_t);
     virtual std::string store_type() const = 0;
+    virtual void on_recovery_completed() = 0;
 };
 
 SCOPED_ENUM_DEF(IndexStore, Type, uint8_t, MEM_BTREE, COPY_ON_WRITE_BTREE, INPLACE_BTREE);
@@ -51,8 +53,8 @@ struct IndexSuperBlock {
     uint32_t ordinal;                  // Ordinal of the Index (unique within the homestore instance)
     IndexStore::Type index_store_type; // Underlying store type for this index
 
-    static constexpr size_t store_index_sb_size = 512;
-    uint8_t underlying_index_sb[store_index_sb_size];
+    static constexpr size_t index_impl_sb_size = 512;
+    std::array< uint8_t, index_impl_sb_size > underlying_index_sb;
 
     // User area of the superblock, which can be updated with cp guard.
     uint32_t user_sb_size;    // Size of the user superblk
@@ -100,21 +102,12 @@ public:
     }
 };
 
-struct IndexMetaInfo {
-    meta_blk* mblk;
-    sisl::byte_view mbuf;
-
-    IndexMetaInfo(meta_blk* blk, sisl::byte_view b) : mblk{blk}, mbuf{std::move(b)} {}
-    uint8_t const* raw_buf() { return mbuf.bytes(); }
-    sisl::byte_view& buf() { return mbuf; }
-};
-
 class IndexService {
 private:
     unique< IndexServiceCallbacks > m_svc_cbs;
-    std::unordered_map< SVC_SUB_GENRE::type_t, shared< VirtualDev > > m_vdevs;
-    std::vector< IndexMetaInfo > m_index_sbs;
-    std::vector< IndexMetaInfo > m_store_sbs;
+    std::unordered_map< ServiceSubType, shared< VirtualDev > > m_vdevs;
+    std::vector< superblk< IndexSuperBlock > > m_index_sbs;
+    std::vector< superblk< IndexStoreSuperBlock > > m_store_sbs;
     unique< sisl::IDReserver > m_ordinal_reserver;
     std::unordered_map< IndexStore::Type, unique< IndexStore > > m_index_stores;
 
@@ -123,13 +116,13 @@ private:
     std::unordered_map< uint32_t, shared< Index > > m_ordinal_index_map;
 
 public:
-    IndexService(unique< IndexServiceCallbacks > cbs);
+    IndexService(unique< IndexServiceCallbacks > cbs, std::vector< ServiceSubType > const& sub_types);
 
     // Creates the vdev that is needed to initialize the device
-    void create_vdev(SVC_SUB_GENRE::type_t sub_type, uint64_t size, HSDevType devType, uint32_t num_chunks);
+    void create_vdev(ServiceSubType sub_type, uint64_t size, HSDevType devType, uint32_t num_chunks);
 
     // Open the existing vdev which is represnted by the vdev_info_block
-    shared< VirtualDev > open_vdev(SVC_SUB_GENRE::type_t sub_type, const vdev_info& vb, bool load_existing);
+    shared< VirtualDev > open_vdev(ServiceSubType sub_type, const vdev_info& vb, bool load_existing);
 
     // Start the Index Service
     void start();
@@ -140,6 +133,8 @@ public:
     // Add/Remove Index Table to/from the index service
     void add_index_table(shared< Index > const& tbl);
     void remove_index_table(shared< Index > const& tbl);
+    void remove_index_table_entry(uuid_t uuid);
+
     shared< Index > get_index_table(uuid_t uuid) const;
     shared< Index > get_index_table(uint32_t ordinal) const;
     std::vector< shared< Index > > get_all_index_tables() const;
@@ -149,8 +144,9 @@ public:
     uint32_t node_size() const;
 
 private:
-    shared< Index > lookup_or_create_store(IndexStore::Type store_type, IndexMetaInfo& imeta_info);
-    shared< VirtualDev > get_vdev(SVC_SUB_GENRE::type_t sub_type);
+    shared< Index > lookup_or_create_store(IndexStore::Type store_type,
+                                           std::vector< superblk< IndexStoreSuperBlock > > sbs);
+    shared< VirtualDev > get_vdev(ServiceSubType sub_type);
 };
 
 extern IndexService& index_service();

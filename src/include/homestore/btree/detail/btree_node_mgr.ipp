@@ -250,7 +250,7 @@ BtreeNodePtr Btree< K, V >::create_interior_node(void* context) {
 template < typename T, typename... Args >
 static BtreeNode* do_create_node(uint32_t ctx_size, Args&&... args) {
     uint8_t* ptr = new uint8_t[sizeof(T) + ctx_size];
-    T* node = new (ptr) T(std::forward< Args >(args)...);
+    T* node = new (ptr + ctx_size) T(std::forward< Args >(args)...);
     return dynamic_cast< BtreeNode* >(node);
 }
 
@@ -262,7 +262,7 @@ BtreeNode* Btree< K, V >::init_node(uint8_t* node_buf, bnodeid_t id, bool init_b
 
     switch (node_type) {
     case btree_node_type::VAR_OBJECT:
-        n = is_leaf ? do_create_node< VarObjSizeNode< K, V > >(ctx_size, node_buf, id, init_buf, true, this->m_bt_cfg, )
+        n = is_leaf ? do_create_node< VarObjSizeNode< K, V > >(ctx_size, node_buf, id, init_buf, true, this->m_bt_cfg)
                     : do_create_node< VarObjSizeNode< K, BtreeLinkInfo > >(ctx_size, node_buf, id, init_buf, false,
                                                                            this->m_bt_cfg);
         break;

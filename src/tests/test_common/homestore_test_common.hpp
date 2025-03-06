@@ -167,11 +167,11 @@ public:
 
     struct test_token {
         std::string name_;
-        std::map< uint32_t, test_params > svc_params_;
+        std::map< ServiceType, test_params > svc_params_;
         hs_before_services_starting_cb_t cb_{nullptr};
         std::vector< homestore::dev_info > devs_;
 
-        test_params& params(uint32_t svc) { return svc_params_[svc]; }
+        test_params& params(ServiceType svc) { return svc_params_[svc]; }
         hs_before_services_starting_cb_t& cb() { return cb_; }
     };
 
@@ -209,7 +209,7 @@ public:
 
     void change_start_cb(hs_before_services_starting_cb_t cb) { m_token.cb() = cb; }
     void change_device_list(std::vector< homestore::dev_info > devs) { m_token.devs_ = std::move(devs); }
-    test_params& params(uint32_t svc) { return m_token.svc_params_[svc]; }
+    test_params& params(ServiceType svc) { return m_token.svc_params_[svc]; }
 
 #ifdef _PRERELEASE
     void wait_for_crash_recovery() {
@@ -422,13 +422,13 @@ private:
         using namespace homestore;
         auto hsi = HomeStore::instance();
         for (auto& [svc, tp] : m_token.svc_params_) {
-            if (svc == HS_SERVICE::DATA) {
+            if (svc == ServiceType::DATA) {
                 hsi->with_data_service(tp.custom_chunk_selector);
-            } else if (svc == HS_SERVICE::INDEX) {
+            } else if (svc == ServiceType::INDEX) {
                 hsi->with_index_service(std::unique_ptr< IndexServiceCallbacks >(tp.index_svc_cbs));
-            } else if ((svc == HS_SERVICE::LOG)) {
+            } else if ((svc == ServiceType::LOG)) {
                 hsi->with_log_service();
-            } else if (svc == HS_SERVICE::REPLICATION) {
+            } else if (svc == ServiceType::REPLICATION) {
                 hsi->with_repl_data_service(tp.repl_app, tp.custom_chunk_selector);
             }
         }
@@ -444,33 +444,34 @@ private:
             hsi->start(hs_input_params{.devices = m_token.devs_, .app_mem_size = app_mem_size}, m_token.cb_);
 
         // We need to set the min chunk size before homestore format
-        if (m_token.svc_params_.contains(HS_SERVICE::LOG) && m_token.svc_params_[HS_SERVICE::LOG].min_chunk_size != 0) {
-            set_min_chunk_size(m_token.svc_params_[HS_SERVICE::LOG].min_chunk_size);
+        if (m_token.svc_params_.contains(ServiceType::LOG) &&
+            m_token.svc_params_[ServiceType::LOG].min_chunk_size != 0) {
+            set_min_chunk_size(m_token.svc_params_[ServiceType::LOG].min_chunk_size);
         }
 
         if (need_format) {
             auto svc_params = m_token.svc_params_;
             hsi->format_and_start(
-                {{{SVC_GENRE::META},
-                  {.dev_type = homestore::HSDevType::Fast, .size_pct = svc_params[HS_SERVICE::META].size_pct}},
-                 {{SVC_GENRE::LOG},
+                {{{ServiceType::META},
+                  {.dev_type = homestore::HSDevType::Fast, .size_pct = svc_params[ServiceType::META].size_pct}},
+                 {{ServiceType::LOG},
                   {.dev_type = homestore::HSDevType::Fast,
-                   .size_pct = svc_params[SVC_GENRE::LOG].size_pct,
-                   .chunk_size = svc_params[SVC_GENRE::LOG].chunk_size,
-                   .vdev_size_type = svc_params[SVC_GENRE::LOG].vdev_size_type}},
-                 {{SVC_GENRE::DATA},
-                  {.size_pct = svc_params[SVC_GENRE::DATA].size_pct,
-                   .num_chunks = svc_params[SVC_GENRE::DATA].num_chunks,
-                   .alloc_type = svc_params[SVC_GENRE::DATA].blkalloc_type,
-                   .chunk_sel_type = svc_params[SVC_GENRE::DATA].custom_chunk_selector
+                   .size_pct = svc_params[ServiceType::LOG].size_pct,
+                   .chunk_size = svc_params[ServiceType::LOG].chunk_size,
+                   .vdev_size_type = svc_params[ServiceType::LOG].vdev_size_type}},
+                 {{ServiceType::DATA},
+                  {.size_pct = svc_params[ServiceType::DATA].size_pct,
+                   .num_chunks = svc_params[ServiceType::DATA].num_chunks,
+                   .alloc_type = svc_params[ServiceType::DATA].blkalloc_type,
+                   .chunk_sel_type = svc_params[ServiceType::DATA].custom_chunk_selector
                        ? chunk_selector_type_t::CUSTOM
                        : chunk_selector_type_t::ROUND_ROBIN}},
-                 {{SVC_GENRE::INDEX, SVC_SUB_GENRE::INDEX_BTREE_COPY_ON_WRITE},
-                  {.dev_type = homestore::HSDevType::Fast, .size_pct = svc_params[SVC_GENRE::INDEX].size_pct}},
-                 {{SVC_GENRE::REPLICATION},
-                  {.size_pct = svc_params[SVC_GENRE::REPLICATION].size_pct,
-                   .alloc_type = svc_params[SVC_GENRE::REPLICATION].blkalloc_type,
-                   .chunk_sel_type = svc_params[SVC_GENRE::REPLICATION].custom_chunk_selector
+                 {{ServiceType::INDEX, ServiceSubType::INDEX_BTREE_COPY_ON_WRITE},
+                  {.dev_type = homestore::HSDevType::Fast, .size_pct = svc_params[ServiceType::INDEX].size_pct}},
+                 {{ServiceType::REPLICATION},
+                  {.size_pct = svc_params[ServiceType::REPLICATION].size_pct,
+                   .alloc_type = svc_params[ServiceType::REPLICATION].blkalloc_type,
+                   .chunk_sel_type = svc_params[ServiceType::REPLICATION].custom_chunk_selector
                        ? chunk_selector_type_t::CUSTOM
                        : chunk_selector_type_t::ROUND_ROBIN}}});
         }

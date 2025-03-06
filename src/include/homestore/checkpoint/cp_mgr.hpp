@@ -28,8 +28,6 @@
 #include <homestore/checkpoint/cp.hpp>
 
 namespace homestore {
-static constexpr size_t MAX_CP_COUNT{2};
-
 class CPMgrMetrics : public sisl::MetricsGroup {
 public:
     explicit CPMgrMetrics() : sisl::MetricsGroup("CPMgr") {
@@ -149,6 +147,9 @@ public:
  */
 class CPManager {
     friend class CPGuard;
+
+public:
+    static constexpr size_t max_concurent_cps{2};
 
 private:
     CP* m_cur_cp{nullptr}; // Current CP information

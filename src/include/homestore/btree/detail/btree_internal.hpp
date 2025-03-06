@@ -15,7 +15,6 @@
  *********************************************************************************/
 #pragma once
 
-#include <homestore/index_service.hpp>
 #include <boost/preprocessor/control/if.hpp>
 #include <boost/preprocessor/facilities/empty.hpp>
 #include <boost/preprocessor/facilities/identity.hpp>

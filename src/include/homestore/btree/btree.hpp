@@ -46,17 +46,30 @@ using QueryPaginateCookie = unique< BtreeQueryRequest< K > >;
 class BtreeStore;
 
 class UnderlyingBtree {
+public:
     virtual ~UnderlyingBtree() = default;
+};
+
+// Btree based implementations superblock area
+struct BtreeSuperBlock {
+    static constexpr size_t underlying_btree_sb_size = IndexSuperBlock::index_impl_sb_size - sizeof(bnodeid_t);
+
+    bnodeid_t root_node{empty_bnodeid}; // Btree Root Node ID
+    std::array< uint8_t, underlying_btree_sb_size > underlying_btree_sb;
 };
 
 class BtreeBase : public Index {
 public:
     BtreeBase(BtreeConfig const& cfg, uuid_t uuid = uuid_t{}, uuid_t parent_uuid = uuid_t{}, uint32_t user_sb_size = 0);
     BtreeBase(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb);
+    virtual ~BtreeBase() = default;
+
     virtual UnderlyingBtree* underlying_btree() { return m_bt_private.get(); }
+    virtual BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf, uint32_t ctx_size) = 0;
     virtual uint32_t node_size() const;
-    virtual uint64_t used_size();
+    virtual uint64_t used_size() const;
     uint32_t ordinal() const;
+    std::string name() const;
 
 protected:
     shared< BtreeStore > m_store;

@@ -50,6 +50,9 @@ private:
     // Total number of incremental cp flushes since last full flushes
     uint32_t m_num_incremental_flushes{0};
 
+    // List of fibers to flush (note that this could be on multiple threads)
+    std::vector< iomgr::io_fiber_t > m_cp_flush_fibers;
+
     // All loaded journals arranged by the btree ordinals
     std::unordered_map< uint32_t, std::vector< sisl::byte_view > > m_journals_by_btree;
 

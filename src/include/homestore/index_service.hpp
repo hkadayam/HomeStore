@@ -94,7 +94,7 @@ public:
 
     // Getters
     uuid_t uuid() const { return m_sb->uuid; }
-    virtual uint64_t used_size() = 0;
+    virtual uint64_t used_size() const = 0;
 
     superblk< IndexSuperBlock > const& super_blk() const { return m_sb; }
     superblk< IndexSuperBlock >& super_blk() {
@@ -141,11 +141,12 @@ public:
 
     IndexStore* lookup_store(IndexStore::Type store_type);
     uint64_t used_size() const;
-    uint32_t node_size() const;
+    uint32_t reserve_ordinal();
+
+    shared< IndexStore > lookup_or_create_store(IndexStore::Type store_type,
+                                                std::vector< superblk< IndexStoreSuperBlock > > sbs);
 
 private:
-    shared< Index > lookup_or_create_store(IndexStore::Type store_type,
-                                           std::vector< superblk< IndexStoreSuperBlock > > sbs);
     shared< VirtualDev > get_vdev(ServiceSubType sub_type);
 };
 

@@ -81,7 +81,7 @@ public:
 
     bool is_fast_destroy_supported() const override { return true; }
 
-    uint64_t used_size(BtreeBase& btree) override;
+    uint64_t used_size(BtreeBase const& btree) const override;
 
     folly::Future< bool > async_cp_flush(COWBtreeCPContext* cp_ctx);
 

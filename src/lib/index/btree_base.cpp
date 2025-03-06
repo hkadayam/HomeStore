@@ -12,7 +12,8 @@ BtreeBase::BtreeBase(BtreeConfig const& cfg, uuid_t uuid, uuid_t parent_uuid, ui
     m_sb->index_store_type = cfg.store_type();
     m_sb->ordinal = hs()->index_service().reserve_ordinal();
 
-    m_store = hs()->index_service().lookup_or_create_store(cfg.store_type(), {});
+    m_store =
+        std::static_pointer_cast< BtreeStore >(hs()->index_service().lookup_or_create_store(cfg.store_type(), {}));
     m_bt_private = std::move(m_store->on_btree_created(*this, false /* load_existing */));
     m_sb.write();
 }
@@ -22,7 +23,8 @@ BtreeBase::BtreeBase(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb) :
     HS_REL_ASSERT_EQ(cfg.store_type(), m_sb->index_store_type,
                      "Config requirement and super block differs in store_type");
     m_sb = std::move(sb);
-    m_store = hs()->index_service().lookup_or_create_store(cfg.store_type(), {});
+    m_store =
+        std::static_pointer_cast< BtreeStore >(hs()->index_service().lookup_or_create_store(cfg.store_type(), {}));
     m_bt_private = std::move(m_store->on_btree_created(*this, true /* load_existing*/));
 }
 
@@ -30,7 +32,7 @@ BtreeBase::~BtreeBase() {
     if (is_ephemeral()) { this->destroy(); }
 }
 
-uint32_t BtreeBase::node_size() const { return m_bt_cfg.node_size; };
+uint32_t BtreeBase::node_size() const { return m_bt_cfg.node_size(); };
 uint64_t BtreeBase::used_size() const { return m_store->used_size(*this); }
 uint32_t BtreeBase::ordinal() const { return m_sb->ordinal; }
 std::string BtreeBase::name() const { return m_bt_cfg.name(); }

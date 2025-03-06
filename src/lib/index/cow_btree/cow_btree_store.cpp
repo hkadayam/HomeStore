@@ -24,8 +24,15 @@ static void cow_btree_node_destructor(BtreeNode* n) {
 }
 
 static COWBtree* to_cow_btree(BtreeBase& btree) { return r_cast< COWBtree* >(btree.underlying_btree()); }
+static COWBtree const* to_cow_btree_const(BtreeBase const& btree) {
+    return r_cast< COWBtree const* >(btree.underlying_btree());
+}
+
 static COWBtree* to_cow_btree(Index* index) {
     return r_cast< COWBtree* >(s_cast< BtreeBase* >(index)->underlying_btree());
+}
+static COWBtree const* to_cow_btree_const(Index const* index) {
+    return r_cast< COWBtree const* >(s_cast< BtreeBase const* >(index)->underlying_btree());
 }
 
 static std::vector< iomgr::io_fiber_t > start_flush_threads() {
@@ -220,7 +227,7 @@ btree_status_t COWBtreeStore::on_root_changed(BtreeBase& bt, BtreeNodePtr const&
 
 void COWBtreeStore::on_node_freed(BtreeNode* node) { cow_btree_node_destructor(node); }
 
-uint64_t COWBtreeStore::used_size(BtreeBase& btree) { return to_cow_btree(btree)->used_size(); }
+uint64_t COWBtreeStore::used_size(BtreeBase const& btree) const { return to_cow_btree_const(btree)->used_size(); }
 
 folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
     LOGTRACEMOD(btree, "Starting COWBtree CP Flush with cp context={}", cp_ctx->to_string());

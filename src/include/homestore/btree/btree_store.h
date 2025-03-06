@@ -36,6 +36,6 @@ public:
     // merging entities and collapsing the tree.
     virtual bool is_fast_destroy_supported() const = 0;
 
-    virtual uint64_t used_size(BtreeBase& btree) = 0;
+    virtual uint64_t used_size(BtreeBase const& btree) const = 0;
 };
 } // namespace homestore

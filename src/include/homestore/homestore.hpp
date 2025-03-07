@@ -67,26 +67,6 @@ struct hs_stats {
     uint64_t used_capacity{0ul};
 };
 
-#if 0
-struct ServiceType {
-    using type_t = uint32_t;
-
-    static constexpr type_t META = 1 << 0;
-    static constexpr type_t LOG = 1 << 1;
-    static constexpr type_t DATA = 1 << 2;
-    static constexpr type_t INDEX = 1 << 3;
-    static constexpr type_t REPLICATION = 1 << 4;
-};
-
-struct ServiceSubType {
-    using type_t = uint32_t;
-
-    static constexpr type_t INDEX_BTREE_COPY_ON_WRITE = 1 << 0;
-    static constexpr type_t INDEX_BTREE_INPLACE = 1 << 1;
-    static constexpr type_t INDEX_BTREE_MEMORY = 1 << 2;
-};
-#endif
-
 ENUM(ServiceType, uint32_t, // List of all services we support
      META = 0,              // Meta Service
      LOG = 1,               // Log Service
@@ -121,55 +101,6 @@ struct ServiceId {
     ServiceId(ServiceType st, ServiceSubType sst) : type{st}, sub_type{sst} {}
     ServiceId(ServiceType st) : type{st}, sub_type{ServiceSubType::DEFAULT} {}
 };
-
-#if 0
-struct ServiceList {
-    ServiceId svcs;
-
-    ServiceList(ServiceId s) : svcs{s} {}
-
-    std::string list() const {
-        std::string str;
-        if (svcs.type & ServiceType::META) { str += "meta,"; }
-        if (svcs.type & ServiceType::DATA) { str += "data,"; }
-        if (svcs.type & ServiceType::INDEX) {
-            if (svcs.sub_type & ServiceSubType::INDEX_BTREE_COPY_ON_WRITE) { str += "index_copy_on_write_btree,"; }
-            if (svcs.sub_type & ServiceSubType::INDEX_BTREE_INPLACE) { str += "index_inplace_btree,"; }
-            if (svcs.sub_type & ServiceSubType::INDEX_BTREE_MEMORY) { str += "index_mem_btree,"; }
-        }
-        if (svcs.type & ServiceType::LOG) { str += "log,"; }
-        if (svcs.type & ServiceType::REPLICATION) { str += "replication,"; }
-        return str;
-    }
-};
-
-struct HS_SERVICE {
-    static constexpr uint32_t META = 1 << 0;
-    static constexpr uint32_t LOG = 1 << 1;
-    static constexpr uint32_t DATA = 1 << 2;
-    static constexpr uint32_t INDEX = 1 << 3;
-    static constexpr uint32_t REPLICATION = 1 << 4;
-
-    uint32_t svcs;
-    uint32_t sub_type{0};
-
-    HS_SERVICE(uint32_t s = META, uint32_t t = 0) : svcs{s}, sub_type{t} {}
-
-    std::string list() const {
-        std::string str;
-        if (svcs & META) { str += "meta,"; }
-        if (svcs & DATA) { str += "data,"; }
-        if (svcs & INDEX) {
-            if (sub_type & INDEX_BTREE_COPY_ON_WRITE) { str += "index_copy_on_write_btree,"; }
-            if (sub_type & INDEX_BTREE_INPLACE) { str += "index_inplace_btree,"; }
-            if (sub_type & INDEX_BTREE_MEM) { str += "index_mem_btree,"; }
-        }
-        if (svcs & LOG) { str += "log,"; }
-        if (svcs & REPLICATION) { str += "replication,"; }
-        return str;
-    }
-};
-#endif
 
 /*
  * IO errors handling by homestore.
@@ -217,7 +148,8 @@ public:
     ///////////////////////////// Member functions /////////////////////////////////////////////
     HomeStore& with_data_service(cshared< ChunkSelector >& custom_chunk_selector = nullptr);
     HomeStore& with_log_service();
-    HomeStore& with_index_service(std::unique_ptr< IndexServiceCallbacks > cbs);
+    HomeStore& with_index_service(std::unique_ptr< IndexServiceCallbacks > cbs,
+                                  std::vector< ServiceSubType > sub_types);
     HomeStore& with_repl_data_service(cshared< ReplApplication >& repl_app,
                                       cshared< ChunkSelector >& custom_chunk_selector = nullptr);
 
@@ -235,6 +167,7 @@ public:
     bool has_meta_service() const;
     bool has_log_service() const;
     bool has_repl_data_service() const;
+    std::string services_list() const;
 
     BlkDataService& data_service() { return *m_data_service; }
     MetaBlkService& meta_service() { return *m_meta_service; }
@@ -259,7 +192,6 @@ private:
     shared< VirtualDev > create_vdev_cb(const vdev_info& vinfo, bool load_existing);
     uint64_t pct_to_size(float pct, HSDevType dev_type) const;
     void do_start();
-    std::string services_list() const;
 };
 
 static HomeStore* hs() { return HomeStore::instance(); }

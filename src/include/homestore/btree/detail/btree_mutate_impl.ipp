@@ -18,6 +18,76 @@
 
 namespace homestore {
 
+template < typename K, typename V >
+template < typename ReqT >
+btree_status_t Btree< K, V >::put(ReqT& put_req) {
+    static_assert(std::is_same_v< ReqT, BtreeSinglePutRequest > || std::is_same_v< ReqT, BtreeRangePutRequest< K > >,
+                  "put api is called with non put request type");
+    COUNTER_INCREMENT(m_metrics, btree_write_ops_count, 1);
+    auto acq_lock = locktype_t::READ;
+    bool is_leaf = false;
+
+    m_btree_lock.lock_shared();
+    btree_status_t ret = btree_status_t::success;
+
+retry:
+#ifndef NDEBUG
+    check_lock_debug();
+#endif
+    BT_LOG_ASSERT_EQ(bt_thread_vars()->rd_locked_nodes.size(), 0);
+    BT_LOG_ASSERT_EQ(bt_thread_vars()->wr_locked_nodes.size(), 0);
+
+    BtreeNodePtr root;
+    ret = read_and_lock_node(m_root_node_info.bnode_id(), root, acq_lock, acq_lock, put_req.m_op_context);
+    if (ret != btree_status_t::success) { goto out; }
+    is_leaf = root->is_leaf();
+
+    if (is_split_needed(root, put_req)) {
+        // Time to do the split of root.
+        unlock_node(root, acq_lock);
+        m_btree_lock.unlock_shared();
+        ret = check_split_root(put_req);
+        BT_LOG_ASSERT_EQ(bt_thread_vars()->rd_locked_nodes.size(), 0);
+        BT_LOG_ASSERT_EQ(bt_thread_vars()->wr_locked_nodes.size(), 0);
+
+        // We must have gotten a new root, need to start from scratch.
+        m_btree_lock.lock_shared();
+        if (ret != btree_status_t::success) {
+            LOGERROR("root split failed btree name {}", m_bt_cfg.name());
+            goto out;
+        }
+
+        goto retry;
+    } else if ((is_leaf) && (acq_lock != locktype_t::WRITE)) {
+        // Root is a leaf, need to take write lock, instead of read, retry
+        unlock_node(root, acq_lock);
+        acq_lock = locktype_t::WRITE;
+        goto retry;
+    } else {
+        ret = do_put(root, acq_lock, put_req);
+        if ((ret == btree_status_t::retry) || (ret == btree_status_t::has_more)) {
+            // Need to start from top down again, since there was a split or we have more to insert in case of range put
+            acq_lock = locktype_t::READ;
+            BT_LOG(TRACE, "retrying put operation");
+            BT_LOG_ASSERT_EQ(bt_thread_vars()->rd_locked_nodes.size(), 0);
+            BT_LOG_ASSERT_EQ(bt_thread_vars()->wr_locked_nodes.size(), 0);
+            goto retry;
+        }
+    }
+
+out:
+    m_btree_lock.unlock_shared();
+#ifndef NDEBUG
+    check_lock_debug();
+#endif
+    if (ret != btree_status_t::success && ret != btree_status_t::cp_mismatch) {
+        BT_LOG(ERROR, "btree put failed {}", ret);
+        COUNTER_INCREMENT(m_metrics, write_err_cnt, 1);
+    }
+
+    return ret;
+}
+
 /* This function does the heavy lifiting of co-ordinating inserts. It is a recursive function which walks
  * down the tree.
  *

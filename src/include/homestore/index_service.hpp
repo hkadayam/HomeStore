@@ -95,6 +95,7 @@ public:
     // Getters
     uuid_t uuid() const { return m_sb->uuid; }
     virtual uint64_t used_size() const = 0;
+    virtual uint32_t ordinal() const = 0;
 
     superblk< IndexSuperBlock > const& super_blk() const { return m_sb; }
     superblk< IndexSuperBlock >& super_blk() {
@@ -109,7 +110,7 @@ private:
     std::vector< superblk< IndexSuperBlock > > m_index_sbs;
     std::vector< superblk< IndexStoreSuperBlock > > m_store_sbs;
     unique< sisl::IDReserver > m_ordinal_reserver;
-    std::unordered_map< IndexStore::Type, unique< IndexStore > > m_index_stores;
+    std::unordered_map< IndexStore::Type, shared< IndexStore > > m_index_stores;
 
     mutable std::shared_mutex m_index_map_mtx;
     std::map< uuid_t, shared< Index > > m_index_map;

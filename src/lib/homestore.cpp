@@ -30,7 +30,6 @@
 #include <homestore/homestore.hpp>
 #include <homestore/checkpoint/cp_mgr.hpp>
 
-#include "index/wb_cache.hpp"
 #include "common/homestore_utils.hpp"
 #include "common/homestore_config.hpp"
 #include "common/homestore_assert.hpp"

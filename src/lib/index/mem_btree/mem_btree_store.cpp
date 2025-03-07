@@ -1,19 +1,13 @@
-#pragma once
-
 #include "index/mem_btree/mem_btree_store.h"
 
 namespace homestore {
-MemBtreeStore::MemBtreeStore() {}
-
 unique< UnderlyingBtree > MemBtreeStore::on_btree_created(BtreeBase& btree, bool load_existing) {
     // We don't need any mem specific btree portion, everything can be accomplished from common store class
     return nullptr;
 }
 
-void MemBtreeStore::on_btree_destroyed(BtreeBase& btree) {}
-
-BtreeNodePtr MemBtreeStore::create_node(BtreeBase& btree, bool is_leaf) override {
-    std::shared_ptr< uint8_t[] > ptr(new uint8_t[btree->node_size()]);
+BtreeNodePtr MemBtreeStore::create_node(BtreeBase& btree, bool is_leaf, void*) {
+    std::shared_ptr< uint8_t[] > ptr(new uint8_t[btree.node_size()]);
     node_buf_ptr_vec.emplace_back(ptr);
 
     auto new_node = btree.init_node(ptr.get(), bnodeid_t{0}, true, is_leaf, 0 /* context_size */);
@@ -26,13 +20,13 @@ btree_status_t MemBtreeStore::write_node(BtreeBase&, BtreeNodePtr const& node, v
     return btree_status_t::success;
 }
 
-btree_status_t MemBtreeStore::read_node(BtreeBase&, bnodeid_t id, BtreeNodePtr& node) const {
+btree_status_t MemBtreeStore::read_node(BtreeBase&, bnodeid_t id, BtreeNodePtr& node) {
     node.reset(r_cast< BtreeNode* >(id));
     return btree_status_t::success;
 }
 
 btree_status_t MemBtreeStore::refresh_node(BtreeBase&, BtreeNodePtr const& node, bool for_read_modify_write,
-                                           void* context) const {
+                                           void* context) {
     return btree_status_t::success;
 }
 
@@ -50,7 +44,7 @@ btree_status_t MemBtreeStore::transact_nodes(BtreeBase& btree, BtreeNodeList con
     this->write_node(btree, parent_node, context);
 
     for (auto const& node : freed_nodes) {
-        this->remove_node(btree, node, locktype_t::WRITE, context);
+        this->remove_node(btree, node, context);
     }
     return btree_status_t::success;
 }

@@ -28,10 +28,6 @@ BtreeBase::BtreeBase(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb) :
     m_bt_private = std::move(m_store->on_btree_created(*this, true /* load_existing*/));
 }
 
-BtreeBase::~BtreeBase() {
-    if (is_ephemeral()) { this->destroy(); }
-}
-
 uint32_t BtreeBase::node_size() const { return m_bt_cfg.node_size(); };
 uint64_t BtreeBase::used_size() const { return m_store->used_size(*this); }
 uint32_t BtreeBase::ordinal() const { return m_sb->ordinal; }

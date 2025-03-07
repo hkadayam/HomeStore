@@ -24,7 +24,7 @@
 #include "device/chunk.h"
 #include "index/cow_btree/cow_btree_store.h"
 //#include "index/inplace_btree/inplace_btree_store.h"
-//#include "index/mem_btree/mem_btree_store.h"
+#include "index/mem_btree/mem_btree_store.h"
 
 namespace homestore {
 IndexService& index_service() { return hs()->index_service(); }
@@ -36,16 +36,16 @@ IndexService::IndexService(std::unique_ptr< IndexServiceCallbacks > cbs,
     meta_service().register_handler(
         "index_table",
         [this](meta_blk* mblk, sisl::byte_view buf, size_t size) {
-            superblk< IndexSuperBlk > sb("index_table");
+            superblk< IndexSuperBlock > sb("index_table");
             sb.load(buf, mblk);
-            m_itable_sbs.emplace_back(std::move(sb));
+            m_index_sbs.emplace_back(std::move(sb));
         },
         nullptr);
 
     meta_service().register_handler(
         "index_store",
         [this](meta_blk* mblk, sisl::byte_view buf, size_t size) {
-            superblk< IndexStoreSuperBlk > sb("index_store");
+            superblk< IndexStoreSuperBlock > sb("index_store");
             sb.load(buf, mblk);
             m_store_sbs.emplace_back(std::move(sb));
         },
@@ -69,18 +69,17 @@ void IndexService::create_vdev(ServiceSubType sub_type, uint64_t size, HSDevType
                                                     .context_data = vdev_ctx.to_blob()});
 }
 
-shared< VirtualDev > IndexService::open_vdev(ServiceSubType::type_id sub_type, const vdev_info& vinfo,
-                                             bool load_existing) {
+shared< VirtualDev > IndexService::open_vdev(ServiceSubType sub_type, const vdev_info& vinfo, bool load_existing) {
     auto const vdev =
         std::make_shared< VirtualDev >(*(hs()->device_mgr()), vinfo, nullptr /* event_cb */, false /* auto_recovery */);
-    m_vdevs.insert(sub_type, vdev);
+    m_vdevs.insert(std::make_pair(sub_type, vdev));
     return vdev;
 }
 
 void IndexService::start() {
     if (m_store_sbs.size()) {
         // Segregate the index store super blocks based on the store type
-        std::unordered_map< IndexStore::Type, std::vector< superblk< IndexStoreSuperBlk > > > m;
+        std::unordered_map< IndexStore::Type, std::vector< superblk< IndexStoreSuperBlock > > > m;
         for (auto& sb : m_store_sbs) {
             m[sb->index_store_type].emplace_back(std::move(sb));
         }
@@ -98,8 +97,8 @@ void IndexService::start() {
 
     // Notify each index store that we have completed recovery
     std::unique_lock lg(m_index_map_mtx);
-    for (auto& store : m_index_stores) {
-        store->recovery_completed();
+    for (auto& [type, store] : m_index_stores) {
+        store->on_recovery_completed();
     }
 }
 
@@ -107,19 +106,19 @@ void IndexService::stop() {
     m_index_map.clear();
     m_ordinal_index_map.clear();
 
-    for (auto& store : m_index_stores) {
+    for (auto& [type, store] : m_index_stores) {
         store.reset();
     }
 }
 
-shared< VirtualDev > get_vdev(ServiceSubType sub_type) {
+shared< VirtualDev > IndexService::get_vdev(ServiceSubType sub_type) {
     auto it = m_vdevs.find(sub_type);
     HS_REL_ASSERT(it != m_vdevs.end(), "Vdev not found for sub_type={}, vdev not created/opened?", sub_type);
     return it->second;
 }
 
 shared< IndexStore > IndexService::lookup_or_create_store(IndexStore::Type store_type,
-                                                          std::vector< superblk< IndexStoreSuperBlk > > sbs) {
+                                                          std::vector< superblk< IndexStoreSuperBlock > > sbs) {
     std::unique_lock lg(m_index_map_mtx);
     auto it = m_index_stores.find(store_type);
     if (it != m_index_stores.end()) { return it->second; }
@@ -133,17 +132,17 @@ shared< IndexStore > IndexService::lookup_or_create_store(IndexStore::Type store
                                               hs()->evictor(), hs()->device_mgr()->atomic_page_size(HSDevType::Fast));
         break;
 
-#if 0
     case IndexStore::Type::INPLACE_BTREE:
+#if 0
         store = std::make_shared< InPlaceBtreeStore >(get_vdev(ServiceSubType::INDEX_BTREE_INPLACE), std::move(sbs),
                                                       hs()->evictor(),
                                                       hs()->device_mgr()->atomic_page_size(HSDevType::Fast));
+#endif
         break;
 
     case IndexStore::Type::MEM_BTREE:
         store = std::make_shared< MemBtreeStore >();
         break;
-#endif
 
     default:
         HS_REL_ASSERT(false, "Unsupported index store type {}", store_type);

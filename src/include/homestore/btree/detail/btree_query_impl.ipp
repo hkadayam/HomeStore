@@ -19,6 +19,56 @@
 namespace homestore {
 
 template < typename K, typename V >
+btree_status_t Btree< K, V >::query(BtreeQueryRequest< K >& qreq, std::vector< std::pair< K, V > >& out_values) const {
+    COUNTER_INCREMENT(m_metrics, btree_query_ops_count, 1);
+
+    btree_status_t ret = btree_status_t::success;
+    if (qreq.batch_size() == 0) { return ret; }
+
+    m_btree_lock.lock_shared();
+    BtreeNodePtr root = nullptr;
+    ret = read_and_lock_node(m_root_node_info.bnode_id(), root, locktype_t::READ, locktype_t::READ, qreq.m_op_context);
+    if (ret != btree_status_t::success) { goto out; }
+
+    switch (qreq.query_type()) {
+    case BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY:
+        ret = do_sweep_query(root, qreq, out_values);
+        break;
+
+    case BtreeQueryType::TREE_TRAVERSAL_QUERY:
+        ret = do_traversal_query(root, qreq, out_values);
+        break;
+
+    default:
+        unlock_node(root, locktype_t::READ);
+        LOGERROR("Query type {} is not supported yet", qreq.query_type());
+        break;
+    }
+
+    if ((qreq.query_type() == BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY ||
+         qreq.query_type() == BtreeQueryType::TREE_TRAVERSAL_QUERY)) {
+        if (out_values.size()) {
+            K out_last_key = out_values.back().first;
+            if (out_last_key.compare(qreq.input_range().end_key()) >= 0) { ret = btree_status_t::success; }
+            qreq.shift_working_range(std::move(out_last_key), false /* non inclusive*/);
+        } else {
+            DEBUG_ASSERT_NE(ret, btree_status_t::has_more, "Query returned has_more, but no values added")
+        }
+    }
+
+out:
+    m_btree_lock.unlock_shared();
+#ifndef NDEBUG
+    check_lock_debug();
+#endif
+    if ((ret != btree_status_t::success) && (ret != btree_status_t::has_more)) {
+        BT_LOG(ERROR, "btree query failed {}", ret);
+        COUNTER_INCREMENT(m_metrics, query_err_cnt, 1);
+    }
+    return ret;
+}
+
+template < typename K, typename V >
 btree_status_t Btree< K, V >::do_sweep_query(BtreeNodePtr& my_node, BtreeQueryRequest< K >& qreq,
                                              std::vector< std::pair< K, V > >& out_values) const {
     btree_status_t ret = btree_status_t::success;

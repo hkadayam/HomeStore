@@ -87,8 +87,16 @@ void Btree< K, V >::get_all_kvs(std::vector< std::pair< K, V > >& kvs) const {
 
 template < typename K, typename V >
 btree_status_t Btree< K, V >::do_destroy() {
+    btree_status_t ret{btree_status_t::success};
+
+    bool expected = false;
+    if (!m_destroyed.compare_exchange_strong(expected, true)) {
+        BT_LOG(DEBUG, "Btree is already being destroyed, ignoring this request");
+        return btree_status_t::not_found;
+    }
+
     if (m_store->is_ephemeral()) {
-        return post_order_traversal(locktype_t::WRITE, [this, &cb](const auto& node, bool is_leaf) -> btree_status_t {
+        ret = post_order_traversal(locktype_t::WRITE, [this, &cb](const auto& node, bool is_leaf) -> btree_status_t {
             // On ephemeral btree, we can directly remove the node, however on non-ephemeral btree, we need to do so
             // only at checkpoint time, which should be handled by the store themselves.
             remove_node(node, locktype_t::WRITE, context);
@@ -105,7 +113,16 @@ btree_status_t Btree< K, V >::do_destroy() {
     } else {
         // Let the store handle the fast delete of btree as part of the on_btree_destroyed() call.
     }
-    return btree_status_t::success;
+
+    if (ret == btree_status_t::success) {
+        BT_LOG(DEBUG, "btree(root: {}) {} nodes destroyed successfully", m_root_node_info.bnode_id(), n_freed_nodes);
+        m_store->on_btree_destroyed(*this);
+    } else {
+        m_destroyed = false;
+        BT_LOG(ERROR, "btree(root: {}) nodes destroyed failed, ret: {}", m_root_node_info.bnode_id(), ret);
+    }
+
+    return ret;
 }
 
 #if 0

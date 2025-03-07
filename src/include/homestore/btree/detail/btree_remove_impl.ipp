@@ -19,6 +19,67 @@
 namespace homestore {
 template < typename K, typename V >
 template < typename ReqT >
+btree_status_t Btree< K, V >::remove(ReqT& req) {
+    static_assert(std::is_same_v< ReqT, BtreeSingleRemoveRequest > ||
+                      std::is_same_v< ReqT, BtreeRangeRemoveRequest< K > > ||
+                      std::is_same_v< ReqT, BtreeRemoveAnyRequest< K > >,
+                  "remove api is called with non remove request type");
+
+    locktype_t acq_lock = locktype_t::READ;
+    m_btree_lock.lock_shared();
+
+retry:
+    btree_status_t ret = btree_status_t::success;
+    BtreeNodePtr root;
+    ret = read_and_lock_node(m_root_node_info.bnode_id(), root, acq_lock, acq_lock, req.m_op_context);
+    if (ret != btree_status_t::success) { goto out; }
+
+    if (root->total_entries() == 0) {
+        if (root->is_leaf()) {
+            // There are no entries in btree.
+            unlock_node(root, acq_lock);
+            m_btree_lock.unlock_shared();
+            ret = btree_status_t::not_found;
+            goto out;
+        }
+
+        BT_NODE_LOG_ASSERT_EQ(root->has_valid_edge(), true, root, "Orphaned root with no entries and no edge");
+        unlock_node(root, acq_lock);
+        m_btree_lock.unlock_shared();
+
+        ret = check_collapse_root(req);
+        if (ret != btree_status_t::success && ret != btree_status_t::merge_not_required) {
+            LOGERROR("check collapse read failed btree name {}", m_bt_cfg.name());
+            goto out;
+        }
+
+        // We must have gotten a new root, need to start from scratch.
+        m_btree_lock.lock_shared();
+        goto retry;
+    } else if (root->is_leaf() && (acq_lock != locktype_t::WRITE)) {
+        // Root is a leaf, need to take write lock, instead of read, retry
+        unlock_node(root, acq_lock);
+        acq_lock = locktype_t::WRITE;
+        goto retry;
+    } else {
+        ret = do_remove(root, acq_lock, req);
+        if (ret == btree_status_t::retry) {
+            // Need to start from top down again, since there was a merge nodes in-between
+            acq_lock = locktype_t::READ;
+            goto retry;
+        }
+    }
+    m_btree_lock.unlock_shared();
+
+out:
+#ifndef NDEBUG
+    check_lock_debug();
+#endif
+    return ret;
+}
+
+template < typename K, typename V >
+template < typename ReqT >
 btree_status_t Btree< K, V >::do_remove(const BtreeNodePtr& my_node, locktype_t curlock, ReqT& req) {
     btree_status_t ret = btree_status_t::success;
     bool at_least_one_child_modified{false};

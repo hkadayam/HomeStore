@@ -150,6 +150,72 @@ btree_status_t Btree< K, V >::query_next(QueryPaginateCookie< K >& cookie, std::
     return status;
 }
 
+template < typename K, typename V >
+btree_status_t Btree< K, V >::put_one(BtreeKey const& key, BtreeValue const& value, btree_put_type put_type,
+                                      BtreeValue* existing_val = nullptr, put_filter_cb_t filter_cb = nullptr) {
+    BtreeSinglePutRequest req{&key, &value, put_type, existing_val, std::move(filter_cb)};
+    return put(req);
+}
+
+template < typename K, typename V >
+std::pair< btree_status_t, PutPaginateCookie >
+Btree< K, V >::put_range(BtreeKeyRange< K >&& inp_range, btree_put_type put_type, BtreeValue const& value,
+                         uint32_t batch_size = std::numeric_limts< uint32_t >::max(),
+                         put_filter_cb_t filter_cb = nullptr) {
+    auto req_ptr = std::make_unique< BtreeRangePutRequest< K > >(std::move(inp_range), put_type, &value, batch_size,
+                                                                 std::move(filter_cb));
+    auto status = put(*req_ptr);
+    return std::pair(status, std::move(req_ptr));
+}
+
+template < typename K, typename V >
+btree_status_t Btree< K, V >::put_range_next(PutPaginateCookie& cookie) {
+    auto const status = put(*cookie);
+    if (status != btree_status_t::has_more) { cookie.reset(); }
+    return status;
+}
+
+template < typename K, typename V >
+btree_status_t Btree< K, V >::get_one(BtreeKey const& key, BtreeValue* out_val) {
+    BtreeGetRequest< K > req{&key, out_val};
+    return get(req);
+}
+
+template < typename K, typename V >
+btree_status_t Btree< K, V >::get_any(BtreeKeyRange< K >&& inp_range, BtreeKey* out_key, BtreeValue* out_val) {
+    BtreeGetRangeRequest< K > req{std::move(inp_range), out_key, out_val};
+    return get(req);
+}
+
+template < typename K, typename V >
+btree_status_t Btree< K, V >::remove_one(BtreeKey const& key, BtreeValue* out_val) {
+    BtreeRemoveRequest< K > req{&key, out_val};
+    return remove(req);
+}
+
+template < typename K, typename V >
+btree_status_t Btree< K, V >::remove_any(BtreeKeyRange< K >&& inp_range, BtreeKey* out_key, BtreeValue* out_val) {
+    BtreeRemoveAnyRequest< K > req{std::move(inp_range), out_key, out_val};
+    return remove(req);
+}
+
+template < typename K, typename V >
+std::pair< btree_status_t, RemovePaginateCookie >
+Btree< K, V >::remove_range(BtreeKeyRange< K >&& inp_range, uint32_t batch_size = std::numeric_limts< uint32_t >::max(),
+                            remove_filter_cb_t filter_cb = nullptr) {
+    auto req_ptr =
+        std::make_unique< BtreeRangeRemoveRequest< K > >(std::move(inp_range), batch_size, std::move(filter_cb));
+    auto status = remove(*req_ptr);
+    return std::pair(status, std::move(req_ptr));
+}
+
+template < typename K, typename V >
+btree_status_t Btree< K, V >::remove_range_next(RemovePaginateCookie& cookie) {
+    auto const status = remove(*cookie);
+    if (status != btree_status_t::has_more) { cookie.reset(); }
+    return status;
+}
+
 #if 0
 /**
  * @brief : verify btree is consistent and no corruption;

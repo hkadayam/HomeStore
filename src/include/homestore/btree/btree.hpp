@@ -45,46 +45,6 @@ using QueryPaginateCookie = unique< BtreeQueryRequest< K > >;
 
 class BtreeStore;
 
-class UnderlyingBtree {
-public:
-    virtual ~UnderlyingBtree() = default;
-};
-
-// Btree based implementations superblock area
-struct BtreeSuperBlock {
-    static constexpr size_t underlying_btree_sb_size = IndexSuperBlock::index_impl_sb_size - sizeof(bnodeid_t);
-
-    bnodeid_t root_node{empty_bnodeid}; // Btree Root Node ID
-    std::array< uint8_t, underlying_btree_sb_size > underlying_btree_sb;
-};
-
-class BtreeBase : public Index {
-public:
-    BtreeBase(BtreeConfig const& cfg, uuid_t uuid = uuid_t{}, uuid_t parent_uuid = uuid_t{}, uint32_t user_sb_size = 0);
-    BtreeBase(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb);
-    virtual ~BtreeBase() = default;
-
-    UnderlyingBtree const* underlying_btree() const { return m_bt_private.get(); }
-    UnderlyingBtree* underlying_btree() {
-        return const_cast< UnderlyingBtree* >(s_cast< const BtreeBase* >(this)->underlying_btree());
-    }
-
-    superblk< IndexSuperBlock >& super_blk() {
-        return const_cast< superblk< IndexSuperBlock >& >(s_cast< const Index* >(this)->super_blk());
-    }
-
-    virtual BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf, uint32_t ctx_size) = 0;
-    virtual uint32_t node_size() const;
-    uint64_t used_size() const override;
-    uint32_t ordinal() const override;
-    std::string name() const;
-
-protected:
-    shared< BtreeStore > m_store;
-    unique< UnderlyingBtree > m_bt_private;
-    BtreeConfig m_bt_cfg;
-};
-
 template < typename K, typename V >
 class Btree : public BtreeBase {
 public:

@@ -140,7 +140,6 @@ shared< IndexStore > IndexService::lookup_or_create_store(IndexStore::Type store
         store = std::make_shared< COWBtreeStore >(get_vdev(ServiceSubType::INDEX_BTREE_COPY_ON_WRITE), std::move(sbs));
         break;
 
-#if 0
     case IndexStore::Type::INPLACE_BTREE:
 #if 0
         store = std::make_shared< InPlaceBtreeStore >(get_vdev(ServiceSubType::INDEX_BTREE_INPLACE), std::move(sbs),
@@ -152,7 +151,6 @@ shared< IndexStore > IndexService::lookup_or_create_store(IndexStore::Type store
     case IndexStore::Type::MEM_BTREE:
         store = std::make_shared< MemBtreeStore >();
         break;
-#endif
 
     default:
         HS_REL_ASSERT(false, "Unsupported index store type {}", store_type);

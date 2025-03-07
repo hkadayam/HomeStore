@@ -205,7 +205,6 @@ private:
     shared< VirtualDev > create_vdev_cb(const vdev_info& vinfo, bool load_existing);
     uint64_t pct_to_size(float pct, HSDevType dev_type) const;
     void do_start();
-    std::string services_list() const;
 };
 
 static HomeStore* hs() { return HomeStore::instance(); }

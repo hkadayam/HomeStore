@@ -50,6 +50,7 @@ Btree< K, V >::Btree(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb) :
     }
 }
 
+#if 0
 template < typename K, typename V >
 Btree< K, V >::~Btree() {
     if (is_ephemeral()) { destroy(); }

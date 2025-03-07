@@ -62,7 +62,7 @@ class BtreeBase : public Index {
 public:
     BtreeBase(BtreeConfig const& cfg, uuid_t uuid = uuid_t{}, uuid_t parent_uuid = uuid_t{}, uint32_t user_sb_size = 0);
     BtreeBase(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb);
-    virtual ~BtreeBase();
+    virtual ~BtreeBase() = default;
 
     UnderlyingBtree const* underlying_btree() const { return m_bt_private.get(); }
     UnderlyingBtree* underlying_btree() {
@@ -76,7 +76,7 @@ public:
     virtual BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf, uint32_t ctx_size) = 0;
     virtual uint32_t node_size() const;
     uint64_t used_size() const override;
-    uint32_t ordinal() const;
+    uint32_t ordinal() const override;
     std::string name() const;
 
 protected:

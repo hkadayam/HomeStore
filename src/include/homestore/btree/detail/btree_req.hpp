@@ -19,6 +19,7 @@
 
 namespace homestore {
 struct BtreeRequest;
+class CPContext;
 
 typedef std::pair< BtreeKey, BtreeValue > btree_kv_t;
 
@@ -44,7 +45,7 @@ struct BtreeRequest {
     }
 
     void* m_app_context{nullptr};
-    void* m_op_context{nullptr};
+    CPContext* m_op_context{nullptr};
     std::unique_ptr< std::vector< trace_route_entry > > route_tracing{nullptr};
 };
 

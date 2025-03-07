@@ -1,5 +1,6 @@
-#include <homestore/btree/btree.hpp>
+#include <homestore/btree/btree_base.hpp>
 #include <homestore/btree/btree_store.h>
+#include <homestore/btree/detail/btree_node.hpp>
 #include "common/homestore_assert.hpp"
 
 namespace homestore {
@@ -32,5 +33,39 @@ uint32_t BtreeBase::node_size() const { return m_bt_cfg.node_size(); };
 uint64_t BtreeBase::used_size() const { return m_store->used_size(*this); }
 uint32_t BtreeBase::ordinal() const { return m_sb->ordinal; }
 std::string BtreeBase::name() const { return m_bt_cfg.name(); }
+
+///////////////////////////// BtreeCPGuard Section //////////////////////////////
+BtreeCPGuard::BtreeCPGuard(BtreeBase& btree) :
+        CPGuard{btree.is_ephemeral() ? nullptr : &(hs()->cp_mgr())}, m_btree{btree} {}
+
+BtreeCPGuard::BtreeCPGuard(const BtreeCPGuard& other) {
+    if (other.m_btree.is_ephemeral()) { return; }
+    m_btree = other.m_btree;
+    CPGuard::operator=(other);
+}
+
+BtreeCPGuard BtreeCPGuard::operator=(const BtreeCPGuard& other) {
+    if (btree.is_ephemeral()) { return *this; }
+    m_btree = other.m_btree;
+    CPGuard::operator=(other);
+    return *this;
+}
+
+CP& BtreeCPGuard::operator*() {
+    // Ephemeral shouldn't be calling *, but just return an empty CP
+    if (m_btree.is_ephemeral()) { return CP{&hs()->cp_mgr()}; }
+    return *get();
+}
+
+CP* BtreeCPGuard::operator->() { return get(); }
+
+CPContext* BtreeCPGuard::context() {
+    return m_btree.is_ephemeral() ? nullptr : get()->context(cp_consumer_t::INDEX_SVC);
+}
+
+CP* BtreeCPGuard::get() {
+    if (m_btree.is_ephemeral()) { return nullptr; }
+    return CPGuard::get();
+}
 
 } // namespace homestore

@@ -131,15 +131,15 @@ private:
 
 public:
     CPGuard(CPManager* mgr);
-    ~CPGuard();
+    virtual ~CPGuard();
 
     CPGuard(const CPGuard& other);
-    CPGuard operator=(const CPGuard& other);
+    virtual CPGuard operator=(const CPGuard& other);
 
     CPContext* context(cp_consumer_t consumer);
-    CP& operator*();
-    CP* operator->();
-    CP* get();
+    virtual CP& operator*();
+    virtual CP* operator->();
+    virtual CP* get();
 };
 
 /* It is responsible to trigger the checkpoints when all concurrent IOs are completed.

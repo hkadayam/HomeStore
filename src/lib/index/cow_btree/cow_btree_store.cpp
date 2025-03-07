@@ -1,4 +1,5 @@
 #include <memory>
+#include <homestore/btree/detail/btree_node.hpp>
 #include "index/cow_btree/cow_btree_store.h"
 #include "index/cow_btree/cow_btree_node.h"
 #include "index/cow_btree/cow_btree.h"

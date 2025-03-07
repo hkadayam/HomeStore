@@ -597,13 +597,4 @@ public:
     }
 };
 
-struct btree_locked_node_info {
-    BtreeNode* node;
-    Clock::time_point start_time;
-    const char* fname;
-    int line;
-
-    void dump() const { LOGINFO("node locked by file: {}, line: {}", fname, line); }
-};
-
 } // namespace homestore

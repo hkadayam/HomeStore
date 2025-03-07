@@ -321,6 +321,8 @@ iomgr::io_fiber_t CPManager::pick_blocking_io_fiber() const {
 
 //////////////////////////////////////// CP Guard class ////////////////////////////////////////////
 CPGuard::CPGuard(CPManager* mgr) {
+    if (mgr == nullptr) { return; }
+
     if (t_cp_stack.empty()) {
         // First CP in this thread stack.
         m_cp = mgr->cp_io_enter();
@@ -344,13 +346,13 @@ CPGuard::~CPGuard() {
 CPGuard::CPGuard(const CPGuard& other) {
     m_cp = other.m_cp;
     m_pushed = false;
-    m_cp->m_cp_mgr->cp_ref(m_cp);
+    if (m_cp) { m_cp->m_cp_mgr->cp_ref(m_cp); }
 }
 
 CPGuard CPGuard::operator=(const CPGuard& other) {
     m_cp = other.m_cp;
     m_pushed = false;
-    m_cp->m_cp_mgr->cp_ref(m_cp);
+    if (m_cp) { m_cp->m_cp_mgr->cp_ref(m_cp); }
     return *this;
 }
 

@@ -4,7 +4,7 @@
 #include <memory>
 
 #include <homestore/btree/btree_store.h>
-#include <homestore/btree/btree.hpp>
+#include <homestore/btree/btree_base.hpp>
 
 namespace homestore {
 class MemBtreeStore : public BtreeStore {

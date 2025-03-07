@@ -30,9 +30,16 @@ btree_status_t Btree< K, V >::remove(ReqT& req) {
 
 retry:
     btree_status_t ret = btree_status_t::success;
+    auto cpg = bt_cp_guard();
+    req.m_op_context = cpg.context();
+
     BtreeNodePtr root;
     ret = read_and_lock_node(m_root_node_info.bnode_id(), root, acq_lock, acq_lock, req.m_op_context);
-    if (ret != btree_status_t::success) { goto out; }
+    if (ret == btree_status_t::cp_mismatch) {
+        goto retry;
+    } else if (ret != btree_status_t::success) {
+        goto out;
+    }
 
     if (root->total_entries() == 0) {
         if (root->is_leaf()) {
@@ -48,7 +55,8 @@ retry:
         m_btree_lock.unlock_shared();
 
         ret = check_collapse_root(req);
-        if (ret != btree_status_t::success && ret != btree_status_t::merge_not_required) {
+        if (ret != btree_status_t::success && ret != btree_status_t::merge_not_required &&
+            ret != btree_status_t::cp_mismatch) {
             LOGERROR("check collapse read failed btree name {}", m_bt_cfg.name());
             goto out;
         }
@@ -63,7 +71,7 @@ retry:
         goto retry;
     } else {
         ret = do_remove(root, acq_lock, req);
-        if (ret == btree_status_t::retry) {
+        if ((ret == btree_status_t::retry) || (ret == btree_status_t::cp_mismatch)) {
             // Need to start from top down again, since there was a merge nodes in-between
             acq_lock = locktype_t::READ;
             goto retry;
@@ -281,7 +289,7 @@ done:
 
 template < typename K, typename V >
 btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const BtreeNodePtr& leftmost_node,
-                                          uint32_t start_idx, uint32_t end_idx, void* context) {
+                                          uint32_t start_idx, uint32_t end_idx, CPContext* context) {
     if (!m_bt_cfg.m_merge_turned_on) { return btree_status_t::merge_not_required; }
     btree_status_t ret{btree_status_t::success};
     BtreeNodeList old_nodes;

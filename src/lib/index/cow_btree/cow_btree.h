@@ -3,7 +3,7 @@
 #include <vector>
 #include <sisl/fds/concurrent_insert_vector.hpp>
 #include <homestore/blk.h>
-#include <homestore/btree/btree.hpp>
+#include <homestore/btree/btree_base.hpp>
 #include <homestore/checkpoint/cp_mgr.hpp>
 #include "common/large_id_reserver.hpp"
 

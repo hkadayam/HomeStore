@@ -31,6 +31,9 @@ btree_status_t Btree< K, V >::put(ReqT& put_req) {
     btree_status_t ret = btree_status_t::success;
 
 retry:
+    auto cpg = bt_cp_guard();
+    put_req.m_op_context = cpg.context();
+
 #ifndef NDEBUG
     check_lock_debug();
 #endif
@@ -65,10 +68,11 @@ retry:
         goto retry;
     } else {
         ret = do_put(root, acq_lock, put_req);
-        if ((ret == btree_status_t::retry) || (ret == btree_status_t::has_more)) {
+        if ((ret == btree_status_t::retry) || (ret == btree_status_t::has_more) ||
+            (ret == btree_status_t::cp_mismatch)) {
             // Need to start from top down again, since there was a split or we have more to insert in case of range put
             acq_lock = locktype_t::READ;
-            BT_LOG(TRACE, "retrying put operation");
+            BT_LOG(TRACE, "retrying put operation because btree reported retriable status {}", ret);
             BT_LOG_ASSERT_EQ(bt_thread_vars()->rd_locked_nodes.size(), 0);
             BT_LOG_ASSERT_EQ(bt_thread_vars()->wr_locked_nodes.size(), 0);
             goto retry;
@@ -80,7 +84,7 @@ out:
 #ifndef NDEBUG
     check_lock_debug();
 #endif
-    if (ret != btree_status_t::success && ret != btree_status_t::cp_mismatch) {
+    if (ret != btree_status_t::success) {
         BT_LOG(ERROR, "btree put failed {}", ret);
         COUNTER_INCREMENT(m_metrics, write_err_cnt, 1);
     }
@@ -324,7 +328,7 @@ done:
 
 template < typename K, typename V >
 btree_status_t Btree< K, V >::split_node(const BtreeNodePtr& parent_node, const BtreeNodePtr& child_node,
-                                         uint32_t parent_ind, K* out_split_key, void* context) {
+                                         uint32_t parent_ind, K* out_split_key, CPContext* context) {
     BtreeNodePtr child_node1 = child_node;
     BtreeNodePtr child_node2;
     child_node2.reset(child_node1->is_leaf() ? create_leaf_node(context).get() : create_interior_node(context).get());

@@ -1,4 +1,6 @@
 #include "index/mem_btree/mem_btree_store.h"
+#include <homestore/btree/detail/btree_node.hpp>
+#include <homestore/btree/btree_base.hpp>
 
 namespace homestore {
 unique< UnderlyingBtree > MemBtreeStore::on_btree_created(BtreeBase& btree, bool load_existing) {

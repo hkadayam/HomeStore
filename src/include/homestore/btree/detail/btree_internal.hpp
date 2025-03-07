@@ -23,6 +23,8 @@
 #include <sisl/metrics/metrics.hpp>
 #include <homestore/index_service.hpp>
 
+SISL_LOGGING_DECL(btree)
+
 namespace homestore {
 
 #define _BT_LOG_METHOD_IMPL(req, btcfg, node)                                                                          \

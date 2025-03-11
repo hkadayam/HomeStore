@@ -31,7 +31,7 @@ btree_status_t Btree< K, V >::remove(ReqT& req) {
 retry:
     btree_status_t ret = btree_status_t::success;
     auto cpg = bt_cp_guard();
-    req.m_op_context = cpg.context();
+    req.m_op_context = cpg.context(cp_consumer_t::INDEX_SVC);
 
     BtreeNodePtr root;
     ret = read_and_lock_node(m_root_node_info.bnode_id(), root, acq_lock, acq_lock, req.m_op_context);
@@ -115,7 +115,7 @@ btree_status_t Btree< K, V >::do_remove(const BtreeNodePtr& my_node, locktype_t 
         if (modified) {
             write_node(my_node, req.m_op_context);
             COUNTER_DECREMENT(m_metrics, btree_obj_count, removed_count);
-            if (req.route_tracing) { append_route_trace(req, my_node, btree_event_t::REMOVE); }
+            if (req.m_route_tracing) { append_route_trace(req, my_node, btree_event_t::REMOVE); }
         }
 
         unlock_node(my_node, curlock);
@@ -154,7 +154,7 @@ retry:
         end_idx = start_idx = (end_idx - start_idx) / 2; // Pick the middle, TODO: Ideally we need to pick random
     }
 
-    if (req.route_tracing) { append_route_trace(req, my_node, btree_event_t::READ, start_idx, end_idx); }
+    if (req.m_route_tracing) { append_route_trace(req, my_node, btree_event_t::READ, start_idx, end_idx); }
     curr_idx = start_idx;
     while (curr_idx <= end_idx) {
         BtreeLinkInfo child_info;
@@ -182,7 +182,7 @@ retry:
                     unlock_lambda(child_node, child_cur_lock);
                     goto out_return;
                 } else if (ret == btree_status_t::success) {
-                    if (req.route_tracing) { append_route_trace(req, child_node, btree_event_t::MERGE); }
+                    if (req.m_route_tracing) { append_route_trace(req, child_node, btree_event_t::MERGE); }
                     unlock_lambda(child_node, child_cur_lock);
                     COUNTER_INCREMENT(m_metrics, btree_merge_count, 1);
                     goto retry;
@@ -268,14 +268,14 @@ btree_status_t Btree< K, V >::check_collapse_root(ReqT& req) {
         goto done;
     }
 
-    ret = m_store->on_root_changed(child, req.m_op_context);
+    ret = m_bt_private->on_root_changed(child, req.m_op_context);
     if (ret != btree_status_t::success) {
         unlock_node(child, locktype_t::WRITE);
         unlock_node(root, locktype_t::WRITE);
         goto done;
     }
 
-    if (req.route_tracing) { append_route_trace(req, root, btree_event_t::MERGE); }
+    if (req.m_route_tracing) { append_route_trace(req, root, btree_event_t::MERGE); }
 
     remove_node(root, locktype_t::WRITE, req.m_op_context);
     m_root_node_info = child->link_info();
@@ -385,7 +385,7 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
     available_size = 0;
     while (src_cursor.ith_node < old_nodes.size()) {
         if (available_size == 0) {
-            new_node.reset(create_node(leftmost_node->is_leaf()).get());
+            new_node = leftmost_node->is_leaf() ? create_leaf_node(context) : create_interior_node(context);
             if (new_node == nullptr) {
                 ret = btree_status_t::merge_failed;
                 goto out;
@@ -546,7 +546,7 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
         }
 #endif
 
-        ret = m_store->transact_nodes(new_nodes, old_nodes, leftmost_node, parent_node, context);
+        ret = m_bt_private->transact_nodes(new_nodes, old_nodes, leftmost_node, parent_node, context);
     }
 
 out:

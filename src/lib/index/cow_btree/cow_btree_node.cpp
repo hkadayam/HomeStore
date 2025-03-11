@@ -6,14 +6,25 @@
 #include "common/homestore_assert.hpp"
 
 namespace homestore {
-
 BtreeNode* COWBtreeNode::to_btree_node() { return r_cast< BtreeNode* >(uintptr_cast(this) + sizeof(COWBtreeNode)); }
+
+COWBtreeNode* COWBtreeNode::construct(BtreeNodePtr const& node) {
+    new (uintptr_cast(node.get()) - sizeof(COWBtreeNode)) COWBtreeNode();
+}
+
+void COWBtreeNode::destruct(BtreeNode* node) {
+    r_cast< COWBtreeNode* >(uintptr_cast(node) - sizeof(COWBtreeNode))->~COWBtreeNode();
+}
+
+COWBtreeNode* COWBtreeNode::convert(BtreeNodePtr const& n) {
+    return r_cast< COWBtreeNode* >(uintptr_cast(n.get()) - sizeof(COWBtreeNode));
+}
 
 COWBtreeNode::~COWBtreeNode() {
     if (m_prev_version_buf != nullptr) { hs_utils::iobuf_free(m_prev_version_buf, sisl::buftag::btree_node); }
 }
 
-bool COWBtreeNode::copy_buf_if_needed(COWBtree& bt, cp_id_t cur_cp_id) {
+bool COWBtreeNode::copy_buf_if_needed(COWBtree const& bt, cp_id_t cur_cp_id) {
     BtreeNode* node = to_btree_node();
 
     // If the buffer for the current version was written as part of previous cp (exactly 1 behind requested cp), then we

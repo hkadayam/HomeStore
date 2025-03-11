@@ -29,7 +29,7 @@ std::string IndexBuffer::to_string() const {
                            m_created_cp_id, m_dirtied_cp_id, m_wait_for_down_buffers.get(),
                            m_node_freed ? " Freed" : "", voidptr_cast(const_cast< IndexBuffer* >(m_up_buffer.get())),
                            (m_bytes == nullptr) ? "not attached yet"
-                                                : r_cast< persistent_hdr_t const* >(m_bytes)->to_compact_string(),
+                                                : r_cast< PersistentHeader const* >(m_bytes)->to_compact_string(),
                            down_bufs);
     }
 }

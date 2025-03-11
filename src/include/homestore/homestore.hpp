@@ -80,7 +80,7 @@ ENUM(ServiceSubType, uint32_t,      // All sub types within services. At this po
      DEFAULT = 0,                   // No sub type
      INDEX_BTREE_COPY_ON_WRITE = 1, // Copy on Write btree index
      INDEX_BTREE_INPLACE = 2,       // LInplace Btree based index
-     MEMORY = 3,                    // Memory based index
+     INDEX_BTREE_MEMORY = 3,        // Memory based index
 );
 
 VENUM(hs_vdev_type_t, uint32_t, DATA_VDEV = 1, INDEX_VDEV = 2, META_VDEV = 3, LOGDEV_VDEV = 4);
@@ -101,6 +101,19 @@ struct ServiceId {
     ServiceId(ServiceType st, ServiceSubType sst) : type{st}, sub_type{sst} {}
     ServiceId(ServiceType st) : type{st}, sub_type{ServiceSubType::DEFAULT} {}
 };
+} // namespace homestore
+
+namespace std {
+template <>
+struct less< homestore::ServiceId > {
+    bool operator()(const homestore::ServiceId& lhs, const homestore::ServiceId& rhs) const {
+        return (lhs.type == rhs.type) ? (uint32_cast(lhs.sub_type) < uint32_cast(lhs.sub_type))
+                                      : (uint32_cast(lhs.type) < uint32_cast(rhs.type));
+    }
+};
+} // namespace std
+
+namespace homestore {
 
 /*
  * IO errors handling by homestore.
@@ -154,7 +167,7 @@ public:
                                       cshared< ChunkSelector >& custom_chunk_selector = nullptr);
 
     bool start(const hs_input_params& input, hs_before_services_starting_cb_t svcs_starting_cb = nullptr);
-    void format_and_start(std::map< uint32_t, hs_format_params >&& format_opts);
+    void format_and_start(std::map< ServiceId, hs_format_params >&& format_opts);
     void shutdown();
 
     // cap_attrs get_system_capacity() const; // Need to move this to homeblks/homeobj

@@ -18,9 +18,8 @@
 
 #include <sisl/fds/compact_bitset.hpp>
 #include <sisl/logging/logging.h>
-#include "btree_node.hpp"
+#include <homestore/btree/detail/btree_node.hpp>
 #include <homestore/btree/btree_kv.hpp>
-#include <homestore/index/index_internal.hpp>
 
 SISL_LOGGING_DECL(btree)
 
@@ -151,7 +150,7 @@ private:
 public:
     FixedPrefixNode(uint8_t* node_buf, bnodeid_t id, bool init, bool is_leaf, const BtreeConfig& cfg) :
             VariantNode< K, V >(node_buf, id, init, is_leaf, cfg),
-            prefix_bitset_{sisl::blob{bitset_area(), reqd_bitset_size(cfg)}, init} {
+            prefix_bitset_{sisl::blob{bitset_area(), reqd_bitset_size(this->node_data_size())}, init} {
         if (init) {
             auto phdr = prefix_header();
             phdr->used_slots = 0;
@@ -516,7 +515,7 @@ public:
         this->sub_entries(this->total_entries());
         this->invalidate_edge();
         this->inc_gen();
-        prefix_bitset_ = sisl::CompactBitSet{sisl::blob{bitset_area(), reqd_bitset_size(cfg)}, true};
+        prefix_bitset_ = sisl::CompactBitSet{sisl::blob{bitset_area(), reqd_bitset_size(this->node_data_size())}, true};
 
 #ifndef NDEBUG
         validate_sanity();
@@ -786,8 +785,8 @@ private:
 #endif
 
     //////////////////////// All Helper methods section ////////////////////////
-    static uint32_t reqd_bitset_size(BtreeConfig const& cfg) {
-        return sisl::round_up(cfg.node_data_size() / (prefix_entry::key_size() + prefix_entry::value_size()) / 8,
+    static uint32_t reqd_bitset_size(uint32_t node_data_size) {
+        return sisl::round_up(node_data_size / (prefix_entry::key_size() + prefix_entry::value_size()) / 8,
                               sisl::CompactBitSet::size_multiples());
     }
 

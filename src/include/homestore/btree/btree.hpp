@@ -34,6 +34,15 @@ namespace homestore {
 
 class BtreeStore;
 
+template < typename K >
+using PutPaginateCookie = unique< BtreeRangePutRequest< K > >;
+
+template < typename K >
+using RemovePaginateCookie = unique< BtreeRangeRemoveRequest< K > >;
+
+template < typename K >
+using QueryPaginateCookie = unique< BtreeQueryRequest< K > >;
+
 template < typename K, typename V >
 class Btree : public BtreeBase {
 public:
@@ -124,9 +133,9 @@ public:
     //
     // @return The status of the put operation and a cookie, if it returns btree_status::has_more, then the caller is
     // expected to call put_range_next()
-    std::pair< btree_status_t, PutPaginateCookie >
+    std::pair< btree_status_t, PutPaginateCookie< K > >
     put_range(BtreeKeyRange< K >&& inp_range, btree_put_type put_type, BtreeValue const& value,
-              uint32_t batch_size = std::numeric_limts< uint32_t >::max(), put_filter_cb_t filter_cb = nullptr);
+              uint32_t batch_size = std::numeric_limits< uint32_t >::max(), put_filter_cb_t filter_cb = nullptr);
 
     // @brief Continuation of the put_range call for the next batch of keys. Calling this method without calling
     // put_range first returns error.
@@ -135,7 +144,7 @@ public:
     //
     // @return The status of the put operation and a cookie, if it returns btree_status::has_more, then the caller is
     // expected to call put_range_next() again. Failing to do so will result in memory leak.
-    btree_status_t put_range_next(PutPaginateCookie& cookie);
+    btree_status_t put_range_next(PutPaginateCookie< K >& cookie);
 
     // @brief Gets the value associated with the specified key from the B-tree.
     //
@@ -175,38 +184,36 @@ public:
     // @return The status of the remove_any operation.
     btree_status_t remove_any(BtreeKeyRange< K >&& inp_range, BtreeKey* out_key, BtreeValue* out_val);
 
-    std::pair< btree_status_t, RemovePaginateCookie >
-    remove_range(BtreeKeyRange< K >&& inp_range, uint32_t batch_size = std::numeric_limts< uint32_t >::max(),
+    std::pair< btree_status_t, RemovePaginateCookie< K > >
+    remove_range(BtreeKeyRange< K >&& inp_range, uint32_t batch_size = std::numeric_limits< uint32_t >::max(),
                  remove_filter_cb_t filter_cb = nullptr);
 
-    btree_status_t remove_range_next(RemovePaginateCookie& cookie);
+    btree_status_t remove_range_next(RemovePaginateCookie< K >& cookie);
 
-    std::pair< btree_status_t, QueryPaginateCookie >
-    query(BtreeKeyRange< K >&& inp_range,                              // Input range to query for
-          std::vector< std::pair< K, V > >& out_kvs,                   // Results will be appended
-          uint32_t batch_size = std::numeric_limts< uint32_t >::max(), // Batch size, default the whole set
-          get_filter_cb_t filter_cb = nullptr, // Any filtering condition while picking the result set
-          BtreeQueryType query_type =
-              BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY // See query_impl for more details
-    );
+    std::pair< btree_status_t, QueryPaginateCookie< K > >
+    query(BtreeKeyRange< K >&& inp_range, std::vector< std::pair< K, V > >& out_kvs,
+          uint32_t batch_size = std::numeric_limits< uint32_t >::max(),
+          BtreeQueryType query_type = BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY,
+          get_filter_cb_t filter_cb = nullptr);
 
-    btree_status_t query_next(QueryPaginateCookie& cookie, std::vector< std::pair< K, V > >& out_kvs);
+    btree_status_t query_next(QueryPaginateCookie< K >& cookie, std::vector< std::pair< K, V > >& out_kvs);
 
     nlohmann::json get_status(int log_level) const;
 
     nlohmann::json get_metrics_in_json(bool updated);
 
     std::string to_string() const;
-    std::string to_custom_string(to_string_cb_t< K, V > const& cb) const;
-    std::string to_digraph_visualizer_format() const;
-    void dump(const std::string& file, std::string format = "string", to_string_cb_t< K, V > cb = nullptr);
+
+    std::string to_custom_string(BtreeNode::ToStringCallback< K, V > cb) const;
+
+    std::string to_digraph_visualize_format() const;
+
+    void dump(const std::string& file, std::string format = "string",
+              BtreeNode::ToStringCallback< K, V > cb = nullptr) const;
 
     bnodeid_t root_node_id() const;
 
     uint64_t count_keys(bnodeid_t start_bnodeid = empty_bnodeid) const;
-
-protected:
-    BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf, uint32_t ctx_size) override;
 
 private:
     /////////////////////////////////// Mutate Impl methods /////////////////////////
@@ -231,10 +238,10 @@ private:
 
     ///////////////////////////////// Get Impl Methods /////////////////////////////////
     template < typename ReqT >
-    btree_status_t get(ReqT& get_req) const;
+    btree_status_t get(ReqT& get_req);
 
     template < typename ReqT >
-    btree_status_t do_get(const BtreeNodePtr& my_node, ReqT& greq) const;
+    btree_status_t do_get(const BtreeNodePtr& my_node, ReqT& greq);
 
     ///////////////////////////////// Remove Impl Methods /////////////////////////////////
     template < typename ReqT >
@@ -250,12 +257,12 @@ private:
                                uint32_t end_indx, CPContext* context);
 
     ///////////////////////////////// Query Impl Methods /////////////////////////////////
-    btree_status_t query(BtreeQueryRequest< K >& query_req, std::vector< std::pair< K, V > >& out_values) const;
+    btree_status_t query(BtreeQueryRequest< K >& query_req, std::vector< std::pair< K, V > >& out_values);
 
     btree_status_t do_sweep_query(BtreeNodePtr& my_node, BtreeQueryRequest< K >& qreq,
-                                  std::vector< std::pair< K, V > >& out_values) const;
+                                  std::vector< std::pair< K, V > >& out_values);
     btree_status_t do_traversal_query(const BtreeNodePtr& my_node, BtreeQueryRequest< K >& qreq,
-                                      std::vector< std::pair< K, V > >& out_values) const;
+                                      std::vector< std::pair< K, V > >& out_values);
 #ifdef SERIALIZABLE_QUERY_IMPLEMENTATION
     btree_status_t do_serialzable_query(const BtreeNodePtr& my_node, BtreeSerializableQueryRequest& qreq,
                                         std::vector< std::pair< K, V > >& out_values);
@@ -299,15 +306,13 @@ private:
                               int line) const;
     void unlock_node(const BtreeNodePtr& node, locktype_t type) const;
 
-    BtreeNodePtr create_leaf_node();
-    BtreeNodePtr create_interior_node();
+    BtreeNodePtr create_leaf_node(CPContext* context);
+    BtreeNodePtr create_interior_node(CPContext* context);
     BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf,
                          uint32_t ctx_size) const override;
-
     void remove_node(const BtreeNodePtr& node, locktype_t cur_lock, CPContext* context);
 
     void observe_lock_time(const BtreeNodePtr& node, locktype_t type, uint64_t time_spent) const;
-
     static void _start_of_lock(const BtreeNodePtr& node, locktype_t ltype, const char* fname, int line);
     static bool remove_locked_node(const BtreeNodePtr& node, locktype_t ltype, btree_locked_node_info* out_info);
     static uint64_t end_of_lock(const BtreeNodePtr& node, locktype_t ltype);
@@ -324,7 +329,8 @@ private:
     uint64_t get_btree_node_cnt() const;
     uint64_t get_child_node_cnt(bnodeid_t bnodeid) const;
     void to_string_internal(bnodeid_t bnodeid, std::string& buf) const;
-    void to_custom_string_internal(bnodeid_t bnodeid, std::string& buf, to_string_cb_t< K, V > const& cb) const;
+    void to_custom_string_internal(bnodeid_t bnodeid, std::string& buf,
+                                   BtreeNode::ToStringCallback< K, V > const& cb) const;
     void to_dot_keys(bnodeid_t bnodeid, std::string& buf, std::map< uint32_t, std::vector< uint64_t > >& l_map,
                      std::map< uint64_t, BtreeVisualizeVariables >& info_map) const;
     void validate_sanity_child(const BtreeNodePtr& parent_node, uint32_t ind) const;

@@ -356,7 +356,6 @@ CPGuard CPGuard::operator=(const CPGuard& other) {
     return *this;
 }
 
-CP& CPGuard::operator*() { return *get(); }
 CP* CPGuard::operator->() { return get(); }
 CPContext* CPGuard::context(cp_consumer_t consumer) { return get()->context(consumer); }
 

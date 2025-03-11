@@ -16,9 +16,9 @@
 #pragma once
 
 #include <homestore/btree/btree.hpp>
-#include <homestore/btree/detail/simple_node.hpp>
-#include <homestore/btree/detail/varlen_node.hpp>
-#include <homestore/btree/detail/prefix_node.hpp>
+#include <homestore/btree/node_variant/simple_node.hpp>
+#include <homestore/btree/node_variant/varlen_node.hpp>
+#include <homestore/btree/node_variant/prefix_node.hpp>
 #include <sisl/fds/utils.hpp>
 // #include <iomgr/iomgr_flip.hpp>
 
@@ -31,22 +31,23 @@ namespace homestore {
 template < typename K, typename V >
 btree_status_t Btree< K, V >::create_root_node() {
     auto cpg = bt_cp_guard();
+    auto cp_context = cpg.context(cp_consumer_t::INDEX_SVC);
 
     // Assign one node as root node and also create a child leaf node and set it as edge
-    BtreeNodePtr root = create_leaf_node(cpg.context());
+    BtreeNodePtr root = create_leaf_node(cp_context);
     if (root == nullptr) { return btree_status_t::space_not_avail; }
 
     root->set_level(0u);
-    auto ret = write_node(root, op_context);
+    auto ret = write_node(root, cp_context);
     if (ret != btree_status_t::success) {
-        remove_node(root, locktype_t::NONE, op_context);
+        remove_node(root, locktype_t::NONE, cp_context);
         return btree_status_t::space_not_avail;
     }
 
     m_root_node_info = BtreeLinkInfo{root->node_id(), root->link_version()};
-    ret = m_store->on_root_changed(root, cpg.context());
+    ret = m_bt_private->on_root_changed(root, cp_context);
     if (ret != btree_status_t::success) {
-        remove_node(root, locktype_t::NONE, cpg.context());
+        remove_node(root, locktype_t::NONE, cp_context);
         m_root_node_info = BtreeLinkInfo{};
     }
     return ret;
@@ -58,7 +59,7 @@ btree_status_t Btree< K, V >::create_root_node() {
 template < typename K, typename V >
 btree_status_t Btree< K, V >::read_and_lock_node(bnodeid_t id, BtreeNodePtr& node_ptr, locktype_t int_lock_type,
                                                  locktype_t leaf_lock_type, CPContext* context) const {
-    auto ret = m_store->read_node(id, node_ptr);
+    auto ret = m_bt_private->read_node(id, node_ptr);
     if (node_ptr == nullptr) {
         BT_LOG(ERROR, "read failed, reason: {}", ret);
         return ret;
@@ -94,15 +95,15 @@ template < typename K, typename V >
 btree_status_t Btree< K, V >::write_node(const BtreeNodePtr& node, CPContext* context) {
     COUNTER_INCREMENT_IF_ELSE(m_metrics, node->is_leaf(), btree_leaf_node_writes, btree_int_node_writes, 1);
     HISTOGRAM_OBSERVE_IF_ELSE(m_metrics, node->is_leaf(), btree_leaf_node_occupancy, btree_int_node_occupancy,
-                              ((m_node_size - node->available_size()) * 100) / m_node_size);
+                              ((node_size() - node->available_size()) * 100) / node_size());
 
-    return (m_store->write_node(node, context));
+    return (m_bt_private->write_node(node, context));
 }
 
 /* Caller of this api doesn't expect read to fail in any circumstance */
 template < typename K, typename V >
 void Btree< K, V >::read_node_or_fail(bnodeid_t id, BtreeNodePtr& node) const {
-    BT_NODE_REL_ASSERT_EQ(m_store->read_node(id, node), btree_status_t::success, node);
+    BT_NODE_REL_ASSERT_EQ(m_bt_private->read_node(id, node), btree_status_t::success, node);
 }
 
 /*
@@ -212,7 +213,7 @@ btree_status_t Btree< K, V >::_lock_node(const BtreeNodePtr& node, locktype_t ty
     _start_of_lock(node, type, fname, line);
     node->lock(type);
 
-    auto ret = m_store->refresh_node(node, (type == locktype_t::WRITE), context);
+    auto ret = m_bt_private->refresh_node(node, (type == locktype_t::WRITE), context);
     if (ret != btree_status_t::success) {
         node->unlock(type);
         end_of_lock(node, type);
@@ -231,7 +232,7 @@ void Btree< K, V >::unlock_node(const BtreeNodePtr& node, locktype_t type) const
 
 template < typename K, typename V >
 BtreeNodePtr Btree< K, V >::create_leaf_node(CPContext* context) {
-    BtreeNodePtr n = m_store->create_node(*this, true /* is_leaf */, context);
+    BtreeNodePtr n = m_bt_private->create_node(true /* is_leaf */, context);
     if (n) {
         COUNTER_INCREMENT(m_metrics, btree_leaf_node_count, 1);
         ++m_total_nodes;
@@ -241,7 +242,7 @@ BtreeNodePtr Btree< K, V >::create_leaf_node(CPContext* context) {
 
 template < typename K, typename V >
 BtreeNodePtr Btree< K, V >::create_interior_node(CPContext* context) {
-    BtreeNodePtr n = m_store->create_node(*this, false /* is_leaf */, context);
+    BtreeNodePtr n = m_bt_private->create_node(false /* is_leaf */, context);
     if (n) {
         COUNTER_INCREMENT(m_metrics, btree_int_node_count, 1);
         ++m_total_nodes;
@@ -298,7 +299,7 @@ BtreeNode* Btree< K, V >::init_node(uint8_t* node_buf, bnodeid_t id, bool init_b
         break;
     }
 
-    if (n) { n->set_store_type(m_bt_cfg->store_type()); }
+    if (n) { n->set_store_type(m_bt_cfg.store_type()); }
     return n;
 }
 
@@ -315,7 +316,7 @@ void Btree< K, V >::remove_node(const BtreeNodePtr& node, locktype_t cur_lock, C
     }
     --m_total_nodes;
 
-    m_store->remove_node(node, context);
+    m_bt_private->remove_node(node, context);
     // intrusive_ptr_release(node.get());
 }
 
@@ -333,7 +334,7 @@ void Btree< K, V >::observe_lock_time(const BtreeNodePtr& node, locktype_t type,
 }
 
 template < typename K, typename V >
-void Btree< K, V >::_start_of_lock(const BtreeNodePtr& node, locktype_t ltype, const char* fname, int line) {
+void Btree< K, V >::_start_of_lock(const BtreeNodePtr& node, locktype_t ltype, const char* fname, int line) const {
     btree_locked_node_info info;
 
 #ifndef NDEBUG

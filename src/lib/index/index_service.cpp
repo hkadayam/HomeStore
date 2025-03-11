@@ -117,6 +117,11 @@ shared< VirtualDev > IndexService::get_vdev(ServiceSubType sub_type) {
     return it->second;
 }
 
+IndexStore* IndexService::lookup_store(IndexStore::Type store_type) {
+    auto it = m_index_stores.find(store_type);
+    return (it != m_index_stores.end()) ? it->second.get() : nullptr;
+}
+
 shared< IndexStore > IndexService::lookup_or_create_store(IndexStore::Type store_type,
                                                           std::vector< superblk< IndexStoreSuperBlock > > sbs) {
     std::unique_lock lg(m_index_map_mtx);

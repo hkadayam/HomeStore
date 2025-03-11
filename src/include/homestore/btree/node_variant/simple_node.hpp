@@ -16,9 +16,8 @@
 #pragma once
 
 #include <homestore/btree/btree_kv.hpp>
-#include <homestore/btree/detail/variant_node.hpp>
+#include <homestore/btree/node_variant/variant_node.hpp>
 #include <homestore/btree/detail/btree_internal.hpp>
-#include "homestore/index/index_internal.hpp"
 
 using namespace std;
 using namespace boost;

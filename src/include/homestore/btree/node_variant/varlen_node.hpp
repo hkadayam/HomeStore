@@ -17,9 +17,8 @@
 #pragma once
 
 #include <sisl/logging/logging.h>
-#include <homestore/btree/detail/variant_node.hpp>
+#include <homestore/btree/node_variant/variant_node.hpp>
 #include <homestore/btree/btree_kv.hpp>
-#include "homestore/index/index_internal.hpp"
 
 SISL_LOGGING_DECL(btree)
 

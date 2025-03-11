@@ -24,21 +24,13 @@
 #include <sisl/utility/enum.hpp>
 #include <homestore/homestore_decl.hpp>
 #include <homestore/superblk_handler.hpp>
+#include <homestore/index/index_common.h>
 #include <homestore/homestore.hpp>
 
 namespace homestore {
 
 class Index;
 class VirtualDev;
-
-class IndexStore {
-public:
-    SCOPED_ENUM_DECL(Type, uint8_t);
-    virtual std::string store_type() const = 0;
-    virtual void on_recovery_completed() = 0;
-};
-
-SCOPED_ENUM_DEF(IndexStore, Type, uint8_t, MEM_BTREE, COPY_ON_WRITE_BTREE, INPLACE_BTREE);
 
 #pragma pack(1)
 struct IndexSuperBlock {
@@ -94,7 +86,7 @@ public:
 
     // Getters
     uuid_t uuid() const { return m_sb->uuid; }
-    virtual uint64_t used_size() const = 0;
+    virtual uint64_t space_occupied() const = 0;
     virtual uint32_t ordinal() const = 0;
 
     superblk< IndexSuperBlock > const& super_blk() const { return m_sb; }
@@ -141,7 +133,7 @@ public:
     std::vector< shared< Index > > get_all_index_tables() const;
 
     IndexStore* lookup_store(IndexStore::Type store_type);
-    uint64_t used_size() const;
+    uint64_t space_occupied() const;
     uint32_t reserve_ordinal();
 
     shared< IndexStore > lookup_or_create_store(IndexStore::Type store_type,

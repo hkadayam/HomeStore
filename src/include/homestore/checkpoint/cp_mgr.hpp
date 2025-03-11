@@ -137,7 +137,6 @@ public:
     virtual CPGuard operator=(const CPGuard& other);
 
     CPContext* context(cp_consumer_t consumer);
-    virtual CP& operator*();
     virtual CP* operator->();
     virtual CP* get();
 };

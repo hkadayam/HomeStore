@@ -277,4 +277,8 @@ public:
     }
 };
 
+ENUM(put_filter_decision, uint8_t, keep, replace, remove);
+using put_filter_cb_t = std::function< put_filter_decision(BtreeKey const&, BtreeValue const&, BtreeValue const&) >;
+using remove_filter_cb_t = std::function< bool(BtreeKey const&, BtreeValue const&) >;
+using get_filter_cb_t = std::function< bool(BtreeKey const&, BtreeValue const&) >;
 } // namespace homestore

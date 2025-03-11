@@ -175,20 +175,19 @@ public:
         hs_before_services_starting_cb_t& cb() { return cb_; }
     };
 
-    virtual void start_homestore(const std::string& test_name, std::map< uint32_t, test_params >&& svc_params,
-                                 hs_before_services_starting_cb_t cb = nullptr,
-                                 std::vector< homestore::dev_info > devs = {}, bool init_device = true) {
-        m_token =
-            test_token{.name_ = test_name, .svc_params_ = std::move(svc_params), .cb_ = cb, .devs_ = std::move(devs)};
-        do_start_homestore(false /* fake_restart */, init_device);
+    virtual void start_homestore(const std::string& test_name, std::map< ServiceType, test_params >&& svc_params,
+                                 hs_before_services_starting_cb_t cb = nullptr, uint64_t dev_size = 0,
+                                 bool create_device = true) {
+        m_token = test_token{.name_ = test_name, .svc_params_ = std::move(svc_params), .cb_ = cb, .devs_ = {}};
+        do_start_homestore(false /* fake_restart */, create_device, 5 /* shutdown_delay_sec */, dev_size);
     }
 
     virtual void restart_homestore(uint32_t shutdown_delay_sec = 5) {
-        do_start_homestore(true /* fake_restart*/, false /* init_device */, shutdown_delay_sec);
+        do_start_homestore(true /* fake_restart*/, false /* create_device */, shutdown_delay_sec);
     }
 
     virtual void start_homestore() {
-        do_start_homestore(true /* fake_restart*/, false /* init_device */, 1 /* shutdown_delay_sec */);
+        do_start_homestore(true /* fake_restart*/, false /* create_device */, 1 /* shutdown_delay_sec */);
     }
 
     virtual void shutdown_homestore(bool cleanup = true) {
@@ -350,9 +349,12 @@ public:
     }
 
 private:
-    void do_start_homestore(bool fake_restart = false, bool init_device = true, uint32_t shutdown_delay_sec = 5) {
+    void do_start_homestore(bool fake_restart = false, bool create_device = true, uint32_t shutdown_delay_sec = 5,
+                            uint64_t dev_size_input = 0) {
         auto const ndevices = SISL_OPTIONS["num_devs"].as< uint32_t >();
-        auto const dev_size = SISL_OPTIONS["dev_size_mb"].as< uint64_t >() * 1024 * 1024;
+        auto const dev_size = (SISL_OPTIONS.count("dev_size_mb")) || (dev_size_input == 0)
+            ? SISL_OPTIONS["dev_size_mb"].as< uint64_t >() * 1024 * 1024
+            : dev_size_input;
         auto num_threads = SISL_OPTIONS["num_threads"].as< uint32_t >();
         auto num_fibers = SISL_OPTIONS["num_fibers"].as< uint32_t >();
         auto is_spdk = SISL_OPTIONS["spdk"].as< bool >();
@@ -384,12 +386,12 @@ private:
                                         return s.empty() ? dinfo.dev_name : s + "," + dinfo.dev_name;
                                     }));
 
-            if (init_device) { init_raw_devices(m_token.devs_); }
+            if (create_device) { init_raw_devices(m_token.devs_); }
         } else {
             for (uint32_t i{0}; i < ndevices; ++i) {
                 m_generated_devs.emplace_back(std::string{"/tmp/" + m_token.name_ + "_" + std::to_string(i + 1)});
             }
-            if (init_device) {
+            if (create_device) {
                 LOGINFO("creating {} device files with each of size {} ", ndevices, homestore::in_bytes(dev_size));
                 init_files(m_generated_devs, dev_size);
             }
@@ -425,7 +427,9 @@ private:
             if (svc == ServiceType::DATA) {
                 hsi->with_data_service(tp.custom_chunk_selector);
             } else if (svc == ServiceType::INDEX) {
-                hsi->with_index_service(std::unique_ptr< IndexServiceCallbacks >(tp.index_svc_cbs));
+                hsi->with_index_service(
+                    std::unique_ptr< IndexServiceCallbacks >(tp.index_svc_cbs),
+                    {ServiceSubType::INDEX_BTREE_COPY_ON_WRITE, ServiceSubType::INDEX_BTREE_MEMORY});
             } else if ((svc == ServiceType::LOG)) {
                 hsi->with_log_service();
             } else if (svc == ServiceType::REPLICATION) {

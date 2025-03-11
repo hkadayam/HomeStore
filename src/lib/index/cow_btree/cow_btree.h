@@ -6,6 +6,7 @@
 #include <homestore/btree/btree_base.hpp>
 #include <homestore/checkpoint/cp_mgr.hpp>
 #include "common/large_id_reserver.hpp"
+#include "index/cow_btree/cow_btree_store.h"
 
 namespace homestore {
 class COWBtreeCPContext;
@@ -16,9 +17,24 @@ public:
     struct Journal;
 
 public:
-    COWBtree(BtreeBase* bt, shared< VirtualDev > vdev, std::vector< sisl::byte_view > journal_bufs);
+    COWBtree(BtreeBase& bt, shared< VirtualDev > vdev, shared< COWBtreeStore::CacheType > cache,
+             std::vector< sisl::byte_view > journal_bufs, bool load_existing);
     virtual ~COWBtree() = default;
 
+    // All overridden methods of UndelyingBtree class
+    BtreeNodePtr create_node(bool is_leaf, CPContext* context) override;
+    btree_status_t write_node(const BtreeNodePtr& node, CPContext* context) override;
+    btree_status_t read_node(bnodeid_t id, BtreeNodePtr& node) const override;
+    btree_status_t refresh_node(const BtreeNodePtr& node, bool for_read_modify_write,
+                                CPContext* context) const override;
+    void remove_node(const BtreeNodePtr& node, CPContext* context) override;
+    btree_status_t transact_nodes(const BtreeNodeList& new_nodes, const BtreeNodeList& removed_nodes,
+                                  const BtreeNodePtr& left_child_node, const BtreeNodePtr& parent_node,
+                                  CPContext* context) override;
+    btree_status_t on_root_changed(BtreeNodePtr const& root, CPContext* context) override;
+    uint64_t space_occupied() const override;
+
+    uint32_t node_size() const override;
     bnodeid_t generate_node_id();
     void add_to_dirty_list(BtreeNodePtr const& node, COWBtreeCPContext* cp_ctx);
     void add_to_remove_list(bnodeid_t node_id, COWBtreeCPContext* cp_ctx);
@@ -54,8 +70,8 @@ public:
 
 #pragma pack(1)
     struct SuperBlock {
-        cp_id_t cp_id;          // CPID when this superblock was written
-        uint16_t num_map_heads; // Total number of map heads
+        cp_id_t cp_id{-1};         // CPID when this superblock was written
+        uint16_t num_map_heads{0}; // Total number of map heads
         BlkId map_heads[1];     // Array of heads of chain which contains the blkid map data
 
         static uint32_t max_map_heads(uint32_t sb_size) {
@@ -203,8 +219,9 @@ public:
     friend class CPSession;
 
 private:
+    BtreeBase& m_base_btree;
+    shared< COWBtreeStore::CacheType > m_cache;
     FullBNodeIdMap m_bnodeid_map;
-    BtreeBase* m_base_btree;
     LargeIDReserver m_nodeid_generator;
     shared< VirtualDev > m_vdev;
 

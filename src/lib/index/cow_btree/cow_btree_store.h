@@ -10,7 +10,7 @@
 #include <homestore/btree/detail/btree_internal.hpp>
 #include <homestore/superblk_handler.hpp>
 #include <homestore/checkpoint/cp_mgr.hpp>
-
+#include <homestore/index_service.hpp>
 #include "common/homestore_utils.hpp"
 
 namespace homestore {
@@ -32,8 +32,10 @@ public:
     };
 #pragma pack()
 
+    using CacheType = sisl::SimpleCache< bnodeid_t, BtreeNodePtr >;
+
 private:
-    sisl::SimpleCache< bnodeid_t, BtreeNodePtr > m_cache;
+    shared< CacheType > m_cache;
     shared< VirtualDev > m_vdev;
     uint32_t const m_node_size;
     uint32_t const m_vdev_blks_per_node;
@@ -59,32 +61,12 @@ public:
     ////////////////// Override Implementation of underlying store requirements //////////////////
     unique< UnderlyingBtree > on_btree_created(BtreeBase& btree, bool load_existing) override;
     void on_btree_destroyed(BtreeBase& bt) override;
-
-    BtreeNodePtr create_node(BtreeBase& btree, bool is_leaf, void* context) override;
-
-    btree_status_t write_node(BtreeBase& btree, const BtreeNodePtr& node, void* context) override;
-
-    btree_status_t read_node(BtreeBase& btree, bnodeid_t id, BtreeNodePtr& node) override;
-
-    btree_status_t refresh_node(BtreeBase& btree, const BtreeNodePtr& node, bool for_read_modify_write,
-                                void* context) override;
-
-    void remove_node(BtreeBase& btree, const BtreeNodePtr& node, void* context) override;
-
-    btree_status_t transact_nodes(BtreeBase& btree, const BtreeNodeList& new_nodes, const BtreeNodeList& removed_nodes,
-                                  const BtreeNodePtr& left_child_node, const BtreeNodePtr& parent_node,
-                                  void* context) override;
-
-    btree_status_t on_root_changed(BtreeBase& btree, BtreeNodePtr const& root, void* context) override;
-
     void on_node_freed(BtreeNode* node) override;
-
     bool is_fast_destroy_supported() const override { return true; }
+    bool is_ephemeral() const { return false; }
 
-    uint64_t used_size(BtreeBase const& btree) const override;
-
+    // Implemenations for flush
     folly::Future< bool > async_cp_flush(COWBtreeCPContext* cp_ctx);
-
     uint32_t parallel_map_flushers_count() const;
 
 private:

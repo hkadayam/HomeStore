@@ -25,6 +25,7 @@
 #include <sisl/utility/enum.hpp>
 #include <iomgr/iomgr_flip.hpp>
 #include <boost/algorithm/string.hpp>
+#include <homestore/btree/btree.ipp>
 
 #include "test_common/range_scheduler.hpp"
 #include "shadow_map.hpp"
@@ -44,6 +45,7 @@ struct BtreeTestHelper {
     void SetUp() {
         m_cfg.m_leaf_node_type = T::leaf_node_type;
         m_cfg.m_int_node_type = T::interior_node_type;
+        m_cfg.m_store_type = T::store_type;
         m_max_range_input = SISL_OPTIONS["num_entries"].as< uint32_t >();
         if (SISL_OPTIONS.count("disable_merge")) { m_cfg.m_merge_turned_on = false; }
 
@@ -67,9 +69,9 @@ struct BtreeTestHelper {
     void TearDown() {}
 
 protected:
-    std::shared_ptr< typename T::BtreeType > m_bt;
+    std::shared_ptr< Btree< K, V > > m_bt;
     ShadowMap< K, V > m_shadow_map;
-    BtreeConfig m_cfg{g_node_size};
+    BtreeConfig m_cfg;
     uint32_t m_max_range_input{1000};
     bool m_is_multi_threaded{false};
     uint32_t m_run_time{0};
@@ -178,10 +180,8 @@ public:
         auto existing_v = std::make_unique< V >();
         K key = K{k};
         V value = V::generate_rand();
-        auto sreq = BtreeSinglePutRequest{&key, &value, btree_put_type::UPSERT, existing_v.get()};
-        sreq.enable_route_tracing();
 
-        auto const ret = m_bt->put(sreq);
+        auto const ret = m_bt->put_one(key, value, btree_put_type::UPSERT, existing_v.get());
         ASSERT_EQ(ret, btree_status_t::success) << "Upsert key=" << k << " failed with error=" << enum_name(ret);
         m_shadow_map.force_put(k, value);
     }
@@ -191,10 +191,9 @@ public:
         K end_key = K{end_k};
         auto const nkeys = end_k - start_k + 1;
 
-        auto preq = BtreeRangePutRequest< K >{BtreeKeyRange< K >{start_key, true, end_key, true},
-                                              update ? btree_put_type::UPDATE : btree_put_type::UPSERT, &value};
-        preq.enable_route_tracing();
-        ASSERT_EQ(m_bt->put(preq), btree_status_t::success) << "range_put failed for " << start_k << "-" << end_k;
+        auto const [ret, cookie] = m_bt->put_range(BtreeKeyRange< K >{start_key, true, end_key, true},
+                                                   update ? btree_put_type::UPDATE : btree_put_type::UPSERT, value);
+        ASSERT_EQ(ret, btree_status_t::success) << "range_put failed for " << start_k << "-" << end_k;
 
         if (update) {
             m_shadow_map.range_update(start_key, nkeys, value);
@@ -221,10 +220,7 @@ public:
         auto existing_v = std::make_unique< V >();
         auto pk = std::make_unique< K >(k);
 
-        auto rreq = BtreeSingleRemoveRequest{pk.get(), existing_v.get()};
-        rreq.enable_route_tracing();
-        bool removed = (m_bt->remove(rreq) == btree_status_t::success);
-
+        bool removed = (m_bt->remove_one(*pk, existing_v.get()) == btree_status_t::success);
         if(care_success) {
             ASSERT_EQ(removed, m_shadow_map.exists(*pk))
                 << "Removal of key " << pk->key() << " status doesn't match with shadow";
@@ -233,8 +229,6 @@ public:
             // Do not care if the key is not present in the btree, just cleanup the shadow map
             m_shadow_map.erase(*pk);
         }
-
-
     }
 
     void remove_random() {
@@ -273,13 +267,20 @@ public:
         uint32_t remaining = m_shadow_map.num_elems_in_range(start_k, end_k);
         auto it = m_shadow_map.map_const().lower_bound(K{start_k});
 
-        BtreeQueryRequest< K > qreq{BtreeKeyRange< K >{K{start_k}, true, K{end_k}, true},
-                                    BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY, batch_size};
+        btree_status_t ret;
+        QueryPaginateCookie< K > cookie;
+
         while (remaining > 0) {
             out_vector.clear();
-            qreq.enable_route_tracing();
-            auto const ret = m_bt->query(qreq, out_vector);
+
             auto const expected_count = std::min(remaining, batch_size);
+            if (!cookie) {
+                std::tie(ret, cookie) = m_bt->query(BtreeKeyRange< K >{K{start_k}, true, K{end_k}, true}, out_vector,
+                                                    batch_size, BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY);
+            } else {
+                ret = m_bt->query_next(cookie, out_vector);
+            }
+
             // this->print_keys();
             ASSERT_EQ(out_vector.size(), expected_count) << "Received incorrect value on query pagination";
 
@@ -300,7 +301,7 @@ public:
             }
         }
         out_vector.clear();
-        auto ret = m_bt->query(qreq, out_vector);
+        ret = m_bt->query_next(cookie, out_vector);
         ASSERT_EQ(ret, btree_status_t::success) << "Expected success on query";
         ASSERT_EQ(out_vector.size(), 0) << "Received incorrect value on empty query pagination";
 
@@ -321,46 +322,39 @@ public:
     ////////////////////// All get operation variants ///////////////////////////////
     void get_all() const {
         m_shadow_map.foreach ([this](K key, V value) {
-            auto copy_key = std::make_unique< K >();
-            *copy_key = key;
             auto out_v = std::make_unique< V >();
-            auto req = BtreeSingleGetRequest{copy_key.get(), out_v.get()};
-            req.enable_route_tracing();
-            const auto ret = m_bt->get(req);
+            const auto ret = m_bt->get_one(key, out_v.get());
+
             ASSERT_EQ(ret, btree_status_t::success) << "Missing key " << key << " in btree but present in shadow map";
-            ASSERT_EQ((const V&)req.value(), value)
-                << "Found value in btree doesn't return correct data for key=" << key;
+            ASSERT_EQ((const V&)*out_v, value) << "Found value in btree doesn't return correct data for key=" << key;
         });
     }
 
     void get_specific(uint32_t k) const {
-        auto pk = std::make_unique< K >(k);
+        K key = K{k};
         auto out_v = std::make_unique< V >();
-        auto req = BtreeSingleGetRequest{pk.get(), out_v.get()};
-        req.enable_route_tracing();
-        const auto status = m_bt->get(req);
+        const auto status = m_bt->get_one(key, out_v.get());
+
         if (status == btree_status_t::success) {
-            m_shadow_map.validate_data(req.key(), (const V&)req.value());
+            m_shadow_map.validate_data(key, (const V&)*out_v);
         } else {
-            ASSERT_EQ(m_shadow_map.exists(req.key()), false) << "Node key " << k << " is missing in the btree";
+            ASSERT_EQ(m_shadow_map.exists(key), false) << "Node key " << k << " is missing in the btree";
         }
     }
 
     void get_any(uint32_t start_k, uint32_t end_k) const {
         auto out_k = std::make_unique< K >();
         auto out_v = std::make_unique< V >();
-        auto req =
-            BtreeGetAnyRequest< K >{BtreeKeyRange< K >{K{start_k}, true, K{end_k}, true}, out_k.get(), out_v.get()};
-        req.enable_route_tracing();
-        const auto status = m_bt->get(req);
+        auto const status =
+            m_bt->get_any(BtreeKeyRange< K >{K{start_k}, true, K{end_k}, true}, out_k.get(), out_v.get());
 
         if (status == btree_status_t::success) {
-            ASSERT_EQ(m_shadow_map.exists_in_range(*(K*)req.m_outkey, start_k, end_k), true)
-                << "Get Any returned key=" << *(K*)req.m_outkey << " which is not in range " << start_k << "-" << end_k
+            ASSERT_EQ(m_shadow_map.exists_in_range(*out_k, start_k, end_k), true)
+                << "Get Any returned key=" << *out_k << " which is not in range " << start_k << "-" << end_k
                 << "according to shadow map";
-            m_shadow_map.validate_data(*(K*)req.m_outkey, *(V*)req.m_outval);
+            m_shadow_map.validate_data(*out_k, *out_v);
         } else {
-            ASSERT_EQ(m_shadow_map.exists_in_range(*(K*)req.m_outkey, start_k, end_k), false)
+            ASSERT_EQ(m_shadow_map.exists_in_range(*out_k, start_k, end_k), false)
                 << "Get Any couldn't find key in the range " << start_k << "-" << end_k
                 << " but it present in shadow map";
         }
@@ -437,10 +431,8 @@ private:
     void do_put(uint64_t k, btree_put_type put_type, V const& value, bool expect_success = true) {
         auto existing_v = std::make_unique< V >();
         K key = K{k};
-        auto sreq = BtreeSinglePutRequest{&key, &value, put_type, existing_v.get()};
-        sreq.enable_route_tracing();
-        bool done = expect_success ? (m_bt->put(sreq) == btree_status_t::success)
-                                   : m_bt->put(sreq) == btree_status_t::put_failed;
+        auto ret = m_bt->put_one(key, value, put_type, existing_v.get());
+        bool done = expect_success ? (ret == btree_status_t::success) : (ret == btree_status_t::put_failed);
 
         if (put_type == btree_put_type::INSERT) {
             ASSERT_EQ(done, !m_shadow_map.exists(key));
@@ -454,10 +446,7 @@ private:
         K start_key = K{start_k};
         K end_key = K{end_k};
 
-        auto rreq = BtreeRangeRemoveRequest< K >{BtreeKeyRange< K >{start_key, true, end_key, true}};
-        rreq.enable_route_tracing();
-        auto const ret = m_bt->remove(rreq);
-
+        auto [ret, cookie] = m_bt->remove_range(BtreeKeyRange< K >{start_key, true, end_key, true});
         if (all_existing) {
             m_shadow_map.range_erase(start_key, end_key);
             ASSERT_EQ((ret == btree_status_t::success), true)

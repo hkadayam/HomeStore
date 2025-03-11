@@ -58,8 +58,6 @@ set(HOMESTORE_OBJECTS
     lib/homestore.cpp
     lib/crc.cpp
     lib/logging.cpp
-    #$<TARGET_OBJECTS:hs_cp>
-    #$<TARGET_OBJECTS:indx_mgr>
 )
 #target_link_libraries(homestore_objs ${COMMON_DEPS})
 

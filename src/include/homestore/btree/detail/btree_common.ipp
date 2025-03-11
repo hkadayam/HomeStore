@@ -96,10 +96,10 @@ btree_status_t Btree< K, V >::do_destroy() {
     }
 
     if (m_store->is_ephemeral()) {
-        ret = post_order_traversal(locktype_t::WRITE, [this, &cb](const auto& node, bool is_leaf) -> btree_status_t {
+        ret = post_order_traversal(locktype_t::WRITE, [this](const auto& node, bool is_leaf) -> btree_status_t {
             // On ephemeral btree, we can directly remove the node, however on non-ephemeral btree, we need to do so
             // only at checkpoint time, which should be handled by the store themselves.
-            remove_node(node, locktype_t::WRITE, context);
+            remove_node(node, locktype_t::WRITE, nullptr);
             return btree_status_t::success;
         });
     } else if (!m_store->is_fast_destroy_supported()) {
@@ -115,7 +115,7 @@ btree_status_t Btree< K, V >::do_destroy() {
     }
 
     if (ret == btree_status_t::success) {
-        BT_LOG(DEBUG, "btree(root: {}) {} nodes destroyed successfully", m_root_node_info.bnode_id(), n_freed_nodes);
+        BT_LOG(DEBUG, "btree(root: {}) destroyed successfully", m_root_node_info.bnode_id());
         m_store->on_btree_destroyed(*this);
     } else {
         m_destroyed = false;
@@ -211,7 +211,7 @@ void Btree< K, V >::to_string_internal(bnodeid_t bnodeid, std::string& buf) cons
 
 template < typename K, typename V >
 void Btree< K, V >::to_custom_string_internal(bnodeid_t bnodeid, std::string& buf,
-                                              to_string_cb_t< K, V > const& cb) const {
+                                              BtreeNode::ToStringCallback< K, V > const& cb) const {
     BtreeNodePtr node;
 
     locktype_t acq_lock = locktype_t::READ;
@@ -271,7 +271,7 @@ void Btree< K, V >::validate_sanity_child(const BtreeNodePtr& parent_node, uint3
 
     parent_node->get_nth_value(ind, &child_info, false /* copy */);
     BtreeNodePtr child_node = nullptr;
-    auto ret = m_store->read_node(child_info.bnode_id(), child_node);
+    auto ret = m_bt_private->read_node(child_info.bnode_id(), child_node);
     BT_REL_ASSERT_EQ(ret, btree_status_t::success, "read failed, reason: {}", ret);
     if (child_node->total_entries() == 0) {
         auto parent_entries = parent_node->total_entries();
@@ -318,7 +318,7 @@ void Btree< K, V >::validate_sanity_next_child(const BtreeNodePtr& parent_node, 
     parent_node->get_nth_value(ind + 1, &child_info, false /* copy */);
 
     BtreeNodePtr child_node = nullptr;
-    auto ret = m_store->read_node(child_info.bnode_id(), child_node);
+    auto ret = m_bt_private->read_node(child_info.bnode_id(), child_node);
     BT_REL_ASSERT_EQ(ret, btree_status_t::success, "read failed, reason: {}", ret);
 
     if (child_node->total_entries() == 0) {
@@ -357,15 +357,15 @@ done:
 template < typename K, typename V >
 void Btree< K, V >::append_route_trace(BtreeRequest& req, const BtreeNodePtr& node, btree_event_t event,
                                        uint32_t start_idx, uint32_t end_idx) const {
-    if (req.route_tracing) {
-        req.route_tracing->emplace_back(trace_route_entry{.node_id = node->node_id(),
-                                                          .node = node.get(),
-                                                          .start_idx = start_idx,
-                                                          .end_idx = end_idx,
-                                                          .num_entries = node->total_entries(),
-                                                          .level = node->level(),
-                                                          .is_leaf = node->is_leaf(),
-                                                          .event = event});
+    if (req.m_route_tracing) {
+        req.m_route_tracing->emplace_back(trace_route_entry{.node_id = node->node_id(),
+                                                            .node = node.get(),
+                                                            .start_idx = start_idx,
+                                                            .end_idx = end_idx,
+                                                            .num_entries = node->total_entries(),
+                                                            .level = node->level(),
+                                                            .is_leaf = node->is_leaf(),
+                                                            .event = event});
     }
 }
 } // namespace homestore

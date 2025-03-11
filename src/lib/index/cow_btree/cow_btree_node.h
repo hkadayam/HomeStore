@@ -5,7 +5,6 @@
 namespace homestore {
 class COWBtreeCPContext;
 class COWBtree;
-class BtreeNode;
 
 class COWBtreeNodeBuffer {
 public:

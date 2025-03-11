@@ -239,7 +239,11 @@ bnodeid_t COWBtree::generate_node_id() {
     return (m_ordinal_shifted | m_nodeid_generator.reserve());
 }
 
-BlkId COWBtree::get_blkid_for_nodeid(bnodeid_t nodeid) const { return lookup_bnode_map(to_compact_nodeid(nodeid)); }
+BtreeNodePtr COWBtree::create_node(bool is_leaf, CPContext* context) {
+    auto buf = hs_utils::iobuf_alloc(node_size(), sisl::buftag::btree_node, m_vdev->align_size());
+    auto n = BtreeNodePtr{
+        m_base_btree.init_node(buf, generate_node_id(), true /* init_buf */, is_leaf, sizeof(COWBtreeNode))};
+    new (uintptr_cast(n.get()) - sizeof(COWBtreeNode)) COWBtreeNode();
 
 void COWBtree::add_to_dirty_list(BtreeNodePtr const& node, COWBtreeCPContext* cp_ctx) {
     cp_session(cp_ctx->id())->m_modified_nodes.push_back(node);

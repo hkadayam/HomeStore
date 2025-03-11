@@ -67,6 +67,8 @@ uint64_t BtreeBase::space_occupied() const { return m_bt_private->space_occupied
 uint32_t BtreeBase::ordinal() const { return m_sb->ordinal; }
 
 std::string BtreeBase::name() const { return m_bt_cfg.name(); }
+BtreeRouteTracer& BtreeBase::route_tracer() { return m_route_tracer; }
+[[nodiscard]] CPGuard BtreeBase::bt_cp_guard() { return CPGuard{is_ephemeral() ? nullptr : &(cp_mgr())}; }
 
 BtreeRouteTracer& BtreeBase::route_tracer() { return m_route_tracer; }
 
@@ -140,6 +142,7 @@ btree_status_t BtreeBase::write_node(const BtreeNodePtr& node, CPContext* contex
 void BtreeBase::read_node_or_fail(bnodeid_t id, BtreeNodePtr& node) const {
     BT_NODE_REL_ASSERT_EQ(m_bt_private->read_node(id, node), btree_status_t::success, node);
 }
+#endif
 
 /*
  * This function upgrades the parent node and child node locks from read lock to write lock and take required steps if

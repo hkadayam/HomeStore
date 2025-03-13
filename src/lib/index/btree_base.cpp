@@ -67,7 +67,224 @@ uint64_t BtreeBase::space_occupied() const { return m_bt_private->space_occupied
 uint32_t BtreeBase::ordinal() const { return m_sb->ordinal; }
 
 std::string BtreeBase::name() const { return m_bt_cfg.name(); }
+
 BtreeRouteTracer& BtreeBase::route_tracer() { return m_route_tracer; }
+
+#define lock_node(a, b, c) _lock_node(a, b, c, __FILE__, __LINE__)
+
+btree_status_t BtreeBase::create_root_node() {
+    auto cpg = bt_cp_guard();
+    auto cp_context = cpg.context(cp_consumer_t::INDEX_SVC);
+
+    // Assign one node as root node and also create a child leaf node and set it as edge
+    BtreeNodePtr root = create_leaf_node(cp_context);
+    if (root == nullptr) { return btree_status_t::space_not_avail; }
+
+    root->set_level(0u);
+    auto ret = write_node(root, cp_context);
+    if (ret != btree_status_t::success) {
+        remove_node(root, locktype_t::NONE, cp_context);
+        return btree_status_t::space_not_avail;
+    }
+
+    m_root_node_info = BtreeLinkInfo{root->node_id(), root->link_version()};
+    ret = m_bt_private->on_root_changed(root, cp_context);
+    if (ret != btree_status_t::success) {
+        remove_node(root, locktype_t::NONE, cp_context);
+        m_root_node_info = BtreeLinkInfo{};
+    }
+    return ret;
+}
+
+btree_status_t BtreeBase::read_and_lock_node(bnodeid_t id, BtreeNodePtr& node_ptr, locktype_t int_lock_type,
+                                             locktype_t leaf_lock_type, CPContext* context) const {
+    auto ret = m_bt_private->read_node(id, node_ptr);
+    if (node_ptr == nullptr) {
+        BT_LOG(ERROR, "read failed, reason: {}", ret);
+        return ret;
+    }
+
+    auto acq_lock = (node_ptr->is_leaf()) ? leaf_lock_type : int_lock_type;
+    ret = lock_node(node_ptr, acq_lock, context);
+    if (ret != btree_status_t::success) { BT_LOG(ERROR, "Node lock and refresh failed"); }
+
+    return ret;
+}
+
+btree_status_t BtreeBase::get_child_and_lock_node(const BtreeNodePtr& node, uint32_t index, BtreeLinkInfo& child_info,
+                                                  BtreeNodePtr& child_node, locktype_t int_lock_type,
+                                                  locktype_t leaf_lock_type, CPContext* context) const {
+    if (index == node->total_entries()) {
+        if (!node->has_valid_edge()) {
+            BT_NODE_LOG_ASSERT(false, node, "Child index {} does not have valid bnode_id", index);
+            return btree_status_t::not_found;
+        }
+        child_info = node->get_edge_value();
+    } else {
+        BT_NODE_LOG_ASSERT_LT(index, node->total_entries(), node);
+        node->get_nth_value(index, &child_info, false /* copy */);
+    }
+
+    return (read_and_lock_node(child_info.bnode_id(), child_node, int_lock_type, leaf_lock_type, context));
+}
+
+btree_status_t BtreeBase::write_node(const BtreeNodePtr& node, CPContext* context) {
+    COUNTER_INCREMENT_IF_ELSE(m_metrics, node->is_leaf(), btree_leaf_node_writes, btree_int_node_writes, 1);
+    HISTOGRAM_OBSERVE_IF_ELSE(m_metrics, node->is_leaf(), btree_leaf_node_occupancy, btree_int_node_occupancy,
+                              ((node_size() - node->available_size()) * 100) / node_size());
+
+    return (m_bt_private->write_node(node, context));
+}
+
+/* Caller of this api doesn't expect read to fail in any circumstance */
+void BtreeBase::read_node_or_fail(bnodeid_t id, BtreeNodePtr& node) const {
+    BT_NODE_REL_ASSERT_EQ(m_bt_private->read_node(id, node), btree_status_t::success, node);
+}
+
+/*
+ * This function upgrades the parent node and child node locks from read lock to write lock and take required steps if
+ * things have changed during the upgrade.
+ *
+ * Inputs:
+ * parent_node - Parent Node to upgrade
+ * child_node - Child Node to upgrade
+ * child_cur_lock - Current child node which is held
+ * context - Context to pass down
+ *
+ * Returns - If successfully able to upgrade both the nodes, return success, else return status of upgrade_node.
+ * In case of not success, all nodes locks are released.
+ *
+ * NOTE: This function expects both the parent_node and child_node to be already locked. Parent node is
+ * expected to be read locked and child node could be either read or write locked.
+ */
+btree_status_t BtreeBase::upgrade_node_locks(const BtreeNodePtr& parent_node, const BtreeNodePtr& child_node,
+                                             locktype_t& parent_cur_lock, locktype_t& child_cur_lock,
+                                             CPContext* context) {
+    btree_status_t ret = btree_status_t::success;
+
+    auto const parent_prev_gen = parent_node->node_gen();
+    auto const child_prev_gen = child_node->node_gen();
+
+    unlock_node(child_node, child_cur_lock);
+    unlock_node(parent_node, parent_cur_lock);
+
+    ret = lock_node(parent_node, locktype_t::WRITE, context);
+    if (ret != btree_status_t::success) {
+        parent_cur_lock = child_cur_lock = locktype_t::NONE;
+        return ret;
+    }
+
+    ret = lock_node(child_node, locktype_t::WRITE, context);
+    if (ret != btree_status_t::success) {
+        unlock_node(parent_node, locktype_t::WRITE);
+        parent_cur_lock = child_cur_lock = locktype_t::NONE;
+        return ret;
+    }
+
+    // If the node things have been changed between unlock and lock example, it has been made invalid (probably by merge
+    // nodes) ask caller to start over again.
+    if (parent_node->is_node_deleted() || (parent_prev_gen != parent_node->node_gen()) ||
+        child_node->is_node_deleted() || (child_prev_gen != child_node->node_gen())) {
+        unlock_node(child_node, locktype_t::WRITE);
+        unlock_node(parent_node, locktype_t::WRITE);
+        parent_cur_lock = child_cur_lock = locktype_t::NONE;
+        return btree_status_t::retry;
+    }
+
+    parent_cur_lock = child_cur_lock = locktype_t::WRITE;
+#if 0
+#ifdef _PRERELEASE
+    {
+        auto time = iomgr_flip::instance()->get_test_flip< uint64_t >("btree_upgrade_delay");
+        if (time) { std::this_thread::sleep_for(std::chrono::microseconds{time.get()}); }
+    }
+#endif
+#endif
+
+#if 0
+#ifdef _PRERELEASE
+    {
+        int is_leaf = 0;
+
+        if (child_node && child_node->is_leaf()) { is_leaf = 1; }
+        if (iomgr_flip::instance()->test_flip("btree_upgrade_node_fail", is_leaf)) {
+            unlock_node(my_node, cur_lock);
+            cur_lock = locktype_t::NONE;
+            if (child_node) {
+                unlock_node(child_node, child_cur_lock);
+                child_cur_lock = locktype_t::NONE;
+            }
+            ret = btree_status_t::retry;
+        }
+    }
+#endif
+#endif
+
+    return ret;
+}
+
+btree_status_t BtreeBase::upgrade_node_lock(const BtreeNodePtr& node, locktype_t& cur_lock, CPContext* context) {
+    auto const prev_gen = node->node_gen();
+
+    unlock_node(node, cur_lock);
+    cur_lock = locktype_t::NONE;
+
+    auto ret = lock_node(node, locktype_t::WRITE, context);
+    if (ret != btree_status_t::success) { return ret; }
+
+    if (node->is_node_deleted() || (prev_gen != node->node_gen())) {
+        unlock_node(node, locktype_t::WRITE);
+        return btree_status_t::retry;
+    }
+    cur_lock = locktype_t::WRITE;
+    return ret;
+}
+
+btree_status_t BtreeBase::_lock_node(const BtreeNodePtr& node, locktype_t type, CPContext* context, const char* fname,
+                                     int line) const {
+#ifdef _DEBUG
+    _start_of_lock(node, type, fname, line);
+#endif
+    node->lock(type);
+
+    auto ret = m_bt_private->refresh_node(node, (type == locktype_t::WRITE), context);
+    if (ret != btree_status_t::success) {
+        node->unlock(type);
+#ifdef _DEBUG
+        end_of_lock(node, type);
+#endif
+        return ret;
+    }
+
+    return btree_status_t::success;
+}
+
+void BtreeBase::unlock_node(const BtreeNodePtr& node, locktype_t type) const {
+    node->unlock(type);
+#ifdef _DEBUG
+    auto time_spent = end_of_lock(node, type);
+    observe_lock_time(node, type, time_spent);
+#endif
+}
+
+BtreeNodePtr BtreeBase::create_leaf_node(CPContext* context) {
+    BtreeNodePtr n = m_bt_private->create_node(true /* is_leaf */, context);
+    if (n) {
+        COUNTER_INCREMENT(m_metrics, btree_leaf_node_count, 1);
+        ++m_total_nodes;
+    }
+    return n;
+}
+
+BtreeNodePtr BtreeBase::create_interior_node(CPContext* context) {
+    BtreeNodePtr n = m_bt_private->create_node(false /* is_leaf */, context);
+    if (n) {
+        COUNTER_INCREMENT(m_metrics, btree_int_node_count, 1);
+        ++m_total_nodes;
+    }
+    return n;
+}
+
 [[nodiscard]] CPGuard BtreeBase::bt_cp_guard() { return CPGuard{is_ephemeral() ? nullptr : &(cp_mgr())}; }
 
 BtreeRouteTracer& BtreeBase::route_tracer() { return m_route_tracer; }

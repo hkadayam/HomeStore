@@ -17,7 +17,7 @@ public:
 
     unique< UnderlyingBtree > on_btree_created(BtreeBase& btree, bool load_existing) override;
     void on_btree_destroyed(BtreeBase&) override {}
-    void on_node_freed(BtreeNode* node) override {}
+    void on_node_freed(BtreeNode* node) override;
     bool is_fast_destroy_supported() const override { return true; }
     bool is_ephemeral() const override { return true; }
 };
@@ -28,8 +28,7 @@ public:
     BtreeNodePtr create_node(bool is_leaf, CPContext* context) override;
     btree_status_t write_node(BtreeNodePtr const& node, CPContext* context) override;
     btree_status_t read_node(bnodeid_t id, BtreeNodePtr& node) const override;
-    btree_status_t refresh_node(BtreeNodePtr const& node, bool for_read_modify_write,
-                                CPContext* context) const override;
+    btree_status_t refresh_node(BtreeNodePtr const& node, bool for_read_modify_write, CPContext* context) override;
     void remove_node(BtreeNodePtr const& node, CPContext* context) override;
     btree_status_t transact_nodes(BtreeNodeList const& new_nodes, BtreeNodeList const& freed_nodes,
                                   BtreeNodePtr const& left_child_node, BtreeNodePtr const& parent_node,

@@ -271,55 +271,10 @@ private:
                                       std::vector< std::pair< K, V > >& out_values);
 #endif
 
-    // bool verify_tree(bool update_debug_bm) const;
-    // void set_root_node_info(const BtreeLinkInfo& info);
-
-    // static void set_io_flip();
-    // static void set_error_flip();
-#ifdef _PRERELEASE
-    void set_flip_point(std::string flip) { m_flips.set_flip(flip); }
-    void set_flips(std::vector< std::string > flips) {
-        for (const auto& flip : flips) {
-            set_flip_point(flip);
-        }
-    }
-    std::string flip_list() const { return m_flips.list(); }
-#endif
-
-    /////////////////////////// Methods the application use case is expected to handle ///////////////////////////
-
 private:
     /////////////////////////////// Internal Node Management Methods ////////////////////////////////////
-    btree_status_t create_root_node();
-    btree_status_t read_and_lock_node(bnodeid_t id, BtreeNodePtr& node_ptr, locktype_t int_lock_type,
-                                      locktype_t leaf_lock_type, CPContext* context) const;
-    btree_status_t get_child_and_lock_node(const BtreeNodePtr& node, uint32_t index, BtreeLinkInfo& child_info,
-                                           BtreeNodePtr& child_node, locktype_t int_lock_type,
-                                           locktype_t leaf_lock_type, CPContext* context) const;
-    btree_status_t write_node(const BtreeNodePtr& node, CPContext* context);
-    void read_node_or_fail(bnodeid_t id, BtreeNodePtr& node) const;
-
-    btree_status_t upgrade_node_locks(const BtreeNodePtr& parent_node, const BtreeNodePtr& child_node,
-                                      locktype_t& parent_cur_lock, locktype_t& child_cur_lock, CPContext* context);
-    btree_status_t upgrade_node_lock(const BtreeNodePtr& node, locktype_t& cur_lock, CPContext* context);
-    btree_status_t _lock_node(const BtreeNodePtr& node, locktype_t type, CPContext* context, const char* fname,
-                              int line) const;
-    void unlock_node(const BtreeNodePtr& node, locktype_t type) const;
-
-    BtreeNodePtr create_leaf_node(CPContext* context);
-    BtreeNodePtr create_interior_node(CPContext* context);
     BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf,
                          uint32_t ctx_size) const override;
-    void remove_node(const BtreeNodePtr& node, locktype_t cur_lock, CPContext* context);
-
-    void observe_lock_time(const BtreeNodePtr& node, locktype_t type, uint64_t time_spent) const;
-    static void _start_of_lock(const BtreeNodePtr& node, locktype_t ltype, const char* fname, int line);
-    static bool remove_locked_node(const BtreeNodePtr& node, locktype_t ltype, btree_locked_node_info* out_info);
-    static uint64_t end_of_lock(const BtreeNodePtr& node, locktype_t ltype);
-
-#ifndef NDEBUG
-    static void check_lock_debug();
-#endif
 
     /////////////////////////////////// Helper Methods ///////////////////////////////////////
     btree_status_t post_order_traversal(locktype_t acq_lock, const auto& cb);
@@ -342,25 +297,6 @@ private:
 
 protected:
     mutable iomgr::FiberManagerLib::shared_mutex m_btree_lock;
-    BtreeLinkInfo m_root_node_info;
-
-    BtreeMetrics m_metrics;
     std::atomic< bool > m_destroyed{false};
-    std::atomic< uint64_t > m_total_nodes{0};
-#ifndef NDEBUG
-    std::atomic< uint64_t > m_req_id{0};
-#endif
-#ifdef _PRERELEASE
-    BTREE_FLIPS m_flips;
-#endif
-    // This workaround of BtreeThreadVariables is needed instead of directly declaring statics
-    // to overcome the gcc bug, pointer here: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=66944
-    static BtreeThreadVariables* bt_thread_vars() {
-        auto this_id(boost::this_fiber::get_id());
-        static thread_local std::map< boost::fibers::fiber::id, std::unique_ptr< BtreeThreadVariables > > fiber_map;
-        if (fiber_map.count(this_id)) { return fiber_map[this_id].get(); }
-        fiber_map[this_id] = std::make_unique< BtreeThreadVariables >();
-        return fiber_map[this_id].get();
-    }
 };
 } // namespace homestore

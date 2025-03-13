@@ -131,6 +131,8 @@ public:
     virtual ~BtreeNode() {
 #ifndef TEST_BNODE_ONLY
         s_cast< BtreeStore* >(index_service().lookup_store(m_trans_hdr.store_type))->on_node_freed(this);
+#else
+        delete uintptr_cast(this);
 #endif
     }
 
@@ -607,7 +609,11 @@ public:
     friend void intrusive_ptr_add_ref(BtreeNode* node) { node->m_refcount.increment(1); }
 
     friend void intrusive_ptr_release(BtreeNode* node) {
-        if (node->m_refcount.decrement_testz(1)) { delete node; }
+        if (node->m_refcount.decrement_testz(1)) {
+            // Do not delete it here, since node is generally an offset inside actual allocation and delete will fail
+            // here (with asan). So let the on_node_freed from the underlying store delete the allocation.
+            node->~BtreeNode();
+        }
     }
 };
 

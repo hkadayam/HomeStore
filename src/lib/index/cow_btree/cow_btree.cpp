@@ -2,6 +2,7 @@
 #include "index/cow_btree/cow_btree.h"
 #include "index/cow_btree/cow_btree_cp.h"
 #include "index/cow_btree/cow_btree_node.h"
+#include "index/index_cp.h"
 #include "common/homestore_config.hpp"
 #include "device/virtual_dev.hpp"
 
@@ -38,7 +39,7 @@ COWBtree::COWBtree(BtreeBase& bt, shared< VirtualDev > vdev, shared< COWBtreeSto
         m_cache{std::move(cache)},
         m_nodeid_generator(std::numeric_limits< uint32_t >::max()),
         m_vdev{std::move(vdev)},
-        m_btree_ordinal{bt->super_blk()->ordinal},
+        m_btree_ordinal{bt.super_blk()->ordinal},
         m_ordinal_shifted{uint64_cast(m_btree_ordinal) << btree_nodeid_bits} {
     for (auto& cp_session : m_cp_sessions) {
         cp_session = std::make_unique< CPSession >(*this);
@@ -63,11 +64,11 @@ COWBtree::COWBtree(BtreeBase& bt, shared< VirtualDev > vdev, shared< COWBtreeSto
 
 uint32_t COWBtree::node_size() const { return m_vdev->atomic_page_size(); }
 
-BtreeNodePtr COWBtree::create_node(bool is_leaf, CPContext* context) {
+BtreeNodePtr COWBtree::create_node(bool is_leaf, CPContext*) {
     auto buf = hs_utils::iobuf_alloc(node_size(), sisl::buftag::btree_node, m_vdev->align_size());
     auto n = BtreeNodePtr{
         m_base_btree.init_node(buf, generate_node_id(), true /* init_buf */, is_leaf, sizeof(COWBtreeNode))};
-    new (uintptr_cast(n.get()) - sizeof(COWBtreeNode)) COWBtreeNode();
+    COWBtreeNode::construct(n);
 
     // Add the node to the cache
     bool done = m_cache->insert(n);
@@ -76,7 +77,7 @@ BtreeNodePtr COWBtree::create_node(bool is_leaf, CPContext* context) {
     return n;
 }
 
-btree_status_t COWBtree::write_node(BtreeNodePtr const& node, CPContext* context) {
+btree_status_t COWBtree::write_node(BtreeNodePtr const& node, CPContext*) {
     // All the required actions are performed during refresh_node with read_modify_write=true
     return btree_status_t::success;
 }
@@ -108,10 +109,14 @@ retry:
     return btree_status_t::success;
 }
 
-btree_status_t COWBtree::refresh_node(BtreeNodePtr const& node, bool for_read_modify_write, CPContext* context) const {
+static inline COWBtreeCPContext* to_my_cp_ctx(CPContext* context) {
+    return IndexCPContext::convert< COWBtreeCPContext >(context, IndexStore::Type::COPY_ON_WRITE_BTREE);
+}
+
+btree_status_t COWBtree::refresh_node(BtreeNodePtr const& node, bool for_read_modify_write, CPContext* context) {
     if (context == nullptr || !for_read_modify_write) { return btree_status_t::success; }
 
-    COWBtreeCPContext* cp_ctx = r_cast< COWBtreeCPContext* >(context);
+    auto cp_ctx = to_my_cp_ctx(context);
     auto const mod_cp_id = node->get_modified_cp_id();
     auto const cur_cp_id = cp_ctx->id();
     if (mod_cp_id == cur_cp_id) {
@@ -128,7 +133,7 @@ btree_status_t COWBtree::refresh_node(BtreeNodePtr const& node, bool for_read_mo
 
 void COWBtree::remove_node(BtreeNodePtr const& node, CPContext* context) {
     // Add the node id to dirty deleted list, which will be applied during the cp flush
-    COWBtreeCPContext* cp_ctx = r_cast< COWBtreeCPContext* >(context);
+    auto cp_ctx = to_my_cp_ctx(context);
     add_to_remove_list(node->node_id(), cp_ctx);
 
     // Now we can remove the node from cache.
@@ -141,18 +146,18 @@ btree_status_t COWBtree::transact_nodes(const BtreeNodeList& new_nodes, const Bt
                                         const BtreeNodePtr& left_child_node, const BtreeNodePtr& parent_node,
                                         CPContext* context) {
     for (const auto& node : new_nodes) {
-        write_node(node, context);
+        m_base_btree.write_node(node, context);
     }
-    write_node(left_child_node, context);
-    write_node(parent_node, context);
+    m_base_btree.write_node(left_child_node, context);
+    m_base_btree.write_node(parent_node, context);
 
     for (const auto& node : removed_nodes) {
-        remove_node(node, context);
+        m_base_btree.remove_node(node, locktype_t::WRITE, context);
     }
     return btree_status_t::success;
 }
 
-btree_status_t COWBtree::on_root_changed(BtreeNodePtr const& new_root, COWBtreeCPContext* cp_ctx) {
+btree_status_t COWBtree::on_root_changed(BtreeNodePtr const& new_root, CPContext* cp_ctx) {
     cp_session(cp_ctx->id())->m_new_root_id.store(new_root->node_id());
     return btree_status_t::success;
 }

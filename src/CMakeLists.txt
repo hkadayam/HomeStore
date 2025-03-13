@@ -53,6 +53,8 @@ set(HOMESTORE_OBJECTS
     $<TARGET_OBJECTS:hs_metablk>
     $<TARGET_OBJECTS:hs_checkpoint>
     $<TARGET_OBJECTS:hs_index>
+    $<TARGET_OBJECTS:hs_mem_btree>
+    $<TARGET_OBJECTS:hs_cow_btree>
     $<TARGET_OBJECTS:hs_datasvc>
     $<TARGET_OBJECTS:hs_replication>
     lib/homestore.cpp

@@ -8,6 +8,11 @@ unique< UnderlyingBtree > MemBtreeStore::on_btree_created(BtreeBase& btree, bool
     return std::make_unique< MemBtree >(btree);
 }
 
+void MemBtreeStore::on_node_freed(BtreeNode* node) {
+    uint8_t* ptr = uintptr_cast(node);
+    delete[] ptr;
+}
+
 MemBtree::MemBtree(BtreeBase& btree) : m_base_btree{btree} {}
 
 BtreeNodePtr MemBtree::create_node(bool is_leaf, CPContext*) {
@@ -27,7 +32,7 @@ btree_status_t MemBtree::read_node(bnodeid_t id, BtreeNodePtr& node) const {
     return btree_status_t::success;
 }
 
-btree_status_t MemBtree::refresh_node(BtreeNodePtr const& node, bool for_read_modify_write, CPContext*) const {
+btree_status_t MemBtree::refresh_node(BtreeNodePtr const& node, bool for_read_modify_write, CPContext*) {
     return btree_status_t::success;
 }
 
@@ -37,13 +42,13 @@ btree_status_t MemBtree::transact_nodes(BtreeNodeList const& new_nodes, BtreeNod
                                         BtreeNodePtr const& left_child_node, BtreeNodePtr const& parent_node,
                                         CPContext* context) {
     for (auto const& node : new_nodes) {
-        this->write_node(node, context);
+        m_base_btree.write_node(node, context);
     }
-    this->write_node(left_child_node, context);
-    this->write_node(parent_node, context);
+    m_base_btree.write_node(left_child_node, context);
+    m_base_btree.write_node(parent_node, context);
 
     for (auto const& node : freed_nodes) {
-        this->remove_node(node, context);
+        m_base_btree.remove_node(node, locktype_t::WRITE, context);
     }
     return btree_status_t::success;
 }

@@ -4,6 +4,7 @@
 #include "index/cow_btree/cow_btree_node.h"
 #include "index/cow_btree/cow_btree.h"
 #include "index/cow_btree/cow_btree_cp.h"
+#include "index/index_cp.h"
 #include "device/virtual_dev.hpp"
 
 #ifdef _PRERELEASE
@@ -72,6 +73,11 @@ COWBtreeStore::COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< I
         m_vdev{std::move(vdev)},
         m_node_size{node_size},
         m_vdev_blks_per_node{node_size / m_vdev->block_size()} {
+
+    // Register ourselves to the IndexCPCallbacks
+    r_cast< IndexCPCallbacks* >(cp_mgr().get_consumer(cp_consumer_t::INDEX_SVC))
+        ->register_consumer(IndexStore::Type::COPY_ON_WRITE_BTREE, std::make_unique< COWBtreeCPCallbacks >(this));
+
     if (store_sbs.size()) {
         // There can be multiple sbs, each sb containing a journal for a particular cp. We need to sort based on cp_id
         // and then split them as
@@ -106,10 +112,10 @@ unique< UnderlyingBtree > COWBtreeStore::on_btree_created(BtreeBase& btree, bool
     auto it = m_journals_by_btree.find(btree.ordinal());
     if (it == m_journals_by_btree.end()) {
         HS_DBG_ASSERT_EQ(load_existing, false, "Btree is asked to load, but its journal is missing");
-        cbtree = std::make_unique< COWBtree >(&btree, m_vdev, std::vector< sisl::byte_view >{}, load_existing);
+        cbtree = std::make_unique< COWBtree >(btree, m_vdev, m_cache, std::vector< sisl::byte_view >{}, load_existing);
     } else {
         HS_DBG_ASSERT_EQ(load_existing, true, "Btree is found, but we are asked to create a new one");
-        cbtree = std::make_unique< COWBtree >(&btree, m_vdev, std::move(it->second), load_existing);
+        cbtree = std::make_unique< COWBtree >(btree, m_vdev, m_cache, std::move(it->second), load_existing);
         m_journals_by_btree.erase(it); // We no longer need btree specific journal records after it is created.
     }
     return cbtree;

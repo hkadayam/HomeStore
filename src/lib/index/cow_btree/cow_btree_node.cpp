@@ -9,11 +9,13 @@ namespace homestore {
 BtreeNode* COWBtreeNode::to_btree_node() { return r_cast< BtreeNode* >(uintptr_cast(this) + sizeof(COWBtreeNode)); }
 
 COWBtreeNode* COWBtreeNode::construct(BtreeNodePtr const& node) {
-    new (uintptr_cast(node.get()) - sizeof(COWBtreeNode)) COWBtreeNode();
+    return new (uintptr_cast(node.get()) - sizeof(COWBtreeNode)) COWBtreeNode();
 }
 
 void COWBtreeNode::destruct(BtreeNode* node) {
-    r_cast< COWBtreeNode* >(uintptr_cast(node) - sizeof(COWBtreeNode))->~COWBtreeNode();
+    uint8_t* ptr = uintptr_cast(node) - sizeof(COWBtreeNode);
+    r_cast< COWBtreeNode* >(ptr)->~COWBtreeNode();
+    delete[] ptr;
 }
 
 COWBtreeNode* COWBtreeNode::convert(BtreeNodePtr const& n) {

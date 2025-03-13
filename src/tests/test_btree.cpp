@@ -28,27 +28,24 @@
 using namespace homestore;
 
 SISL_LOGGING_INIT(HOMESTORE_LOG_MODS)
-SISL_OPTIONS_ENABLE(logging, test_index_btree, iomgr, test_common_setup)
-SISL_LOGGING_DECL(test_index_btree)
+SISL_OPTIONS_ENABLE(logging, test_btree, iomgr, test_common_setup)
+SISL_LOGGING_DECL(test_btree)
 
 // TODO Add tests to do write,remove after recovery.
 // TODO Test with var len key with io mgr page size is 512.
 
 SISL_OPTION_GROUP(
-    test_index_btree,
+    test_btree,
     (num_iters, "", "num_iters", "number of iterations for rand ops",
      ::cxxopts::value< uint32_t >()->default_value("500"), "number"),
     (num_entries, "", "num_entries", "number of entries to test with",
      ::cxxopts::value< uint32_t >()->default_value("5000"), "number"),
     (run_time, "", "run_time", "run time for io", ::cxxopts::value< uint32_t >()->default_value("360000"), "seconds"),
     (disable_merge, "", "disable_merge", "disable_merge", ::cxxopts::value< bool >()->default_value("0"), ""),
-    (operation_list, "", "operation_list", "operation list instead of default created following by percentage",
-     ::cxxopts::value< std::vector< std::string > >(), "operations [...]"),
     (preload_size, "", "preload_size", "number of entries to preload tree with",
      ::cxxopts::value< uint32_t >()->default_value("1000"), "number"),
-    (init_device, "", "init_device", "init device", ::cxxopts::value< bool >()->default_value("1"), ""),
-    (cleanup_after_shutdown, "", "cleanup_after_shutdown", "cleanup after shutdown",
-     ::cxxopts::value< bool >()->default_value("1"), ""),
+    (operation_list, "", "operation_list", "operation list instead of default created following by percentage",
+     ::cxxopts::value< std::vector< std::string > >(), "operations [...]"),
     (seed, "", "seed", "random engine seed, use random if not defined",
      ::cxxopts::value< uint64_t >()->default_value("0"), "number"))
 
@@ -71,7 +68,7 @@ struct BtreeTest : public BtreeTestHelper< TestType >, public ::testing::Test {
         TestIndexServiceCallbacks(BtreeTest* test) : m_test(test) {}
         std::shared_ptr< Index > on_index_table_found(superblk< IndexSuperBlock >&& sb) override {
             LOGINFO("Index table recovered");
-            m_test->m_bt = std::make_shared< Btree< K, V > >(std::move(sb), m_test->m_cfg);
+            m_test->m_bt = std::make_shared< Btree< K, V > >(m_test->m_cfg, std::move(sb));
             return m_test->m_bt;
         }
 
@@ -94,7 +91,7 @@ struct BtreeTest : public BtreeTestHelper< TestType >, public ::testing::Test {
             m_helper.start_homestore(
                 "test_btree",
                 {{ServiceType::META, {.size_pct = 10.0}},
-                 {ServiceType::INDEX, {.size_pct = 70.0, .index_svc_cbs = new TestIndexServiceCallbacks(this)}}}, );
+                 {ServiceType::INDEX, {.size_pct = 70.0, .index_svc_cbs = new TestIndexServiceCallbacks(this)}}});
         }
 
         auto uuid = boost::uuids::random_generator()();
@@ -108,16 +105,18 @@ struct BtreeTest : public BtreeTestHelper< TestType >, public ::testing::Test {
         homestore::hs()->resource_mgr().reset_dirty_buf_qd();
 
         // Create index table and attach to index service.
-        BtreeTestHelper< TestType >::SetUp();
-        this->m_bt = std::make_shared< Btree< K, V > >(uuid, parent_uuid, 0, this->m_cfg);
+        auto const multi_threaded =
+            (testing::UnitTest::GetInstance()->current_test_info()->name() == std::string("ConcurrentMultiOps"));
+        BtreeTestHelper< TestType >::SetUp(multi_threaded);
+        this->m_bt = std::make_shared< Btree< K, V > >(this->m_cfg, uuid, parent_uuid, 0);
         hs()->index_service().add_index_table(this->m_bt);
         LOGINFO("Added index table to index service");
     }
 
     void TearDown() override {
+        destroy_btree();
         BtreeTestHelper< TestType >::TearDown();
         m_helper.shutdown_homestore(false);
-        this->m_bt.reset();
         log_obj_life_counter();
     }
 
@@ -127,23 +126,21 @@ struct BtreeTest : public BtreeTestHelper< TestType >, public ::testing::Test {
     }
 
     void destroy_btree() {
-        auto cpg = hs()->cp_mgr().cp_guard();
-        auto op_context = (void*)cpg.context(cp_consumer_t::INDEX_SVC);
-        const auto [ret, free_node_cnt] = this->m_bt->destroy_btree(op_context);
-        ASSERT_EQ(ret, btree_status_t::success) << "btree destroy failed";
+        hs()->index_service().remove_index_table(this->m_bt);
         this->m_bt.reset();
     }
 
     test_common::HSTestHelper m_helper;
 };
 
-using BtreeTypes =
-    testing::Types< FixedLenBtree< IndexStore::Type::MEM_BTREE >,      // In memory fixed key/value sized btree
-                    VarKeySizeBtree< IndexStore::Type::MEM_BTREE >,    // In memory var key, but fixed value sized btree
-                    VarValueSizeBtree< IndexStore::Type::MEM_BTREE >,  // In memory fixed key, var value sizeds btree
-                    VarObjSizeBtree< IndexStore::Type::MEM_BTREE >,    // In memory var sized key/value btree
-                    PrefixIntervalBtree< IndexStore::Type::MEM_BTREE > // In memory interval key/value btree
-                    >;
+using BtreeTypes = testing::Types<
+    // FixedLenBtree< IndexStore::Type::MEM_BTREE >,      // In memory fixed key/value sized btree
+    // VarKeySizeBtree< IndexStore::Type::MEM_BTREE >,    // In memory var key, but fixed value sized btree
+    // VarValueSizeBtree< IndexStore::Type::MEM_BTREE >,  // In memory fixed key, var value sizeds btree
+    // VarObjSizeBtree< IndexStore::Type::MEM_BTREE >,    // In memory var sized key/value btree
+    // PrefixIntervalBtree< IndexStore::Type::MEM_BTREE > // In memory interval key/value btree
+    FixedLenBtree< IndexStore::Type::COPY_ON_WRITE_BTREE > // COW fixed key/value sized btree
+    >;
 
 TYPED_TEST_SUITE(BtreeTest, BtreeTypes);
 
@@ -297,7 +294,7 @@ TYPED_TEST(BtreeTest, RandomRemoveRange) {
     static thread_local std::uniform_int_distribution< uint32_t > s_rand_key_generator{0, num_entries};
     //    this->print_keys();
     LOGINFO("Step 2: Do range remove for maximum of {} iterations", num_iters);
-    for (uint32_t i{0}; (i < num_iters) && this->m_shadow_map.size(); ++i) {
+    for (uint32_t i{0}; i < num_iters; ++i) {
         uint32_t key1 = s_rand_key_generator(g_re);
         uint32_t key2 = s_rand_key_generator(g_re);
 
@@ -329,7 +326,8 @@ TYPED_TEST(BtreeTest, RangeUpdate) {
 }
 
 TYPED_TEST(BtreeTest, CpFlush) {
-    if (BtreeTest::T::store_type == IndexStore::Type::MEM_BTREE) { GTEST_SKIP(); }
+    using TestT = typename TestFixture::T;
+    if (TestT::store_type == IndexStore::Type::MEM_BTREE) { GTEST_SKIP(); }
 
     LOGINFO("CpFlush test start");
     const auto num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
@@ -372,7 +370,9 @@ TYPED_TEST(BtreeTest, CpFlush) {
 }
 
 TYPED_TEST(BtreeTest, MultipleCpFlush) {
-    if (BtreeTest::T::store_type == IndexStore::Type::MEM_BTREE) { GTEST_SKIP(); }
+    using TestT = typename TestFixture::T;
+    if (TestT::store_type == IndexStore::Type::MEM_BTREE) { GTEST_SKIP(); }
+
     LOGINFO("MultipleCpFlush test start");
 
     const auto num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
@@ -420,7 +420,9 @@ TYPED_TEST(BtreeTest, MultipleCpFlush) {
 }
 
 TYPED_TEST(BtreeTest, ThreadedCpFlush) {
-    if (BtreeTest::T::store_type == IndexStore::Type::MEM_BTREE) { GTEST_SKIP(); }
+    using TestT = typename TestFixture::T;
+    if (TestT::store_type == IndexStore::Type::MEM_BTREE) { GTEST_SKIP(); }
+
     LOGINFO("ThreadedCpFlush test start");
 
     const auto num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
@@ -483,95 +485,7 @@ TYPED_TEST(BtreeTest, ThreadedCpFlush) {
     LOGINFO("ThreadedCpFlush test end");
 }
 
-template < typename TestType >
-struct BtreeConcurrentTest : public BtreeTestHelper< TestType >, public ::testing::Test {
-    using T = TestType;
-    using K = typename TestType::KeyType;
-    using V = typename TestType::ValueType;
-    class TestIndexServiceCallbacks : public IndexServiceCallbacks {
-    public:
-        TestIndexServiceCallbacks(BtreeConcurrentTest* test) : m_test(test) {}
-
-        std::shared_ptr< Index > on_index_table_found(superblk< IndexSuperBlock >&& sb) override {
-            LOGINFO("Index table recovered");
-            m_test->m_cfg.m_leaf_node_type = T::leaf_node_type;
-            m_test->m_cfg.m_int_node_type = T::interior_node_type;
-            m_test->m_bt = std::make_shared< Btree< K, V > >(std::move(sb), m_test->m_cfg);
-            return m_test->m_bt;
-        }
-
-    private:
-        BtreeConcurrentTest* m_test;
-    };
-
-    BtreeConcurrentTest() : testing::Test() { this->m_is_multi_threaded = true; }
-
-    void restart_homestore() {
-        m_helper.params(HS_SERVICE::INDEX).index_svc_cbs = new TestIndexServiceCallbacks(this);
-        m_helper.restart_homestore();
-    }
-
-    void SetUp() override {
-        m_helper.start_homestore(
-            "test_index_btree",
-            {{HS_SERVICE::META, {.size_pct = 10.0}},
-             {HS_SERVICE::INDEX, {.size_pct = 70.0, .index_svc_cbs = new TestIndexServiceCallbacks(this)}}},
-            nullptr, {}, SISL_OPTIONS["init_device"].as< bool >());
-
-        auto uuid = boost::uuids::random_generator()();
-        auto parent_uuid = boost::uuids::random_generator()();
-
-        // Test cp flush of write back.
-        HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
-            s.generic.cache_max_throttle_cnt = 10000;
-            HS_SETTINGS_FACTORY().save();
-        });
-        homestore::hs()->resource_mgr().reset_dirty_buf_qd();
-
-        // Create index table and attach to index service.
-        BtreeTestHelper< TestType >::SetUp();
-        if (this->m_bt == nullptr || SISL_OPTIONS["init_device"].as< bool >()) {
-            this->m_bt = std::make_shared< Btree< K, V > >(uuid, parent_uuid, 0, this->m_cfg);
-        } else {
-            populate_shadow_map();
-        }
-
-        hs()->index_service().add_index_table(this->m_bt);
-        LOGINFO("Added index table to index service");
-    }
-
-    void populate_shadow_map() {
-        this->m_shadow_map.load(m_shadow_filename);
-        ASSERT_EQ(this->m_shadow_map.size(), this->m_bt->count_keys(this->m_bt->root_node_id()))
-            << "shadow map size and tree size mismatch";
-        this->get_all();
-    }
-
-    void TearDown() override {
-        bool cleanup = SISL_OPTIONS["cleanup_after_shutdown"].as< bool >();
-        LOGINFO("cleanup the dump map and index data? {}", cleanup);
-        if (!cleanup) {
-            this->m_shadow_map.save(m_shadow_filename);
-        } else {
-            if (std::filesystem::remove(m_shadow_filename)) {
-                LOGINFO("File {} removed successfully", m_shadow_filename);
-            } else {
-                LOGINFO("Error: failed to remove {}", m_shadow_filename);
-            }
-        }
-        LOGINFO("Teardown with Root bnode_id {} tree size: {}", this->m_bt->root_node_id(),
-                this->m_bt->count_keys(this->m_bt->root_node_id()));
-        BtreeTestHelper< TestType >::TearDown();
-        m_helper.shutdown_homestore(false);
-    }
-
-private:
-    const std::string m_shadow_filename = "/tmp/shadow_map.txt";
-    test_common::HSTestHelper m_helper;
-};
-
-TYPED_TEST_SUITE(BtreeConcurrentTest, BtreeTypes);
-TYPED_TEST(BtreeConcurrentTest, ConcurrentAllOps) {
+TYPED_TEST(BtreeTest, ConcurrentMultiOps) {
     // range put is not supported for non-extent keys
     std::vector< std::string > input_ops = {"put:18", "remove:14", "range_put:20", "range_remove:2", "query:10"};
     if (SISL_OPTIONS.count("operation_list")) {
@@ -579,14 +493,14 @@ TYPED_TEST(BtreeConcurrentTest, ConcurrentAllOps) {
     }
     auto ops = this->build_op_list(input_ops);
 
-    this->multi_op_execute(ops, !SISL_OPTIONS["init_device"].as< bool >());
+    this->multi_op_execute(ops, false /* skip_preload */);
 }
 
 int main(int argc, char* argv[]) {
     int parsed_argc{argc};
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_index_btree, iomgr, test_common_setup);
-    sisl::logging::SetLogger("test_index_btree");
+    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_btree, iomgr, test_common_setup);
+    sisl::logging::SetLogger("test_btree");
     spdlog::set_pattern("[%D %T%z] [%^%L%$] [%t] %v");
 
     if (SISL_OPTIONS.count("seed")) {

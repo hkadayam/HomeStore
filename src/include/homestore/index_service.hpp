@@ -72,11 +72,13 @@ public:
 
 class Index {
 protected:
-    superblk< IndexSuperBlock > m_sb;
     bool const m_is_ephemeral; // Is it a persistent btree?
+    superblk< IndexSuperBlock > m_sb;
 
 public:
-    Index(bool is_ephermal) : m_is_ephemeral{is_ephermal} {}
+    Index(bool is_ephermal) : m_is_ephemeral{is_ephermal}, m_sb{"index_table"} {}
+    virtual ~Index() = default;
+
     bool is_ephemeral() const { return m_is_ephemeral; }
 
     // Destroys the index and remove all its resources. This could be delayed call as in actual destroy could

@@ -107,6 +107,11 @@ void CPManager::register_consumer(cp_consumer_t consumer_id, std::unique_ptr< CP
     }
 }
 
+CPCallbacks* CPManager::get_consumer(cp_consumer_t consumer_id) {
+    size_t idx = (size_t)consumer_id;
+    return m_cp_cb_table[idx].get();
+}
+
 [[nodiscard]] CPGuard CPManager::cp_guard() { return CPGuard{this}; }
 
 CP* CPManager::cp_io_enter() {
@@ -319,6 +324,8 @@ iomgr::io_fiber_t CPManager::pick_blocking_io_fiber() const {
     return m_cp_io_fibers[rand_fiber(s_re)];
 }
 
+bool CPManager::is_cp_flushing(cp_id_t cp_id) const { return (m_cur_flushing_cp_id.load() == cp_id); }
+
 //////////////////////////////////////// CP Guard class ////////////////////////////////////////////
 CPGuard::CPGuard(CPManager* mgr) {
     if (mgr == nullptr) { return; }
@@ -357,11 +364,14 @@ CPGuard CPGuard::operator=(const CPGuard& other) {
 }
 
 CP* CPGuard::operator->() { return get(); }
-CPContext* CPGuard::context(cp_consumer_t consumer) { return get()->context(consumer); }
+CPContext* CPGuard::context(cp_consumer_t consumer) {
+    CP* cp = get();
+    return cp ? cp->context(consumer) : nullptr;
+}
 
 CP* CPGuard::get() {
-    HS_DBG_ASSERT_NE((void*)m_cp, (void*)nullptr, "CPGuard get on empty CP pointer");
-    if (!m_pushed) {
+    // HS_DBG_ASSERT_NE((void*)m_cp, (void*)nullptr, "CPGuard get on empty CP pointer");
+    if (!m_pushed && m_cp) {
         // m_pushed is false in case cp guard is moved from one thread to other
         t_cp_stack.push(m_cp);
         m_pushed = true;

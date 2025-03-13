@@ -25,6 +25,7 @@
 #include "index/cow_btree/cow_btree_store.h"
 //#include "index/inplace_btree/inplace_btree_store.h"
 #include "index/mem_btree/mem_btree_store.h"
+#include "index/index_cp.h"
 
 namespace homestore {
 IndexService& index_service() { return hs()->index_service(); }
@@ -77,6 +78,8 @@ shared< VirtualDev > IndexService::open_vdev(ServiceSubType sub_type, const vdev
 }
 
 void IndexService::start() {
+    cp_mgr().register_consumer(cp_consumer_t::INDEX_SVC, std::move(std::make_unique< IndexCPCallbacks >()));
+
     if (m_store_sbs.size()) {
         // Segregate the index store super blocks based on the store type
         std::unordered_map< IndexStore::Type, std::vector< superblk< IndexStoreSuperBlock > > > m;
@@ -199,11 +202,11 @@ std::vector< shared< Index > > IndexService::get_all_index_tables() const {
 
 uint32_t IndexService::reserve_ordinal() { return m_ordinal_reserver->reserve(); }
 
-uint64_t IndexService::used_size() const {
+uint64_t IndexService::space_occupied() const {
     auto size{0};
     std::unique_lock lg{m_index_map_mtx};
     for (auto& [id, index] : m_index_map) {
-        size += index->used_size();
+        size += index->space_occupied();
     }
     return size;
 }

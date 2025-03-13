@@ -37,13 +37,13 @@
 namespace homestore {
 template < typename K, typename V >
 Btree< K, V >::Btree(BtreeConfig const& cfg, uuid_t uuid, uuid_t parent_uuid, uint32_t user_sb_size) :
-        BtreeBase::BtreeBase(cfg, uuid, parent_uuid, user_sb_size), m_metrics{cfg.name().c_str()} {
+        BtreeBase::BtreeBase(cfg, uuid, parent_uuid, user_sb_size) {
     create_root_node();
 }
 
 template < typename K, typename V >
 Btree< K, V >::Btree(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb) :
-        BtreeBase::BtreeBase(cfg, std::move(sb)), m_metrics{cfg.name().c_str()} {}
+        BtreeBase::BtreeBase(cfg, std::move(sb)) {}
 
 template < typename K, typename V >
 Btree< K, V >::~Btree() {
@@ -191,7 +191,7 @@ template < typename K, typename V >
 std::string Btree< K, V >::to_string() const {
     std::string buf;
     m_btree_lock.lock_shared();
-    to_string(m_root_node_info.bnode_id(), buf);
+    to_string_internal(m_root_node_info.bnode_id(), buf);
     m_btree_lock.unlock_shared();
     BT_LOG(DEBUG, "Pre order traversal of tree:\n<{}>", buf);
 
@@ -257,7 +257,7 @@ void Btree< K, V >::dump(const std::string& file, std::string format, BtreeNode:
     } else if (format == "dot") {
         BT_LOG(DEBUG, "Dumping btree to dot format");
         buf = to_digraph_visualize_format();
-    } else if (format = "custom") {
+    } else if (format == "custom") {
         if (cb == nullptr) {
             BT_LOG(WARN, "Custom format requested but no callback provided, dumping as string");
             buf = to_string();

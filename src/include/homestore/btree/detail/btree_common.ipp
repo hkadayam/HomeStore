@@ -100,7 +100,7 @@ btree_status_t Btree< K, V >::do_destroy() {
             // On ephemeral btree, we can directly remove the node, however on non-ephemeral btree, we need to do so
             // only at checkpoint time, which should be handled by the store themselves.
             remove_node(node, locktype_t::WRITE, nullptr);
-            return btree_status_t::success;
+            return btree_status_t::node_freed;
         });
     } else if (!m_store->is_fast_destroy_supported()) {
         // TODO: Need to be implemented. We need to create a BtreeRangeRemoveRequest and put the entire range in the

@@ -42,11 +42,12 @@ struct BtreeTestHelper {
 
     BtreeTestHelper() : m_shadow_map{SISL_OPTIONS["num_entries"].as< uint32_t >()} {}
 
-    void SetUp() {
+    void SetUp(bool is_multi_threaded = false) {
         m_cfg.m_leaf_node_type = T::leaf_node_type;
         m_cfg.m_int_node_type = T::interior_node_type;
         m_cfg.m_store_type = T::store_type;
         m_max_range_input = SISL_OPTIONS["num_entries"].as< uint32_t >();
+        m_is_multi_threaded = is_multi_threaded;
         if (SISL_OPTIONS.count("disable_merge")) { m_cfg.m_merge_turned_on = false; }
 
         if (m_is_multi_threaded) {
@@ -374,7 +375,7 @@ public:
         run_in_parallel(op_list);
     }
 
-    void dump_to_file(const std::string& file = "") const { m_bt->dump_tree_to_file(file); }
+    void dump_to_file(const std::string& file = "") const { m_bt->dump(file); }
     void print_keys(const std::string& preamble = "") const {
         auto print_key_range = [](std::vector< std::pair< K, V > > const& kvs) -> std::string {
             uint32_t start = 0;

@@ -188,6 +188,8 @@ public:
     /// @param callbacks : Callbacks denoted by the consumers. Details are provided in CPCallbacks class
     void register_consumer(cp_consumer_t consumer_id, std::unique_ptr< CPCallbacks > callbacks);
 
+    CPCallbacks* get_consumer(cp_consumer_t consumer_id);
+
     /// @brief Call this method before every IO that needs to be checkpointed. It marks the entrance of critical section
     /// of the returned CP and ensures that until it is exited, flush of the CP will not happen.
     ///

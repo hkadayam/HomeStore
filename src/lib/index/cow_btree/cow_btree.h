@@ -25,8 +25,7 @@ public:
     BtreeNodePtr create_node(bool is_leaf, CPContext* context) override;
     btree_status_t write_node(const BtreeNodePtr& node, CPContext* context) override;
     btree_status_t read_node(bnodeid_t id, BtreeNodePtr& node) const override;
-    btree_status_t refresh_node(const BtreeNodePtr& node, bool for_read_modify_write,
-                                CPContext* context) const override;
+    btree_status_t refresh_node(const BtreeNodePtr& node, bool for_read_modify_write, CPContext* context) override;
     void remove_node(const BtreeNodePtr& node, CPContext* context) override;
     btree_status_t transact_nodes(const BtreeNodeList& new_nodes, const BtreeNodeList& removed_nodes,
                                   const BtreeNodePtr& left_child_node, const BtreeNodePtr& parent_node,
@@ -38,8 +37,6 @@ public:
     bnodeid_t generate_node_id();
     void add_to_dirty_list(BtreeNodePtr const& node, COWBtreeCPContext* cp_ctx);
     void add_to_remove_list(bnodeid_t node_id, COWBtreeCPContext* cp_ctx);
-
-    void on_root_changed(BtreeNodePtr const& new_root, COWBtreeCPContext* cp_ctx);
     void on_btree_destroyed();
 
     BlkId get_blkid_for_nodeid(bnodeid_t nodeid) const;
@@ -244,7 +241,7 @@ private:
     CPSession* cp_session(cp_id_t cp_id);
 
     BtreeSuperBlock const& bt_super_blk() const {
-        return *(r_cast< BtreeSuperBlock const* >(m_base_btree->super_blk()->underlying_index_sb.data()));
+        return *(r_cast< BtreeSuperBlock const* >(m_base_btree.super_blk()->underlying_index_sb.data()));
     }
 
     BtreeSuperBlock& bt_super_blk() {

@@ -33,8 +33,6 @@ public:
     };
 #pragma pack()
 
-    using CacheType = sisl::SimpleCache< bnodeid_t, BtreeNodePtr >;
-
 private:
     shared< VirtualDev > m_vdev;
 

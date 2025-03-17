@@ -101,7 +101,7 @@ unique< UnderlyingBtree > COWBtreeStore::create_underlying_btree(BtreeBase& btre
                                               load_existing);
     } else {
         HS_DBG_ASSERT_EQ(load_existing, true, "Btree is found, but we are asked to create a new one");
-        cbtree = std::make_unique< COWBtree >(btree, m_vdev, m_cache, std::move(it->second), load_existing);
+        cbtree = std::make_unique< COWBtree >(btree, m_vdev, std::move(it->second), load_existing);
         m_journals_by_btree.erase(it); // We no longer need btree specific journal records after it is created.
     }
     return cbtree;

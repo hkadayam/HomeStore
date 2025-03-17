@@ -42,7 +42,13 @@ COWBtree::COWBtree(BtreeBase& bt, shared< VirtualDev > vdev,
                    shared< sisl::SimpleCache< bnodeid_t, BtreeNodePtr > > cache,
                    std::vector< unique< Journal > > journals, bool load_existing) :
         m_base_btree{bt},
-        m_cache{std::move(cache)},
+        m_cache{std::make_unique< sisl::SimpleCache< bnodeid_t, BtreeNodePtr > >(
+            hs()->evictor(), 50000, bt.bt_config().node_size(),
+            [](const BtreeNodePtr& node) -> bnodeid_t { return node->node_id(); },
+            [](const sisl::CacheRecord& rec) -> bool {
+                const auto& hnode = (sisl::SingleEntryHashNode< BtreeNodePtr >&)rec;
+                return (hnode.m_value->m_refcount.test_le(1));
+            })},
         m_nodeid_generator(std::numeric_limits< uint32_t >::max()),
         m_vdev{std::move(vdev)},
         m_btree_ordinal{bt.super_blk()->ordinal},

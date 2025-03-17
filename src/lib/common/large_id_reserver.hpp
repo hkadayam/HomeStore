@@ -4,12 +4,12 @@
 #include <boost/icl/interval_map.hpp>
 #include "common/homestore_assert.hpp"
 
-using IntervalSet = boost::icl::interval_set< uint32_t >;
-using Interval = IntervalSet::interval_type;
-
 namespace homestore {
 class LargeIDReserver {
 private:
+    using IntervalSet = boost::icl::interval_set< uint32_t >;
+    using Interval = IntervalSet::interval_type;
+
     IntervalSet m_iset;
     uint64_t m_max;
 
@@ -21,7 +21,7 @@ public:
     uint64_t reserve() {
         uint64_t id = find_next();
         if (id >= m_max) { return out_of_bounds; }
-        m_iset.insert(id);
+        m_iset.insert(Interval::right_open(id, id + 1));
         return id;
     }
 

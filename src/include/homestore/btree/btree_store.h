@@ -30,5 +30,7 @@ public:
     virtual bool is_fast_destroy_supported() const = 0;
 
     virtual bool is_ephemeral() const = 0;
+
+    virtual uint32_t max_node_size() const = 0;
 };
 } // namespace homestore

@@ -66,4 +66,5 @@ set(HOMESTORE_OBJECTS
 add_library(homestore STATIC 
     ${HOMESTORE_OBJECTS} 
 )
+target_compile_definitions (homestore PRIVATE LOG_MODS_V2_SUPPORT)
 target_link_libraries(homestore ${COMMON_DEPS})

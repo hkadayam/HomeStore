@@ -135,9 +135,7 @@ shared< IndexStore > IndexService::lookup_or_create_store(IndexStore::Type store
 
     switch (store_type) {
     case IndexStore::Type::COPY_ON_WRITE_BTREE:
-        store =
-            std::make_shared< COWBtreeStore >(get_vdev(ServiceSubType::INDEX_BTREE_COPY_ON_WRITE), std::move(sbs),
-                                              hs()->evictor(), hs()->device_mgr()->atomic_page_size(HSDevType::Fast));
+        store = std::make_shared< COWBtreeStore >(get_vdev(ServiceSubType::INDEX_BTREE_COPY_ON_WRITE), std::move(sbs));
         break;
 
     case IndexStore::Type::INPLACE_BTREE:
@@ -166,18 +164,19 @@ void IndexService::add_index_table(const shared< Index >& index) {
     m_ordinal_index_map.insert(std::make_pair(index->ordinal(), index));
 }
 
-void IndexService::remove_index_table(const shared< Index >& index) {
-    // It will call the destroy and let the index store calls the remove index table entry when it is ready to purge.
+void IndexService::destroy_index_table(const shared< Index >& index) {
+    auto const uuid = index->uuid();
+    auto const ordinal = index->ordinal();
     index->destroy();
-}
+    {
+        std::unique_lock lg(m_index_map_mtx);
+        auto it = m_index_map.find(uuid);
+        if (it == m_index_map.end()) { return; }
 
-void IndexService::remove_index_table_entry(uuid_t uuid) {
-    std::unique_lock lg(m_index_map_mtx);
-    auto it = m_index_map.find(uuid);
-    if (it == m_index_map.end()) { return; }
-    m_ordinal_index_map.erase(it->second->ordinal());
-    m_ordinal_reserver->unreserve(it->second->ordinal());
-    m_index_map.erase(it);
+        m_ordinal_index_map.erase(ordinal);
+        m_ordinal_reserver->unreserve(ordinal);
+        m_index_map.erase(it);
+    }
 }
 
 shared< Index > IndexService::get_index_table(uuid_t uuid) const {

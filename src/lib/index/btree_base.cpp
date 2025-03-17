@@ -20,15 +20,16 @@ BtreeBase::BtreeBase(BtreeConfig const& cfg, uuid_t uuid, uuid_t parent_uuid, ui
     auto bt_sb = new (m_sb.get()->underlying_index_sb.data()) BtreeSuperBlock();
     m_store =
         std::static_pointer_cast< BtreeStore >(hs()->index_service().lookup_or_create_store(cfg.store_type(), {}));
+
+    // Determine the correct node size
+    auto const max_node_size = m_store->max_node_size();
+    if ((m_bt_cfg.m_node_size == 0) || (m_bt_cfg.m_node_size > max_node_size)) { m_bt_cfg.m_node_size = max_node_size; }
+    m_bt_cfg.finalize(sizeof(BtreeNode::PersistentHeader));
+
+    // Create the underlying btree instance
     m_bt_private = std::move(m_store->on_btree_created(*this, false /* load_existing */));
 
-    if (m_bt_cfg.node_size() == 0) {
-        // Caller is requesting to use underlying btree's node size
-        m_bt_cfg.m_node_size = m_bt_private->node_size();
-    }
-    m_bt_cfg.finalize(sizeof(BtreeNode::PersistentHeader));
-    bt_sb->node_size = m_bt_cfg.node_size();
-
+    bt_sb->node_size = m_bt_cfg.m_node_size;
     m_sb.write();
 }
 
@@ -36,12 +37,21 @@ BtreeBase::BtreeBase(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb) :
         Index::Index{cfg.store_type() == IndexStore::Type::MEM_BTREE},
         m_bt_cfg{cfg},
         m_metrics{m_bt_cfg.name().c_str()} {
-    HS_REL_ASSERT_EQ(cfg.store_type(), m_sb->index_store_type,
+    HS_REL_ASSERT_EQ(cfg.store_type(), sb->index_store_type,
                      "Config requirement and super block differs in store_type");
     m_sb = std::move(sb);
     m_store =
         std::static_pointer_cast< BtreeStore >(hs()->index_service().lookup_or_create_store(cfg.store_type(), {}));
+
+    // Retrieve the correct node_size
+    auto bt_sb = r_cast< BtreeSuperBlock* >(m_sb.get()->underlying_index_sb.data());
+    m_bt_cfg.m_node_size = bt_sb->node_size;
+    HS_DBG_ASSERT_NE(bt_sb->node_size, 0, "Invalid node_size in the btree super block");
+    HS_DBG_ASSERT_LE(bt_sb->node_size, m_store->max_node_size(),
+                     "Node size in btree super block, exceeds store max node size");
     m_bt_cfg.finalize(sizeof(BtreeNode::PersistentHeader));
+
+    m_root_node_info = BtreeLinkInfo{bt_sb->root_node_id, bt_sb->root_link_version};
     m_bt_private = std::move(m_store->on_btree_created(*this, true /* load_existing*/));
 }
 

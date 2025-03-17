@@ -70,7 +70,7 @@ public:
     }
 };
 
-class Index {
+class Index : public std::enable_shared_from_this< Index > {
 protected:
     bool const m_is_ephemeral; // Is it a persistent btree?
     superblk< IndexSuperBlock > m_sb;
@@ -127,8 +127,7 @@ public:
 
     // Add/Remove Index Table to/from the index service
     void add_index_table(shared< Index > const& tbl);
-    void remove_index_table(shared< Index > const& tbl);
-    void remove_index_table_entry(uuid_t uuid);
+    void destroy_index_table(shared< Index > const& tbl);
 
     shared< Index > get_index_table(uuid_t uuid) const;
     shared< Index > get_index_table(uint32_t ordinal) const;

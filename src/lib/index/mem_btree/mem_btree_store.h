@@ -20,6 +20,7 @@ public:
     void on_node_freed(BtreeNode* node) override;
     bool is_fast_destroy_supported() const override { return true; }
     bool is_ephemeral() const override { return true; }
+    uint32_t max_node_size() const override { return 4096u; }
 };
 
 class MemBtree : public UnderlyingBtree {
@@ -35,7 +36,6 @@ public:
                                   CPContext* context) override;
     btree_status_t on_root_changed(BtreeNodePtr const&, CPContext*) override;
     uint64_t space_occupied() const override { return 0; }
-    uint32_t node_size() const override { return 4096u; }
 
 private:
     BtreeBase& m_base_btree;

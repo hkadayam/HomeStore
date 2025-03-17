@@ -64,6 +64,8 @@ HomeStore* HomeStore::instance() {
 }
 
 HomeStore::HomeStore() {
+    REGISTER_LOG_MODS(HOMESTORE_LOG_MODS);
+
     // Always start the meta service
     for (uint32_t i{0}; i < enum_count< ServiceType >(); ++i) {
         m_services.emplace_back(std::vector< ServiceSubType >{});

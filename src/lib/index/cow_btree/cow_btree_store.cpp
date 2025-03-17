@@ -61,19 +61,8 @@ static std::vector< iomgr::io_fiber_t > start_flush_threads() {
     return std::move(ctx->cp_flush_fibers);
 }
 
-COWBtreeStore::COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< IndexStoreSuperBlock > > store_sbs,
-                             shared< sisl::Evictor > evictor, uint32_t node_size) :
-        m_cache{std::make_shared< CacheType >(
-            std::move(evictor), 100000, node_size,
-            [](const BtreeNodePtr& node) -> bnodeid_t { return node->node_id(); },
-            [](const sisl::CacheRecord& rec) -> bool {
-                const auto& hnode = (sisl::SingleEntryHashNode< BtreeNodePtr >&)rec;
-                return (hnode.m_value->m_refcount.test_le(1));
-            })},
-        m_vdev{std::move(vdev)},
-        m_node_size{node_size},
-        m_vdev_blks_per_node{node_size / m_vdev->block_size()} {
-
+COWBtreeStore::COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< IndexStoreSuperBlock > > store_sbs) :
+        m_vdev{std::move(vdev)} {
     // Register ourselves to the IndexCPCallbacks
     r_cast< IndexCPCallbacks* >(cp_mgr().get_consumer(cp_consumer_t::INDEX_SVC))
         ->register_consumer(IndexStore::Type::COPY_ON_WRITE_BTREE, std::make_unique< COWBtreeCPCallbacks >(this));
@@ -92,6 +81,9 @@ COWBtreeStore::COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< I
     }
     m_cp_flush_fibers = std::move(start_flush_threads());
 }
+
+uint32_t COWBtreeStore::max_node_size() const { return m_vdev->atomic_page_size(); }
+uint32_t COWBtreeStore::align_size() const { return m_vdev->align_size(); }
 
 void COWBtreeStore::on_recovery_completed() {
     HS_DBG_ASSERT_EQ(m_journals_by_btree.size(), 0,
@@ -112,29 +104,70 @@ unique< UnderlyingBtree > COWBtreeStore::on_btree_created(BtreeBase& btree, bool
     auto it = m_journals_by_btree.find(btree.ordinal());
     if (it == m_journals_by_btree.end()) {
         HS_DBG_ASSERT_EQ(load_existing, false, "Btree is asked to load, but its journal is missing");
-        cbtree = std::make_unique< COWBtree >(btree, m_vdev, m_cache, std::vector< sisl::byte_view >{}, load_existing);
+        cbtree = std::make_unique< COWBtree >(btree, m_vdev, std::vector< sisl::byte_view >{}, load_existing);
     } else {
         HS_DBG_ASSERT_EQ(load_existing, true, "Btree is found, but we are asked to create a new one");
-        cbtree = std::make_unique< COWBtree >(btree, m_vdev, m_cache, std::move(it->second), load_existing);
+        cbtree = std::make_unique< COWBtree >(btree, m_vdev, std::move(it->second), load_existing);
         m_journals_by_btree.erase(it); // We no longer need btree specific journal records after it is created.
     }
     return cbtree;
 }
 
 void COWBtreeStore::on_btree_destroyed(BtreeBase& bt) {
-    to_cow_btree(bt)->on_btree_destroyed();
-    hs()->index_service().remove_index_table_entry(bt.uuid());
+    CPGuard cpg = cp_mgr().cp_guard();
+    auto context = cpg->context(cp_consumer_t::INDEX_SVC);
+    auto cp_ctx = IndexCPContext::convert< COWBtreeCPContext >(context, IndexStore::Type::COPY_ON_WRITE_BTREE);
+
+    {
+        std::unique_lock lg{cp_ctx->m_bt_list_mtx};
+        cp_ctx->m_destroyed_btrees.emplace_back(bt.shared_from_this());
+    }
 }
 
 void COWBtreeStore::on_node_freed(BtreeNode* node) { COWBtreeNode::destruct(node); }
+
+class CPFlushGuard {
+public:
+    CPFlushGuard(COWBtreeCPContext* ctx, std::function< void(COWBtreeCPContext* cp_ctx) > done_cb) :
+            m_cp_ctx{ctx}, m_done_cb{std::move(done_cb)} {
+        ctx->m_flushing_fibers_count.increment(1);
+    }
+
+    ~CPFlushGuard() {
+        if (m_cp_ctx->m_flushing_fibers_count.decrement_testz(1)) { m_done_cb(m_cp_ctx); }
+    }
+
+    CPFlushGuard(CPFlushGuard const& other) {
+        m_cp_ctx = other.m_cp_ctx;
+        m_done_cb = other.m_done_cb;
+        m_cp_ctx->m_flushing_fibers_count.increment(1);
+    }
+
+    CPFlushGuard(CPFlushGuard&& other) = delete;
+
+    CPFlushGuard operator=(CPFlushGuard const& other) {
+        m_cp_ctx = other.m_cp_ctx;
+        m_done_cb = other.m_done_cb;
+        m_cp_ctx->m_flushing_fibers_count.increment(1);
+        return *this;
+    }
+
+    CPFlushGuard operator=(CPFlushGuard&& other) = delete;
+
+    COWBtreeCPContext* cp_ctx() { return m_cp_ctx; }
+
+private:
+    COWBtreeCPContext* m_cp_ctx;
+    std::function< void(COWBtreeCPContext* ctx) > m_done_cb;
+};
 
 folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
     LOGTRACEMOD(btree, "Starting COWBtree CP Flush with cp context={}", cp_ctx->to_string());
     if (!cp_ctx->any_dirty_nodes()) {
         if (cp_ctx->id() == 0) {
             // For the first CP, we need to flush the journal buffer to the meta blk
-            LOGINFO("First time boot cp, we shall flush the vdev to ensure all cp information is created");
-            m_vdev->cp_flush(cp_ctx);
+            // LOGINFO("First time boot cp, we shall flush the vdev to ensure all cp information is created");
+            // m_vdev->cp_flush(cp_ctx);
         } else {
             CP_PERIODIC_LOG(DEBUG, cp_ctx->id(), "Btree does not have any dirty buffers to flush");
         }
@@ -148,18 +181,31 @@ folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
     }
 #endif
 
+    // Prepare the header for the journal to be written. The header details will be filled along the way while flushing
+    cp_ctx->prepare_store_journal();
+
     // Get all the current btrees in the system.
     cp_ctx->m_all_btrees = std::move(hs()->index_service().get_all_index_tables());
+    auto on_flush_nodes_done = [this](COWBtreeCPContext* cp_ctx) {
+        // If there are any destroyed btrees as part of the CP, do the actual destroy now.
+        for (auto& btree : cp_ctx->m_destroyed_btrees) {
+            to_cow_btree(btree.get())->destroy();
+        }
 
+        // All dirty nodes from all btrees have been flushed, now we can flush the full map or journal
+        // (depending on cp type) for each of the modified btree
+        flush_map(cp_ctx);
+    };
+
+    CPFlushGuard fg{cp_ctx, on_flush_nodes_done};
     for (auto& fiber : m_cp_flush_fibers) {
-        iomanager.run_on_forget(fiber, [this, cp_ctx]() {
-            cp_ctx->m_flushing_fibers_count.increment(1);
-
+        iomanager.run_on_forget(fiber, [fg]() mutable {
             // Each thread will walk through all btrees created and alive at the point of CP flush and try to flush
             // their dirty nodes. We take this approach as against marking the dirtied btree seperately while dirtying
             // is that, we keep the code path of dirtying as waitfree as possible. It is more critical code path.
             // However, we pay the cost during the flushing by walking across all btrees and then check if they are
             // dirty. I feel this is much lower cost than doing in critical IO path.
+            auto cp_ctx = fg.cp_ctx();
             for (auto const& btree : cp_ctx->m_all_btrees) {
                 COWBtree* cow_btree = to_cow_btree(btree.get());
                 auto const [has_flushed, journal, is_sb_changed] = cow_btree->flush_nodes(cp_ctx);
@@ -174,45 +220,44 @@ folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
                     if (cp_ctx->need_full_map_flush()) {
                         cp_ctx->m_active_btree_list.emplace_back(cow_btree);
                     } else {
-                        cp_ctx->m_merged_journal_buf.append(journal->m_base_buf);
+                        cp_ctx->append_btree_journal(journal->m_base_buf);
                         if (is_sb_changed) { cp_ctx->m_active_btree_list.emplace_back(cow_btree); }
                     }
                 }
             }
-
-            if (cp_ctx->m_flushing_fibers_count.decrement_testz(1)) {
-                // All dirty nodes from all btrees have been flushed, now we can flush the full map or journal
-                // (depending on cp type) for each of the modified btree
-                flush_map(cp_ctx);
-            }
         });
     }
+
     return std::move(cp_ctx->get_future());
 }
 
 void COWBtreeStore::flush_map(COWBtreeCPContext* cp_ctx) {
     if (cp_ctx->need_full_map_flush()) {
+        auto on_flush_map_done = [this](COWBtreeCPContext* cp_ctx) {
+            // We just flushed the full bnode map of all btrees, we can remove all previous journal
+            // superblks
+            for (auto& journal : m_journals_by_cpid) {
+                journal.destroy();
+            }
+            cp_ctx->complete(true);
+        };
+
+        CPFlushGuard fg{cp_ctx, on_flush_map_done};
         for (auto& fiber : m_cp_flush_fibers) {
-            iomanager.run_on_forget(fiber, [this, cp_ctx]() {
-                cp_ctx->m_flushing_fibers_count.increment(1);
+            iomanager.run_on_forget(fiber, [fg]() mutable {
+                auto cp_ctx = fg.cp_ctx();
+
                 // Yes we access m_active_btree_list outside of lock, but we are sure that there is no one mutating this
                 // btree list
                 for (auto cow_btree : cp_ctx->m_active_btree_list) {
                     cow_btree->flush_map_and_sb(cp_ctx);
                 }
-                if (cp_ctx->m_flushing_fibers_count.decrement_testz(1)) {
-                    // We just flushed the full bnode map of all btrees, we can remove all previous journal superblks
-                    for (auto& journal : m_journals_by_cpid) {
-                        journal.destroy();
-                    }
-                    cp_ctx->complete(true);
-                }
             });
         }
     } else {
         auto sb = superblk< IndexStoreSuperBlock >{"index_store"};
-        sb.load(cp_ctx->m_merged_journal_buf.view(), nullptr); // Load an empty meta_blk but with given buffer
-        sb.write();                                     // Write the metablk
+        sb.load(cp_ctx->store_journal(), nullptr); // Load an empty meta_blk but with given buffer
+        sb.write();                                // Write the metablk
         sb.raw_buf().reset(); // after we wrote the superblk, we no longer need the merged journal buffer, free it
         m_journals_by_cpid.emplace_back(std::move(sb)); // Append to the end in the journal
 

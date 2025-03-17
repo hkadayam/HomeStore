@@ -25,11 +25,11 @@
 #include <homestore/checkpoint/cp.hpp>
 #include <iomgr/fiber_lib.hpp>
 #include "device/virtual_dev.hpp"
+#include "index/cow_btree/cow_btree_store.h"
 
 namespace homestore {
 class Index;
 class COWBtree;
-class COWBtreeStore;
 
 class COWBtreeCPCallbacks : public CPCallbacks {
 public:
@@ -46,7 +46,7 @@ private:
     COWBtreeStore* m_bt_store;
 };
 
-struct COWBtreeCPContext : public VDevCPContext {
+struct COWBtreeCPContext : public CPContext {
 public:
     sisl::atomic_counter< int64_t > m_dirty_node_count{0};
     sisl::atomic_counter< int64_t > m_removed_node_count{0};
@@ -55,15 +55,22 @@ public:
 
     iomgr::FiberManagerLib::shared_mutex m_bt_list_mtx;
     std::vector< shared< Index > > m_all_btrees;
+    std::vector< shared< Index > > m_destroyed_btrees;
     std::vector< COWBtree* > m_active_btree_list;
     sisl::buf_builder m_merged_journal_buf;
+    COWBtreeStore::Journal* m_journal_header;
 
 public:
-    COWBtreeCPContext(CP* cp, uint32_t parallel_flushers_count) :
-            VDevCPContext(cp), m_parallel_flushers_count{parallel_flushers_count} {}
+    COWBtreeCPContext(CP* cp, uint32_t parallel_flushers_count, uint32_t journal_align_size) :
+            CPContext(cp),
+            m_parallel_flushers_count{parallel_flushers_count},
+            m_merged_journal_buf{4096u, journal_align_size, sisl::buftag::btree_journal} {}
     virtual ~COWBtreeCPContext() = default;
     bool need_full_map_flush() const;
     bool any_dirty_nodes() const { return (!m_dirty_node_count.testz() || !m_removed_node_count.testz()); }
+    void prepare_store_journal();
+    void append_btree_journal(sisl::io_blob_safe const& btree_journal_buf);
+    sisl::byte_view store_journal() const;
     std::string to_string() const;
 };
 } // namespace homestore

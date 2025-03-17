@@ -3,7 +3,6 @@
 #include <vector>
 #include <atomic>
 #include <unordered_map>
-#include <sisl/cache/simple_cache.hpp>
 
 #include <homestore/blk.h>
 #include <homestore/btree/btree_store.h>
@@ -23,22 +22,15 @@ public:
     struct Journal : public IndexStoreSuperBlock {
     public:
         cp_id_t cp_id;                   // CP Id for this journal, we have one meta blk which contains journal per CP
-        uint32_t size;                   // Total journal size
+        uint32_t size{sizeof(Journal)};  // Total journal size
         uint32_t num_btrees{0};          // Total number of btrees updated in this
-        uint32_t total_written_nodes{0}; // Total number of nodes written in this journal
-        uint32_t total_removed_nodes{0}; // Total number of nodes removed in this journal
 
         // Followed by multiple cowbtree journals
     };
 #pragma pack()
 
-    using CacheType = sisl::SimpleCache< bnodeid_t, BtreeNodePtr >;
-
 private:
-    shared< CacheType > m_cache;
     shared< VirtualDev > m_vdev;
-    uint32_t const m_node_size;
-    uint32_t const m_vdev_blks_per_node;
 
     // List of fibers to flush (note that this could be on multiple threads)
     std::vector< iomgr::io_fiber_t > m_cp_flush_fibers;
@@ -50,8 +42,7 @@ private:
     std::vector< superblk< IndexStoreSuperBlock > > m_journals_by_cpid;
 
 public:
-    COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< IndexStoreSuperBlock > > store_sbs,
-                  shared< sisl::Evictor > evictor, uint32_t node_size);
+    COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< IndexStoreSuperBlock > > store_sbs);
     virtual ~COWBtreeStore() = default;
 
     //////////////////////// Override of IndexStore Interfaces //////////////////////////
@@ -64,6 +55,8 @@ public:
     void on_node_freed(BtreeNode* node) override;
     bool is_fast_destroy_supported() const override { return true; }
     bool is_ephemeral() const { return false; }
+    uint32_t max_node_size() const override;
+    uint32_t align_size() const;
 
     // Implemenations for flush
     folly::Future< bool > async_cp_flush(COWBtreeCPContext* cp_ctx);

@@ -2,11 +2,12 @@
 
 #include <vector>
 #include <sisl/fds/concurrent_insert_vector.hpp>
+#include <sisl/cache/simple_cache.hpp>
 #include <homestore/blk.h>
 #include <homestore/btree/btree_base.hpp>
 #include <homestore/checkpoint/cp_mgr.hpp>
+
 #include "common/large_id_reserver.hpp"
-#include "index/cow_btree/cow_btree_store.h"
 
 namespace homestore {
 class COWBtreeCPContext;
@@ -17,8 +18,7 @@ public:
     struct Journal;
 
 public:
-    COWBtree(BtreeBase& bt, shared< VirtualDev > vdev, shared< COWBtreeStore::CacheType > cache,
-             std::vector< sisl::byte_view > journal_bufs, bool load_existing);
+    COWBtree(BtreeBase& bt, shared< VirtualDev > vdev, std::vector< sisl::byte_view > journal_bufs, bool load_existing);
     virtual ~COWBtree() = default;
 
     // All overridden methods of UndelyingBtree class
@@ -33,11 +33,10 @@ public:
     btree_status_t on_root_changed(BtreeNodePtr const& root, CPContext* context) override;
     uint64_t space_occupied() const override;
 
-    uint32_t node_size() const override;
     bnodeid_t generate_node_id();
     void add_to_dirty_list(BtreeNodePtr const& node, COWBtreeCPContext* cp_ctx);
     void add_to_remove_list(bnodeid_t node_id, COWBtreeCPContext* cp_ctx);
-    void on_btree_destroyed();
+    void destroy();
 
     BlkId get_blkid_for_nodeid(bnodeid_t nodeid) const;
     uint64_t used_size() const;
@@ -217,7 +216,7 @@ public:
 
 private:
     BtreeBase& m_base_btree;
-    shared< COWBtreeStore::CacheType > m_cache;
+    unique< sisl::SimpleCache< bnodeid_t, BtreeNodePtr > > m_cache;
     FullBNodeIdMap m_bnodeid_map;
     LargeIDReserver m_nodeid_generator;
     shared< VirtualDev > m_vdev;

@@ -4,6 +4,7 @@
 #include "index/cow_btree/cow_btree_node.h"
 #include "index/index_cp.h"
 #include "common/homestore_config.hpp"
+#include "common/homestore_utils.hpp"
 #include "device/virtual_dev.hpp"
 
 namespace homestore {
@@ -33,10 +34,16 @@ static void write_or_fail(VirtualDev* vdev, uint8_t* buf, uint32_t size, BlkId l
     HS_REL_ASSERT(!err, "Flush of full map failed with err={}. best is to crash the system and replay", err.message());
 }
 
-COWBtree::COWBtree(BtreeBase& bt, shared< VirtualDev > vdev, shared< COWBtreeStore::CacheType > cache,
-                   std::vector< sisl::byte_view > journal_bufs, bool load_existing) :
+COWBtree::COWBtree(BtreeBase& bt, shared< VirtualDev > vdev, std::vector< sisl::byte_view > journal_bufs,
+                   bool load_existing) :
         m_base_btree{bt},
-        m_cache{std::move(cache)},
+        m_cache{std::make_unique< sisl::SimpleCache< bnodeid_t, BtreeNodePtr > >(
+            hs()->evictor(), 50000, bt.bt_config().node_size(),
+            [](const BtreeNodePtr& node) -> bnodeid_t { return node->node_id(); },
+            [](const sisl::CacheRecord& rec) -> bool {
+                const auto& hnode = (sisl::SingleEntryHashNode< BtreeNodePtr >&)rec;
+                return (hnode.m_value->m_refcount.test_le(1));
+            })},
         m_nodeid_generator(std::numeric_limits< uint32_t >::max()),
         m_vdev{std::move(vdev)},
         m_btree_ordinal{bt.super_blk()->ordinal},
@@ -62,10 +69,12 @@ COWBtree::COWBtree(BtreeBase& bt, shared< VirtualDev > vdev, shared< COWBtreeSto
     }
 }
 
-uint32_t COWBtree::node_size() const { return m_vdev->atomic_page_size(); }
+static inline COWBtreeCPContext* to_my_cp_ctx(CPContext* context) {
+    return IndexCPContext::convert< COWBtreeCPContext >(context, IndexStore::Type::COPY_ON_WRITE_BTREE);
+}
 
-BtreeNodePtr COWBtree::create_node(bool is_leaf, CPContext*) {
-    auto buf = hs_utils::iobuf_alloc(node_size(), sisl::buftag::btree_node, m_vdev->align_size());
+BtreeNodePtr COWBtree::create_node(bool is_leaf, CPContext* context) {
+    auto buf = hs_utils::iobuf_alloc(m_base_btree.node_size(), sisl::buftag::btree_node, m_vdev->align_size());
     auto n = BtreeNodePtr{
         m_base_btree.init_node(buf, generate_node_id(), true /* init_buf */, is_leaf, sizeof(COWBtreeNode))};
     COWBtreeNode::construct(n);
@@ -74,6 +83,8 @@ BtreeNodePtr COWBtree::create_node(bool is_leaf, CPContext*) {
     bool done = m_cache->insert(n);
     HS_REL_ASSERT_EQ(done, true, "Unable to add alloc'd node to cache, low memory or duplicate inserts?");
 
+    n->set_modified_cp_id(context->id());
+    add_to_dirty_list(n, to_my_cp_ctx(context));
     return n;
 }
 
@@ -91,8 +102,8 @@ retry:
     BlkId blkid = get_blkid_for_nodeid(node_id);
     if (!blkid.is_valid()) { return btree_status_t::not_found; }
 
-    auto raw_buf = hs_utils::iobuf_alloc(node_size(), sisl::buftag::btree_node, m_vdev->align_size());
-    m_vdev->sync_read(r_cast< char* >(raw_buf), node_size(), blkid);
+    auto raw_buf = hs_utils::iobuf_alloc(m_base_btree.node_size(), sisl::buftag::btree_node, m_vdev->align_size());
+    m_vdev->sync_read(r_cast< char* >(raw_buf), m_base_btree.node_size(), blkid);
 
     // Initialize the node
     node = BtreeNodePtr{m_base_btree.init_node(raw_buf, node_id, false /* init_buf*/,
@@ -109,10 +120,6 @@ retry:
     return btree_status_t::success;
 }
 
-static inline COWBtreeCPContext* to_my_cp_ctx(CPContext* context) {
-    return IndexCPContext::convert< COWBtreeCPContext >(context, IndexStore::Type::COPY_ON_WRITE_BTREE);
-}
-
 btree_status_t COWBtree::refresh_node(BtreeNodePtr const& node, bool for_read_modify_write, CPContext* context) {
     if (context == nullptr || !for_read_modify_write) { return btree_status_t::success; }
 
@@ -123,9 +130,10 @@ btree_status_t COWBtree::refresh_node(BtreeNodePtr const& node, bool for_read_mo
         // For same cp, we don't need a copy, we can rewrite on the same buffer
         return btree_status_t::success;
     } else if (mod_cp_id > cur_cp_id) {
-        return btree_status_t::cp_mismatch; // We are asked to provide the buffer of an older CP, which is not possible
+        return btree_status_t::cp_mismatch; // We are asked to provide the buffer of an older CP, which is not
+                                            // possible
     } else {
-        COWBtreeNode::convert(node)->copy_buf_if_needed(*this, cp_ctx->id());
+        COWBtreeNode::convert(node)->copy_buf_if_needed(*this, cur_cp_id);
         add_to_dirty_list(node, cp_ctx);
     }
     return btree_status_t::success;
@@ -167,28 +175,25 @@ uint64_t COWBtree::space_occupied() const {
     return m_bnodeid_map.m_map.size() * m_vdev->block_size();
 }
 
-void COWBtree::on_btree_destroyed() {
-    // Walk through the entire map and free all the node blks and then free the map blks. This whole operation needs to
-    // be done under a lock CPGuard, because during this process a CP should not be taken.
-    cp_mgr().cp_guard();
-
-    {
-        // Free all the blks allocated for the nodes
-        std::unique_lock< iomgr::FiberManagerLib::shared_mutex > lg(m_bnodeid_map.m_mtx);
-        for (auto const [nodeid, blkid] : m_bnodeid_map.m_map) {
-            m_vdev->free_blk(blkid.to_blkid());
-        }
-
-        // Free all the blks allocated for the map
-        for (auto const& locs : m_bnodeid_map.m_locations) {
-            m_vdev->free_blk(locs);
-        }
-
-        // Reset the map, cp_session etc.
-        m_bnodeid_map.m_map.clear();
-        m_bnodeid_map.m_updates_since_last_flush = 0;
-        m_bnodeid_map.m_locations.clear();
+void COWBtree::destroy() {
+    // Free all the blks allocated for the nodes
+    std::unique_lock< iomgr::FiberManagerLib::shared_mutex > lg(m_bnodeid_map.m_mtx);
+    for (auto const [_, blkid] : m_bnodeid_map.m_map) {
+        m_vdev->free_blk(blkid.to_blkid());
     }
+
+    // Free all the blks allocated for the map
+    for (auto const& locs : m_bnodeid_map.m_locations) {
+        m_vdev->free_blk(locs);
+    }
+
+    // Reset the map, cp_session etc.
+    m_bnodeid_map.m_map.clear();
+    m_bnodeid_map.m_updates_since_last_flush = 0;
+    m_bnodeid_map.m_locations.clear();
+
+    // Free the cache, which in-turn should free up all nodes in cache
+    m_cache.reset();
 
     // Reset all the dirty nodes, deleted nodes etc.
     for (auto& cp_session : m_cp_sessions) {
@@ -237,7 +242,9 @@ struct NodeFlushUnit {
     uint32_t m_nodes_count{0};
 
     NodeFlushUnit(COWBtreeCPContext* cp_ctx, BlkId location, sisl::blob& journal_area) :
-            m_cp_ctx{cp_ctx}, m_jentry{r_cast< JournalEntry* >(journal_area.bytes())}, m_nodes_location{location} {
+            m_cp_ctx{cp_ctx}, m_nodes_location{location} {
+        m_jentry = new (journal_area.bytes()) JournalEntry();
+        m_jentry->nodes_location = location;
         m_iovs.reserve(location.blk_count());
         if (m_jentry) { m_jentry->nodes_location = location; }
     }
@@ -451,7 +458,7 @@ std::tuple< bool, unique< COWBtree::Journal >, bool > COWBtree::flush_nodes(COWB
         auto const new_root = session->new_root();
         bool sb_changed{false};
         if (new_root != empty_bnodeid) {
-            bt_super_blk().root_node = new_root;
+            bt_super_blk().root_node_id = new_root;
             sb_changed = true;
         }
 
@@ -672,7 +679,7 @@ bool COWBtree::CPSession::prepare_to_flush_nodes(COWBtreeCPContext* cp_ctx) {
 
     auto const status =
         m_bt.m_vdev->alloc_blks(m_modified_count, blk_alloc_hints{.partial_alloc_ok = true}, m_node_locations);
-    if ((status != BlkAllocStatus::SUCCESS) || (status != BlkAllocStatus::PARTIAL)) {
+    if ((status != BlkAllocStatus::SUCCESS) && (status != BlkAllocStatus::PARTIAL)) {
         HS_REL_ASSERT(false, "Blk allocation to persist btree pages failed, we are crashing for now");
     }
 
@@ -711,12 +718,11 @@ std::tuple< BlkId, COWBtree::DirtyNodeList::iterator, sisl::blob > COWBtree::CPS
         HS_DBG_ASSERT(m_modified_it == m_modified_nodes.end(),
                       "Mismatch between number of blks allocated for node and dirty node iterator");
         return std::make_tuple(BlkId{}, m_modified_it, ret_blob);
-    } else {
-        HS_DBG_ASSERT(
-            m_modified_it != m_modified_nodes.end(),
-            "There are more blks allocated for nodes, but the dirty list doesn't have anymore node to fill it in");
-        return std::make_tuple(BlkId{}, m_modified_it, ret_blob);
     }
+
+    HS_DBG_ASSERT(
+        m_modified_it != m_modified_nodes.end(),
+        "There are more blks allocated for nodes, but the dirty list doesn't have anymore node to fill it in");
 
     BlkId ret_loc = m_node_locations[m_next_location_idx++];
     auto ret_it = m_modified_it;
@@ -732,7 +738,7 @@ std::tuple< BlkId, COWBtree::DirtyNodeList::iterator, sisl::blob > COWBtree::CPS
 std::tuple< COWBtree::DeletedNodeList::iterator, COWBtree::DeletedNodeList::iterator, sisl::blob >
 COWBtree::CPSession::next_deleted() {
     std::lock_guard lg{m_flush_mtx};
-    HS_DBG_ASSERT_EQ(m_state, FlushState::NODES_FLUSHING,
+    HS_DBG_ASSERT_EQ(m_state, FlushState::NODES_FLUSHED,
                      "Unexpected state while pulling a dirty nodes, we expect all fibers have drained the iterator "
                      "before moving to flushed or collecting state");
     auto ret_it = m_deleted_it;

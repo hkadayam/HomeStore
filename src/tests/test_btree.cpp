@@ -122,11 +122,12 @@ struct BtreeTest : public BtreeTestHelper< TestType >, public ::testing::Test {
 
     void restart_homestore() {
         m_helper.params(HS_SERVICE::INDEX).index_svc_cbs = new TestIndexServiceCallbacks(this);
+        this->m_bt.reset();
         m_helper.restart_homestore();
     }
 
     void destroy_btree() {
-        hs()->index_service().remove_index_table(this->m_bt);
+        hs()->index_service().destroy_index_table(this->m_bt);
         this->m_bt.reset();
     }
 
@@ -352,8 +353,6 @@ TYPED_TEST(BtreeTest, CpFlush) {
 
     this->dump_to_file(std::string("before.txt"));
 
-    this->destroy_btree();
-
     // Restart homestore. m_bt is updated by the TestIndexServiceCallback.
     this->restart_homestore();
 
@@ -402,8 +401,6 @@ TYPED_TEST(BtreeTest, MultipleCpFlush) {
     this->do_query(0, num_entries - 1, 75);
 
     this->dump_to_file(std::string("before.txt"));
-
-    this->destroy_btree();
 
     // Restart homestore. m_bt is updated by the TestIndexServiceCallback.
     this->restart_homestore();
@@ -469,7 +466,6 @@ TYPED_TEST(BtreeTest, ThreadedCpFlush) {
     this->do_query(0, num_entries - 1, 75);
 
     this->dump_to_file(std::string("before.txt"));
-    this->destroy_btree();
 
     // Restart homestore. m_bt is updated by the TestIndexServiceCallback.
     this->restart_homestore();

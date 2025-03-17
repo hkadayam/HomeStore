@@ -11,9 +11,6 @@ class UnderlyingBtree {
 public:
     virtual ~UnderlyingBtree() = default;
 
-    // Get the node size of underlying btree. The return is expected to be non-zero
-    virtual uint32_t node_size() const = 0;
-
     virtual BtreeNodePtr create_node(bool is_leaf, CPContext* context) = 0;
     virtual btree_status_t write_node(BtreeNodePtr const& node, CPContext* context) = 0;
     virtual btree_status_t read_node(bnodeid_t id, BtreeNodePtr& node) const = 0;
@@ -31,7 +28,8 @@ struct BtreeSuperBlock {
     static constexpr size_t underlying_btree_sb_size =
         IndexSuperBlock::index_impl_sb_size - sizeof(bnodeid_t) - sizeof(uint32_t);
 
-    bnodeid_t root_node{empty_bnodeid}; // Btree Root Node ID
+    bnodeid_t root_node_id{empty_bnodeid}; // Btree Root Node ID
+    uint64_t root_link_version{0};
     uint32_t node_size{0};              // Node size used for this btree
     std::array< uint8_t, underlying_btree_sb_size > underlying_btree_sb;
 };

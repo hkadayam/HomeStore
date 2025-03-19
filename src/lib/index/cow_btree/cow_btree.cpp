@@ -233,6 +233,9 @@ void COWBtree::destroy() {
             m_cache->remove(node->node_id(), tmp);
         }
         cp_session->finish();
+#if 0
+        //cp_session.reset();
+#endif
     }
 
     // Destroy this btree's superblk, so that it can be re-initialized again.
@@ -744,6 +747,16 @@ COWBtree::CPSession* COWBtree::cp_session(cp_id_t cp_id) {
         session->m_state = CPSession::FlushState::DIRTYING;
         session->m_cp_id = cp_id;
     }
+#if 0
+    auto const slot_num = cp_id % CPManager::max_concurent_cps;
+    COWBtree::CPSession* session = m_cp_sessions[slot_num].get();
+    if (session == nullptr) {
+        m_cp_sessions[slot_num].reset(new CPSession(*this));
+        session = m_cp_sessions[slot_num].get();
+        session->m_state = CPSession::FlushState::DIRTYING;
+        session->m_cp_id = cp_id;
+    }
+#endif
     return session;
 }
 

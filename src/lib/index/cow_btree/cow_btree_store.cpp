@@ -188,6 +188,11 @@ folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
     auto on_flush_nodes_done = [this](COWBtreeCPContext* cp_ctx) {
         cp_ctx->actual_destroy_btrees();
 
+        CP_PERIODIC_LOG(
+            INFO, cp_ctx->id(),
+            "CowBtreeStore has {} btrees destroyed in this cp, destroyed all persistent structures for them",
+            cp_ctx->m_destroyed_btrees.size());
+
         // All dirty nodes from all btrees have been flushed, now we can flush the full map or journal
         // (depending on cp type) for each of the modified btree
         flush_map(cp_ctx);

@@ -39,8 +39,6 @@
 #include "blkalloc/blk_allocator.h"
 #include "meta_sb.hpp"
 
-SISL_LOGGING_DECL(metablk)
-
 namespace homestore {
 
 MetaBlkService& meta_service() { return hs()->meta_service(); }

@@ -20,8 +20,6 @@
 #include <homestore/superblk_handler.hpp>
 #include <homestore/homestore_decl.hpp>
 
-SISL_LOGGING_DECL(index)
-
 namespace homestore {
 
 using bnodeid_t = uint64_t;

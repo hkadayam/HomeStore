@@ -198,6 +198,9 @@ void COWBtree::destroy() {
     // Reset all the dirty nodes, deleted nodes etc.
     for (auto& cp_session : m_cp_sessions) {
         cp_session->finish();
+#if 0
+        //cp_session.reset();
+#endif
     }
 
     // Destroy this btree's superblk, so that it can be re-initialized again.
@@ -238,6 +241,7 @@ struct NodeFlushUnit {
     COWBtreeCPContext* m_cp_ctx;
     JournalEntry* m_jentry{nullptr};
     std::vector< iovec > m_iovs;
+    std::vector< COWBtreeNodeBuffer > m_node_bufs;
     BlkId m_nodes_location;
     uint32_t m_nodes_count{0};
 
@@ -246,13 +250,15 @@ struct NodeFlushUnit {
         m_jentry = new (journal_area.bytes()) JournalEntry();
         m_jentry->nodes_location = location;
         m_iovs.reserve(location.blk_count());
+        m_node_bufs.reserve(location.blk_count());
         if (m_jentry) { m_jentry->nodes_location = location; }
     }
 
     void add(COWBtreeNode* cow_node) {
         HS_DBG_ASSERT_LT(m_nodes_count, m_nodes_location.blk_count(), "Adding more nodes than node allocated for");
-        m_iovs.emplace_back(iovec{.iov_base = cow_node->get_flush_version_buf(m_cp_ctx->id()),
-                                  .iov_len = cow_node->to_btree_node()->node_size()});
+        m_node_bufs.emplace_back(cow_node->get_flush_version_buf(m_cp_ctx->id()));
+        m_iovs.emplace_back(
+            iovec{.iov_base = m_node_bufs.back().bytes(), .iov_len = cow_node->to_btree_node()->node_size()});
         ++m_nodes_count;
         if (m_jentry) { m_jentry->nodes[m_jentry->n_nodes++] = get_compact_nodeid(cow_node); }
     }
@@ -563,19 +569,21 @@ void COWBtree::flush_sb(COWBtreeCPContext* cp_ctx) {
 }
 
 void COWBtree::update_bnode_map(CompactNodeId nodeid, CompactBlkId cblkid, bool in_recovery) {
-    auto do_update = [this](CompactNodeId nodeid, CompactBlkId cblkid) {
+    auto do_update = [this](CompactNodeId nodeid, CompactBlkId cblkid) -> bool {
         auto it = m_bnodeid_map.m_map.find(nodeid);
+        bool newly_inserted{false};
         if (it != m_bnodeid_map.m_map.end()) {
             m_vdev->free_blk(it->second.to_blkid());
             it->second = cblkid;
         } else {
             m_bnodeid_map.m_map.emplace(nodeid, cblkid);
+            newly_inserted = true;
         }
+        return newly_inserted;
     };
 
     if (in_recovery) {
-        do_update(nodeid, cblkid);
-        m_nodeid_generator.reserve(nodeid);
+        if (do_update(nodeid, cblkid)) { m_nodeid_generator.reserve(nodeid); }
         m_vdev->commit_blk(cblkid.to_blkid());
     } else {
         std::unique_lock< iomgr::FiberManagerLib::shared_mutex > lg(m_bnodeid_map.m_mtx);
@@ -654,6 +662,16 @@ COWBtree::CPSession* COWBtree::cp_session(cp_id_t cp_id) {
         session->m_state = CPSession::FlushState::DIRTYING;
         session->m_cp_id = cp_id;
     }
+#if 0
+    auto const slot_num = cp_id % CPManager::max_concurent_cps;
+    COWBtree::CPSession* session = m_cp_sessions[slot_num].get();
+    if (session == nullptr) {
+        m_cp_sessions[slot_num].reset(new CPSession(*this));
+        session = m_cp_sessions[slot_num].get();
+        session->m_state = CPSession::FlushState::DIRTYING;
+        session->m_cp_id = cp_id;
+    }
+#endif
     return session;
 }
 
@@ -825,8 +843,8 @@ void COWBtree::CPSession::finish() {
 
     m_node_locations.clear();
     m_next_location_idx = 0;
-    m_modified_it = m_modified_nodes.end();
-    m_deleted_it = m_deleted_nodes.end();
+    m_modified_it = DirtyNodeList::iterator{};
+    m_deleted_it = DeletedNodeList::iterator{};
     m_modified_count = 0;
     m_deleted_count = 0;
     m_journal.reset();

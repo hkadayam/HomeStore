@@ -44,7 +44,6 @@
  * CP end :- when cp flush is completed. It frees the CP.
  */
 namespace homestore {
-SISL_LOGGING_DECL(cp, replay)
 
 #define CP_PERIODIC_LOG(level, cp_id, msg, ...)                                                                        \
     HS_PERIODIC_DETAILED_LOG(level, cp, "cp_id", cp_id, , , msg, ##__VA_ARGS__)

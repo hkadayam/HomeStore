@@ -26,8 +26,6 @@
 #include <homestore/btree/detail/btree_internal.hpp>
 #include <iomgr/iomgr_flip.hpp>
 
-SISL_LOGGING_DECL(wbcache)
-
 namespace homestore {
 
 class BtreeStoreBase;

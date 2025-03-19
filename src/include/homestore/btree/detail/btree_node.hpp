@@ -180,7 +180,10 @@ public:
         return phdr->node_deleted == 0x1;
     }
 
-    int64_t get_modified_cp_id() const { return get_persistent_header_const()->modified_cp_id; }
+    static bnodeid_t get_node_id(uint8_t const* buf) {
+        auto phdr = r_cast< PersistentHeader const* >(buf);
+        return phdr->node_id;
+    }
 
     /// @brief Finds the index of the entry with the specified key in the node.
     ///
@@ -532,6 +535,7 @@ public:
 
     void set_node_id(bnodeid_t id) { get_persistent_header()->node_id = id; }
     bnodeid_t node_id() const { return get_persistent_header_const()->node_id; }
+    int64_t get_modified_cp_id() const { return get_persistent_header_const()->modified_cp_id; }
 
     void set_checksum() {
         get_persistent_header()->checksum = crc16_t10dif(bt_init_crc_16, node_data_area_const(), node_data_size());

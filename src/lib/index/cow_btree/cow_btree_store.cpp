@@ -162,7 +162,7 @@ private:
 };
 
 folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
-    LOGTRACEMOD(btree, "Starting COWBtree CP Flush with cp context={}", cp_ctx->to_string());
+    CP_PERIODIC_LOG(DEBUG, cp_ctx->id(), "Starting COWBtree CP Flush with cp context={}", cp_ctx->to_string());
     if (!cp_ctx->any_dirty_nodes()) {
         if (cp_ctx->id() == 0) {
             // For the first CP, we need to flush the journal buffer to the meta blk
@@ -181,6 +181,10 @@ folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
     }
 #endif
 
+    CP_PERIODIC_LOG(DEBUG, cp_ctx->id(),
+                    "CowBtree has {} dirtied nodes, {} deleted nodes across all btrees, flushing them",
+                    cp_ctx->m_dirty_node_count.get(), cp_ctx->m_removed_node_count.get());
+
     // Prepare the header for the journal to be written. The header details will be filled along the way while flushing
     cp_ctx->prepare_store_journal();
 
@@ -191,6 +195,11 @@ folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
         for (auto& btree : cp_ctx->m_destroyed_btrees) {
             to_cow_btree(btree.get())->destroy();
         }
+
+        CP_PERIODIC_LOG(
+            INFO, cp_ctx->id(),
+            "CowBtreeStore has {} btrees destroyed in this cp, destroyed all persistent structures for them",
+            cp_ctx->m_destroyed_btrees.size());
 
         // All dirty nodes from all btrees have been flushed, now we can flush the full map or journal
         // (depending on cp type) for each of the modified btree
@@ -217,6 +226,7 @@ folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
                     // That is why we need to keep track of all btrees whose superblk has been changed and then write
                     // later.
                     std::unique_lock lg{cp_ctx->m_bt_list_mtx};
+                    ++cp_ctx->m_flushed_btrees_count;
                     if (cp_ctx->need_full_map_flush()) {
                         cp_ctx->m_active_btree_list.emplace_back(cow_btree);
                     } else {
@@ -239,6 +249,11 @@ void COWBtreeStore::flush_map(COWBtreeCPContext* cp_ctx) {
             for (auto& journal : m_journals_by_cpid) {
                 journal.destroy();
             }
+            CP_PERIODIC_LOG(
+                INFO, cp_ctx->id(),
+                "CowBtree has completed flush of nodes across {} btrees and persisted full map for all btrees",
+                cp_ctx->m_flushed_btrees_count);
+
             cp_ctx->complete(true);
         };
 
@@ -258,8 +273,11 @@ void COWBtreeStore::flush_map(COWBtreeCPContext* cp_ctx) {
         auto sb = superblk< IndexStoreSuperBlock >{"index_store"};
         sb.load(cp_ctx->store_journal(), nullptr); // Load an empty meta_blk but with given buffer
         sb.write();                                // Write the metablk
+        auto const sb_size = sb.raw_buf()->size();
         sb.raw_buf().reset(); // after we wrote the superblk, we no longer need the merged journal buffer, free it
-        m_journals_by_cpid.emplace_back(std::move(sb)); // Append to the end in the journal
+
+        // We only keep track of the metablk here, not buffer (so as to free after full map write)
+        m_journals_by_cpid.emplace_back(std::move(sb));
 
         {
             std::unique_lock lg{cp_ctx->m_bt_list_mtx};
@@ -267,6 +285,10 @@ void COWBtreeStore::flush_map(COWBtreeCPContext* cp_ctx) {
                 cow_btree->flush_sb(cp_ctx);
             }
         }
+        CP_PERIODIC_LOG(INFO, cp_ctx->id(),
+                        "CowBtree has completed flush of nodes across {} btrees and persisted incremental journal for "
+                        "map, journal size={}",
+                        cp_ctx->m_flushed_btrees_count, sb_size);
         cp_ctx->complete(true);
     }
 }

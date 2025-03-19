@@ -20,8 +20,6 @@
 #include <homestore/btree/node_variant/variant_node.hpp>
 #include <homestore/btree/btree_kv.hpp>
 
-SISL_LOGGING_DECL(btree)
-
 namespace homestore {
 #pragma pack(1)
 struct btree_obj_record {

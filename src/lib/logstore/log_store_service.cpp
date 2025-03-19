@@ -32,7 +32,6 @@
 #include "log_dev.hpp"
 
 namespace homestore {
-SISL_LOGGING_DECL(logstore)
 
 LogStoreService& logstore_service() { return hs()->logstore_service(); }
 

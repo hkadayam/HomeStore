@@ -22,8 +22,6 @@
 using namespace std;
 using namespace boost;
 
-SISL_LOGGING_DECL(btree)
-
 namespace homestore {
 
 template < typename K, typename V >

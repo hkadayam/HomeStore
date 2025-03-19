@@ -55,6 +55,7 @@ public:
 
     iomgr::FiberManagerLib::shared_mutex m_bt_list_mtx;
     std::vector< shared< Index > > m_all_btrees;
+    uint32_t m_flushed_btrees_count{0};
     std::vector< shared< Index > > m_destroyed_btrees;
     std::vector< COWBtree* > m_active_btree_list;
     sisl::buf_builder m_merged_journal_buf;

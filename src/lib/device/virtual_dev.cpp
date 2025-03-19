@@ -48,8 +48,6 @@
 #include "blkalloc/append_blk_allocator.h"
 #include "blkalloc/fixed_blk_allocator.h"
 
-SISL_LOGGING_DECL(device)
-
 namespace homestore {
 
 static std::shared_ptr< BlkAllocator > create_blk_allocator(blk_allocator_type_t btype, uint32_t vblock_size,

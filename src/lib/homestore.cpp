@@ -64,7 +64,7 @@ HomeStore* HomeStore::instance() {
 }
 
 HomeStore::HomeStore() {
-    REGISTER_LOG_MODS(HOMESTORE_LOG_MODS);
+    REGISTER_LOG_MODS(btree, device, blkalloc, cp, logstore, replication, journalvdev);
 
     // Always start the meta service
     for (uint32_t i{0}; i < enum_count< ServiceType >(); ++i) {

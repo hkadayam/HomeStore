@@ -28,8 +28,6 @@
 
 #include "varsize_blk_allocator.h"
 
-SISL_LOGGING_DECL(blkalloc)
-
 template <>
 struct fmt::formatter< std::thread::id > {
     constexpr auto parse(format_parse_context& ctx) -> format_parse_context::iterator { return ctx.begin(); }

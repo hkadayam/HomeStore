@@ -30,8 +30,6 @@
 #include "common/crash_simulator.hpp"
 #endif
 
-SISL_LOGGING_DECL(wbcache)
-
 namespace homestore {
 
 IndexWBCacheBase& wb_cache() {

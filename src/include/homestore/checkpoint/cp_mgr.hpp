@@ -163,7 +163,6 @@ private:
     bool m_in_flush_phase{false};
     bool m_pending_trigger_cp{false}; // Is there is a waiter for a cp flush to start
     folly::SharedPromise< bool > m_pending_trigger_cp_comp;
-    std::atomic< cp_id_t > m_cur_flushing_cp_id{-1}; // An informational to find out which cp is flushing
 
 public:
     CPManager();
@@ -224,10 +223,10 @@ public:
 
     iomgr::io_fiber_t pick_blocking_io_fiber() const;
 
-    /// @brief Is the given cp is currently in flushing phase
+    /// @brief Is the given cp has already finished flushing
     /// @param cp_id
-    /// @return True or False if cp is flushing now.
-    bool is_cp_flushing(cp_id_t cp_id) const;
+    /// @return True or False if cp has flushed or not
+    bool has_cp_flushed(cp_id_t cp_id) const;
 
 private:
     void cp_ref(CP* cp);

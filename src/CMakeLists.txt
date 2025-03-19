@@ -59,7 +59,6 @@ set(HOMESTORE_OBJECTS
     $<TARGET_OBJECTS:hs_replication>
     lib/homestore.cpp
     lib/crc.cpp
-    lib/logging.cpp
 )
 #target_link_libraries(homestore_objs ${COMMON_DEPS})
 

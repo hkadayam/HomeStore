@@ -36,8 +36,6 @@
 #include "common/resource_mgr.hpp"
 #include "common/crash_simulator.hpp"
 
-SISL_LOGGING_DECL(journalvdev)
-
 namespace homestore {
 JournalVirtualDev::JournalVirtualDev(DeviceManager& dmgr, const vdev_info& vinfo, vdev_event_cb_t event_cb) :
         VirtualDev{dmgr, vinfo, std::move(event_cb), false /* is_auto_recovery */} {

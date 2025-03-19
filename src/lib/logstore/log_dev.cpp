@@ -34,8 +34,6 @@
 
 namespace homestore {
 
-SISL_LOGGING_DECL(logstore)
-
 #define THIS_LOGDEV_LOG(level, msg, ...) HS_SUBMOD_LOG(level, logstore, , "log_dev", m_logdev_id, msg, __VA_ARGS__)
 #define THIS_LOGDEV_PERIODIC_LOG(level, msg, ...)                                                                      \
     HS_PERIODIC_DETAILED_LOG(level, logstore, "log_dev", m_logdev_id, , , msg, __VA_ARGS__)

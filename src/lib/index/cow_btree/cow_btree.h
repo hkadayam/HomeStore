@@ -8,6 +8,7 @@
 #include <homestore/checkpoint/cp_mgr.hpp>
 
 #include "common/large_id_reserver.hpp"
+#include "common/concurrent_vector.hpp"
 
 namespace homestore {
 class COWBtreeCPContext;
@@ -164,8 +165,10 @@ public:
         std::atomic< uint64_t > m_updates_since_last_flush{0};
     };
 
-    using DirtyNodeList = sisl::ConcurrentInsertVector< BtreeNodePtr >;
-    using DeletedNodeList = sisl::ConcurrentInsertVector< CompactNodeId >;
+    // using DirtyNodeList = sisl::ConcurrentInsertVector< BtreeNodePtr >;
+    // using DeletedNodeList = sisl::ConcurrentInsertVector< CompactNodeId >;
+    using DirtyNodeList = ConcurrentVector< BtreeNodePtr >;
+    using DeletedNodeList = ConcurrentVector< CompactNodeId >;
 
     struct CPSession {
     public:

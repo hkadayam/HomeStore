@@ -180,7 +180,7 @@ folly::Future< bool > CPManager::do_trigger_cp_flush(bool force, bool flush_on_s
     folly::Future< bool > ret_fut = folly::Future< bool >::makeEmpty();
     auto cur_cp = cp_guard();
     cur_cp->m_cp_status = cp_status_t::cp_trigger;
-    HS_PERIODIC_LOG(INFO, cp, "<<<<<<<<<<< Triggering flush of the CP {}", cur_cp->to_string());
+    CP_PERIODIC_LOG(INFO, cur_cp->id(), "Time to flush the CP {}", cur_cp->to_string());
     COUNTER_INCREMENT(*m_metrics, cp_cnt, 1);
     m_wd_cp->set_cp(cur_cp.get());
 
@@ -188,14 +188,13 @@ folly::Future< bool > CPManager::do_trigger_cp_flush(bool force, bool flush_on_s
     auto new_cp = new CP(this);
     new_cp->m_cp_id = cur_cp->m_cp_id + 1;
 
-    HS_PERIODIC_LOG(DEBUG, cp, "Create New CP session", new_cp->id());
+    CP_PERIODIC_LOG(DEBUG, new_cp->id(), "Create New CP session");
     size_t idx{0};
     for (auto& consumer : m_cp_cb_table) {
         if (consumer) { new_cp->m_contexts[idx] = std::move(consumer->on_switchover_cp(cur_cp.get(), new_cp)); }
         ++idx;
     }
 
-    HS_PERIODIC_LOG(DEBUG, cp, "CP Attached completed, proceed to exit cp critical section");
     if (m_pending_trigger_cp) {
         // Triggered because of back-2-back CP, use the pending promise/future.
         cur_cp->m_comp_promise = std::move(m_pending_trigger_cp_comp);
@@ -215,15 +214,14 @@ folly::Future< bool > CPManager::do_trigger_cp_flush(bool force, bool flush_on_s
     // might start cp flush and we don't want that to hold this mutex.
     lk.unlock();
 
-    HS_PERIODIC_LOG(DEBUG, cp, "CP critical section done, doing cp_io_exit");
+    HS_PERIODIC_LOG(DEBUG, cp, "Active CP switch completed");
     return ret_fut;
 }
 
 void CPManager::cp_start_flush(CP* cp) {
     std::vector< folly::Future< bool > > futs;
-    HS_PERIODIC_LOG(INFO, cp, "Starting CP {} flush", cp->id());
+    CP_PERIODIC_LOG(INFO, cp->id(), "Starting CP flush");
     cp->m_cp_status = cp_status_t::cp_flushing;
-    m_cur_flushing_cp_id.store(cp->id());
 
     for (size_t svcid = 0; svcid < (size_t)cp_consumer_t::SENTINEL; svcid++) {
         if (svcid == (size_t)cp_consumer_t::REPLICATION_SVC) {
@@ -248,12 +246,11 @@ void CPManager::on_cp_flush_done(CP* cp) {
     cp->m_cp_status = cp_status_t::cp_flush_done;
 
     iomanager.run_on_forget(pick_blocking_io_fiber(), [this, cp]() {
-        m_cur_flushing_cp_id.store(-1);
-
         // Persist the superblock with this flushed cp information
         ++(m_sb->m_last_flushed_cp);
         m_sb.write();
 
+        CP_PERIODIC_LOG(INFO, cp->id(), "CP Flush completed");
         cleanup_cp(cp);
 
         // Setting promise will cause the CP manager destructor to cleanup before getting a chance to do the
@@ -324,7 +321,7 @@ iomgr::io_fiber_t CPManager::pick_blocking_io_fiber() const {
     return m_cp_io_fibers[rand_fiber(s_re)];
 }
 
-bool CPManager::is_cp_flushing(cp_id_t cp_id) const { return (m_cur_flushing_cp_id.load() == cp_id); }
+bool CPManager::has_cp_flushed(cp_id_t cp_id) const { return (m_sb->m_last_flushed_cp >= cp_id); }
 
 //////////////////////////////////////// CP Guard class ////////////////////////////////////////////
 CPGuard::CPGuard(CPManager* mgr) {

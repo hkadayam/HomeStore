@@ -27,9 +27,8 @@
 
 using namespace homestore;
 
-SISL_LOGGING_INIT(HOMESTORE_LOG_MODS)
+ 
 SISL_OPTIONS_ENABLE(logging, test_index_crash_recovery, iomgr, test_common_setup)
-SISL_LOGGING_DECL(test_index_crash_recovery)
 
 // TODO Add tests to do write,remove after recovery.
 // TODO Test with var len key with io mgr page size is 512.

@@ -21,8 +21,6 @@
 #include <homestore/btree/detail/btree_node.hpp>
 #include <homestore/btree/btree_kv.hpp>
 
-SISL_LOGGING_DECL(btree)
-
 namespace homestore {
 
 // Internal format of variable node:

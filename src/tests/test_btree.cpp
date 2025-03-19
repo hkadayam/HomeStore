@@ -27,9 +27,7 @@
 
 using namespace homestore;
 
-SISL_LOGGING_INIT(HOMESTORE_LOG_MODS)
 SISL_OPTIONS_ENABLE(logging, test_btree, iomgr, test_common_setup)
-SISL_LOGGING_DECL(test_btree)
 
 // TODO Add tests to do write,remove after recovery.
 // TODO Test with var len key with io mgr page size is 512.
@@ -134,14 +132,18 @@ struct BtreeTest : public BtreeTestHelper< TestType >, public ::testing::Test {
     test_common::HSTestHelper m_helper;
 };
 
-using BtreeTypes = testing::Types<
-    // FixedLenBtree< IndexStore::Type::MEM_BTREE >,      // In memory fixed key/value sized btree
-    // VarKeySizeBtree< IndexStore::Type::MEM_BTREE >,    // In memory var key, but fixed value sized btree
-    // VarValueSizeBtree< IndexStore::Type::MEM_BTREE >,  // In memory fixed key, var value sizeds btree
-    // VarObjSizeBtree< IndexStore::Type::MEM_BTREE >,    // In memory var sized key/value btree
-    // PrefixIntervalBtree< IndexStore::Type::MEM_BTREE > // In memory interval key/value btree
-    FixedLenBtree< IndexStore::Type::COPY_ON_WRITE_BTREE > // COW fixed key/value sized btree
-    >;
+using BtreeTypes =
+    testing::Types< FixedLenBtree< IndexStore::Type::MEM_BTREE >,     // In memory fixed key/value sized btree
+                    VarKeySizeBtree< IndexStore::Type::MEM_BTREE >,   // In memory var key, but fixed value sized btree
+                    VarValueSizeBtree< IndexStore::Type::MEM_BTREE >, // In memory fixed key, var value sizeds btree
+                    VarObjSizeBtree< IndexStore::Type::MEM_BTREE >,   // In memory var sized key/value btree
+                    PrefixIntervalBtree< IndexStore::Type::MEM_BTREE >,         // In memory interval key/value btree
+                    FixedLenBtree< IndexStore::Type::COPY_ON_WRITE_BTREE >,     // COW fixed key/value sized btree
+                    VarKeySizeBtree< IndexStore::Type::COPY_ON_WRITE_BTREE >,   // COW var key, fixed value sized btree
+                    VarValueSizeBtree< IndexStore::Type::COPY_ON_WRITE_BTREE >, // COW fixed key, var value sizeds btree
+                    VarObjSizeBtree< IndexStore::Type::COPY_ON_WRITE_BTREE >,   // COW var sized key/value btree
+                    PrefixIntervalBtree< IndexStore::Type::COPY_ON_WRITE_BTREE > // COW interval key/value btree
+                    >;
 
 TYPED_TEST_SUITE(BtreeTest, BtreeTypes);
 

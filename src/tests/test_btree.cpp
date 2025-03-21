@@ -83,13 +83,17 @@ struct BtreeTest : public BtreeTestHelper< TestType >, public ::testing::Test {
                 {{ServiceType::META, {.size_pct = 100.0}},
                  {ServiceType::INDEX, {.size_pct = 0.0, .index_svc_cbs = new TestIndexServiceCallbacks(this)}}},
                 nullptr,
-                1 * 1024 * 1024 // For mem btree, let us create small size device
-            );
+                {homestore::dev_info{"", homestore::HSDevType::Data, 64 * 1024 * 1024},
+                 homestore::dev_info{"", homestore::HSDevType::Data, 64 * 1024 * 1024}});
+            // For mem btree use create only 1 small device
         } else {
             m_helper.start_homestore(
                 "test_btree",
                 {{ServiceType::META, {.size_pct = 10.0}},
-                 {ServiceType::INDEX, {.size_pct = 70.0, .index_svc_cbs = new TestIndexServiceCallbacks(this)}}});
+                 {ServiceType::INDEX, {.size_pct = 70.0, .index_svc_cbs = new TestIndexServiceCallbacks(this)}}},
+                nullptr, {homestore::dev_info{"", homestore::HSDevType::Fast, 0}});
+            // For persistent btree, we try to create a default size, but with only 1 device explictly, since this tests
+            // start restart homestore several times and its better to use 1 disk always.
         }
 
         auto uuid = boost::uuids::random_generator()();

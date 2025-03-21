@@ -32,6 +32,8 @@ public:
         this->set_node_type(btree_node_type::FIXED);
     }
 
+    virtual ~SimpleNode() = default;
+
     using BtreeNode::get_nth_key_internal;
     using BtreeNode::get_nth_key_size;
     using BtreeNode::get_nth_obj_size;

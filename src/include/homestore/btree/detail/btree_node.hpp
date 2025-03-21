@@ -131,8 +131,6 @@ public:
     virtual ~BtreeNode() {
 #ifndef TEST_BNODE_ONLY
         s_cast< BtreeStore* >(index_service().lookup_store(m_trans_hdr.store_type))->on_node_freed(this);
-#else
-        delete uintptr_cast(this);
 #endif
     }
 

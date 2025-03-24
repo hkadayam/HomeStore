@@ -13,20 +13,6 @@
 
 namespace homestore {
 
-static COWBtree* to_cow_btree(BtreeBase& btree) { return r_cast< COWBtree* >(btree.underlying_btree()); }
-
-static COWBtree const* to_cow_btree(BtreeBase const& btree) {
-    return r_cast< COWBtree const* >(btree.underlying_btree());
-}
-
-static COWBtree* to_cow_btree(Index* index) {
-    return r_cast< COWBtree* >(s_cast< BtreeBase* >(index)->underlying_btree());
-}
-
-static COWBtree const* to_cow_btree(Index const* index) {
-    return r_cast< COWBtree const* >(s_cast< BtreeBase const* >(index)->underlying_btree());
-}
-
 static std::vector< iomgr::io_fiber_t > start_flush_threads() {
     // Start WBCache flush threads
     struct Context {
@@ -82,6 +68,7 @@ COWBtreeStore::COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< I
     m_cp_flush_fibers = std::move(start_flush_threads());
 }
 
+uint32_t COWBtreeStore::max_capacity() const { return m_vdev->size(); }
 uint32_t COWBtreeStore::max_node_size() const { return m_vdev->atomic_page_size(); }
 uint32_t COWBtreeStore::align_size() const { return m_vdev->align_size(); }
 
@@ -117,11 +104,7 @@ void COWBtreeStore::on_btree_destroyed(BtreeBase& bt) {
     CPGuard cpg = cp_mgr().cp_guard();
     auto context = cpg->context(cp_consumer_t::INDEX_SVC);
     auto cp_ctx = IndexCPContext::convert< COWBtreeCPContext >(context, IndexStore::Type::COPY_ON_WRITE_BTREE);
-
-    {
-        std::unique_lock lg{cp_ctx->m_bt_list_mtx};
-        cp_ctx->m_destroyed_btrees.emplace_back(bt.shared_from_this());
-    }
+    cp_ctx->add_to_destroyed_list(bt.shared_from_this());
 }
 
 void COWBtreeStore::on_node_freed(BtreeNode* node) { COWBtreeNode::destruct(node); }
@@ -181,25 +164,27 @@ folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
     }
 #endif
 
-    CP_PERIODIC_LOG(DEBUG, cp_ctx->id(),
-                    "CowBtree has {} dirtied nodes, {} deleted nodes across all btrees, flushing them",
-                    cp_ctx->m_dirty_node_count.get(), cp_ctx->m_removed_node_count.get());
+    auto has_hit_incremental_flush_count_threshold = [this]() -> bool {
+        return (m_num_incremental_flushes >= HS_DYNAMIC_CONFIG(btree->cow_max_incremental_map_flushes));
+    };
 
-    // Prepare the header for the journal to be written. The header details will be filled along the way while flushing
-    cp_ctx->prepare_store_journal();
+    auto has_hit_meta_vdev_size_threshold = [this]() -> bool {
+        return (
+            meta_service().used_size() <
+            uint64_cast(
+                (HS_DYNAMIC_CONFIG(btree->cow_full_map_flush_size_threshold_pct) * meta_service().total_size()) / 100));
+    };
 
-    // Get all the current btrees in the system.
-    cp_ctx->m_all_btrees = std::move(hs()->index_service().get_all_index_tables());
+    // First determine if this CP flush should be full_map flush
+    if (has_hit_incremental_flush_count_threshold() || has_hit_meta_vdev_size_threshold()) {
+        cp_ctx->prepare_to_flush(true); // Full map flush
+    } else {
+        cp_ctx->prepare_to_flush(false); // Incremental map flush
+        ++m_num_incremental_flushes;
+    }
+
     auto on_flush_nodes_done = [this](COWBtreeCPContext* cp_ctx) {
-        // If there are any destroyed btrees as part of the CP, do the actual destroy now.
-        for (auto& btree : cp_ctx->m_destroyed_btrees) {
-            to_cow_btree(btree.get())->destroy();
-        }
-
-        CP_PERIODIC_LOG(
-            INFO, cp_ctx->id(),
-            "CowBtreeStore has {} btrees destroyed in this cp, destroyed all persistent structures for them",
-            cp_ctx->m_destroyed_btrees.size());
+        cp_ctx->actual_destroy_btrees();
 
         // All dirty nodes from all btrees have been flushed, now we can flush the full map or journal
         // (depending on cp type) for each of the modified btree
@@ -216,23 +201,13 @@ folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
             // dirty. I feel this is much lower cost than doing in critical IO path.
             auto cp_ctx = fg.cp_ctx();
             for (auto const& btree : cp_ctx->m_all_btrees) {
-                COWBtree* cow_btree = to_cow_btree(btree.get());
+                COWBtree* cow_btree = COWBtree::cast_to(btree.get());
                 auto const [has_flushed, journal, is_sb_changed] = cow_btree->flush_nodes(cp_ctx);
 
                 if (has_flushed) {
-                    // This btree was dirtied in this cp, keep track of these btrees to persist their full map (if full
-                    // map cp) or if superblk is changed.
-                    // NOTE: We cannot persist superblk before persisting the journal that all btrees have been built.
-                    // That is why we need to keep track of all btrees whose superblk has been changed and then write
-                    // later.
-                    std::unique_lock lg{cp_ctx->m_bt_list_mtx};
-                    ++cp_ctx->m_flushed_btrees_count;
-                    if (cp_ctx->need_full_map_flush()) {
-                        cp_ctx->m_active_btree_list.emplace_back(cow_btree);
-                    } else {
-                        cp_ctx->append_btree_journal(journal->m_base_buf);
-                        if (is_sb_changed) { cp_ctx->m_active_btree_list.emplace_back(cow_btree); }
-                    }
+                    // Notify the cp context that we have flushed a btree and provide the journal. CP context will build
+                    // the journal, which we will flush after all btrees are done flushing the nodes.
+                    cp_ctx->flushed_a_btree(cow_btree, journal.get(), is_sb_changed);
                 }
             }
         });
@@ -262,8 +237,8 @@ void COWBtreeStore::flush_map(COWBtreeCPContext* cp_ctx) {
             iomanager.run_on_forget(fiber, [fg]() mutable {
                 auto cp_ctx = fg.cp_ctx();
 
-                // Yes we access m_active_btree_list outside of lock, but we are sure that there is no one mutating this
-                // btree list
+                // Yes we access m_active_btree_list outside of lock, but we are sure that there is no one mutating
+                // this btree list
                 for (auto cow_btree : cp_ctx->m_active_btree_list) {
                     cow_btree->flush_map_and_sb(cp_ctx);
                 }

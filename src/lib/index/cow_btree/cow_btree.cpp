@@ -214,12 +214,12 @@ BlkId COWBtree::get_blkid_for_nodeid(bnodeid_t nodeid) const { return lookup_bno
 
 void COWBtree::add_to_dirty_list(BtreeNodePtr const& node, COWBtreeCPContext* cp_ctx) {
     cp_session(cp_ctx->id())->m_modified_nodes.push_back(node);
-    cp_ctx->m_dirty_node_count.increment(1);
+    cp_ctx->increment_dirty_size(node->node_size());
 }
 
 void COWBtree::add_to_remove_list(bnodeid_t node_id, COWBtreeCPContext* cp_ctx) {
     cp_session(cp_ctx->id())->m_deleted_nodes.push_back(node_id);
-    cp_ctx->m_removed_node_count.increment(1);
+    cp_ctx->increment_pending_free_size(m_base_btree.node_size());
 }
 
 // FlushUnit represents one contiguous block where all btree nodes that can be packed are done and written at once

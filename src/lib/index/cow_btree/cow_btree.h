@@ -47,6 +47,20 @@ public:
     void flush_map_and_sb(COWBtreeCPContext* cp_ctx);
     void flush_sb(COWBtreeCPContext* cp_ctx);
 
+    static COWBtree* cast_to(BtreeBase& btree) { return r_cast< COWBtree* >(btree.underlying_btree()); }
+
+    static COWBtree const* cast_to(BtreeBase const& btree) {
+        return r_cast< COWBtree const* >(btree.underlying_btree());
+    }
+
+    static COWBtree* cast_to(Index* index) {
+        return r_cast< COWBtree* >(s_cast< BtreeBase* >(index)->underlying_btree());
+    }
+
+    static COWBtree const* cast_to(Index const* index) {
+        return r_cast< COWBtree const* >(s_cast< BtreeBase const* >(index)->underlying_btree());
+    }
+
 public:
     using CompactNodeId = uint32_t;
 

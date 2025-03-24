@@ -41,6 +41,9 @@ private:
     // All journals maintained (sorted) by its cp_id
     std::vector< superblk< IndexStoreSuperBlock > > m_journals_by_cpid;
 
+    // Total number of incremental cp flushes since last full flushes
+    uint32_t m_num_incremental_flushes{0};
+
 public:
     COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< IndexStoreSuperBlock > > store_sbs);
     virtual ~COWBtreeStore() = default;
@@ -57,6 +60,7 @@ public:
     bool is_ephemeral() const { return false; }
     uint32_t max_node_size() const override;
     uint32_t align_size() const;
+    uint32_t max_capacity() const;
 
     // Implemenations for flush
     folly::Future< bool > async_cp_flush(COWBtreeCPContext* cp_ctx);

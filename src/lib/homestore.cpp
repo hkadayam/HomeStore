@@ -293,7 +293,7 @@ void HomeStore::do_start() {
     // boot going forward on next reboot.
     if (m_dev_mgr->is_first_time_boot()) {
         // Take the first CP after we have initialized all subsystems and wait for it to complete.
-        m_cp_mgr->trigger_cp_flush(true /* force */).get();
+        m_cp_mgr->trigger_cp_flush(true /* force */, CPTriggerReason::Timer).get();
         m_dev_mgr->commit_formatting();
     }
 

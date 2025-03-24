@@ -69,6 +69,13 @@ if (${io_tests})
     set_property(TEST Btree PROPERTY ENVIRONMENT "ASAN_OPTIONS=detect_stack_use_after_return=true")
     set_tests_properties(Btree PROPERTIES TIMEOUT 1200)
 
+    set(TEST_COW_BTREE_RECOVERY_SOURCE_FILES test_cow_btree_recovery.cpp)
+    add_executable(test_cow_btree_recovery ${TEST_COW_BTREE_RECOVERY_SOURCE_FILES})
+    target_link_libraries(test_cow_btree_recovery homestore ${COMMON_TEST_DEPS} GTest::gtest)
+    add_test(NAME COWBtreeRecovery COMMAND test_cow_btree_recovery)
+    set_property(TEST COWBtreeRecovery PROPERTY ENVIRONMENT "ASAN_OPTIONS=detect_stack_use_after_return=true")
+    set_tests_properties(COWBtreeRecovery PROPERTIES TIMEOUT 1200)
+
     add_executable(test_data_service)
     target_sources(test_data_service PRIVATE test_data_service.cpp)
     target_link_libraries(test_data_service homestore ${COMMON_TEST_DEPS} GTest::gmock)

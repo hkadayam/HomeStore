@@ -33,6 +33,8 @@ public:
     explicit CPMgrMetrics() : sisl::MetricsGroup("CPMgr") {
         REGISTER_COUNTER(back_to_back_cps, "back to back cp");
         REGISTER_COUNTER(cp_cnt, "cp cnt");
+        REGISTER_COUNTER(cp_by_timer, "Cp taken because of timer");
+        REGISTER_COUNTER(cp_by_index_full, "Cp taken because of index dirty buffer/free blks fulls");
         REGISTER_HISTOGRAM(cp_latency, "cp latency (in us)");
         register_me_to_farm();
     }
@@ -141,6 +143,16 @@ public:
     virtual CP* get();
 };
 
+VENUM(CPTriggerReason, uint8_t,
+      Unknown = 0,               // Caller has not given a reason for it
+      Timer = 1,                 // Time was up
+      IndexBufferFull = 2,       // Index Dirty buffer was full
+      IndexFreeBlksExceeded = 3, // Index blocks freed has hit a limit
+      LogStoreFull = 4,          // Log store has gotten really full
+      DataFreeBlksExceeded = 5,  // Number of free blks in data service exceeded
+      UserDriven = 6,            // User explicitly requested for
+);
+
 /* It is responsible to trigger the checkpoints when all concurrent IOs are completed.
  * @ cp_type :- It is a consumer checkpoint with a base class of cp
  */
@@ -163,6 +175,7 @@ private:
     bool m_in_flush_phase{false};
     bool m_pending_trigger_cp{false}; // Is there is a waiter for a cp flush to start
     folly::SharedPromise< bool > m_pending_trigger_cp_comp;
+    std::vector< uint64_t > m_trigger_reasons;
 
 public:
     CPManager();
@@ -215,7 +228,7 @@ public:
     /// @brief Trigger a checkpoint flush on all subsystems registered. There is only 1 checkpoint per checkpoint
     /// manager. Checkpoint flush will wait for cp to exited all critical io sections.
     /// @param force : Do we need to force queue the checkpoint flush, in case previous checkpoint is being flushed
-    folly::Future< bool > trigger_cp_flush(bool force = false);
+    folly::Future< bool > trigger_cp_flush(bool force = false, CPTriggerReason reason = CPTriggerReason::Unknown);
 
     const std::array< std::unique_ptr< CPCallbacks >, (size_t)cp_consumer_t::SENTINEL >& consumer_list() const {
         return m_cp_cb_table;
@@ -236,7 +249,8 @@ private:
     void cleanup_cp(CP* cp);
     void on_meta_blk_found(const sisl::byte_view& buf, void* meta_cookie);
     void start_cp_thread();
-    folly::Future< bool > do_trigger_cp_flush(bool force, bool flush_on_shutdown);
+    folly::Future< bool > do_trigger_cp_flush(bool force, bool flush_on_shutdown,
+                                              CPTriggerReason reason = CPTriggerReason::Unknown);
 };
 
 extern CPManager& cp_mgr();

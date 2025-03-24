@@ -32,14 +32,12 @@ CPManager& cp_mgr() { return hs()->cp_mgr(); }
 CPManager::CPManager() :
         m_metrics{std::make_unique< CPMgrMetrics >()},
         m_wd_cp{std::make_unique< CPWatchdog >(this)},
-        m_sb{"CPSuperBlock"} {
+        m_sb{"CPSuperBlock"},
+        m_trigger_reasons{enum_count< CPTriggerReason >(), 0ul} {
     meta_service().register_handler(
         "CPSuperBlock",
         [this](meta_blk* mblk, sisl::byte_view buf, size_t size) { on_meta_blk_found(std::move(buf), (void*)mblk); },
         nullptr);
-
-    resource_mgr().register_dirty_buf_exceed_cb(
-        [this]([[maybe_unused]] int64_t dirty_buf_count, bool critical) { this->trigger_cp_flush(false /* force */); });
 
     start_cp_thread();
 }
@@ -58,7 +56,7 @@ void CPManager::start_timer() {
     LOGINFO("cp timer is set to {} usec", HS_DYNAMIC_CONFIG(generic.cp_timer_us));
     m_cp_timer_hdl = iomanager.schedule_global_timer(
         HS_DYNAMIC_CONFIG(generic.cp_timer_us) * 1000, true, nullptr /*cookie*/, iomgr::reactor_regex::all_worker,
-        [this](void*) { trigger_cp_flush(false /* false */); }, true /* wait_to_schedule */);
+        [this](void*) { trigger_cp_flush(false /* false */, CPTriggerReason::Timer); }, true /* wait_to_schedule */);
 }
 
 void CPManager::on_meta_blk_found(const sisl::byte_view& buf, void* meta_cookie) {
@@ -85,7 +83,7 @@ void CPManager::shutdown() {
     }
 
     LOGINFO("Trigger cp flush at CP shutdown");
-    auto success = do_trigger_cp_flush(true /* force */, true /* flush_on_shutdown */).get();
+    auto success = do_trigger_cp_flush(true /* force */, true /* flush_on_shutdown */, CPTriggerReason::Timer).get();
     HS_REL_ASSERT_EQ(success, true, "CP Flush failed");
     LOGINFO("Trigger cp done");
 
@@ -152,11 +150,11 @@ CP* CPManager::get_cur_cp() {
     return p;
 }
 
-folly::Future< bool > CPManager::trigger_cp_flush(bool force) {
-    return do_trigger_cp_flush(force, false /* flush_on_shutdown */);
+folly::Future< bool > CPManager::trigger_cp_flush(bool force, CPTriggerReason reason) {
+    return do_trigger_cp_flush(force, false /* flush_on_shutdown */, reason);
 }
 
-folly::Future< bool > CPManager::do_trigger_cp_flush(bool force, bool flush_on_shutdown) {
+folly::Future< bool > CPManager::do_trigger_cp_flush(bool force, bool flush_on_shutdown, CPTriggerReason reason) {
     std::unique_lock< std::mutex > lk(m_trigger_cp_mtx);
 
     if (m_in_flush_phase) {
@@ -176,6 +174,7 @@ folly::Future< bool > CPManager::do_trigger_cp_flush(bool force, bool flush_on_s
         }
     }
     m_in_flush_phase = true;
+    ++m_trigger_reasons[(size_t)reason];
 
     folly::Future< bool > ret_fut = folly::Future< bool >::makeEmpty();
     auto cur_cp = cp_guard();
@@ -274,7 +273,7 @@ void CPManager::on_cp_flush_done(CP* cp) {
         if (trigger_back_2_back_cp) {
             HS_PERIODIC_LOG(INFO, cp, "Triggering back to back CP");
             COUNTER_INCREMENT(*m_metrics, back_to_back_cps, 1);
-            trigger_cp_flush(false);
+            trigger_cp_flush(false, CPTriggerReason::Timer);
         }
     });
 }

@@ -69,10 +69,12 @@ struct BtreeTestHelper {
 
     void TearDown() {}
 
-protected:
+public:
     std::shared_ptr< Btree< K, V > > m_bt;
-    ShadowMap< K, V > m_shadow_map;
     BtreeConfig m_cfg;
+
+protected:
+    ShadowMap< K, V > m_shadow_map;
     uint32_t m_max_range_input{1000};
     bool m_is_multi_threaded{false};
     uint32_t m_run_time{0};
@@ -458,7 +460,7 @@ private:
         }
     }
 
-protected:
+public:
     void run_in_parallel(const std::vector< std::pair< std::string, int > >& op_list) {
         auto test_count = m_fibers.size();
         const auto total_iters = SISL_OPTIONS["num_iters"].as< uint32_t >();

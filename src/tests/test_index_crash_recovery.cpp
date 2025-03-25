@@ -403,7 +403,7 @@ struct IndexCrashTest : public test_common::HSTestHelper, BtreeTestHelper< TestT
     void crash_and_recover(uint32_t s_key, uint32_t e_key) {
         // this->print_keys("Btree prior to CP and susbsequent simulated crash: ");
         trigger_cp(false);
-        this->wait_for_crash_recovery();
+        this->wait_for_crash_recovery(true);
         // this->visualize_keys("tree_after_crash_" + std::to_string(s_key) + "_" + std::to_string(e_key) + ".dot");
 
         // this->print_keys("Post crash and recovery, btree structure: ");
@@ -453,7 +453,7 @@ struct IndexCrashTest : public test_common::HSTestHelper, BtreeTestHelper< TestT
 
         trigger_cp(false);
         LOGINFO("waiting for crash to recover");
-        this->wait_for_crash_recovery();
+        this->wait_for_crash_recovery(true);
 
         if (!filename.empty()) {
             std::string rec_filename = filename + "_after_recovery.dot";
@@ -502,7 +502,7 @@ TYPED_TEST(IndexCrashTest, CrashBeforeFirstCp) {
 
     // Trigger a cp, which should induce the crash and wait for hs to recover
     test_common::HSTestHelper::trigger_cp(false);
-    this->wait_for_crash_recovery();
+    this->wait_for_crash_recovery(true);
 
     // Post crash, load the shadow_map into a new instance and compute the diff. Redo the operation
     this->reapply_after_crash();

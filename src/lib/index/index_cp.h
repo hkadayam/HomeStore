@@ -44,7 +44,6 @@ private:
 
 struct IndexCPContext : public CPContext {
 public:
-    CP* m_cp;
     std::vector< unique< CPContext > > m_store_contexts;
 
 public:

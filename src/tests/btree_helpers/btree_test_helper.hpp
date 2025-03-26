@@ -53,6 +53,7 @@ struct BtreeTestHelper {
         if (m_is_multi_threaded) {
             std::mutex mtx;
             m_run_time = SISL_OPTIONS["run_time"].as< uint32_t >();
+            m_fibers.clear();
             iomanager.run_on_wait(iomgr::reactor_regex::all_worker, [this, &mtx]() {
                 auto fv = iomanager.sync_io_capable_fibers();
                 std::unique_lock lg(mtx);
@@ -363,8 +364,8 @@ public:
         }
     }
 
-    void multi_op_execute(const std::vector< std::pair< std::string, int > >& op_list, bool skip_preload = false) {
-        if (!skip_preload) {
+    void multi_op_execute(const std::vector< std::pair< std::string, int > >& op_list) {
+        if (m_shadow_map.size() == 0) {
             auto preload_size = SISL_OPTIONS["preload_size"].as< uint32_t >();
             auto const num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
             if (preload_size > num_entries / 2) {

@@ -25,7 +25,7 @@
 #include "cp_internal.hpp"
 
 namespace homestore {
-thread_local std::stack< CP* > CPGuard::t_cp_stack;
+iomgr::FiberManagerLib::FiberLocal< std::stack< CP* > > CPGuard::t_cp_stack;
 
 CPManager& cp_mgr() { return hs()->cp_mgr(); }
 
@@ -326,22 +326,22 @@ bool CPManager::has_cp_flushed(cp_id_t cp_id) const { return (m_sb->m_last_flush
 CPGuard::CPGuard(CPManager* mgr) {
     if (mgr == nullptr) { return; }
 
-    if (t_cp_stack.empty()) {
+    if (t_cp_stack->empty()) {
         // First CP in this thread stack.
         m_cp = mgr->cp_io_enter();
     } else {
         // Nested CP sections
-        m_cp = t_cp_stack.top();
+        m_cp = t_cp_stack->top();
         m_cp->m_cp_mgr->cp_ref(m_cp);
     }
-    t_cp_stack.push(m_cp);
+    t_cp_stack->push(m_cp);
     m_pushed = true; // m_pushed represented if this is added to current thread stack
 }
 
 CPGuard::~CPGuard() {
-    if (m_pushed && !t_cp_stack.empty()) {
+    if (m_pushed && !t_cp_stack->empty()) {
         //        HS_DBG_ASSERT_EQ((void*)m_cp, (void*)t_cp_stack.top(), "CPGuard mismatch of CP pointers");
-        t_cp_stack.pop();
+        t_cp_stack->pop();
     }
     if (m_cp) { m_cp->m_cp_mgr->cp_io_exit(m_cp); }
 }
@@ -369,7 +369,7 @@ CP* CPGuard::get() {
     // HS_DBG_ASSERT_NE((void*)m_cp, (void*)nullptr, "CPGuard get on empty CP pointer");
     if (!m_pushed && m_cp) {
         // m_pushed is false in case cp guard is moved from one thread to other
-        t_cp_stack.push(m_cp);
+        t_cp_stack->push(m_cp);
         m_pushed = true;
     }
     return m_cp;

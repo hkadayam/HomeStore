@@ -21,6 +21,8 @@ BtreeBase::BtreeBase(BtreeConfig const& cfg, uuid_t uuid, uuid_t parent_uuid, ui
     m_store =
         std::static_pointer_cast< BtreeStore >(hs()->index_service().lookup_or_create_store(cfg.store_type(), {}));
 
+    if (m_bt_cfg.m_btree_name.empty()) { m_bt_cfg.m_btree_name = "btree" + std::to_string(m_sb->ordinal); }
+
     // Determine the correct node size
     auto const max_node_size = m_store->max_node_size();
     if ((m_bt_cfg.m_node_size == 0) || (m_bt_cfg.m_node_size > max_node_size)) { m_bt_cfg.m_node_size = max_node_size; }
@@ -42,6 +44,8 @@ BtreeBase::BtreeBase(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb) :
     m_sb = std::move(sb);
     m_store =
         std::static_pointer_cast< BtreeStore >(hs()->index_service().lookup_or_create_store(cfg.store_type(), {}));
+
+    if (m_bt_cfg.m_btree_name.empty()) { m_bt_cfg.m_btree_name = "btree" + std::to_string(m_sb->ordinal); }
 
     // Retrieve the correct node_size
     auto bt_sb = r_cast< BtreeSuperBlock* >(m_sb.get()->underlying_index_sb.data());

@@ -129,7 +129,7 @@ private:
     // and passes the cp1 to thread2. However, before accessing cp1, thread2 already takes cp2 critical section and then
     // access cp1, then it needs to wind up with cp1 and once cp1 is done, has to go back to cp2. This nesting can
     // potentially happen recursively (although such pattern is not great, it can exist). That is why we use stack here
-    static thread_local std::stack< CP* > t_cp_stack;
+    static iomgr::FiberManagerLib::FiberLocal< std::stack< CP* > > t_cp_stack;
 
 public:
     CPGuard(CPManager* mgr);

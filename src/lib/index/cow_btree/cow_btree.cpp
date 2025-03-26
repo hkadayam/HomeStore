@@ -8,6 +8,9 @@
 #include "device/virtual_dev.hpp"
 
 namespace homestore {
+#define COWBT_PERIODIC_LOG(level, cp_id, ...)                                                                          \
+    HS_PERIODIC_DETAILED_LOG(level, cp, "cp_id", cp_id, "btree", m_base_btree.bt_config().name(), __VA_ARGS__)
+
 static constexpr uint64_t btree_nodeid_bits = sizeof(uint32_t) * 8;
 static constexpr uint64_t btree_ordinal_bits = 64 - btree_nodeid_bits;
 static constexpr uint64_t btree_nodeid_mask = ((1ull << btree_nodeid_bits) - 1);
@@ -29,8 +32,8 @@ static BlkId alloc_blks_or_fail(VirtualDev* vdev, uint32_t size, blk_alloc_hints
     return out_blkid;
 }
 
-static void write_or_fail(VirtualDev* vdev, uint8_t* buf, uint32_t size, BlkId location) {
-    auto err = vdev->sync_write(r_cast< const char* >(buf), size, location);
+static void write_or_fail(VirtualDev* vdev, sisl::io_blob const& blob, BlkId location) {
+    auto err = vdev->sync_write(r_cast< const char* >(blob.cbytes()), blob.size(), location);
     HS_REL_ASSERT(!err, "Flush of full map failed with err={}. best is to crash the system and replay", err.message());
 }
 
@@ -247,11 +250,12 @@ struct NodeFlushUnit {
 
     NodeFlushUnit(COWBtreeCPContext* cp_ctx, BlkId location, sisl::blob& journal_area) :
             m_cp_ctx{cp_ctx}, m_nodes_location{location} {
-        m_jentry = new (journal_area.bytes()) JournalEntry();
-        m_jentry->nodes_location = location;
+        if (journal_area.bytes() != nullptr) {
+            m_jentry = new (journal_area.bytes()) JournalEntry();
+            m_jentry->nodes_location = location;
+        }
         m_iovs.reserve(location.blk_count());
         m_node_bufs.reserve(location.blk_count());
-        if (m_jentry) { m_jentry->nodes_location = location; }
     }
 
     void add(COWBtreeNode* cow_node) {
@@ -376,7 +380,7 @@ public:
 
     void link(BNodeMapWriteUnit& next) { header()->next_unit_location = COWBtree::CompactBlkId{next.m_location}; }
 
-    void finalize() {
+    sisl::io_blob finalize() {
         ++(header()->n_entries); // We increment as the last entry would be open until we finalize
 
         // Trim down the alloc size and actual blks (if we alloced them)
@@ -388,6 +392,8 @@ public:
 
         // Write the checksum
         header()->checksum = compute_crc();
+
+        return sisl::io_blob{m_buf.cbytes(), valid.blk_count() * m_vdev->block_size(), true /* is_aligned */};
     }
 
     Header* header() { return r_cast< Header* >(m_buf.bytes()); }
@@ -396,6 +402,32 @@ public:
     uint32_t compute_crc() const {
         return crc32_ieee(init_crc32, r_cast< const uint8_t* >(header_const()) + sizeof(Header),
                           header_const()->size - sizeof(Header));
+    }
+
+    std::string to_string() const {
+        std::string str;
+        auto* hdr = header_const();
+        fmt::vformat_to(
+            std::back_inserter(str),
+            fmt::string_view{
+                "\nLocation: [{}], Header: [next_unit_location:[{}], size={}, n_entries={}, checksum={}]\n"},
+            fmt::make_format_args(m_location.to_string(), hdr->next_unit_location.to_compact_string(), hdr->size,
+                                  hdr->n_entries, hdr->checksum));
+
+        auto* entry = r_cast< MapEntry const* >(m_buf.cbytes() + sizeof(Header));
+        for (uint32_t i{0}; i < hdr->n_entries; ++i) {
+            fmt::vformat_to(
+                std::back_inserter(str), fmt::string_view{"  NodeEntry{}: [ids=[{}-{}], locations:["},
+                fmt::make_format_args(i, entry->nodeid_start, entry->nodeid_start + entry->nodes_count - 1));
+
+            for (uint16_t j{0}; j < entry->nodes_count; ++j) {
+                fmt::vformat_to(std::back_inserter(str), fmt::string_view{"[{}],"},
+                                fmt::make_format_args(entry->nodes_locations[j].to_compact_string()));
+            }
+            fmt::format_to(std::back_inserter(str), "]\n");
+            entry = r_cast< MapEntry const* >(r_cast< uint8_t const* >(entry) + entry->size());
+        }
+        return str;
     }
 };
 
@@ -468,8 +500,8 @@ std::tuple< bool, unique< COWBtree::Journal >, bool > COWBtree::flush_nodes(COWB
             sb_changed = true;
         }
 
-        CP_PERIODIC_LOG(DEBUG, cp_ctx->id(), "Btree={} has flushed {} dirty nodes and deleted {} nodes",
-                        m_base_btree.ordinal(), session->m_modified_count, session->m_deleted_count);
+        COWBT_PERIODIC_LOG(DEBUG, cp_ctx->id(), "Flushed {} dirty nodes and deleted {} nodes",
+                           session->m_modified_count, session->m_deleted_count);
         m_bnodeid_map.m_updates_since_last_flush.fetch_add(session->m_modified_count + session->m_deleted_count);
 
         // If either map has to be updated or sb is changed, we need to hold onto the session and it will be completed
@@ -493,15 +525,15 @@ void COWBtree::flush_map_and_sb(COWBtreeCPContext* cp_ctx) {
     HS_DBG_ASSERT(cp_ctx->need_full_map_flush(), "Flush map called on a cp which doesn't need full map flush");
 
     if (m_bnodeid_map.m_updates_since_last_flush.load() == 0) {
-        CP_PERIODIC_LOG(DEBUG, cp_ctx->id(),
-                        "For Btree={} there was no update of the bnodeid map since last flush, so ignoring",
-                        m_base_btree.name());
+        COWBT_PERIODIC_LOG(DEBUG, cp_ctx->id(), "No update of the bnodeid map since last flush, so ignoring");
         return;
     }
 
     CPSession* session = cp_session(cp_ctx->id());
     auto const entries = session->prepare_to_flush_map(cp_ctx);
     auto count = entries.size();
+    if (count == 0) { return; }
+
     auto it = entries.begin();
 
     // Worst Estimate of 1 entry per count packed in a single blk
@@ -514,8 +546,9 @@ void COWBtree::flush_map_and_sb(COWBtreeCPContext* cp_ctx) {
             auto new_unit = std::make_unique< BNodeMapWriteUnit >(m_vdev.get(), count);
             munit->link(*new_unit);
 
-            munit->finalize();
-            write_or_fail(m_vdev.get(), munit->m_buf.bytes(), munit->m_buf.size(), munit->m_location);
+            auto const blob = munit->finalize();
+            COWBT_PERIODIC_LOG(TRACE, cp_ctx->id(), "Flushing a map unit: {}", munit->to_string());
+            write_or_fail(m_vdev.get(), blob, munit->m_location);
             map_locations.emplace_back(munit->m_location);
 
             munit = std::move(new_unit);
@@ -526,12 +559,13 @@ void COWBtree::flush_map_and_sb(COWBtreeCPContext* cp_ctx) {
     }
 
     if (!munit->is_empty()) {
-        munit->finalize();
-        write_or_fail(m_vdev.get(), munit->m_buf.bytes(), munit->m_buf.size(), munit->m_location);
+        auto const blob = munit->finalize();
+        COWBT_PERIODIC_LOG(TRACE, cp_ctx->id(), "Flushing a map unit: {}", munit->to_string());
+        write_or_fail(m_vdev.get(), blob, munit->m_location);
         map_locations.emplace_back(munit->m_location);
     }
 
-    auto const [done, all_map_locations] = session->done_flushing_map(std::move(map_locations));
+    auto const [done, all_map_locations] = session->done_flushing_map(std::move(map_locations), entries.size());
     if (!done) {
         // Still there are other fibers flushing the map.
         return;
@@ -799,35 +833,39 @@ COWBtree::CPSession::prepare_to_flush_map(COWBtreeCPContext* cp_ctx) {
 
     if (m_state == FlushState::MAP_FLUSHING) {
         // Some other fiber has started the flushing, get the next range of maps and iterate over and start flushing
-        ++m_flushing_req_count;
         return to_vector(m_parallel_flush_range);
     } else if (m_state != FlushState::NODES_FLUSHED) {
         // The nodes themselves have not been flushed or we have already finished flushing map, so we don't need to
         // anything now
         HS_DBG_ASSERT(m_next_full_map_it == m_bt.m_bnodeid_map.m_map.end(),
-                      "In NODE_FLUSHED state, but outstanding count is non zero");
+                      "In {} state, but outstanding count is non zero", m_state);
         return {};
     } else {
         // First fiber to start flushing, prepare the iterator. First flusher wll also get reminder of range also
-        HS_DBG_ASSERT_EQ(m_flushing_req_count, 0, "In NODE_FLUSHED state, but outstanding count is non zero");
         m_state = FlushState::MAP_FLUSHING;
 
         // First fiber to flush the full map in this session. All fibers get equal portion to flush except the first
         // one which gets additional
         auto const total_count = m_bt.m_bnodeid_map.m_map.size();
+        m_pending_map_entries_to_flush = total_count;
         m_parallel_flush_range = total_count / cp_ctx->m_parallel_flushers_count;
+        m_next_full_map_it = m_bt.m_bnodeid_map.m_map.begin();
         return to_vector(m_parallel_flush_range + (total_count % cp_ctx->m_parallel_flushers_count));
     }
 }
 
 std::pair< bool, std::vector< std::vector< BlkId > > >
-COWBtree::CPSession::done_flushing_map(std::vector< BlkId > map_locations) {
+COWBtree::CPSession::done_flushing_map(std::vector< BlkId > map_locations, size_t num_flushed_entries) {
     std::lock_guard lg{m_flush_mtx};
     HS_DBG_ASSERT_EQ(m_state, FlushState::MAP_FLUSHING,
                      "Received a flush done while state was not in flushing, some race condition?");
 
-    m_location_chains.emplace_back(std::move(map_locations));
-    if (--m_flushing_req_count != 0) { return std::pair(false, std::vector< std::vector< BlkId > >{}); }
+    if (!map_locations.empty()) { m_location_chains.emplace_back(std::move(map_locations)); }
+    m_pending_map_entries_to_flush -= num_flushed_entries;
+
+    if (m_pending_map_entries_to_flush > 0) { return std::pair(false, std::vector< std::vector< BlkId > >{}); }
+    HS_DBG_ASSERT(m_next_full_map_it == m_bt.m_bnodeid_map.m_map.end(),
+                  "We have no pending fibers flushing map, but the iterator has not pointing to end");
 
     m_state = FlushState::MAP_FLUSHED;
     return std::pair(true, std::move(m_location_chains));

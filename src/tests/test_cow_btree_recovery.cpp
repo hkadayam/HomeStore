@@ -66,6 +66,7 @@ struct BtreeTest : public ::testing::Test {
         TestIndexServiceCallbacks(BtreeTest* test) : m_test(test) {}
         std::shared_ptr< Index > on_index_table_found(superblk< IndexSuperBlock >&& sb) override {
             auto bt_helper = m_test->m_bt_helpers[m_test->m_recovered++].get();
+            bt_helper->SetUp(true /* multi_threaded */);
             bt_helper->m_bt = std::make_shared< Btree< K, V > >(bt_helper->m_cfg, std::move(sb));
             return bt_helper->m_bt;
         }
@@ -98,21 +99,34 @@ struct BtreeTest : public ::testing::Test {
             (testing::UnitTest::GetInstance()->current_test_info()->name() == std::string("ConcurrentMultiOps"));
 
         for (uint32_t i{0}; i < SISL_OPTIONS["num_btrees"].as< uint32_t >(); ++i) {
-            auto uuid = boost::uuids::random_generator()();
-            auto parent_uuid = boost::uuids::random_generator()();
-
-            auto bt_helper = std::make_unique< BtreeTestHelper< T > >();
-            bt_helper->SetUp(true /* multi_threaded */);
-            bt_helper->m_bt = std::make_shared< Btree< K, V > >(bt_helper->m_cfg, uuid, parent_uuid, 0);
-            hs()->index_service().add_index_table(bt_helper->m_bt);
-            m_bt_helpers.emplace_back(std::move(bt_helper));
+            create_new_btree();
         }
     }
 
-    void fillup_btrees() {
+    void create_new_btree() {
+        auto uuid = boost::uuids::random_generator()();
+        auto parent_uuid = boost::uuids::random_generator()();
+
+        auto bt_helper = std::make_unique< BtreeTestHelper< T > >();
+        bt_helper->SetUp(true /* multi_threaded */);
+        bt_helper->m_bt = std::make_shared< Btree< K, V > >(bt_helper->m_cfg, uuid, parent_uuid, 0);
+        hs()->index_service().add_index_table(bt_helper->m_bt);
+        m_bt_helpers.emplace_back(std::move(bt_helper));
+    }
+
+    void destroy_a_btree() {
+        if (this->m_bt_helpers.empty()) { return; }
+
+        auto& bt_helper = this->m_bt_helpers.front();
+        hs()->index_service().destroy_index_table(bt_helper->m_bt);
+        bt_helper->m_bt.reset();
+        m_bt_helpers.erase(m_bt_helpers.begin());
+    }
+
+    void io_on_btrees() {
         std::vector< std::string > input_ops = {"put:70", "remove:30"};
         for (auto& bt_helper : this->m_bt_helpers) {
-            bt_helper->multi_op_execute(bt_helper->build_op_list(input_ops), false /* skip_preload */);
+            bt_helper->multi_op_execute(bt_helper->build_op_list(input_ops));
         }
     }
 
@@ -152,37 +166,69 @@ struct BtreeTest : public ::testing::Test {
         std::this_thread::sleep_for(std::chrono::seconds{1});
         LOGINFO(" Restarted homestore with {} indexes recovered", m_recovered);
 
-        // TODO: Vadlidate if the expected recovered == total recovered
-
+        ASSERT_EQ(m_recovered, this->m_bt_helpers.size()) << "Number of btrees before and after restart mismatch";
         for (auto& bt_helper : this->m_bt_helpers) {
             std::string before_fname = fmt::format("/tmp/btree_{}_before.txt", bt_helper->m_bt->ordinal());
             std::string after_fname = fmt::format("/tmp/btree_{}_after.txt", bt_helper->m_bt->ordinal());
             bt_helper->dump_to_file(after_fname);
             bt_helper->compare_files(before_fname, after_fname); // Validate with dumping
-            bt_helper->query_all_paginate(500); // Validate with query as well.
+            bt_helper->query_all_paginate(500);                  // Validate with query as well.
         }
     }
 
-    void incremental_map_cp_then_restart_validate() {
-        LOGINFO("Setup to do incremental map cp flush and then trigger CP");
+    void trigger_incremental_map_cp() {
+        LOGINFO("Trigger Incremental Map Flush CP");
         // Modify the settings to take incremental map flushes only once
         HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
-            s.cow_max_incremental_map_flushes = 100000;
+            s.btree.cow_max_incremental_map_flushes = 100000;
             HS_SETTINGS_FACTORY().save();
         });
         test_common::HSTestHelper::trigger_cp(true /* wait */);
-        restart_and_validate();
     }
 
-    void fullmap_cp_then_restart_validate() {
-        LOGINFO("Setup to do full map cp flush and then trigger CP");
+    void trigger_full_map_cp() {
+        LOGINFO("Trigger Full Map Flush CP");
+
         // Modify the settings to take incremental map flushes only once
         HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
-            s.cow_max_incremental_map_flushes = 0;
+            s.btree.cow_max_incremental_map_flushes = 0;
             HS_SETTINGS_FACTORY().save();
         });
         test_common::HSTestHelper::trigger_cp(true /* wait */);
-        restart_and_validate();
+    }
+
+    struct cp_params {
+        uint32_t num_new_btrees{0};                                     // # of new btrees to create before cp
+        uint32_t num_destroy_btrees{0};                                 // # of btrees to destroy before cp
+        uint32_t num_io_btrees{std::numeric_limits< uint32_t >::max()}; // # of btrees to do IO
+        bool is_full_map_flush_cp{false};                               // Is it a full map flush cp or incremental
+        bool restart_post_cp{false};                                    // Should we restart the homestore after cp
+    };
+
+    void action_with_cp(cp_params p) {
+        for (uint32_t i{0}; i < p.num_new_btrees; ++i) {
+            create_new_btree();
+        }
+
+        for (uint32_t i{0}; i < p.num_destroy_btrees; ++i) {
+            destroy_a_btree();
+        }
+
+        if (p.num_io_btrees == std::numeric_limits< uint32_t >::max()) { p.num_io_btrees = this->m_bt_helpers.size(); }
+
+        LOGINFO("CPSpec: Created {} new btrees, Destroyed {} btrees, IO on {} btrees, then take {} CP, post CP "
+                "restart={}",
+                p.num_new_btrees, p.num_destroy_btrees, p.num_io_btrees,
+                p.is_full_map_flush_cp ? "FullFlush" : "IncrementalFlush", p.restart_post_cp ? "Yes" : "No");
+
+        std::vector< std::string > input_ops = {"put:70", "remove:30"};
+        for (uint32_t i{0}; i < p.num_io_btrees; ++i) {
+            auto& bt_helper = this->m_bt_helpers[i];
+            bt_helper->multi_op_execute(bt_helper->build_op_list(input_ops));
+        }
+
+        p.is_full_map_flush_cp ? trigger_full_map_cp() : trigger_incremental_map_cp();
+        if (p.restart_post_cp) { restart_and_validate(); }
     }
 
 protected:
@@ -191,16 +237,85 @@ protected:
     uint32_t m_recovered{0};
 };
 
-TEST_F(BtreeTest, IOFullMapFlushThenRestart) {
-    LOGINFO("Fill up the {} btrees", SISL_OPTIONS["num_btrees"].as< uint32_t >());
-    this->fillup_btrees();
-    this->fullmap_cp_then_restart_validate();
+TEST_F(BtreeTest, IOThenFullMapFlushThenRestart) {
+    action_with_cp({.num_new_btrees = 0,
+                    .num_destroy_btrees = 0,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = true,
+                    .restart_post_cp = true});
+
+    LOGINFO("Post Restart we do IO on all recovered btrees");
+    this->io_on_btrees();
 }
 
-TEST_F(BtreeTest, IOIncrementalMapFlushThenRestart) {
-    LOGINFO("Fill up the {} btrees", SISL_OPTIONS["num_btrees"].as< uint32_t >());
-    this->fillup_btrees();
-    this->incremental_map_cp_then_restart_validate();
+TEST_F(BtreeTest, IOThenIncrementalMapFlushThenRestart) {
+    action_with_cp({.num_new_btrees = 0,
+                    .num_destroy_btrees = 0,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = false,
+                    .restart_post_cp = true});
+
+    LOGINFO("Post Restart we do IO on all recovered btrees");
+    this->io_on_btrees();
+}
+
+TEST_F(BtreeTest, CreateThenFullMapFlushThenRestart) {
+    action_with_cp({.num_new_btrees = 1,
+                    .num_destroy_btrees = 0,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = true,
+                    .restart_post_cp = true});
+
+    LOGINFO("Post Restart we do IO on all recovered btrees");
+    this->io_on_btrees();
+}
+
+TEST_F(BtreeTest, CreateThenIncrementalMapFlushThenRestart) {
+    action_with_cp({.num_new_btrees = 1,
+                    .num_destroy_btrees = 0,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = false,
+                    .restart_post_cp = true});
+
+    LOGINFO("Post Restart we do IO on all recovered btrees");
+    this->io_on_btrees();
+}
+
+TEST_F(BtreeTest, DestroyThenFullMapFlushThenRestart) {
+    action_with_cp({.num_new_btrees = 0,
+                    .num_destroy_btrees = 1,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = true,
+                    .restart_post_cp = true});
+
+    LOGINFO("Post Restart we do IO on all recovered btrees");
+    this->io_on_btrees();
+}
+
+TEST_F(BtreeTest, DestroyThenIncrementalMapFlushThenRestart) {
+    action_with_cp({.num_new_btrees = 0,
+                    .num_destroy_btrees = 1,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = false,
+                    .restart_post_cp = true});
+
+    LOGINFO("Post Restart we do IO on all recovered btrees");
+    this->io_on_btrees();
+}
+
+TEST_F(BtreeTest, RandomMultiOps) {
+    static std::uniform_int_distribution< uint32_t > num_gen{1, std::numeric_limits< uint32_t >::max()};
+
+    for (auto i{0}; i < SISL_OPTIONS["num_cps"].as< uint32_t >(); ++i) {
+        action_with_cp({.num_new_btrees = num_gen(g_re) % 3,
+                        .num_destroy_btrees = num_gen(g_re) % 2,
+                        .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                        .is_full_map_flush_cp = false,
+                        .restart_post_cp = true});
+    }
+
+    LOGINFO("Post Restart we do IO on all recovered btrees");
+    this->io_on_btrees();
 }
 
 int main(int argc, char* argv[]) {

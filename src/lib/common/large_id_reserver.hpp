@@ -27,7 +27,7 @@ public:
 
     void reserve(uint64_t id) {
         HS_DBG_ASSERT(!is_reserved(id), "Reserving an already reserved id={}", id);
-        m_iset.insert(id);
+        m_iset.insert(Interval::right_open(id, id + 1));
     }
 
     void unreserve(uint64_t id) {

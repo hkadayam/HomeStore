@@ -76,6 +76,12 @@ public:
                 is_valid{true}, blk_num{b.blk_num() + offset}, chunk_num{b.chunk_num()} {}
 
         BlkId to_blkid() const { return is_valid ? BlkId{blk_num, 1u, chunk_num} : BlkId{}; };
+        std::string to_string() const {
+            return is_valid ? fmt::format("blknum={},chunk={}", blk_num, chunk_num) : fmt::format("Invalid");
+        }
+        std::string to_compact_string() const {
+            return is_valid ? fmt::format("{}:{}", blk_num, chunk_num) : fmt::format("NA");
+        }
     };
 #pragma pack()
 
@@ -211,6 +217,7 @@ public:
         /////////////// Map and SB flush related entities ///////////////////////
         BNodeIDMap::iterator m_next_full_map_it;
         uint32_t m_parallel_flush_range{0};
+        size_t m_pending_map_entries_to_flush{0};
         std::vector< std::vector< BlkId > > m_location_chains;
 
     public:
@@ -223,7 +230,8 @@ public:
 
         std::vector< std::pair< COWBtree::CompactNodeId, COWBtree::CompactBlkId > >
         prepare_to_flush_map(COWBtreeCPContext* cp_ctx);
-        std::pair< bool, std::vector< std::vector< BlkId > > > done_flushing_map(std::vector< BlkId > map_locations);
+        std::pair< bool, std::vector< std::vector< BlkId > > > done_flushing_map(std::vector< BlkId > map_locations,
+                                                                                 size_t num_flushed_entries);
 
         bool flush_sb(COWBtreeCPContext* cp_ctx);
         void finish();

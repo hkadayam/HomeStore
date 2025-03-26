@@ -495,7 +495,7 @@ TYPED_TEST(BtreeTest, ConcurrentMultiOps) {
     }
     auto ops = this->build_op_list(input_ops);
 
-    this->multi_op_execute(ops, false /* skip_preload */);
+    this->multi_op_execute(ops);
 }
 
 int main(int argc, char* argv[]) {

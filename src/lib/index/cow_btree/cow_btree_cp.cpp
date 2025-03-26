@@ -42,13 +42,13 @@ std::string COWBtreeCPContext::to_string() const {
 }
 
 void COWBtreeCPContext::increment_dirty_size(uint32_t size) {
-    if (m_dirty_size.increment_test_ge(size, m_max_dirty_size)) {
+    if (m_dirty_size.increment_test_ge(m_max_dirty_size, size)) {
         hs()->cp_mgr().trigger_cp_flush(false /* force */, CPTriggerReason::IndexBufferFull);
     }
 }
 
 void COWBtreeCPContext::increment_pending_free_size(uint32_t size) {
-    if (m_pending_free_size.increment_test_ge(size, m_max_pending_free_size)) {
+    if (m_pending_free_size.increment_test_ge(m_max_pending_free_size, size)) {
         hs()->cp_mgr().trigger_cp_flush(false /* force */, CPTriggerReason::IndexFreeBlksExceeded);
     }
 }

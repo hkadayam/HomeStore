@@ -245,7 +245,7 @@ struct BtreeConfig {
     btree_node_type m_leaf_node_type{btree_node_type::VAR_OBJECT};
     btree_node_type m_int_node_type{btree_node_type::VAR_KEY};
     IndexStore::Type m_store_type{IndexStore::Type::COPY_ON_WRITE_BTREE};
-    std::string m_btree_name{"btree"}; // Unique name for the btree
+    std::string m_btree_name{""}; // Unique name for the btree
 
 private:
     uint32_t m_suggested_min_size; // Precomputed values

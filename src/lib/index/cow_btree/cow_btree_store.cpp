@@ -49,10 +49,6 @@ static std::vector< iomgr::io_fiber_t > start_flush_threads() {
 
 COWBtreeStore::COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< IndexStoreSuperBlock > > store_sbs) :
         m_vdev{std::move(vdev)} {
-    // Register ourselves to the IndexCPCallbacks
-    r_cast< IndexCPCallbacks* >(cp_mgr().get_consumer(cp_consumer_t::INDEX_SVC))
-        ->register_consumer(IndexStore::Type::COPY_ON_WRITE_BTREE, std::make_unique< COWBtreeCPCallbacks >(this));
-
     if (store_sbs.size()) {
         // There can be multiple sbs, each sb containing a journal for a particular cp. We need to sort based on cp_id
         // and then split them as
@@ -66,6 +62,10 @@ COWBtreeStore::COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< I
         }
     }
     m_cp_flush_fibers = std::move(start_flush_threads());
+
+    // Register ourselves to the IndexCPCallbacks. Make sure you call this at the end of constructor.
+    r_cast< IndexCPCallbacks* >(cp_mgr().get_consumer(cp_consumer_t::INDEX_SVC))
+        ->register_consumer(IndexStore::Type::COPY_ON_WRITE_BTREE, std::make_unique< COWBtreeCPCallbacks >(this));
 }
 
 uint32_t COWBtreeStore::max_capacity() const { return m_vdev->size(); }
@@ -90,7 +90,6 @@ unique< UnderlyingBtree > COWBtreeStore::on_btree_created(BtreeBase& btree, bool
 
     auto it = m_journals_by_btree.find(btree.ordinal());
     if (it == m_journals_by_btree.end()) {
-        HS_DBG_ASSERT_EQ(load_existing, false, "Btree is asked to load, but its journal is missing");
         cbtree = std::make_unique< COWBtree >(btree, m_vdev, std::vector< sisl::byte_view >{}, load_existing);
     } else {
         HS_DBG_ASSERT_EQ(load_existing, true, "Btree is found, but we are asked to create a new one");
@@ -109,33 +108,33 @@ void COWBtreeStore::on_btree_destroyed(BtreeBase& bt) {
 
 void COWBtreeStore::on_node_freed(BtreeNode* node) { COWBtreeNode::destruct(node); }
 
-class CPFlushGuard {
+class FlushGuard {
 public:
-    CPFlushGuard(COWBtreeCPContext* ctx, std::function< void(COWBtreeCPContext* cp_ctx) > done_cb) :
+    FlushGuard(COWBtreeCPContext* ctx, std::function< void(COWBtreeCPContext* cp_ctx) > done_cb) :
             m_cp_ctx{ctx}, m_done_cb{std::move(done_cb)} {
         ctx->m_flushing_fibers_count.increment(1);
     }
 
-    ~CPFlushGuard() {
+    ~FlushGuard() {
         if (m_cp_ctx->m_flushing_fibers_count.decrement_testz(1)) { m_done_cb(m_cp_ctx); }
     }
 
-    CPFlushGuard(CPFlushGuard const& other) {
+    FlushGuard(FlushGuard const& other) {
         m_cp_ctx = other.m_cp_ctx;
         m_done_cb = other.m_done_cb;
         m_cp_ctx->m_flushing_fibers_count.increment(1);
     }
 
-    CPFlushGuard(CPFlushGuard&& other) = delete;
+    FlushGuard(FlushGuard&& other) = delete;
 
-    CPFlushGuard operator=(CPFlushGuard const& other) {
+    FlushGuard operator=(FlushGuard const& other) {
         m_cp_ctx = other.m_cp_ctx;
         m_done_cb = other.m_done_cb;
         m_cp_ctx->m_flushing_fibers_count.increment(1);
         return *this;
     }
 
-    CPFlushGuard operator=(CPFlushGuard&& other) = delete;
+    FlushGuard operator=(FlushGuard&& other) = delete;
 
     COWBtreeCPContext* cp_ctx() { return m_cp_ctx; }
 
@@ -191,7 +190,7 @@ folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
         flush_map(cp_ctx);
     };
 
-    CPFlushGuard fg{cp_ctx, on_flush_nodes_done};
+    FlushGuard fg{cp_ctx, on_flush_nodes_done};
     for (auto& fiber : m_cp_flush_fibers) {
         iomanager.run_on_forget(fiber, [fg]() mutable {
             // Each thread will walk through all btrees created and alive at the point of CP flush and try to flush
@@ -232,7 +231,7 @@ void COWBtreeStore::flush_map(COWBtreeCPContext* cp_ctx) {
             cp_ctx->complete(true);
         };
 
-        CPFlushGuard fg{cp_ctx, on_flush_map_done};
+        FlushGuard fg{cp_ctx, on_flush_map_done};
         for (auto& fiber : m_cp_flush_fibers) {
             iomanager.run_on_forget(fiber, [fg]() mutable {
                 auto cp_ctx = fg.cp_ctx();

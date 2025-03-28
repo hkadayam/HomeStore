@@ -58,7 +58,7 @@ public:
     iomgr::FiberManagerLib::shared_mutex m_bt_list_mtx;
     std::vector< shared< Index > > m_all_btrees;
     uint32_t m_flushed_btrees_count{0};
-    std::vector< shared< Index > > m_destroyed_btrees;
+    std::vector< std::pair< shared< Index >, folly::Promise< folly::Unit > > > m_destroyed_btrees;
     std::vector< COWBtree* > m_active_btree_list;
     sisl::buf_builder m_merged_journal_buf;
     COWBtreeStore::Journal* m_journal_header;
@@ -74,7 +74,7 @@ public:
     void prepare_to_flush(bool full_map_flush);
 
     void flushed_a_btree(COWBtree* cow_btree, COWBtree::Journal const* journal, bool is_sb_changed);
-    void add_to_destroyed_list(shared< Index > btree);
+    folly::Future< folly::Unit > add_to_destroyed_list(shared< Index > btree);
     void actual_destroy_btrees();
     bool any_dirty_nodes() const { return (!m_dirty_size.testz() || !m_pending_free_size.testz()); }
     void append_btree_journal(sisl::io_blob_safe const& btree_journal_buf);

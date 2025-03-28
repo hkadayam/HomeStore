@@ -12,11 +12,12 @@ public:
     MemBtreeStore() = default;
     virtual ~MemBtreeStore() = default;
 
+    void stop() override {}
     std::string store_type() const override { return "MEM_BTREE"; }
     void on_recovery_completed() override {}
 
-    unique< UnderlyingBtree > on_btree_created(BtreeBase& btree, bool load_existing) override;
-    void on_btree_destroyed(BtreeBase&) override {}
+    unique< UnderlyingBtree > create_underlying_btree(BtreeBase& btree, bool load_existing) override;
+    folly::Future< folly::Unit > destroy_underlying_btree(BtreeBase&) override { return folly::makeFuture(); }
     void on_node_freed(BtreeNode* node) override;
     bool is_fast_destroy_supported() const override { return true; }
     bool is_ephemeral() const override { return true; }

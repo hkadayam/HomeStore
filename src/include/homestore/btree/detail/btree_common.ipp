@@ -86,17 +86,15 @@ void Btree< K, V >::get_all_kvs(std::vector< std::pair< K, V > >& kvs) const {
 }
 
 template < typename K, typename V >
-btree_status_t Btree< K, V >::do_destroy() {
-    btree_status_t ret{btree_status_t::success};
-
+folly::Future< folly::Unit > Btree< K, V >::destroy() {
     bool expected = false;
     if (!m_destroyed.compare_exchange_strong(expected, true)) {
         BT_LOG(DEBUG, "Btree is already being destroyed, ignoring this request");
-        return btree_status_t::not_found;
+        return folly::makeFuture< folly::Unit >(folly::Unit{});
     }
 
     if (m_store->is_ephemeral()) {
-        ret = post_order_traversal(locktype_t::WRITE, [this](const auto& node, bool is_leaf) -> btree_status_t {
+        post_order_traversal(locktype_t::WRITE, [this](const auto& node, bool is_leaf) -> btree_status_t {
             // On ephemeral btree, we can directly remove the node, however on non-ephemeral btree, we need to do so
             // only at checkpoint time, which should be handled by the store themselves.
             remove_node(node, locktype_t::WRITE, nullptr);
@@ -111,18 +109,11 @@ btree_status_t Btree< K, V >::do_destroy() {
         // b) Generate a magical BtreeKey called "min" and "max" and put that in the range. However the user of the
         // Btree should understand this and should handle in their compare function.
     } else {
-        // Let the store handle the fast delete of btree as part of the on_btree_destroyed() call.
+        // Let the store handle the fast delete of btree as part of the destroy_underlying_btree() call.
     }
 
-    if (ret == btree_status_t::success) {
-        BT_LOG(DEBUG, "btree(root: {}) destroyed successfully", m_root_node_info.bnode_id());
-        m_store->on_btree_destroyed(*this);
-    } else {
-        m_destroyed = false;
-        BT_LOG(ERROR, "btree(root: {}) nodes destroyed failed, ret: {}", m_root_node_info.bnode_id(), ret);
-    }
-
-    return ret;
+    BT_LOG(DEBUG, "btree(root: {}) destroyed successfully", m_root_node_info.bnode_id());
+    return m_store->destroy_underlying_btree(*this);
 }
 
 #if 0

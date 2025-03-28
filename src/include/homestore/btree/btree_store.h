@@ -1,5 +1,6 @@
 #pragma once
 
+#include <folly/futures/Future.h>
 #include <homestore/btree/detail/btree_internal.hpp>
 #include <homestore/homestore_decl.hpp>
 
@@ -15,8 +16,8 @@ public:
     virtual ~BtreeStore() = default;
 
     // All Btree related operations
-    virtual unique< UnderlyingBtree > on_btree_created(BtreeBase& btree, bool load_existing) = 0;
-    virtual void on_btree_destroyed(BtreeBase& btree) = 0;
+    virtual unique< UnderlyingBtree > create_underlying_btree(BtreeBase& btree, bool load_existing) = 0;
+    virtual folly::Future< folly::Unit > destroy_underlying_btree(BtreeBase& btree) = 0;
 
     // Called whenever a particular btree node has been freed. The underlying implementation could use this oppurtunity
     // to free any contexts stored for this node.

@@ -37,16 +37,11 @@ static void write_or_fail(VirtualDev* vdev, sisl::io_blob const& blob, BlkId loc
     HS_REL_ASSERT(!err, "Flush of full map failed with err={}. best is to crash the system and replay", err.message());
 }
 
-COWBtree::COWBtree(BtreeBase& bt, shared< VirtualDev > vdev, std::vector< sisl::byte_view > journal_bufs,
-                   bool load_existing) :
+COWBtree::COWBtree(BtreeBase& bt, shared< VirtualDev > vdev,
+                   shared< sisl::SimpleCache< bnodeid_t, BtreeNodePtr > > cache,
+                   std::vector< sisl::byte_view > journal_bufs, bool load_existing) :
         m_base_btree{bt},
-        m_cache{std::make_unique< sisl::SimpleCache< bnodeid_t, BtreeNodePtr > >(
-            hs()->evictor(), 50000, bt.bt_config().node_size(),
-            [](const BtreeNodePtr& node) -> bnodeid_t { return node->node_id(); },
-            [](const sisl::CacheRecord& rec) -> bool {
-                const auto& hnode = (sisl::SingleEntryHashNode< BtreeNodePtr >&)rec;
-                return (hnode.m_value->m_refcount.test_le(1));
-            })},
+        m_cache{std::move(cache)},
         m_nodeid_generator(std::numeric_limits< uint32_t >::max()),
         m_vdev{std::move(vdev)},
         m_btree_ordinal{bt.super_blk()->ordinal},
@@ -174,15 +169,27 @@ btree_status_t COWBtree::on_root_changed(BtreeNodePtr const& new_root, CPContext
 }
 
 uint64_t COWBtree::space_occupied() const {
-    std::shared_lock< iomgr::FiberManagerLib::shared_mutex > lg(m_bnodeid_map.m_mtx);
-    return m_bnodeid_map.m_map.size() * m_vdev->block_size();
+    size_t num_nodes{0};
+    {
+        std::shared_lock< iomgr::FiberManagerLib::shared_mutex > lg(m_bnodeid_map.m_mtx);
+        num_nodes = m_bnodeid_map.m_map.size();
+    }
+
+    for (auto const& cp_session : m_cp_sessions) {
+        num_nodes += cp_session->m_modified_nodes.size();
+        num_nodes -= cp_session->m_deleted_nodes.size();
+    }
+
+    return num_nodes * m_vdev->block_size();
 }
 
 void COWBtree::destroy() {
     // Free all the blks allocated for the nodes
     std::unique_lock< iomgr::FiberManagerLib::shared_mutex > lg(m_bnodeid_map.m_mtx);
-    for (auto const [_, blkid] : m_bnodeid_map.m_map) {
+    BtreeNodePtr tmp;
+    for (auto const [node_id, blkid] : m_bnodeid_map.m_map) {
         m_vdev->free_blk(blkid.to_blkid());
+        m_cache->remove(m_ordinal_shifted | node_id, tmp);
     }
 
     // Free all the blks allocated for the map
@@ -195,15 +202,12 @@ void COWBtree::destroy() {
     m_bnodeid_map.m_updates_since_last_flush = 0;
     m_bnodeid_map.m_locations.clear();
 
-    // Free the cache, which in-turn should free up all nodes in cache
-    m_cache.reset();
-
     // Reset all the dirty nodes, deleted nodes etc.
     for (auto& cp_session : m_cp_sessions) {
+        for (auto const& node : cp_session->m_modified_nodes) {
+            m_cache->remove(node->node_id(), tmp);
+        }
         cp_session->finish();
-#if 0
-        //cp_session.reset();
-#endif
     }
 
     // Destroy this btree's superblk, so that it can be re-initialized again.

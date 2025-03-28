@@ -19,6 +19,7 @@
 #include <vector>
 #include <array>
 
+#include <folly/futures/Future.h>
 #include <iomgr/iomgr.hpp>
 #include <sisl/fds/id_reserver.hpp>
 #include <sisl/utility/enum.hpp>
@@ -84,7 +85,7 @@ public:
     // Destroys the index and remove all its resources. This could be delayed call as in actual destroy could
     // potentially takes place in subsequent checkpoints. Hence caller should not assume that destroy is completed
     // instantly. This is an idempotent call and the implementer of this method needs to support that.
-    virtual void destroy() = 0;
+    virtual folly::Future< folly::Unit > destroy() = 0;
 
     // Getters
     uuid_t uuid() const { return m_sb->uuid; }
@@ -127,7 +128,7 @@ public:
 
     // Add/Remove Index Table to/from the index service
     void add_index_table(shared< Index > const& tbl);
-    void destroy_index_table(shared< Index > const& tbl);
+    folly::Future< folly::Unit > destroy_index_table(shared< Index > const& tbl);
 
     shared< Index > get_index_table(uuid_t uuid) const;
     shared< Index > get_index_table(uint32_t ordinal) const;

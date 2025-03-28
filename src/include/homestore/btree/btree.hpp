@@ -53,7 +53,7 @@ public:
 
     // Destroy the entire btree from persistent and from memory. It is to be noted that all blocks are not destroyed at
     // one go. For persistent btree, it might be a staged operation on multiple checkpoints.
-    void destroy() override;
+    folly::Future< folly::Unit > destroy() override;
 
     // @brief Inserts or updates a key-value pair in the B-tree.
     //
@@ -280,7 +280,6 @@ private:
     btree_status_t post_order_traversal(locktype_t acq_lock, const auto& cb);
     btree_status_t post_order_traversal(const BtreeNodePtr& node, locktype_t acq_lock, const auto& cb);
     void get_all_kvs(std::vector< std::pair< K, V > >& kvs) const;
-    btree_status_t do_destroy();
     uint64_t get_btree_node_cnt() const;
     uint64_t get_child_node_cnt(bnodeid_t bnodeid) const;
     void to_string_internal(bnodeid_t bnodeid, std::string& buf) const;

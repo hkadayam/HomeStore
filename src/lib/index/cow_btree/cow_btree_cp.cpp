@@ -91,15 +91,17 @@ void COWBtreeCPContext::flushed_a_btree(COWBtree* cow_btree, COWBtree::Journal c
     }
 }
 
-void COWBtreeCPContext::add_to_destroyed_list(shared< Index > btree) {
+folly::Future< folly::Unit > COWBtreeCPContext::add_to_destroyed_list(shared< Index > btree) {
     std::unique_lock lg{m_bt_list_mtx};
-    m_destroyed_btrees.emplace_back(btree);
+    m_destroyed_btrees.emplace_back(std::pair(btree, folly::Promise< folly::Unit >{}));
+    return m_destroyed_btrees.back().second.getFuture();
 }
 
 void COWBtreeCPContext::actual_destroy_btrees() {
     // If there are any destroyed btrees as part of the CP, do the actual destroy now.
-    for (auto& btree : m_destroyed_btrees) {
+    for (auto& [btree, p] : m_destroyed_btrees) {
         COWBtree::cast_to(btree.get())->destroy();
+        p.setValue();
     }
 
     CP_PERIODIC_LOG(INFO, id(),

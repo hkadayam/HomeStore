@@ -47,7 +47,7 @@ Btree< K, V >::Btree(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb) :
 
 template < typename K, typename V >
 Btree< K, V >::~Btree() {
-    if (is_ephemeral()) { do_destroy(); }
+    if (is_ephemeral()) { destroy(); }
 }
 
 #if 0
@@ -56,12 +56,6 @@ void Btree< K, V >::set_root_node_info(const BtreeLinkInfo& info) {
     m_root_node_info = info;
 }
 #endif
-
-template < typename K, typename V >
-void Btree< K, V >::destroy() {
-    auto status = do_destroy();
-    BT_LOG(DEBUG, "Btree destroy returned status={}", status);
-}
 
 template < typename K, typename V >
 btree_status_t Btree< K, V >::put_one(BtreeKey const& key, BtreeValue const& value, btree_put_type put_type,

@@ -3,7 +3,7 @@
 #include <homestore/btree/btree_base.hpp>
 
 namespace homestore {
-unique< UnderlyingBtree > MemBtreeStore::on_btree_created(BtreeBase& btree, bool load_existing) {
+unique< UnderlyingBtree > MemBtreeStore::create_underlying_btree(BtreeBase& btree, bool load_existing) {
     // We don't need any mem specific btree portion, everything can be accomplished from common store class
     return std::make_unique< MemBtree >(btree);
 }

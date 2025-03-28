@@ -29,7 +29,7 @@ BtreeBase::BtreeBase(BtreeConfig const& cfg, uuid_t uuid, uuid_t parent_uuid, ui
     m_bt_cfg.finalize(sizeof(BtreeNode::PersistentHeader));
 
     // Create the underlying btree instance
-    m_bt_private = std::move(m_store->on_btree_created(*this, false /* load_existing */));
+    m_bt_private = std::move(m_store->create_underlying_btree(*this, false /* load_existing */));
 
     bt_sb->node_size = m_bt_cfg.m_node_size;
     m_sb.write();
@@ -56,7 +56,7 @@ BtreeBase::BtreeBase(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb) :
     m_bt_cfg.finalize(sizeof(BtreeNode::PersistentHeader));
 
     m_root_node_info = BtreeLinkInfo{bt_sb->root_node_id, bt_sb->root_link_version};
-    m_bt_private = std::move(m_store->on_btree_created(*this, true /* load_existing*/));
+    m_bt_private = std::move(m_store->create_underlying_btree(*this, true /* load_existing*/));
 }
 
 BtreeBase::~BtreeBase() = default;

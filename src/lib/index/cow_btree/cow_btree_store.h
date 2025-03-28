@@ -4,6 +4,7 @@
 #include <atomic>
 #include <unordered_map>
 
+#include <sisl/cache/simple_cache.hpp>
 #include <homestore/blk.h>
 #include <homestore/btree/btree_store.h>
 #include <homestore/btree/detail/btree_internal.hpp>
@@ -32,6 +33,8 @@ public:
 private:
     shared< VirtualDev > m_vdev;
 
+    shared< sisl::SimpleCache< bnodeid_t, BtreeNodePtr > > m_cache;
+
     // List of fibers to flush (note that this could be on multiple threads)
     std::vector< iomgr::io_fiber_t > m_cp_flush_fibers;
 
@@ -47,14 +50,15 @@ private:
 public:
     COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< IndexStoreSuperBlock > > store_sbs);
     virtual ~COWBtreeStore() = default;
+    void stop() override;
 
     //////////////////////// Override of IndexStore Interfaces //////////////////////////
     std::string store_type() const override { return "COW_BTREE"; }
     void on_recovery_completed() override;
 
     ////////////////// Override Implementation of underlying store requirements //////////////////
-    unique< UnderlyingBtree > on_btree_created(BtreeBase& btree, bool load_existing) override;
-    void on_btree_destroyed(BtreeBase& bt) override;
+    unique< UnderlyingBtree > create_underlying_btree(BtreeBase& btree, bool load_existing) override;
+    folly::Future< folly::Unit > destroy_underlying_btree(BtreeBase& bt) override;
     void on_node_freed(BtreeNode* node) override;
     bool is_fast_destroy_supported() const override { return true; }
     bool is_ephemeral() const { return false; }

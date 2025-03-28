@@ -19,7 +19,8 @@ public:
     struct Journal;
 
 public:
-    COWBtree(BtreeBase& bt, shared< VirtualDev > vdev, std::vector< sisl::byte_view > journal_bufs, bool load_existing);
+    COWBtree(BtreeBase& bt, shared< VirtualDev > vdev, shared< sisl::SimpleCache< bnodeid_t, BtreeNodePtr > > cache,
+             std::vector< sisl::byte_view > journal_bufs, bool load_existing);
     virtual ~COWBtree() = default;
 
     // All overridden methods of UndelyingBtree class
@@ -63,6 +64,7 @@ public:
 
 public:
     using CompactNodeId = uint32_t;
+    static constexpr CompactNodeId EmptyCompactNodeId = std::numeric_limits< CompactNodeId >::max();
 
 #pragma pack(1)
     struct CompactBlkId {
@@ -105,9 +107,9 @@ public:
             uint32_t size{sizeof(Header)}; // Size of this journal
             uint32_t num_flush_units{0};   // Number of flush units in this journal
             uint32_t num_delete_units{0};  // Number of nodes removed for this btree.
+            CompactNodeId new_root_nodeid{EmptyCompactNodeId}; // New root node id
 
-            // Followed by an array of FlushUnitentry and then array of Deleted
-            // Nodeids
+            // Followed by an array of FlushUnitentry and then array of Deleted nodeids
         };
 #pragma pack()
 
@@ -241,7 +243,7 @@ public:
 
 private:
     BtreeBase& m_base_btree;
-    unique< sisl::SimpleCache< bnodeid_t, BtreeNodePtr > > m_cache;
+    shared< sisl::SimpleCache< bnodeid_t, BtreeNodePtr > > m_cache;
     FullBNodeIdMap m_bnodeid_map;
     LargeIDReserver m_nodeid_generator;
     shared< VirtualDev > m_vdev;

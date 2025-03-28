@@ -17,6 +17,7 @@
 #include <homestore/index_service.hpp>
 #include <homestore/btree/detail/btree_node.hpp>
 
+#include <folly/futures/Future.h>
 #include "common/homestore_utils.hpp"
 #include "common/homestore_assert.hpp"
 #include "device/virtual_dev.hpp"
@@ -110,6 +111,7 @@ void IndexService::stop() {
     m_ordinal_index_map.clear();
 
     for (auto& [type, store] : m_index_stores) {
+        store->stop();
         store.reset();
     }
 }
@@ -164,19 +166,32 @@ void IndexService::add_index_table(const shared< Index >& index) {
     m_ordinal_index_map.insert(std::make_pair(index->ordinal(), index));
 }
 
-void IndexService::destroy_index_table(const shared< Index >& index) {
+folly::Future< folly::Unit > IndexService::destroy_index_table(const shared< Index >& index) {
     auto const uuid = index->uuid();
     auto const ordinal = index->ordinal();
-    index->destroy();
+    auto fut = index->destroy();
+
+    // We remove from the map right away for the following reason:
+    // Typically before a btree is destroyed, it could have done some IO or merging the nodes. So if IO is done, then
+    // btree is initiated a destroy and then CP is taken, underlying btree will request for all indexes and flush
+    // them before it starts processing the destroyed btrees. This is because maintaining a map of removed btrees and
+    // removing from flusing is slightly more expensive for something that is rare event (delete of a btree). So we
+    // remove the map right away to minimize this cost.
     {
         std::unique_lock lg(m_index_map_mtx);
         auto it = m_index_map.find(uuid);
-        if (it == m_index_map.end()) { return; }
+        if (it == m_index_map.end()) { return folly::makeFuture< folly::Unit >(folly::Unit{}); }
 
         m_ordinal_index_map.erase(ordinal);
-        m_ordinal_reserver->unreserve(ordinal);
         m_index_map.erase(it);
     }
+
+    // We cannot unreserve the ordinal, until we complete the destroy in underlying tree, otherwise, there could be 2
+    // live btrees with same ordinal.
+    return std::move(fut).thenValue([this, ordinal](auto&&) {
+        m_ordinal_reserver->unreserve(ordinal);
+        return folly::makeFuture< folly::Unit >(folly::Unit{});
+    });
 }
 
 shared< Index > IndexService::get_index_table(uuid_t uuid) const {

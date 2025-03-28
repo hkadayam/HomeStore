@@ -9,6 +9,7 @@ public:
 
     IndexStore() = default;
     virtual ~IndexStore() = default;
+    virtual void stop() = 0;
 
     virtual std::string store_type() const = 0;
     virtual void on_recovery_completed() = 0;

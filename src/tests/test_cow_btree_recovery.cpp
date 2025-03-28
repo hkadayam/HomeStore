@@ -37,6 +37,8 @@ SISL_OPTION_GROUP(test_cow_btree_recovery,
                    ::cxxopts::value< uint32_t >()->default_value("500"), "number"),
                   (num_btrees, "", "num_btrees", "number of btrees to test",
                    ::cxxopts::value< uint32_t >()->default_value("2"), "number"),
+                  (num_cps, "", "num_cps", "number of cps to test (for functional tests)",
+                   ::cxxopts::value< uint32_t >()->default_value("25"), "number"),
                   (num_entries, "", "num_entries", "number of entries per btree to test with",
                    ::cxxopts::value< uint32_t >()->default_value("50000"), "number"),
                   (run_time, "", "run_time", "run time for io", ::cxxopts::value< uint32_t >()->default_value("360000"),
@@ -65,7 +67,22 @@ struct BtreeTest : public ::testing::Test {
     public:
         TestIndexServiceCallbacks(BtreeTest* test) : m_test(test) {}
         std::shared_ptr< Index > on_index_table_found(superblk< IndexSuperBlock >&& sb) override {
-            auto bt_helper = m_test->m_bt_helpers[m_test->m_recovered++].get();
+            // Locate the helper corresponding to this btree ordinal
+            auto it1 = m_test->m_bt_helpers.find(sb->ordinal);
+            if (it1 == m_test->m_bt_helpers.end()) {
+                auto it2 = m_test->m_destroyed_bt_helpers.find(sb->ordinal);
+                RELEASE_ASSERT((it2 != m_test->m_destroyed_bt_helpers.end()),
+                               "BT Helper for ordinal={} is not found, some issue in destroying btree?", sb->ordinal);
+                LOGINFO("Prior to restart, btree_ordinal={} was attempted to destroy, but CP was not taken, so we "
+                        "recovered that as well",
+                        sb->ordinal);
+                bool happened;
+                std::tie(it1, happened) = m_test->m_bt_helpers.insert(*it2);
+                m_test->m_destroyed_bt_helpers.erase(it2);
+            }
+
+            ++m_test->m_recovered;
+            auto bt_helper = it1->second.get();
             bt_helper->SetUp(true /* multi_threaded */);
             bt_helper->m_bt = std::make_shared< Btree< K, V > >(bt_helper->m_cfg, std::move(sb));
             return bt_helper->m_bt;
@@ -103,41 +120,47 @@ struct BtreeTest : public ::testing::Test {
         }
     }
 
-    void create_new_btree() {
+    uint32_t create_new_btree() {
         auto uuid = boost::uuids::random_generator()();
         auto parent_uuid = boost::uuids::random_generator()();
 
-        auto bt_helper = std::make_unique< BtreeTestHelper< T > >();
+        auto bt_helper = std::make_shared< BtreeTestHelper< T > >();
         bt_helper->SetUp(true /* multi_threaded */);
         bt_helper->m_bt = std::make_shared< Btree< K, V > >(bt_helper->m_cfg, uuid, parent_uuid, 0);
         hs()->index_service().add_index_table(bt_helper->m_bt);
-        m_bt_helpers.emplace_back(std::move(bt_helper));
+        auto ordinal = bt_helper->m_bt->ordinal();
+        m_bt_helpers.insert(std::make_pair(bt_helper->m_bt->ordinal(), std::move(bt_helper)));
+        return ordinal;
     }
 
     void destroy_a_btree() {
-        if (this->m_bt_helpers.empty()) { return; }
+        if (m_bt_helpers.empty()) { return; }
 
-        auto& bt_helper = this->m_bt_helpers.front();
-        hs()->index_service().destroy_index_table(bt_helper->m_bt);
+        auto it = m_bt_helpers.begin();
+        auto [ordinal, bt_helper] = *it;
+
+        hs()->index_service().destroy_index_table(bt_helper->m_bt).thenValue([this, bt_helper, ordinal](auto&&) {
+            m_destroyed_bt_helpers.insert(std::make_pair(ordinal, bt_helper));
+        });
         bt_helper->m_bt.reset();
-        m_bt_helpers.erase(m_bt_helpers.begin());
+        m_bt_helpers.erase(it);
     }
 
     void io_on_btrees() {
         std::vector< std::string > input_ops = {"put:70", "remove:30"};
-        for (auto& bt_helper : this->m_bt_helpers) {
+        for (auto& [_, bt_helper] : m_bt_helpers) {
             bt_helper->multi_op_execute(bt_helper->build_op_list(input_ops));
         }
     }
 
     void validate_btrees() {
-        for (auto& bt_helper : this->m_bt_helpers) {
+        for (auto& [_, bt_helper] : m_bt_helpers) {
             bt_helper->query_all_paginate(500);
         }
     }
 
     void TearDown() override {
-        for (auto& bt_helper : this->m_bt_helpers) {
+        for (auto& [_, bt_helper] : m_bt_helpers) {
             hs()->index_service().destroy_index_table(bt_helper->m_bt);
             bt_helper->m_bt.reset();
             bt_helper->TearDown();
@@ -149,7 +172,7 @@ struct BtreeTest : public ::testing::Test {
     void restart_homestore() {
         m_recovered = 0;
         m_helper.params(HS_SERVICE::INDEX).index_svc_cbs = new TestIndexServiceCallbacks(this);
-        for (auto& bt_helper : this->m_bt_helpers) {
+        for (auto& [_, bt_helper] : this->m_bt_helpers) {
             bt_helper->m_bt.reset();
         }
 
@@ -158,7 +181,7 @@ struct BtreeTest : public ::testing::Test {
 
     void restart_and_validate() {
         LOGINFO("Restart homestore and validate if before and after states of btrees are identical");
-        for (auto& bt_helper : this->m_bt_helpers) {
+        for (auto& [_, bt_helper] : this->m_bt_helpers) {
             std::string fname = fmt::format("/tmp/btree_{}_before.txt", bt_helper->m_bt->ordinal());
             bt_helper->dump_to_file(fname);
         }
@@ -167,7 +190,7 @@ struct BtreeTest : public ::testing::Test {
         LOGINFO(" Restarted homestore with {} indexes recovered", m_recovered);
 
         ASSERT_EQ(m_recovered, this->m_bt_helpers.size()) << "Number of btrees before and after restart mismatch";
-        for (auto& bt_helper : this->m_bt_helpers) {
+        for (auto& [_, bt_helper] : this->m_bt_helpers) {
             std::string before_fname = fmt::format("/tmp/btree_{}_before.txt", bt_helper->m_bt->ordinal());
             std::string after_fname = fmt::format("/tmp/btree_{}_after.txt", bt_helper->m_bt->ordinal());
             bt_helper->dump_to_file(after_fname);
@@ -206,25 +229,43 @@ struct BtreeTest : public ::testing::Test {
     };
 
     void action_with_cp(cp_params p) {
+        std::vector< uint32_t > created;
+        created.reserve(p.num_new_btrees);
+
         for (uint32_t i{0}; i < p.num_new_btrees; ++i) {
-            create_new_btree();
+            created.push_back(create_new_btree());
+        }
+
+        auto created_list = [](std::vector< uint32_t > const& v) -> std::string {
+            return std::accumulate(v.begin(), v.end(), std::string(""),
+                                   [](std::string a, uint32_t b) { return a + std::to_string(b) + std::string(","); });
+        };
+
+        auto first_n = [](std::map< uint32_t, std::shared_ptr< BtreeTestHelper< T > > > const& m,
+                          size_t n) -> std::string {
+            if (m.empty()) { return ""; }
+            auto end_it = m.begin();
+            std::advance(end_it, std::min(n, m.size()));
+            return std::accumulate(m.begin(), end_it, std::string(""), [](std::string a, auto const& pair) {
+                return a + std::to_string(pair.first) + std::string(",");
+            });
+        };
+
+        if (p.num_io_btrees > this->m_bt_helpers.size()) { p.num_io_btrees = this->m_bt_helpers.size(); }
+        LOGINFO("CPSpec: Create btrees=[{}] -> IO on btrees=[{}] -> Destroy btrees=[{}] -> CP_type={} -> Restart?={}",
+                created_list(created), first_n(m_bt_helpers, p.num_io_btrees),
+                first_n(m_bt_helpers, p.num_destroy_btrees), p.is_full_map_flush_cp ? "FullFlush" : "IncrementalFlush",
+                p.restart_post_cp ? "Yes" : "No");
+
+        std::vector< std::string > input_ops = {"put:70", "remove:30"};
+        uint32_t b{0};
+        for (auto& [_, bt_helper] : this->m_bt_helpers) {
+            if (b++ == p.num_io_btrees) { break; }
+            bt_helper->multi_op_execute(bt_helper->build_op_list(input_ops));
         }
 
         for (uint32_t i{0}; i < p.num_destroy_btrees; ++i) {
             destroy_a_btree();
-        }
-
-        if (p.num_io_btrees == std::numeric_limits< uint32_t >::max()) { p.num_io_btrees = this->m_bt_helpers.size(); }
-
-        LOGINFO("CPSpec: Created {} new btrees, Destroyed {} btrees, IO on {} btrees, then take {} CP, post CP "
-                "restart={}",
-                p.num_new_btrees, p.num_destroy_btrees, p.num_io_btrees,
-                p.is_full_map_flush_cp ? "FullFlush" : "IncrementalFlush", p.restart_post_cp ? "Yes" : "No");
-
-        std::vector< std::string > input_ops = {"put:70", "remove:30"};
-        for (uint32_t i{0}; i < p.num_io_btrees; ++i) {
-            auto& bt_helper = this->m_bt_helpers[i];
-            bt_helper->multi_op_execute(bt_helper->build_op_list(input_ops));
         }
 
         p.is_full_map_flush_cp ? trigger_full_map_cp() : trigger_incremental_map_cp();
@@ -233,9 +274,24 @@ struct BtreeTest : public ::testing::Test {
 
 protected:
     test_common::HSTestHelper m_helper;
-    std::vector< std::unique_ptr< BtreeTestHelper< T > > > m_bt_helpers;
+    std::map< uint32_t, std::shared_ptr< BtreeTestHelper< T > > > m_bt_helpers;
+    std::map< uint32_t, std::shared_ptr< BtreeTestHelper< T > > > m_destroyed_bt_helpers;
     uint32_t m_recovered{0};
 };
+
+TEST_F(BtreeTest, DeleteCheckSizeReduction) {
+    std::vector< std::string > input_ops = {"put:70", "remove:30"};
+    for (auto& [_, bt_helper] : this->m_bt_helpers) {
+        bt_helper->multi_op_execute(bt_helper->build_op_list(input_ops));
+    }
+
+    auto const before_space = hs()->index_service().space_occupied();
+    for (auto& [_, bt_helper] : this->m_bt_helpers) {
+        destroy_a_btree();
+    }
+    auto const after_space = hs()->index_service().space_occupied();
+    ASSERT_LT(after_space, before_space) << "Destroy of btree didn't recapture space";
+}
 
 TEST_F(BtreeTest, IOThenFullMapFlushThenRestart) {
     action_with_cp({.num_new_btrees = 0,
@@ -304,14 +360,18 @@ TEST_F(BtreeTest, DestroyThenIncrementalMapFlushThenRestart) {
 }
 
 TEST_F(BtreeTest, RandomMultiOps) {
-    static std::uniform_int_distribution< uint32_t > num_gen{1, std::numeric_limits< uint32_t >::max()};
+    static std::uniform_int_distribution< uint32_t > new_rand_count{0, 3};
+    static std::uniform_int_distribution< uint32_t > destroy_rand_count{0, 2};
+    static std::normal_distribution<> io_rand_count{(double)(SISL_OPTIONS["num_btrees"].as< uint32_t >()), 4.0};
+    static std::uniform_int_distribution< uint32_t > rand_cp_type{0, 3}; // 25% times for full map cp
+    static std::uniform_int_distribution< uint32_t > rand_restart{0, 3}; // 25% times for restart
 
-    for (auto i{0}; i < SISL_OPTIONS["num_cps"].as< uint32_t >(); ++i) {
-        action_with_cp({.num_new_btrees = num_gen(g_re) % 3,
-                        .num_destroy_btrees = num_gen(g_re) % 2,
-                        .num_io_btrees = std::numeric_limits< uint32_t >::max(),
-                        .is_full_map_flush_cp = false,
-                        .restart_post_cp = true});
+    for (uint32_t i{0}; i < SISL_OPTIONS["num_cps"].as< uint32_t >(); ++i) {
+        action_with_cp({.num_new_btrees = new_rand_count(g_re),
+                        .num_destroy_btrees = destroy_rand_count(g_re),
+                        .num_io_btrees = (uint32_t)std::lround(io_rand_count(g_re)),
+                        .is_full_map_flush_cp = (rand_cp_type(g_re) == 0),
+                        .restart_post_cp = rand_restart(g_re) == 0});
     }
 
     LOGINFO("Post Restart we do IO on all recovered btrees");

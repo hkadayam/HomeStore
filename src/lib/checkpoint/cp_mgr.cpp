@@ -32,8 +32,8 @@ CPManager& cp_mgr() { return hs()->cp_mgr(); }
 CPManager::CPManager() :
         m_metrics{std::make_unique< CPMgrMetrics >()},
         m_wd_cp{std::make_unique< CPWatchdog >(this)},
-        m_sb{"CPSuperBlock"},
-        m_trigger_reasons{enum_count< CPTriggerReason >(), 0ul} {
+        m_sb{"CPSuperBlock"} {
+    // m_trigger_reasons{enum_count< CPTriggerReason >(), 0ul} {
     meta_service().register_handler(
         "CPSuperBlock",
         [this](meta_blk* mblk, sisl::byte_view buf, size_t size) { on_meta_blk_found(std::move(buf), (void*)mblk); },
@@ -174,7 +174,7 @@ folly::Future< bool > CPManager::do_trigger_cp_flush(bool force, bool flush_on_s
         }
     }
     m_in_flush_phase = true;
-    ++m_trigger_reasons[(size_t)reason];
+    //++m_trigger_reasons[(size_t)reason];
 
     folly::Future< bool > ret_fut = folly::Future< bool >::makeEmpty();
     auto cur_cp = cp_guard();

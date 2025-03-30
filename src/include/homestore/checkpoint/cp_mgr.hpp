@@ -175,7 +175,7 @@ private:
     bool m_in_flush_phase{false};
     bool m_pending_trigger_cp{false}; // Is there is a waiter for a cp flush to start
     folly::SharedPromise< bool > m_pending_trigger_cp_comp;
-    std::vector< uint64_t > m_trigger_reasons;
+    // std::vector< uint64_t > m_trigger_reasons;
 
 public:
     CPManager();

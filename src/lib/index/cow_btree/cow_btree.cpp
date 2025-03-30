@@ -78,8 +78,9 @@ BtreeNodePtr COWBtree::create_node(bool is_leaf, CPContext* context) {
     COWBtreeNode::construct(n);
 
     // Add the node to the cache
-    bool done = m_cache->insert(n);
-    HS_REL_ASSERT_EQ(done, true, "Unable to add alloc'd node to cache, low memory or duplicate inserts?");
+    auto status = m_cache->insert(n);
+    HS_REL_ASSERT_EQ(status, sisl::SimpleCacheStatus::success,
+                     "Unable to add alloc'd node to cache, low memory or duplicate inserts?");
 
     n->set_modified_cp_id(context->id());
     add_to_dirty_list(n, to_my_cp_ctx(context));
@@ -94,7 +95,8 @@ btree_status_t COWBtree::write_node(BtreeNodePtr const& node, CPContext*) {
 btree_status_t COWBtree::read_node(bnodeid_t node_id, BtreeNodePtr& node) const {
 retry:
     // Attempt to locate the node in the cache
-    if (m_cache->get(node_id, node)) { return btree_status_t::success; }
+    auto status = m_cache->get(node_id, node);
+    if (status == sisl::SimpleCacheStatus::success) { return btree_status_t::success; }
 
     // Need to read from the blk, so check that in the map
     BlkId blkid = get_blkid_for_nodeid(node_id);
@@ -109,13 +111,18 @@ retry:
     COWBtreeNode::construct(node);
 
     // Add the node to the cache
-    if (!m_cache->insert(node)) {
+    status = m_cache->insert(node);
+    if (status == sisl::SimpleCacheStatus::duplicate) {
         // There is a race between 2 concurrent reads of same node, Re-read from cache again
         COWBtreeNode::destruct(node.get());
         goto retry;
+    } else if (status == sisl::SimpleCacheStatus::success) {
+        return btree_status_t::success;
+    } else {
+        HS_DBG_ASSERT(false, "Insert read node to cache failed, probably because of low memory status={}",
+                      enum_name(status));
+        return btree_status_t::space_not_avail;
     }
-
-    return btree_status_t::success;
 }
 
 btree_status_t COWBtree::refresh_node(BtreeNodePtr const& node, bool for_read_modify_write, CPContext* context) {
@@ -144,8 +151,8 @@ void COWBtree::remove_node(BtreeNodePtr const& node, CPContext* context) {
 
     // Now we can remove the node from cache.
     BtreeNodePtr tmp;
-    bool done = m_cache->remove(node->node_id(), tmp);
-    HS_REL_ASSERT_EQ(done, true, "Race on cache removal of btree blkid?");
+    auto status = m_cache->remove(node->node_id(), tmp);
+    HS_DBG_ASSERT_EQ(status, sisl::SimpleCacheStatus::success, "Race on cache removal of btree blkid?");
 }
 
 btree_status_t COWBtree::transact_nodes(const BtreeNodeList& new_nodes, const BtreeNodeList& removed_nodes,
@@ -215,7 +222,10 @@ void COWBtree::destroy() {
 }
 
 //////////////////////// COWBtree specific methods ////////////////////////////////////////
-bnodeid_t COWBtree::generate_node_id() { return (m_ordinal_shifted | m_nodeid_generator.reserve()); }
+bnodeid_t COWBtree::generate_node_id() {
+    std::unique_lock lg{m_id_mtx};
+    return (m_ordinal_shifted | m_nodeid_generator.reserve());
+}
 
 BlkId COWBtree::get_blkid_for_nodeid(bnodeid_t nodeid) const { return lookup_bnode_map(to_compact_nodeid(nodeid)); }
 

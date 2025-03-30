@@ -256,6 +256,7 @@ private:
 
     // Flush related structures
     iomgr::FiberManagerLib::mutex m_flush_mtx;
+    iomgr::FiberManagerLib::mutex m_id_mtx;
 
 private:
     void update_bnode_map(CompactNodeId nodeid, CompactBlkId blkid, bool in_recovery);

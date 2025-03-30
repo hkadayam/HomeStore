@@ -32,23 +32,27 @@ SISL_OPTIONS_ENABLE(logging, test_cow_btree_recovery, iomgr, test_common_setup)
 // TODO Add tests to do write,remove after recovery.
 // TODO Test with var len key with io mgr page size is 512.
 
-SISL_OPTION_GROUP(test_cow_btree_recovery,
-                  (num_iters, "", "num_iters", "number of iterations for rand ops",
-                   ::cxxopts::value< uint32_t >()->default_value("500"), "number"),
-                  (num_btrees, "", "num_btrees", "number of btrees to test",
-                   ::cxxopts::value< uint32_t >()->default_value("2"), "number"),
-                  (num_cps, "", "num_cps", "number of cps to test (for functional tests)",
-                   ::cxxopts::value< uint32_t >()->default_value("25"), "number"),
-                  (num_entries, "", "num_entries", "number of entries per btree to test with",
-                   ::cxxopts::value< uint32_t >()->default_value("50000"), "number"),
-                  (run_time, "", "run_time", "run time for io", ::cxxopts::value< uint32_t >()->default_value("360000"),
-                   "seconds"),
-                  (disable_merge, "", "disable_merge", "disable_merge", ::cxxopts::value< bool >()->default_value("0"),
-                   ""),
-                  (preload_size, "", "preload_size", "number of entries to preload tree with",
-                   ::cxxopts::value< uint32_t >()->default_value("1000"), "number"),
-                  (seed, "", "seed", "random engine seed, use random if not defined",
-                   ::cxxopts::value< uint64_t >()->default_value("0"), "number"))
+SISL_OPTION_GROUP(
+    test_cow_btree_recovery,
+    (test_type, "", "test_type", "What type of test, [unit | functional | stress ]",
+     ::cxxopts::value< std::string >()->default_value("unit"), "string"),
+    (num_ios, "", "num_ios", "[override] number of io operations to test", ::cxxopts::value< uint32_t >(), "number"),
+    (num_btrees, "", "num_btrees", "[override] number of btrees to test", ::cxxopts::value< uint32_t >(), "number"),
+    (num_cps, "", "num_cps", "[override] number of cps to test", ::cxxopts::value< uint32_t >(), "number"),
+    (num_entries, "", "num_entries", "[override] number of entries per btree", ::cxxopts::value< uint32_t >(),
+     "number"),
+    (run_time, "", "run_time", "[override] run time for io", ::cxxopts::value< uint32_t >(), "seconds"),
+    (disable_merge, "", "disable_merge", "disable_merge", ::cxxopts::value< bool >()->default_value("0"), ""),
+    (preload_size, "", "preload_size", "[ovveride] number of entries to preload tree with",
+     ::cxxopts::value< uint32_t >(), "number"),
+    (seed, "", "seed", "random engine seed, use random if not defined",
+     ::cxxopts::value< uint64_t >()->default_value("0"), "number"))
+
+struct COWBtreeTestOptions : public BtreeTestOptions {
+    uint32_t num_cps;
+    uint32_t num_btrees;
+};
+COWBtreeTestOptions g_opts;
 
 void log_obj_life_counter() {
     std::string str;
@@ -56,6 +60,36 @@ void log_obj_life_counter() {
         fmt::format_to(std::back_inserter(str), "{}: created={} alive={}\n", name, created, alive);
     });
     LOGINFO("Object Life Counter\n:{}", str);
+}
+
+static void set_options() {
+    if (SISL_OPTIONS["test_type"].as< std::string >() == "unit") {
+        g_opts.num_entries = 5000;
+        g_opts.preload_size = 2500;
+        g_opts.num_ios = 500;
+        g_opts.run_time_secs = 36000; // Limit is on ios than time
+        g_opts.num_btrees = 2;
+        g_opts.num_cps = 0;
+    } else if (SISL_OPTIONS["test_type"].as< std::string >() == "functional") {
+        g_opts.num_entries = 50000;
+        g_opts.preload_size = 25000;
+        g_opts.num_ios = 50000;
+        g_opts.run_time_secs = 36000; // Limit is on ios than time
+        g_opts.num_btrees = 2;
+        g_opts.num_cps = 25;
+    }
+
+    if (SISL_OPTIONS.count("num_entries")) { g_opts.num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >(); }
+    if (SISL_OPTIONS.count("preload_size")) { g_opts.preload_size = SISL_OPTIONS["preload_size"].as< uint32_t >(); }
+    if (SISL_OPTIONS.count("num_ios")) { g_opts.num_ios = SISL_OPTIONS["num_ios"].as< uint32_t >(); }
+    if (SISL_OPTIONS.count("run_time")) { g_opts.run_time_secs = SISL_OPTIONS["run_time"].as< uint32_t >(); }
+    if (SISL_OPTIONS.count("num_cps")) { g_opts.num_cps = SISL_OPTIONS["num_cps"].as< uint32_t >(); }
+    if (SISL_OPTIONS.count("disable_merge")) { g_opts.disable_merge = SISL_OPTIONS["disable_merge"].as< bool >(); }
+
+    if (SISL_OPTIONS.count("seed")) {
+        LOGINFO("Using seed {} to sow the random generation", SISL_OPTIONS["seed"].as< uint64_t >());
+        g_re.seed(SISL_OPTIONS["seed"].as< uint64_t >());
+    }
 }
 
 struct BtreeTest : public ::testing::Test {
@@ -115,7 +149,7 @@ struct BtreeTest : public ::testing::Test {
         auto const multi_threaded =
             (testing::UnitTest::GetInstance()->current_test_info()->name() == std::string("ConcurrentMultiOps"));
 
-        for (uint32_t i{0}; i < SISL_OPTIONS["num_btrees"].as< uint32_t >(); ++i) {
+        for (uint32_t i{0}; i < g_opts.num_btrees; ++i) {
             create_new_btree();
         }
     }
@@ -124,7 +158,7 @@ struct BtreeTest : public ::testing::Test {
         auto uuid = boost::uuids::random_generator()();
         auto parent_uuid = boost::uuids::random_generator()();
 
-        auto bt_helper = std::make_shared< BtreeTestHelper< T > >();
+        auto bt_helper = std::make_shared< BtreeTestHelper< T > >(g_opts);
         bt_helper->SetUp(true /* multi_threaded */);
         bt_helper->m_bt = std::make_shared< Btree< K, V > >(bt_helper->m_cfg, uuid, parent_uuid, 0);
         hs()->index_service().add_index_table(bt_helper->m_bt);
@@ -237,18 +271,22 @@ struct BtreeTest : public ::testing::Test {
         }
 
         auto created_list = [](std::vector< uint32_t > const& v) -> std::string {
-            return std::accumulate(v.begin(), v.end(), std::string(""),
-                                   [](std::string a, uint32_t b) { return a + std::to_string(b) + std::string(","); });
+            std::string str = v.empty() ? "" : std::to_string(v[0]);
+            for (size_t i{1}; i < v.size(); ++i) {
+                str += std::string(",") + std::to_string(v[i]);
+            }
+            return str;
         };
 
         auto first_n = [](std::map< uint32_t, std::shared_ptr< BtreeTestHelper< T > > > const& m,
                           size_t n) -> std::string {
-            if (m.empty()) { return ""; }
-            auto end_it = m.begin();
-            std::advance(end_it, std::min(n, m.size()));
-            return std::accumulate(m.begin(), end_it, std::string(""), [](std::string a, auto const& pair) {
-                return a + std::to_string(pair.first) + std::string(",");
-            });
+            auto it = m.begin();
+            std::string str = (it == m.end() || n == 0) ? "" : std::to_string(it->first);
+            size_t i{1};
+            for (++it; (it != m.end()) && (i < n); ++it, ++i) {
+                str += std::string(",") + std::to_string(it->first);
+            }
+            return str;
         };
 
         if (p.num_io_btrees > this->m_bt_helpers.size()) { p.num_io_btrees = this->m_bt_helpers.size(); }
@@ -360,13 +398,15 @@ TEST_F(BtreeTest, DestroyThenIncrementalMapFlushThenRestart) {
 }
 
 TEST_F(BtreeTest, RandomMultiOps) {
+    if (SISL_OPTIONS["test_type"].as< std::string >() == "unit") { GTEST_SKIP(); }
+
     static std::uniform_int_distribution< uint32_t > new_rand_count{0, 3};
     static std::uniform_int_distribution< uint32_t > destroy_rand_count{0, 2};
-    static std::normal_distribution<> io_rand_count{(double)(SISL_OPTIONS["num_btrees"].as< uint32_t >()), 4.0};
+    static std::normal_distribution<> io_rand_count{(double)(g_opts.num_btrees), 4.0};
     static std::uniform_int_distribution< uint32_t > rand_cp_type{0, 3}; // 25% times for full map cp
     static std::uniform_int_distribution< uint32_t > rand_restart{0, 3}; // 25% times for restart
 
-    for (uint32_t i{0}; i < SISL_OPTIONS["num_cps"].as< uint32_t >(); ++i) {
+    for (uint32_t i{0}; i < g_opts.num_cps; ++i) {
         action_with_cp({.num_new_btrees = new_rand_count(g_re),
                         .num_destroy_btrees = destroy_rand_count(g_re),
                         .num_io_btrees = (uint32_t)std::lround(io_rand_count(g_re)),
@@ -385,11 +425,7 @@ int main(int argc, char* argv[]) {
     sisl::logging::SetLogger("test_cow_btree_recovery");
     spdlog::set_pattern("[%D %T%z] [%^%L%$] [%t] %v");
 
-    if (SISL_OPTIONS.count("seed")) {
-        auto seed = SISL_OPTIONS["seed"].as< uint64_t >();
-        LOGINFO("Using seed {} to sow the random generation", seed);
-        g_re.seed(seed);
-    }
+    set_options();
     auto ret = RUN_ALL_TESTS();
     return ret;
 }

@@ -32,6 +32,14 @@
 
 static constexpr uint32_t g_node_size{4096};
 
+struct BtreeTestOptions {
+    uint32_t num_entries;
+    uint32_t preload_size;
+    uint32_t num_ios;
+    uint32_t run_time_secs;
+    bool disable_merge{false};
+};
+
 template < typename TestType >
 struct BtreeTestHelper {
     using T = TestType;
@@ -40,19 +48,18 @@ struct BtreeTestHelper {
     using mutex = iomgr::FiberManagerLib::shared_mutex;
     using op_func_t = std::function< void(void) >;
 
-    BtreeTestHelper() : m_shadow_map{SISL_OPTIONS["num_entries"].as< uint32_t >()} {}
+    BtreeTestHelper(BtreeTestOptions options) : m_options{std::move(options)}, m_shadow_map{options.num_entries} {}
 
     void SetUp(bool is_multi_threaded = false) {
         m_cfg.m_leaf_node_type = T::leaf_node_type;
         m_cfg.m_int_node_type = T::interior_node_type;
         m_cfg.m_store_type = T::store_type;
-        m_max_range_input = SISL_OPTIONS["num_entries"].as< uint32_t >();
+        m_max_range_input = m_options.num_entries;
         m_is_multi_threaded = is_multi_threaded;
-        if (SISL_OPTIONS.count("disable_merge")) { m_cfg.m_merge_turned_on = false; }
+        if (m_options.disable_merge) { m_cfg.m_merge_turned_on = false; }
 
         if (m_is_multi_threaded) {
             std::mutex mtx;
-            m_run_time = SISL_OPTIONS["run_time"].as< uint32_t >();
             m_fibers.clear();
             iomanager.run_on_wait(iomgr::reactor_regex::all_worker, [this, &mtx]() {
                 auto fv = iomanager.sync_io_capable_fibers();
@@ -75,10 +82,10 @@ public:
     BtreeConfig m_cfg;
 
 protected:
+    BtreeTestOptions const m_options;
     ShadowMap< K, V > m_shadow_map;
     uint32_t m_max_range_input{1000};
     bool m_is_multi_threaded{false};
-    uint32_t m_run_time{0};
 
     std::map< std::string, op_func_t > m_operations;
     std::vector< iomgr::io_fiber_t > m_fibers;
@@ -86,6 +93,7 @@ protected:
     std::condition_variable m_test_done_cv;
     std::random_device m_re;
     std::atomic< uint32_t > m_num_ops{0};
+    Clock::time_point m_start_time;
 #ifdef _PRERELEASE
     flip::FlipClient m_fc{iomgr_flip::instance()};
 #endif
@@ -105,6 +113,7 @@ public:
         LOGINFO("Flip {} reset", flip_name);
     }
 #endif
+
     void preload(uint32_t preload_size) {
         if (preload_size == 0) {
             LOGINFO("Preload Skipped");
@@ -116,40 +125,17 @@ public:
         const auto last_chunk_size = preload_size % chunk_size ?: chunk_size;
         auto test_count = n_fibers;
 
+        LOGINFO("Btree{}: {} entries will be preloaded in {} fibers in parallel", m_bt->ordinal(), preload_size,
+                m_fibers.size());
         for (std::size_t i = 0; i < n_fibers; ++i) {
             const auto start_range = i * chunk_size;
             const auto end_range = start_range + ((i == n_fibers - 1) ? last_chunk_size : chunk_size) - 1;
             auto fiber_id = i;
             iomanager.run_on_forget(m_fibers[i], [this, start_range, end_range, &test_count, fiber_id, preload_size]() {
-                double progress_interval =
-                    (double)(end_range - start_range) / 20; // 5% of the total number of iterations
-                double progress_thresh = progress_interval; // threshold for progress interval
-                double elapsed_time, progress_percent, last_progress_time = 0;
-                auto m_start_time = Clock::now();
-
+                m_start_time = Clock::now();
                 for (uint32_t i = start_range; i < end_range; i++) {
                     put(i, btree_put_type::INSERT);
-                    if (fiber_id == 0) {
-                        elapsed_time = get_elapsed_time_sec(m_start_time);
-                        progress_percent = (double)(i - start_range) / (end_range - start_range) * 100;
-
-                        // check progress every 5% of the total number of iterations or every 30 seconds
-                        bool print_time = false;
-                        if (i >= progress_thresh) {
-                            progress_thresh += progress_interval;
-                            print_time = true;
-                        }
-                        if (elapsed_time - last_progress_time > 30) {
-                            last_progress_time = elapsed_time;
-                            print_time = true;
-                        }
-                        if (print_time) {
-                            LOGINFO("Progress: iterations completed ({:.2f}%)- Elapsed time: {:.0f} seconds- "
-                                    "populated entries: {} ({:.2f}%)",
-                                    progress_percent, elapsed_time, m_shadow_map.size(),
-                                    m_shadow_map.size() * 100.0 / preload_size);
-                        }
-                    }
+                    track_progress(preload_size, "Preload");
                 }
                 {
                     std::unique_lock lg(m_test_done_mtx);
@@ -163,10 +149,34 @@ public:
             m_test_done_cv.wait(lk, [&]() { return test_count == 0; });
         }
 
-        LOGINFO("Preload Done");
+        LOGINFO("Btree{}: Preload Done", m_bt->ordinal());
     }
 
     uint32_t get_op_num() const { return m_num_ops.load(); }
+
+    void track_progress(uint32_t max_ops, std::string_view work_type) {
+        static Clock::time_point last_print_time{Clock::now()};
+
+        bool print{false};
+        auto completed = m_num_ops.fetch_add(1) + 1;
+
+        auto elapsed_time = get_elapsed_time_sec(last_print_time);
+        if (elapsed_time > 30) {
+            // Print percent every 30 seconds no matter what
+            print = true;
+        } else if ((completed % (max_ops / 10) == 0) && (elapsed_time > 1)) {
+            // 10% completed and at least 1 second after last print time, we can print again
+            print = true;
+        }
+
+        if (print) {
+            auto map_size = m_shadow_map.size();
+            LOGINFO("Progress=({:.2f}%) IOsCompleted={} ElapsedTime={} seconds {} EntriesFilled={} ({:.2f}%)",
+                    completed * 100.0 / max_ops, completed, get_elapsed_time_sec(m_start_time), work_type, map_size,
+                    map_size * 100.0 / m_max_range_input);
+            last_print_time = Clock::now();
+        }
+    }
 
     ////////////////////// All put operation variants ///////////////////////////////
     void put(uint64_t k, btree_put_type put_type, bool expect = true) {
@@ -225,11 +235,11 @@ public:
         auto pk = std::make_unique< K >(k);
 
         bool removed = (m_bt->remove_one(*pk, existing_v.get()) == btree_status_t::success);
-        if(care_success) {
+        if (care_success) {
             ASSERT_EQ(removed, m_shadow_map.exists(*pk))
                 << "Removal of key " << pk->key() << " status doesn't match with shadow";
             if (removed) { m_shadow_map.remove_and_check(*pk, *existing_v); }
-        }else {
+        } else {
             // Do not care if the key is not present in the btree, just cleanup the shadow map
             m_shadow_map.erase(*pk);
         }
@@ -259,11 +269,9 @@ public:
     }
 
     ////////////////////// All query operation variants ///////////////////////////////
-    void query_all() { do_query(0u, SISL_OPTIONS["num_entries"].as< uint32_t >() - 1, UINT32_MAX); }
+    void query_all() { do_query(0u, m_options.num_entries - 1, UINT32_MAX); }
 
-    void query_all_paginate(uint32_t batch_size) {
-        do_query(0u, SISL_OPTIONS["num_entries"].as< uint32_t >() - 1, batch_size);
-    }
+    void query_all_paginate(uint32_t batch_size) { do_query(0u, m_options.num_entries - 1, batch_size); }
 
     void do_query(uint32_t start_k, uint32_t end_k, uint32_t batch_size) {
         std::vector< std::pair< K, V > > out_vector;
@@ -366,16 +374,18 @@ public:
 
     void multi_op_execute(const std::vector< std::pair< std::string, int > >& op_list) {
         if (m_shadow_map.size() == 0) {
-            auto preload_size = SISL_OPTIONS["preload_size"].as< uint32_t >();
-            auto const num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
-            if (preload_size > num_entries / 2) {
+            auto preload_size = m_options.preload_size;
+            if (preload_size > m_options.num_entries / 2) {
                 LOGWARN("Preload size={} is more than half of num_entries, setting preload_size to {}", preload_size,
-                        num_entries / 2);
-                preload_size = num_entries / 2;
+                        m_options.num_entries / 2);
+                preload_size = m_options.num_entries / 2;
             }
             preload(preload_size);
         }
+        LOGINFO("Btree{}: {} IOs will be executed in {} fibers in parallel", m_bt->ordinal(), m_options.num_ios,
+                m_fibers.size());
         run_in_parallel(op_list);
+        LOGINFO("Btree{}: {} IOs completed", m_bt->ordinal(), m_options.num_ios);
     }
 
     void dump_to_file(const std::string& file = "") const { m_bt->dump(file); }
@@ -464,58 +474,28 @@ private:
 public:
     void run_in_parallel(const std::vector< std::pair< std::string, int > >& op_list) {
         auto test_count = m_fibers.size();
-        const auto total_iters = SISL_OPTIONS["num_iters"].as< uint32_t >();
-        const auto num_iters_per_thread = total_iters / m_fibers.size();
-        const auto extra_iters = total_iters % num_iters_per_thread;
-        LOGINFO("number of fibers {} num_iters_per_thread {} extra_iters {} ", m_fibers.size(), num_iters_per_thread,
-                extra_iters);
+        const auto num_ios_per_thread = m_options.num_ios / m_fibers.size();
+        const auto extra_ios = m_options.num_ios % num_ios_per_thread;
 
+        m_num_ops = 0; // Reset the ops counter
         for (uint32_t fiber_id = 0; fiber_id < m_fibers.size(); ++fiber_id) {
-            auto num_iters_this_fiber = num_iters_per_thread + (fiber_id < extra_iters ? 1 : 0);
-            iomanager.run_on_forget(m_fibers[fiber_id], [this, fiber_id, &test_count, op_list, num_iters_this_fiber]() {
+            auto num_ios_this_fiber = num_ios_per_thread + (fiber_id < extra_ios ? 1 : 0);
+            iomanager.run_on_forget(m_fibers[fiber_id], [this, fiber_id, &test_count, op_list, num_ios_this_fiber]() {
                 std::random_device g_rd{};
                 std::default_random_engine re{g_rd()};
                 std::vector< uint32_t > weights;
                 std::transform(op_list.begin(), op_list.end(), std::back_inserter(weights),
                                [](const auto& pair) { return pair.second; });
 
-                double progress_interval = (double)num_iters_this_fiber / 20; // 5% of the total number of iterations
-                double progress_thresh = progress_interval;                   // threshold for progress interval
-                double elapsed_time, progress_percent, last_progress_time = 0;
-
                 // Construct a weighted distribution based on the input frequencies
                 std::discrete_distribution< uint32_t > s_rand_op_generator(weights.begin(), weights.end());
-                auto m_start_time = Clock::now();
-                auto time_to_stop = [this, m_start_time]() {
-                    return (get_elapsed_time_sec(m_start_time) > m_run_time);
-                };
+                m_start_time = Clock::now();
+                auto time_to_stop = [this]() { return (get_elapsed_time_sec(m_start_time) > m_options.run_time_secs); };
 
-                for (uint32_t i = 0; i < num_iters_this_fiber && !time_to_stop(); i++) {
+                for (uint32_t i = 0; i < num_ios_this_fiber && !time_to_stop(); i++) {
                     uint32_t op_idx = s_rand_op_generator(re);
                     (this->m_operations[op_list[op_idx].first])();
-                    m_num_ops.fetch_add(1);
-
-                    if (fiber_id == 0) {
-                        elapsed_time = get_elapsed_time_sec(m_start_time);
-                        progress_percent = (double)i / num_iters_this_fiber * 100;
-
-                        // check progress every 5% of the total number of iterations or every 30 seconds
-                        bool print_time = false;
-                        if (i >= progress_thresh) {
-                            progress_thresh += progress_interval;
-                            print_time = true;
-                        }
-                        if (elapsed_time - last_progress_time > 30) {
-                            last_progress_time = elapsed_time;
-                            print_time = true;
-                        }
-                        if (print_time) {
-                            LOGINFO("Progress: iterations completed ({:.2f}%)- Elapsed time: {:.0f} seconds of total "
-                                    "{} ({:.2f}%) - total entries: {} ({:.2f}%)",
-                                    progress_percent, elapsed_time, m_run_time, elapsed_time * 100.0 / m_run_time,
-                                    m_shadow_map.size(), m_shadow_map.size() * 100.0 / m_max_range_input);
-                        }
-                    }
+                    track_progress(m_options.num_ios, "Workload");
                 }
                 {
                     std::unique_lock lg(m_test_done_mtx);
@@ -528,7 +508,6 @@ public:
             std::unique_lock< std::mutex > lk(m_test_done_mtx);
             m_test_done_cv.wait(lk, [&]() { return test_count == 0; });
         }
-        LOGINFO("ALL parallel jobs joined");
     }
 
     std::vector< std::pair< std::string, int > > build_op_list(std::vector< std::string > const& input_ops) {

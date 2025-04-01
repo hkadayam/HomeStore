@@ -28,7 +28,7 @@ SoloReplDev::SoloReplDev(superblk< repl_dev_superblk >&& rd_sb, bool load_existi
 }
 
 void SoloReplDev::async_alloc_write(sisl::blob const& header, sisl::blob const& key, sisl::sg_list const& value,
-                                    repl_req_ptr_t rreq) {
+                                    repl_req_ptr_t rreq, trace_id_t tid) {
     if (!rreq) { auto rreq = repl_req_ptr_t(new repl_req_ctx{}); }
     auto status = rreq->init(repl_key{.server_id = 0, .term = 1, .dsn = 1},
                              value.size ? journal_type_t::HS_DATA_LINKED : journal_type_t::HS_DATA_INLINED, true,
@@ -92,11 +92,13 @@ void SoloReplDev::on_log_found(logstore_seq_num_t lsn, log_buffer buf, void* ctx
 }
 
 folly::Future< std::error_code > SoloReplDev::async_read(MultiBlkId const& bid, sisl::sg_list& sgs, uint32_t size,
-                                                         bool part_of_batch) {
+                                                         bool part_of_batch, trace_id_t tid) {
     return data_service().async_read(bid, sgs, size, part_of_batch);
 }
 
-void SoloReplDev::async_free_blks(int64_t, MultiBlkId const& bid) { data_service().async_free_blk(bid); }
+folly::Future< std::error_code > SoloReplDev::async_free_blks(int64_t, MultiBlkId const& bid, trace_id_t tid) {
+    return data_service().async_free_blk(bid);
+}
 
 uint32_t SoloReplDev::get_blk_size() const { return data_service().get_blk_size(); }
 
@@ -107,7 +109,6 @@ void SoloReplDev::cp_flush(CP*) {
     m_rd_sb.write();
 }
 
-void SoloReplDev::cp_cleanup(CP*) { /* m_data_journal->truncate(m_rd_sb->checkpoint_lsn); */
-}
+void SoloReplDev::cp_cleanup(CP*) { /* m_data_journal->truncate(m_rd_sb->checkpoint_lsn); */ }
 
 } // namespace homestore

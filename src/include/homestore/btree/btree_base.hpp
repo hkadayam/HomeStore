@@ -19,6 +19,7 @@ public:
     virtual btree_status_t transact_nodes(const BtreeNodeList& new_nodes, const BtreeNodeList& removed_nodes,
                                           const BtreeNodePtr& left_child_node, const BtreeNodePtr& parent_node,
                                           CPContext* context) = 0;
+    virtual BtreeLinkInfo load_root_node_id() = 0;
     virtual btree_status_t on_root_changed(BtreeNodePtr const& root, CPContext* context) = 0;
     virtual uint64_t space_occupied() const = 0;
 };
@@ -71,8 +72,12 @@ public:
         return const_cast< UnderlyingBtree* >(s_cast< const BtreeBase* >(this)->underlying_btree());
     }
 
-    superblk< IndexSuperBlock >& super_blk() {
-        return const_cast< superblk< IndexSuperBlock >& >(s_cast< const Index* >(this)->super_blk());
+    BtreeSuperBlock const& bt_super_blk() const {
+        return *(r_cast< BtreeSuperBlock const* >(super_blk()->underlying_index_sb.data()));
+    }
+
+    BtreeSuperBlock& bt_super_blk() {
+        return const_cast< BtreeSuperBlock& >(s_cast< const BtreeBase* >(this)->bt_super_blk());
     }
 
     virtual BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf,

@@ -12,6 +12,7 @@
 #include <homestore/checkpoint/cp_mgr.hpp>
 #include <homestore/index_service.hpp>
 #include "common/homestore_utils.hpp"
+#include "index/cow_btree/cow_btree.h"
 
 namespace homestore {
 class COWBtreeCPContext;
@@ -39,7 +40,7 @@ private:
     std::vector< iomgr::io_fiber_t > m_cp_flush_fibers;
 
     // All loaded journals arranged by the btree ordinals
-    std::unordered_map< uint32_t, std::vector< sisl::byte_view > > m_journals_by_btree;
+    std::unordered_map< uint32_t, std::vector< unique< COWBtree::Journal > > > m_journals_by_btree;
 
     // All journals maintained (sorted) by its cp_id
     std::vector< superblk< IndexStoreSuperBlock > > m_journals_by_cpid;

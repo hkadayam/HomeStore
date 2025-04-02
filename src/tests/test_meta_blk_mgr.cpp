@@ -835,7 +835,7 @@ TEST_F(VMetaBlkMgrTest, recovery_test) {
     // write 1/2 of the available blks;
     for (uint64_t i = 0; i < max_write_times / 2; i++) {
         EXPECT_GT(this->do_sb_write(true, uint64_cast(64 * Ki)), uint64_cast(0));
-        LOGINFO("iter {}, available_blks {}", i, m_mbm->available_blks());
+        LOGDEBUG("iter {}, available_blks {}", i, m_mbm->available_blks());
     }
 
     // restart homestore
@@ -846,7 +846,7 @@ TEST_F(VMetaBlkMgrTest, recovery_test) {
     this->register_client();
     for (uint64_t i = 0; i < (max_write_times / 2); i++) {
         EXPECT_GT(this->do_sb_write(true, uint64_cast(64 * Ki)), uint64_cast(0));
-        LOGINFO("iter {}, available_blks {}", i, m_mbm->available_blks());
+        LOGDEBUG("iter {}, available_blks {}", i, m_mbm->available_blks());
     }
     this->shutdown();
 }

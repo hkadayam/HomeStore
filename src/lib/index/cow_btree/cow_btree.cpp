@@ -5,6 +5,7 @@
 #include "index/index_cp.h"
 #include "common/homestore_config.hpp"
 #include "common/homestore_utils.hpp"
+#include "common/crash_simulator.hpp"
 #include "device/virtual_dev.hpp"
 
 namespace homestore {
@@ -39,7 +40,7 @@ static void write_or_fail(VirtualDev* vdev, sisl::io_blob const& blob, BlkId loc
 
 COWBtree::COWBtree(BtreeBase& bt, shared< VirtualDev > vdev,
                    shared< sisl::SimpleCache< bnodeid_t, BtreeNodePtr > > cache,
-                   std::vector< sisl::byte_view > journal_bufs, bool load_existing) :
+                   std::vector< unique< Journal > > journals, bool load_existing) :
         m_base_btree{bt},
         m_cache{std::move(cache)},
         m_nodeid_generator(std::numeric_limits< uint32_t >::max()),
@@ -51,6 +52,12 @@ COWBtree::COWBtree(BtreeBase& bt, shared< VirtualDev > vdev,
     }
 
     if (load_existing) {
+        m_root_node_id = m_base_btree.bt_super_blk().root_node_id;
+        if (m_root_node_id != empty_bnodeid) {
+            HS_REL_ASSERT_EQ(m_root_node_id & btree_ordinal_mask, m_ordinal_shifted,
+                             "Ordinal of root node_id inside the superblk doesn't match btree's ordinal");
+        }
+
         // If we have full map persisted before, recover that
         for (uint32_t i{0}; i < cow_bt_super_blk().num_map_heads; ++i) {
             recover_bnode_map(cow_bt_super_blk().map_heads[i]);
@@ -58,12 +65,12 @@ COWBtree::COWBtree(BtreeBase& bt, shared< VirtualDev > vdev,
 
         // Apply all incremental journal entries containing map updates/removes. Each journal_buf listed here
         // corresponding to a journal written as part of cps, sorted by the cp_id
-        for (auto const& journal_buf : journal_bufs) {
-            apply_incremental_map(journal_buf);
+        for (auto& journal : journals) {
+            apply_incremental_map(*journal);
         }
     } else {
         // New COWBtree, format the cow btree superblk area
-        new (bt_super_blk().underlying_btree_sb.data()) SuperBlock();
+        new (m_base_btree.bt_super_blk().underlying_btree_sb.data()) SuperBlock();
     }
 }
 
@@ -170,8 +177,13 @@ btree_status_t COWBtree::transact_nodes(const BtreeNodeList& new_nodes, const Bt
     return btree_status_t::success;
 }
 
+BtreeLinkInfo COWBtree::load_root_node_id() {
+    return BtreeLinkInfo{m_root_node_id, m_base_btree.bt_super_blk().root_link_version};
+}
+
 btree_status_t COWBtree::on_root_changed(BtreeNodePtr const& new_root, CPContext* cp_ctx) {
-    cp_session(cp_ctx->id())->m_new_root_id.store(new_root->node_id());
+    m_root_node_id = new_root->node_id();
+    cp_session(cp_ctx->id())->m_new_root_id.store(m_root_node_id);
     return btree_status_t::success;
 }
 
@@ -445,7 +457,7 @@ public:
     }
 };
 
-std::tuple< bool, unique< COWBtree::Journal >, bool > COWBtree::flush_nodes(COWBtreeCPContext* cp_ctx) {
+std::tuple< bool, unique< COWBtree::Journal > > COWBtree::flush_nodes(COWBtreeCPContext* cp_ctx) {
     CPSession* session = cp_session(cp_ctx->id());
 
     // We prepare to flush nodes, by allocating blks in vdev to accomodate all the dirty blks. Its obviously not
@@ -453,7 +465,7 @@ std::tuple< bool, unique< COWBtree::Journal >, bool > COWBtree::flush_nodes(COWB
     // then pack nodes inside these blks.
     if (!session->prepare_to_flush_nodes(cp_ctx)) {
         // Already flushed the cp and moved on.
-        return std::make_tuple(false, nullptr, false);
+        return std::make_tuple(false, nullptr);
     }
 
     // 3 steps on per btree CP node flush
@@ -502,40 +514,33 @@ std::tuple< bool, unique< COWBtree::Journal >, bool > COWBtree::flush_nodes(COWB
             ++it;
         }
 
-        //
-        // Step 3: Check if there are any changes that needs changes in superblock of the btree. If so modify them. We
-        // do not persist them yet, because we need all fibers to finish flushing, write journal etc before committing
-        // to superblock to disk. In this step, we just updated the superblk based on what has been dirtied earlier.
-        //
-        auto const new_root = session->new_root();
-        bool sb_changed{false};
-        if (new_root != empty_bnodeid) {
-            bt_super_blk().root_node_id = new_root;
-            sb_changed = true;
-        }
-
         COWBT_PERIODIC_LOG(DEBUG, cp_ctx->id(), "Flushed {} dirty nodes and deleted {} nodes",
                            session->m_modified_count, session->m_deleted_count);
         m_bnodeid_map.m_updates_since_last_flush.fetch_add(session->m_modified_count + session->m_deleted_count);
 
-        // If either map has to be updated or sb is changed, we need to hold onto the session and it will be completed
-        // after that is done. Otherwise, we can complete the session now (which means all dirty node list, deleted node
-        // list, journal and everything has been cleaned)
-        if (sb_changed || cp_ctx->need_full_map_flush()) {
-            return std::make_tuple(session->m_modified_count || session->m_deleted_count, std::move(session->m_journal),
-                                   true);
+        // If map has to be updated, we need to hold onto the session and it will be completed after that is done.
+        // Otherwise, we can complete the session now (which means all dirty node list, deleted node list, journal and
+        // everything has been cleaned)
+        if (cp_ctx->need_full_map_flush()) {
+            return std::make_tuple(session->m_modified_count || session->m_deleted_count,
+                                   std::move(session->m_journal));
         } else {
             auto journal = std::move(session->m_journal);
+
+            // Step 3: Update the new root into the journal
+            auto new_root = session->new_root_id();
+            if (new_root != empty_bnodeid) { journal->header()->new_root_nodeid = to_compact_nodeid(new_root); }
+
             bool const has_modified = session->m_modified_count || session->m_deleted_count;
             session->finish();
-            return std::make_tuple(has_modified, std::move(journal), sb_changed);
+            return std::make_tuple(has_modified, std::move(journal));
         }
     } else {
-        return std::make_tuple(false, nullptr, false);
+        return std::make_tuple(false, nullptr);
     }
 }
 
-void COWBtree::flush_map_and_sb(COWBtreeCPContext* cp_ctx) {
+void COWBtree::flush_map(COWBtreeCPContext* cp_ctx) {
     HS_DBG_ASSERT(cp_ctx->need_full_map_flush(), "Flush map called on a cp which doesn't need full map flush");
 
     if (m_bnodeid_map.m_updates_since_last_flush.load() == 0) {
@@ -585,6 +590,13 @@ void COWBtree::flush_map_and_sb(COWBtreeCPContext* cp_ctx) {
         return;
     }
 
+#ifdef _PRERELEASE
+    if (iomgr_flip::instance()->test_flip("crash_during_full_map_flush", ordinal())) {
+        LOGINFOMOD(btree, "Simulating crash during the full map flush on btree={}", ordinal());
+        hs()->crash_simulator().start_crash();
+    }
+#endif
+
     // We are the last fiber to finish parallel flush of map, its time to update the superblk with all map locations and
     // flush the superblk and free up old map blks.
     SuperBlock& sb = cow_bt_super_blk();
@@ -594,10 +606,15 @@ void COWBtree::flush_map_and_sb(COWBtreeCPContext* cp_ctx) {
         sb.map_heads[sb.num_map_heads++] = map_locs[0]; // Pick head of each map locs from different fibers
     }
 
-    // Persist the superblk now
-    flush_sb(cp_ctx);
+    // Persist the superblk now with the updated root_id
+    auto root_node = session->new_root_id();
+    if (root_node != empty_bnodeid) { m_base_btree.bt_super_blk().root_node_id = root_node; }
+    m_base_btree.super_blk().write();
+    session->finish();
 
-    // We have completed the flush of map and now we can free up the old map blks
+    // We have completed the flush of map and now we can free up the old map blks. It is ok if system crashed after
+    // persisting superblk containing new map location and before freeing this blks, because these blks are in-memory
+    // bitmap, hence it will not be marked as busy upon restart.
     for (auto const& loc : m_bnodeid_map.m_locations) {
         m_vdev->free_blk(loc);
     }
@@ -608,12 +625,6 @@ void COWBtree::flush_map_and_sb(COWBtreeCPContext* cp_ctx) {
         m_bnodeid_map.m_locations.insert(m_bnodeid_map.m_locations.end(), loc_array.begin(), loc_array.end());
     }
     m_bnodeid_map.m_updates_since_last_flush.store(0); // Reset the count, as we just flushed the full map
-}
-
-void COWBtree::flush_sb(COWBtreeCPContext* cp_ctx) {
-    CPSession* session = cp_session(cp_ctx->id());
-    m_base_btree.super_blk().write();
-    session->finish();
 }
 
 void COWBtree::update_bnode_map(CompactNodeId nodeid, CompactBlkId cblkid, bool in_recovery) {
@@ -684,21 +695,33 @@ void COWBtree::recover_bnode_map(BlkId const& map_loc) {
 
 uint32_t COWBtree::align_size() const { return m_vdev->align_size(); }
 
-void COWBtree::apply_incremental_map(sisl::byte_view const& journal_buf) {
-    auto jhdr = r_cast< Journal::Header const* >(journal_buf.bytes());
+void COWBtree::apply_incremental_map(Journal& journal) {
+    auto jhdr = journal.header();
     HS_REL_ASSERT_EQ(jhdr->ordinal, m_btree_ordinal, "Btree Ordinal mismatch between journal and in-memory");
 
-    uint8_t const* cur_ptr = journal_buf.bytes() + sizeof(Journal::Header);
+    // If the full map recovered already have recorded this cp_id, we should skip these journals
+    if (journal.m_cp_id <= cow_bt_super_blk().cp_id) {
+        SPECIFIC_BT_LOG(INFO, m_base_btree,
+                        "Btree journal for cp_id={} is SKIPPED, because full map already recovered with cp_id={}",
+                        journal.m_cp_id, cow_bt_super_blk().cp_id);
+        return;
+    }
+
+    if (jhdr->new_root_nodeid != EmptyCompactNodeId) {
+        // Root was changed in this incremental map.
+        m_root_node_id = m_ordinal_shifted | jhdr->new_root_nodeid;
+    }
+
     for (uint32_t i{0}; i < jhdr->num_flush_units; ++i) {
-        NodeFlushUnit::JournalEntry const* nf_jentry = r_cast< NodeFlushUnit::JournalEntry const* >(cur_ptr);
+        NodeFlushUnit::JournalEntry const* nf_jentry = r_cast< NodeFlushUnit::JournalEntry const* >(journal.m_cur_ptr);
         BlkId const location = nf_jentry->nodes_location.to_blkid();
         for (uint16_t n{0}; n < nf_jentry->n_nodes; ++n) {
             update_bnode_map(nf_jentry->nodes[n], CompactBlkId{location, n}, true /* in_recovery */);
         }
-        cur_ptr += nf_jentry->size();
+        journal.m_cur_ptr += nf_jentry->size();
     }
 
-    auto* deleted_nodes = r_cast< CompactNodeId const* >(cur_ptr);
+    auto* deleted_nodes = r_cast< CompactNodeId const* >(journal.m_cur_ptr);
     for (uint32_t i{0}; i < jhdr->num_delete_units; ++i) {
         delete_from_bnode_map(deleted_nodes[i], true /* in_recovery */);
     }
@@ -710,16 +733,6 @@ COWBtree::CPSession* COWBtree::cp_session(cp_id_t cp_id) {
         session->m_state = CPSession::FlushState::DIRTYING;
         session->m_cp_id = cp_id;
     }
-#if 0
-    auto const slot_num = cp_id % CPManager::max_concurent_cps;
-    COWBtree::CPSession* session = m_cp_sessions[slot_num].get();
-    if (session == nullptr) {
-        m_cp_sessions[slot_num].reset(new CPSession(*this));
-        session = m_cp_sessions[slot_num].get();
-        session->m_state = CPSession::FlushState::DIRTYING;
-        session->m_cp_id = cp_id;
-    }
-#endif
     return session;
 }
 
@@ -762,7 +775,7 @@ bool COWBtree::CPSession::prepare_to_flush_nodes(COWBtreeCPContext* cp_ctx) {
         auto const journal_size = sizeof(Journal::Header) +
             (NodeFlushUnit::JournalEntry::size(0) * m_node_locations.size()) +
             ((m_modified_count + m_deleted_count) * sizeof(CompactNodeId));
-        m_journal = std::make_unique< Journal >(m_bt.m_btree_ordinal, journal_size);
+        m_journal = std::make_unique< Journal >(m_bt.m_btree_ordinal, journal_size, cp_ctx->id());
         m_journal->header()->num_flush_units = m_node_locations.size();
         m_journal->header()->num_delete_units = m_deleted_count;
     }
@@ -818,7 +831,7 @@ COWBtree::CPSession::next_deleted() {
     return std::make_tuple(std::move(ret_it), m_deleted_nodes.end(), std::move(ret_blob));
 }
 
-bnodeid_t COWBtree::CPSession::new_root() { return m_new_root_id.exchange(empty_bnodeid); }
+bnodeid_t COWBtree::CPSession::new_root_id() { return m_new_root_id.exchange(empty_bnodeid); }
 
 bool COWBtree::CPSession::done_flushing_nodes() {
     std::lock_guard lg{m_flush_mtx};

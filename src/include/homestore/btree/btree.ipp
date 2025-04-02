@@ -43,7 +43,12 @@ Btree< K, V >::Btree(BtreeConfig const& cfg, uuid_t uuid, uuid_t parent_uuid, ui
 
 template < typename K, typename V >
 Btree< K, V >::Btree(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb) :
-        BtreeBase::BtreeBase(cfg, std::move(sb)) {}
+        BtreeBase::BtreeBase(cfg, std::move(sb)) {
+    if (m_root_node_info.bnode_id() == empty_bnodeid) {
+        BT_LOG(INFO, "Loaded an empty btree, we are creating a new root node");
+        create_root_node();
+    }
+}
 
 template < typename K, typename V >
 Btree< K, V >::~Btree() {

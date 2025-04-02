@@ -53,6 +53,8 @@ btree_status_t MemBtree::transact_nodes(BtreeNodeList const& new_nodes, BtreeNod
     return btree_status_t::success;
 }
 
+BtreeLinkInfo MemBtree::load_root_node_id() { return BtreeLinkInfo{empty_bnodeid, 0}; }
+
 btree_status_t MemBtree::on_root_changed(BtreeNodePtr const&, CPContext*) { return btree_status_t::success; }
 
 } // namespace homestore

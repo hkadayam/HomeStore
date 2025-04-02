@@ -83,9 +83,7 @@ struct CP {
     cp_id_t m_cp_id;
     std::array< std::unique_ptr< CPContext >, (size_t)cp_consumer_t::SENTINEL > m_contexts;
     folly::SharedPromise< bool > m_comp_promise;
-#ifdef _PRERELEASE
-    std::atomic< bool > m_abrupt_cp{false};
-#endif
+    bool m_is_on_shutdown{false}; // Is this CP taken as part of shutdown of homestore
 
 public:
     CP(CPManager* mgr) : m_cp_mgr{mgr} {}

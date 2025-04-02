@@ -53,19 +53,13 @@ protected:
 
 public:
     CPContext(CP* cp) : m_cp{cp} {}
+    virtual ~CPContext() = default;
+
     CP* cp() { return m_cp; }
     cp_id_t id() const;
-    void complete(bool status) { m_flush_comp.setValue(status); }
-#ifdef _PRERELEASE
-    void abrupt() {
-        m_cp->m_abrupt_cp.store(true);
-        complete(true);
-    }
-    bool is_abrupt() { return m_cp->m_abrupt_cp.load(); }
-#endif
-    folly::Future< bool > get_future() { return m_flush_comp.getFuture(); }
 
-    virtual ~CPContext() = default;
+    void complete(bool status);
+    folly::Future< bool > get_future() { return m_flush_comp.getFuture(); }
 };
 
 class CPCallbacks {

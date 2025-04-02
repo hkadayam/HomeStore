@@ -48,12 +48,17 @@ struct BtreeTestHelper {
     using mutex = iomgr::FiberManagerLib::shared_mutex;
     using op_func_t = std::function< void(void) >;
 
-    BtreeTestHelper(BtreeTestOptions options) : m_options{std::move(options)}, m_shadow_map{options.num_entries} {}
-
-    void SetUp(bool is_multi_threaded = false) {
+    BtreeTestHelper(BtreeTestOptions options) : m_options{std::move(options)}, m_shadow_map{options.num_entries} {
         m_cfg.m_leaf_node_type = T::leaf_node_type;
         m_cfg.m_int_node_type = T::interior_node_type;
         m_cfg.m_store_type = T::store_type;
+    }
+
+    virtual void SetUp(std::shared_ptr< Btree< K, V > > bt, bool load, bool is_multi_threaded = false) {
+        m_bt = std::move(bt);
+        m_shadow_filename = fmt::format("/tmp/btree_{}_shadow_map", m_bt->ordinal());
+
+        if (!load) { std::filesystem::remove(m_shadow_filename); }
         m_max_range_input = m_options.num_entries;
         m_is_multi_threaded = is_multi_threaded;
         if (m_options.disable_merge) { m_cfg.m_merge_turned_on = false; }
@@ -94,6 +99,8 @@ protected:
     std::random_device m_re;
     std::atomic< uint32_t > m_num_ops{0};
     Clock::time_point m_start_time;
+    std::string m_shadow_filename;
+
 #ifdef _PRERELEASE
     flip::FlipClient m_fc{iomgr_flip::instance()};
 #endif
@@ -198,6 +205,17 @@ public:
         auto const ret = m_bt->put_one(key, value, btree_put_type::UPSERT, existing_v.get());
         ASSERT_EQ(ret, btree_status_t::success) << "Upsert key=" << k << " failed with error=" << enum_name(ret);
         m_shadow_map.force_put(k, value);
+    }
+
+    void put_delta(uint64_t k) {
+        K key{k};
+        auto it = m_shadow_map.map_const().find(key);
+        ASSERT_TRUE(it != m_shadow_map.map_const().cend())
+            << "Asked to put_delta for key=" << k << " but its not in the map";
+
+        auto existing_v = std::make_unique< V >();
+        auto const ret = m_bt->put_one(key, it->second, btree_put_type::UPSERT, existing_v.get());
+        ASSERT_EQ(ret, btree_status_t::success) << "Upsert key=" << k << " failed with error=" << enum_name(ret);
     }
 
     void range_put(uint32_t start_k, uint32_t end_k, V const& value, bool update) {
@@ -438,6 +456,30 @@ public:
                 assert(false);
             }
             pending -= count;
+        }
+    }
+
+    ///////////////////////// All crash recovery methods ///////////////////////////////////
+    void save_snapshot() { this->m_shadow_map.save(m_shadow_filename); }
+
+    void reapply_after_crash() {
+        ShadowMap< K, V > snapshot_map{m_shadow_map.max_keys()};
+        snapshot_map.load(m_shadow_filename);
+        LOGDEBUG("Btree:{} Snapshot before crash\n{}", m_bt->ordinal(), snapshot_map.to_string());
+
+        auto diff = m_shadow_map.diff(snapshot_map);
+        std::string dif_str;
+        for (const auto& [k, delta] : diff) {
+            dif_str += fmt::format("[{}-{}] ", k.key(), enum_name(delta));
+        }
+        LOGDEBUG("Btree:{} Diff between shadow map and snapshot map\n{}\n", m_bt->ordinal(), dif_str);
+
+        for (const auto& [k, delta] : diff) {
+            if ((delta == ShadowMapDelta::Added) || (delta == ShadowMapDelta::Updated)) {
+                this->put_delta(k.key());
+            } else if (delta == ShadowMapDelta::Removed) {
+                this->remove_one(k.key(), false);
+            }
         }
     }
 

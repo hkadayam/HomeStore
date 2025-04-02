@@ -92,7 +92,7 @@ static void set_options() {
     }
 }
 
-struct BtreeTest : public ::testing::Test {
+struct BtreeTest : public test_common::HSTestHelper, public ::testing::Test {
     using T = VarObjSizeBtree< IndexStore::Type::COPY_ON_WRITE_BTREE >;
     using K = typename T::KeyType;
     using V = typename T::ValueType;
@@ -117,8 +117,8 @@ struct BtreeTest : public ::testing::Test {
 
             ++m_test->m_recovered;
             auto bt_helper = it1->second.get();
-            bt_helper->SetUp(true /* multi_threaded */);
-            bt_helper->m_bt = std::make_shared< Btree< K, V > >(bt_helper->m_cfg, std::move(sb));
+            bt_helper->SetUp(std::make_shared< Btree< K, V > >(bt_helper->m_cfg, std::move(sb)), true /* load */,
+                             true /* multi_threaded */);
             return bt_helper->m_bt;
         }
 
@@ -130,7 +130,7 @@ struct BtreeTest : public ::testing::Test {
     BtreeTest() : testing::Test() {}
 
     void SetUp() override {
-        m_helper.start_homestore(
+        start_homestore(
             "test_btree",
             {{ServiceType::META, {.size_pct = 10.0}},
              {ServiceType::INDEX, {.size_pct = 70.0, .index_svc_cbs = new TestIndexServiceCallbacks(this)}}},
@@ -159,8 +159,8 @@ struct BtreeTest : public ::testing::Test {
         auto parent_uuid = boost::uuids::random_generator()();
 
         auto bt_helper = std::make_shared< BtreeTestHelper< T > >(g_opts);
-        bt_helper->SetUp(true /* multi_threaded */);
-        bt_helper->m_bt = std::make_shared< Btree< K, V > >(bt_helper->m_cfg, uuid, parent_uuid, 0);
+        bt_helper->SetUp(std::make_shared< Btree< K, V > >(bt_helper->m_cfg, uuid, parent_uuid, 0), false /* load */,
+                         true /* multi_threaded */);
         hs()->index_service().add_index_table(bt_helper->m_bt);
         auto ordinal = bt_helper->m_bt->ordinal();
         m_bt_helpers.insert(std::make_pair(bt_helper->m_bt->ordinal(), std::move(bt_helper)));
@@ -199,18 +199,18 @@ struct BtreeTest : public ::testing::Test {
             bt_helper->m_bt.reset();
             bt_helper->TearDown();
         }
-        m_helper.shutdown_homestore(false);
+        shutdown_homestore(false);
         log_obj_life_counter();
     }
 
-    void restart_homestore() {
+    void restart_homestore(uint32_t shutdown_delay_sec = 5) override {
         m_recovered = 0;
-        m_helper.params(HS_SERVICE::INDEX).index_svc_cbs = new TestIndexServiceCallbacks(this);
+        this->params(HS_SERVICE::INDEX).index_svc_cbs = new TestIndexServiceCallbacks(this);
         for (auto& [_, bt_helper] : this->m_bt_helpers) {
             bt_helper->m_bt.reset();
         }
 
-        m_helper.restart_homestore();
+        test_common::HSTestHelper::restart_homestore(shutdown_delay_sec);
     }
 
     void restart_and_validate() {
@@ -220,7 +220,6 @@ struct BtreeTest : public ::testing::Test {
             bt_helper->dump_to_file(fname);
         }
         restart_homestore();
-        std::this_thread::sleep_for(std::chrono::seconds{1});
         LOGINFO(" Restarted homestore with {} indexes recovered", m_recovered);
 
         ASSERT_EQ(m_recovered, this->m_bt_helpers.size()) << "Number of btrees before and after restart mismatch";
@@ -233,36 +232,42 @@ struct BtreeTest : public ::testing::Test {
         }
     }
 
-    void trigger_incremental_map_cp() {
-        LOGINFO("Trigger Incremental Map Flush CP");
-        // Modify the settings to take incremental map flushes only once
-        HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
-            s.btree.cow_max_incremental_map_flushes = 100000;
-            HS_SETTINGS_FACTORY().save();
-        });
-        test_common::HSTestHelper::trigger_cp(true /* wait */);
+    void trigger_incremental_map_cp() { do_trigger_cp(false /* full_map_cp */, false /* crash */); }
+
+    void trigger_full_map_cp() { do_trigger_cp(true /* full_map_cp */, false /* crash */); }
+
+    void post_crash_validate() {
+        // Post crash reapply on all btrees
+        for (auto& [_, bt_helper] : this->m_bt_helpers) {
+            bt_helper->reapply_after_crash();
+            bt_helper->query_all_paginate(500); // Validate with query as well.
+        }
     }
 
-    void trigger_full_map_cp() {
-        LOGINFO("Trigger Full Map Flush CP");
+    struct CPParams {
+        enum class RestartType : uint8_t { none, clean, crash };
 
-        // Modify the settings to take incremental map flushes only once
-        HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
-            s.btree.cow_max_incremental_map_flushes = 0;
-            HS_SETTINGS_FACTORY().save();
-        });
-        test_common::HSTestHelper::trigger_cp(true /* wait */);
-    }
-
-    struct cp_params {
         uint32_t num_new_btrees{0};                                     // # of new btrees to create before cp
         uint32_t num_destroy_btrees{0};                                 // # of btrees to destroy before cp
         uint32_t num_io_btrees{std::numeric_limits< uint32_t >::max()}; // # of btrees to do IO
         bool is_full_map_flush_cp{false};                               // Is it a full map flush cp or incremental
-        bool restart_post_cp{false};                                    // Should we restart the homestore after cp
+        RestartType restart_post_cp{RestartType::none};                 // Should we restart the homestore after cp
+
+        std::string restart_type() const {
+            switch (restart_post_cp) {
+            case RestartType::none:
+                return "none";
+            case RestartType::clean:
+                return "clean";
+            case RestartType::crash:
+                return "crash";
+            default:
+                return "unknown";
+            }
+        }
     };
 
-    void action_with_cp(cp_params p) {
+    void action_with_cp(CPParams p) {
         std::vector< uint32_t > created;
         created.reserve(p.num_new_btrees);
 
@@ -293,7 +298,7 @@ struct BtreeTest : public ::testing::Test {
         LOGINFO("CPSpec: Create btrees=[{}] -> IO on btrees=[{}] -> Destroy btrees=[{}] -> CP_type={} -> Restart?={}",
                 created_list(created), first_n(m_bt_helpers, p.num_io_btrees),
                 first_n(m_bt_helpers, p.num_destroy_btrees), p.is_full_map_flush_cp ? "FullFlush" : "IncrementalFlush",
-                p.restart_post_cp ? "Yes" : "No");
+                p.restart_type());
 
         std::vector< std::string > input_ops = {"put:70", "remove:30"};
         uint32_t b{0};
@@ -306,12 +311,55 @@ struct BtreeTest : public ::testing::Test {
             destroy_a_btree();
         }
 
-        p.is_full_map_flush_cp ? trigger_full_map_cp() : trigger_incremental_map_cp();
-        if (p.restart_post_cp) { restart_and_validate(); }
+        if (p.restart_post_cp == CPParams::RestartType::crash) {
+            do_trigger_cp(p.is_full_map_flush_cp /* full_map_cp */, true /* crash */);
+            post_crash_validate();
+        } else if (p.restart_post_cp == CPParams::RestartType::clean) {
+            do_trigger_cp(p.is_full_map_flush_cp /* full_map_cp */, false /* crash */);
+            restart_and_validate();
+        } else {
+            do_trigger_cp(p.is_full_map_flush_cp /* full_map_cp */, false /* crash */);
+        }
+    }
+
+#ifdef _PRERELEASE
+    void set_btree_flip(std::string const& flip_name, std::optional< uint32_t > bt_ordinal = std::nullopt,
+                        uint32_t count = 1, uint32_t percent = 100) {
+        flip::FlipCondition cond;
+        auto fc = iomgr_flip::client_instance();
+        if (bt_ordinal) {
+            fc->create_condition("btree_ordinal", flip::Operator::EQUAL, (int)*bt_ordinal, &cond);
+        } else {
+            fc->create_condition("", flip::Operator::DONT_CARE, (int)1, &cond);
+        }
+        flip::FlipFrequency freq;
+        freq.set_count(count);
+        freq.set_percent(percent);
+        fc->inject_noreturn_flip(flip_name, {cond}, freq);
+    }
+#endif
+
+private:
+    void do_trigger_cp(bool full_map_cp, bool crash) {
+        LOGINFO("Trigger {} Map Flush CP {}", full_map_cp ? "Full" : "Incremental", crash ? " to simulate crash" : "");
+
+        // Modify the settings to take incremental map flushes only once
+        HS_SETTINGS_FACTORY().modifiable_settings([full_map_cp](auto& s) {
+            s.btree.cow_max_incremental_map_flushes = full_map_cp ? 0 : 100000;
+            HS_SETTINGS_FACTORY().save();
+        });
+        if (crash) {
+            test_common::HSTestHelper::trigger_cp(false /* wait */);
+            this->wait_for_crash_recovery();
+        } else {
+            test_common::HSTestHelper::trigger_cp(true /* wait */);
+            for (auto& [_, bt_helper] : this->m_bt_helpers) {
+                bt_helper->save_snapshot(); // Save every btree shadow as snapshot
+            }
+        }
     }
 
 protected:
-    test_common::HSTestHelper m_helper;
     std::map< uint32_t, std::shared_ptr< BtreeTestHelper< T > > > m_bt_helpers;
     std::map< uint32_t, std::shared_ptr< BtreeTestHelper< T > > > m_destroyed_bt_helpers;
     uint32_t m_recovered{0};
@@ -336,7 +384,7 @@ TEST_F(BtreeTest, IOThenFullMapFlushThenRestart) {
                     .num_destroy_btrees = 0,
                     .num_io_btrees = std::numeric_limits< uint32_t >::max(),
                     .is_full_map_flush_cp = true,
-                    .restart_post_cp = true});
+                    .restart_post_cp = CPParams::RestartType::clean});
 
     LOGINFO("Post Restart we do IO on all recovered btrees");
     this->io_on_btrees();
@@ -347,7 +395,7 @@ TEST_F(BtreeTest, IOThenIncrementalMapFlushThenRestart) {
                     .num_destroy_btrees = 0,
                     .num_io_btrees = std::numeric_limits< uint32_t >::max(),
                     .is_full_map_flush_cp = false,
-                    .restart_post_cp = true});
+                    .restart_post_cp = CPParams::RestartType::clean});
 
     LOGINFO("Post Restart we do IO on all recovered btrees");
     this->io_on_btrees();
@@ -358,7 +406,7 @@ TEST_F(BtreeTest, CreateThenFullMapFlushThenRestart) {
                     .num_destroy_btrees = 0,
                     .num_io_btrees = std::numeric_limits< uint32_t >::max(),
                     .is_full_map_flush_cp = true,
-                    .restart_post_cp = true});
+                    .restart_post_cp = CPParams::RestartType::clean});
 
     LOGINFO("Post Restart we do IO on all recovered btrees");
     this->io_on_btrees();
@@ -369,7 +417,7 @@ TEST_F(BtreeTest, CreateThenIncrementalMapFlushThenRestart) {
                     .num_destroy_btrees = 0,
                     .num_io_btrees = std::numeric_limits< uint32_t >::max(),
                     .is_full_map_flush_cp = false,
-                    .restart_post_cp = true});
+                    .restart_post_cp = CPParams::RestartType::clean});
 
     LOGINFO("Post Restart we do IO on all recovered btrees");
     this->io_on_btrees();
@@ -380,7 +428,7 @@ TEST_F(BtreeTest, DestroyThenFullMapFlushThenRestart) {
                     .num_destroy_btrees = 1,
                     .num_io_btrees = std::numeric_limits< uint32_t >::max(),
                     .is_full_map_flush_cp = true,
-                    .restart_post_cp = true});
+                    .restart_post_cp = CPParams::RestartType::clean});
 
     LOGINFO("Post Restart we do IO on all recovered btrees");
     this->io_on_btrees();
@@ -391,7 +439,7 @@ TEST_F(BtreeTest, DestroyThenIncrementalMapFlushThenRestart) {
                     .num_destroy_btrees = 1,
                     .num_io_btrees = std::numeric_limits< uint32_t >::max(),
                     .is_full_map_flush_cp = false,
-                    .restart_post_cp = true});
+                    .restart_post_cp = CPParams::RestartType::clean});
 
     LOGINFO("Post Restart we do IO on all recovered btrees");
     this->io_on_btrees();
@@ -411,12 +459,105 @@ TEST_F(BtreeTest, RandomMultiOps) {
                         .num_destroy_btrees = destroy_rand_count(g_re),
                         .num_io_btrees = (uint32_t)std::lround(io_rand_count(g_re)),
                         .is_full_map_flush_cp = (rand_cp_type(g_re) == 0),
-                        .restart_post_cp = rand_restart(g_re) == 0});
+                        .restart_post_cp =
+                            (rand_restart(g_re) == 0) ? CPParams::RestartType::clean : CPParams::RestartType::none});
     }
 
     LOGINFO("Post Restart we do IO on all recovered btrees");
     this->io_on_btrees();
 }
+
+#ifdef _PRERELEASE
+TEST_F(BtreeTest, CrashBeforeFirstCp) {
+    // Simulate the crash even before first cp. Here we trigger crash CP, so no actual CP is taken in this test
+    this->set_btree_flip("crash_on_flush_cow_btree_nodes");
+    action_with_cp({.num_new_btrees = 0,
+                    .num_destroy_btrees = 0,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = false,
+                    .restart_post_cp = CPParams::RestartType::crash});
+
+    LOGINFO("Post Restart we do IO on all recovered btrees");
+    this->io_on_btrees();
+}
+
+TEST_F(BtreeTest, CrashDuringFlushNodes) {
+    // Take couple of CPs, one full map and then one incremental
+    action_with_cp({.num_new_btrees = 0,
+                    .num_destroy_btrees = 0,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = true,
+                    .restart_post_cp = CPParams::RestartType::none});
+    action_with_cp({.num_new_btrees = 0,
+                    .num_destroy_btrees = 0,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = false,
+                    .restart_post_cp = CPParams::RestartType::none});
+
+    // Simulate the crash after couple of cps by triggering an incremental cp.
+    this->set_btree_flip("crash_on_flush_cow_btree_nodes", (uint32_t)1);
+    action_with_cp({.num_new_btrees = 0,
+                    .num_destroy_btrees = 0,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = false,
+                    .restart_post_cp = CPParams::RestartType::crash});
+
+    LOGINFO("Post Restart we do IO on all recovered btrees");
+    this->io_on_btrees();
+}
+
+TEST_F(BtreeTest, CrashBeforeIncrementalCpCommit) {
+    // Take couple of CPs, one full map and then one incremental
+    action_with_cp({.num_new_btrees = 0,
+                    .num_destroy_btrees = 0,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = true,
+                    .restart_post_cp = CPParams::RestartType::none});
+    action_with_cp({.num_new_btrees = 0,
+                    .num_destroy_btrees = 0,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = false,
+                    .restart_post_cp = CPParams::RestartType::none});
+
+    // Simulate the crash on next cp
+    this->set_btree_flip("crash_before_incr_map_flush_commit");
+    action_with_cp({.num_new_btrees = 0,
+                    .num_destroy_btrees = 0,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = false,
+                    .restart_post_cp = CPParams::RestartType::crash});
+
+    LOGINFO("Post Restart we do IO on all recovered btrees");
+    this->io_on_btrees();
+}
+
+TEST_F(BtreeTest, CrashBeforeLastFullMapCpCommit) {
+    // Take couple of CPs, one full map and then one incremental
+    action_with_cp({.num_new_btrees = 0,
+                    .num_destroy_btrees = 0,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = true,
+                    .restart_post_cp = CPParams::RestartType::none});
+    action_with_cp({.num_new_btrees = 0,
+                    .num_destroy_btrees = 0,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = false,
+                    .restart_post_cp = CPParams::RestartType::none});
+
+    // Set the flip to crash while full map cp flush is ongoing on the last btree, which means other btrees have
+    // successfully completed the full map flush cp and the last one isn't. This should test both replay of map updates
+    // which already committed and one btree which has not.
+    this->set_btree_flip("crash_during_full_map_flush", (uint32_t)1);
+    action_with_cp({.num_new_btrees = 0,
+                    .num_destroy_btrees = 0,
+                    .num_io_btrees = std::numeric_limits< uint32_t >::max(),
+                    .is_full_map_flush_cp = true,
+                    .restart_post_cp = CPParams::RestartType::crash});
+
+    LOGINFO("Post Restart we do IO on all recovered btrees");
+    this->io_on_btrees();
+}
+#endif
 
 int main(int argc, char* argv[]) {
     int parsed_argc{argc};

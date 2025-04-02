@@ -34,6 +34,7 @@
 #include <sisl/utility/atomic_counter.hpp>
 #include <iomgr/iomgr_flip.hpp>
 #include <homestore/homestore_decl.hpp>
+#include <homestore/checkpoint/cp_mgr.hpp>
 
 #include "device/chunk.h"
 #include "device/physical_dev.hpp"
@@ -329,7 +330,9 @@ folly::Future< std::error_code > VirtualDev::async_write(const char* buf, uint32
     HS_DBG_ASSERT_EQ(bid.is_multi(), false, "async_write needs individual pieces of blkid - not MultiBlkid");
 
 #ifdef _PRERELEASE
-    if (hs()->crash_simulator().is_crashed()) { return folly::makeFuture< std::error_code >(std::error_code()); }
+    if (hs()->crash_simulator().is_in_crashing_phase()) {
+        return folly::makeFuture< std::error_code >(std::error_code());
+    }
 #endif
 
     Chunk* chunk;
@@ -351,7 +354,9 @@ folly::Future< std::error_code > VirtualDev::async_write(const char* buf, uint32
 folly::Future< std::error_code > VirtualDev::async_write(const char* buf, uint32_t size, cshared< Chunk >& chunk,
                                                          uint64_t offset_in_chunk) {
 #ifdef _PRERELEASE
-    if (hs()->crash_simulator().is_crashed()) { return folly::makeFuture< std::error_code >(std::error_code()); }
+    if (hs()->crash_simulator().is_in_crashing_phase()) {
+        return folly::makeFuture< std::error_code >(std::error_code());
+    }
 #endif
 
     if (sisl_unlikely(!is_chunk_available(chunk))) {
@@ -372,7 +377,9 @@ folly::Future< std::error_code > VirtualDev::async_writev(const iovec* iov, cons
                                                           bool part_of_batch) {
     HS_DBG_ASSERT_EQ(bid.is_multi(), false, "async_writev needs individual pieces of blkid - not MultiBlkid");
 #ifdef _PRERELEASE
-    if (hs()->crash_simulator().is_crashed()) { return folly::makeFuture< std::error_code >(std::error_code()); }
+    if (hs()->crash_simulator().is_in_crashing_phase()) {
+        return folly::makeFuture< std::error_code >(std::error_code());
+    }
 #endif
 
     Chunk* chunk;
@@ -394,7 +401,9 @@ folly::Future< std::error_code > VirtualDev::async_writev(const iovec* iov, cons
 folly::Future< std::error_code > VirtualDev::async_writev(const iovec* iov, const int iovcnt, cshared< Chunk >& chunk,
                                                           uint64_t offset_in_chunk) {
 #ifdef _PRERELEASE
-    if (hs()->crash_simulator().is_crashed()) { return folly::makeFuture< std::error_code >(std::error_code()); }
+    if (hs()->crash_simulator().is_in_crashing_phase()) {
+        return folly::makeFuture< std::error_code >(std::error_code());
+    }
 #endif
 
     if (sisl_unlikely(!is_chunk_available(chunk))) {
@@ -415,7 +424,7 @@ folly::Future< std::error_code > VirtualDev::async_writev(const iovec* iov, cons
 ////////////////////////// sync write section //////////////////////////////////
 std::error_code VirtualDev::sync_write(const char* buf, uint32_t size, BlkId const& bid) {
 #ifdef _PRERELEASE
-    if (hs()->crash_simulator().is_crashed()) { return std::error_code{}; }
+    if (hs()->crash_simulator().is_in_crashing_phase()) { return std::error_code{}; }
 #endif
 
     HS_DBG_ASSERT_EQ(bid.is_multi(), false, "sync_write needs individual pieces of blkid - not MultiBlkid");
@@ -431,7 +440,7 @@ std::error_code VirtualDev::sync_write(const char* buf, uint32_t size, BlkId con
 std::error_code VirtualDev::sync_write(const char* buf, uint32_t size, cshared< Chunk >& chunk,
                                        uint64_t offset_in_chunk) {
 #ifdef _PRERELEASE
-    if (hs()->crash_simulator().is_crashed()) { return std::error_code{}; }
+    if (hs()->crash_simulator().is_in_crashing_phase()) { return std::error_code{}; }
 #endif
 
     if (sisl_unlikely(!is_chunk_available(chunk))) {
@@ -444,7 +453,7 @@ std::error_code VirtualDev::sync_writev(const iovec* iov, int iovcnt, BlkId cons
     HS_DBG_ASSERT_EQ(bid.is_multi(), false, "sync_writev needs individual pieces of blkid - not MultiBlkid");
 
 #ifdef _PRERELEASE
-    if (hs()->crash_simulator().is_crashed()) { return std::error_code{}; }
+    if (hs()->crash_simulator().is_in_crashing_phase()) { return std::error_code{}; }
 #endif
 
     Chunk* chunk;
@@ -466,7 +475,7 @@ std::error_code VirtualDev::sync_writev(const iovec* iov, int iovcnt, BlkId cons
 std::error_code VirtualDev::sync_writev(const iovec* iov, int iovcnt, cshared< Chunk >& chunk,
                                         uint64_t offset_in_chunk) {
 #ifdef _PRERELEASE
-    if (hs()->crash_simulator().is_crashed()) { return std::error_code{}; }
+    if (hs()->crash_simulator().is_in_crashing_phase()) { return std::error_code{}; }
 #endif
 
     if (sisl_unlikely(!is_chunk_available(chunk))) {

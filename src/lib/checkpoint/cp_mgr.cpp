@@ -23,7 +23,9 @@
 #include "common/homestore_config.hpp"
 #include "common/resource_mgr.hpp"
 #include "cp_internal.hpp"
-
+#ifdef _PRERELEASE
+#include "common/crash_simulator.hpp"
+#endif
 namespace homestore {
 iomgr::FiberManagerLib::FiberLocal< std::stack< CP* > > CPGuard::t_cp_stack;
 
@@ -82,10 +84,17 @@ void CPManager::shutdown() {
         m_cp_shutdown_initiated = true;
     }
 
-    LOGINFO("Trigger cp flush at CP shutdown");
-    auto success = do_trigger_cp_flush(true /* force */, true /* flush_on_shutdown */, CPTriggerReason::Timer).get();
-    HS_REL_ASSERT_EQ(success, true, "CP Flush failed");
-    LOGINFO("Trigger cp done");
+#ifdef _PRERELEASE
+    if (!hs()->crash_simulator().is_in_crashing_phase()) {
+#endif
+        LOGINFO("Trigger cp flush at CP shutdown");
+        auto success =
+            do_trigger_cp_flush(true /* force */, true /* flush_on_shutdown */, CPTriggerReason::Timer).get();
+        HS_REL_ASSERT_EQ(success, true, "CP Flush failed");
+        LOGINFO("Trigger cp done");
+#ifdef _PRERELEASE
+    }
+#endif
 
     delete (m_cur_cp);
     rcu_xchg_pointer(&m_cur_cp, nullptr);
@@ -179,6 +188,7 @@ folly::Future< bool > CPManager::do_trigger_cp_flush(bool force, bool flush_on_s
     folly::Future< bool > ret_fut = folly::Future< bool >::makeEmpty();
     auto cur_cp = cp_guard();
     cur_cp->m_cp_status = cp_status_t::cp_trigger;
+    cur_cp->m_is_on_shutdown = flush_on_shutdown;
     CP_PERIODIC_LOG(INFO, cur_cp->id(), "Time to flush the CP {}", cur_cp->to_string());
     COUNTER_INCREMENT(*m_metrics, cp_cnt, 1);
     m_wd_cp->set_cp(cur_cp.get());
@@ -223,18 +233,22 @@ void CPManager::cp_start_flush(CP* cp) {
     cp->m_cp_status = cp_status_t::cp_flushing;
 
     for (size_t svcid = 0; svcid < (size_t)cp_consumer_t::SENTINEL; svcid++) {
-        if (svcid == (size_t)cp_consumer_t::REPLICATION_SVC) {
-            continue;
-        }
+        if (svcid == (size_t)cp_consumer_t::REPLICATION_SVC) { continue; }
         auto& consumer = m_cp_cb_table[svcid];
         if (consumer) { futs.emplace_back(std::move(consumer->cp_flush(cp))); }
     }
 
     folly::collectAllUnsafe(futs).thenValue([this, cp](auto) {
+#ifdef _PRERELEASE
+        if (hs()->crash_simulator().is_in_crashing_phase()) {
+            on_cp_flush_done(cp);
+            return;
+        }
+#endif
         // Sync flushing replication svc at last as the cp_lsn updated here
         // other component should at least flushed to cp_lsn
         auto& repl_cp = m_cp_cb_table[(size_t)cp_consumer_t::REPLICATION_SVC];
-        if (repl_cp) {repl_cp->cp_flush(cp).wait();}
+        if (repl_cp) { repl_cp->cp_flush(cp).wait(); }
         // All consumers have flushed for the cp
         on_cp_flush_done(cp);
     });
@@ -267,13 +281,18 @@ void CPManager::on_cp_flush_done(CP* cp) {
         }
 
         promise.setValue(true);
+        if (!cp->m_is_on_shutdown) { // No need of back_2_back cp etc on shutdown.
+            // Dont access any cp state after this, in case trigger_back_2_back_cp is false, because its false on
+            // cp_shutdown_initated and setting this promise could destruct the CPManager itself.
+            if (trigger_back_2_back_cp) {
+                HS_PERIODIC_LOG(INFO, cp, "Triggering back to back CP");
+                COUNTER_INCREMENT(*m_metrics, back_to_back_cps, 1);
+                trigger_cp_flush(false, CPTriggerReason::Timer);
+            }
 
-        // Dont access any cp state after this, in case trigger_back_2_back_cp is false, because its false on
-        // cp_shutdown_initated and setting this promise could destruct the CPManager itself.
-        if (trigger_back_2_back_cp) {
-            HS_PERIODIC_LOG(INFO, cp, "Triggering back to back CP");
-            COUNTER_INCREMENT(*m_metrics, back_to_back_cps, 1);
-            trigger_cp_flush(false, CPTriggerReason::Timer);
+#ifdef _PRERELEASE
+            if (hs()->crash_simulator().is_in_crashing_phase()) { hs()->crash_simulator().crash_now(); }
+#endif
         }
     });
 }
@@ -453,5 +472,7 @@ void CPWatchdog::cp_watchdog_timer() {
 }
 
 cp_id_t CPContext::id() const { return m_cp->id(); }
+
+void CPContext::complete(bool status) { m_flush_comp.setValue(status); }
 
 } // namespace homestore

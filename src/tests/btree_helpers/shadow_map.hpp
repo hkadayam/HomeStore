@@ -3,6 +3,7 @@
 
 #include "btree_test_kvs.hpp"
 
+ENUM(ShadowMapDelta, uint8_t, Added, Removed, Updated);
 
 template < typename K, typename V >
 class ShadowMap {
@@ -142,33 +143,34 @@ public:
         m_range_scheduler.remove_keys(start_key.key(), end_key.key());
     }
 
-    std::vector< std::pair< K, bool > > diff(ShadowMap< K, V > const& other) {
+    std::vector< std::pair< K, ShadowMapDelta > > diff(ShadowMap< K, V > const& other) {
         auto it1 = m_map.begin();
         auto it2 = other.m_map.begin();
-        std::vector< std::pair< K, bool > > ret_diff;
+        std::vector< std::pair< K, ShadowMapDelta > > ret_diff;
 
         while ((it1 != m_map.end()) && (it2 != other.m_map.end())) {
             auto const x = it1->first.compare(it2->first);
             if (x == 0) {
+                if (it1->second != it2->second) { ret_diff.emplace_back(it1->first, ShadowMapDelta::Updated); }
                 ++it1;
                 ++it2;
             } else if (x < 0) {
                 // Has in current map, add it to addition
-                ret_diff.emplace_back(it1->first, true /* addition */);
+                ret_diff.emplace_back(it1->first, ShadowMapDelta::Added);
                 ++it1;
             } else {
-                ret_diff.emplace_back(it2->first, false /* addition */);
+                ret_diff.emplace_back(it2->first, ShadowMapDelta::Removed);
                 ++it2;
             }
         }
 
         while (it1 != m_map.end()) {
-            ret_diff.emplace_back(it1->first, true /* addition */);
+            ret_diff.emplace_back(it1->first, ShadowMapDelta::Added);
             ++it1;
         }
 
         while (it2 != other.m_map.end()) {
-            ret_diff.emplace_back(it2->first, false /* addition */);
+            ret_diff.emplace_back(it2->first, ShadowMapDelta::Removed);
             ++it2;
         }
         return ret_diff;
@@ -237,7 +239,7 @@ public:
         std::lock_guard lock{m_mutex};
         std::ofstream file(filename);
         for (const auto& [key, value] : m_map) {
-            file << key << " " << value << '\n';
+            file << key.key() << " " << value << '\n';
         }
         file.close();
     }
@@ -247,11 +249,12 @@ public:
         std::ifstream file(filename);
         if (file.is_open()) {
             m_map.clear();
-            K key;
+            uint64_t k;
             V value;
-            while (file >> key >> value) {
+            while (file >> k >> value) {
+                K key{k};
                 m_map.emplace(key, std::move(value));
-                m_range_scheduler.put_key(key.key());
+                m_range_scheduler.put_key(k);
             }
             file.close();
         }

@@ -6,10 +6,7 @@
 #include "index/cow_btree/cow_btree_cp.h"
 #include "index/index_cp.h"
 #include "device/virtual_dev.hpp"
-
-#ifdef _PRERELEASE
 #include "common/crash_simulator.hpp"
-#endif
 
 namespace homestore {
 
@@ -100,7 +97,8 @@ unique< UnderlyingBtree > COWBtreeStore::create_underlying_btree(BtreeBase& btre
 
     auto it = m_journals_by_btree.find(btree.ordinal());
     if (it == m_journals_by_btree.end()) {
-        cbtree = std::make_unique< COWBtree >(btree, m_vdev, m_cache, std::vector< sisl::byte_view >{}, load_existing);
+        cbtree = std::make_unique< COWBtree >(btree, m_vdev, m_cache, std::vector< unique< COWBtree::Journal > >{},
+                                              load_existing);
     } else {
         HS_DBG_ASSERT_EQ(load_existing, true, "Btree is found, but we are asked to create a new one");
         cbtree = std::make_unique< COWBtree >(btree, m_vdev, m_cache, std::move(it->second), load_existing);
@@ -166,20 +164,13 @@ folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
         return folly::makeFuture< bool >(true); // nothing to flush
     }
 
-#ifdef _PRERELEASE
-    if (hs()->crash_simulator().is_crashed()) {
-        LOGINFOMOD(btree, "crash simulation is ongoing, so skip the cp flush");
-        return folly::makeFuture< bool >(true);
-    }
-#endif
-
     auto has_hit_incremental_flush_count_threshold = [this]() -> bool {
         return (m_num_incremental_flushes >= HS_DYNAMIC_CONFIG(btree->cow_max_incremental_map_flushes));
     };
 
     auto has_hit_meta_vdev_size_threshold = [this]() -> bool {
         return (
-            meta_service().used_size() <
+            meta_service().used_size() >
             uint64_cast(
                 (HS_DYNAMIC_CONFIG(btree->cow_full_map_flush_size_threshold_pct) * meta_service().total_size()) / 100));
     };
@@ -211,12 +202,20 @@ folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
             auto cp_ctx = fg.cp_ctx();
             for (auto const& btree : cp_ctx->m_all_btrees) {
                 COWBtree* cow_btree = COWBtree::cast_to(btree.get());
-                auto const [has_flushed, journal, is_sb_changed] = cow_btree->flush_nodes(cp_ctx);
+                auto const [has_flushed, journal] = cow_btree->flush_nodes(cp_ctx);
+
+#ifdef _PRERELEASE
+                if (iomgr_flip::instance()->test_flip("crash_on_flush_cow_btree_nodes", cow_btree->ordinal())) {
+                    LOGINFOMOD(btree, "Simulating crash while flushing node for btree={}", cow_btree->ordinal());
+                    hs()->crash_simulator().start_crash();
+                    break;
+                }
+#endif
 
                 if (has_flushed) {
                     // Notify the cp context that we have flushed a btree and provide the journal. CP context will
                     // build the journal, which we will flush after all btrees are done flushing the nodes.
-                    cp_ctx->flushed_a_btree(cow_btree, journal.get(), is_sb_changed);
+                    cp_ctx->flushed_a_btree(cow_btree, journal.get());
                 }
             }
         });
@@ -249,11 +248,18 @@ void COWBtreeStore::flush_map(COWBtreeCPContext* cp_ctx) {
                 // Yes we access m_active_btree_list outside of lock, but we are sure that there is no one mutating
                 // this btree list
                 for (auto cow_btree : cp_ctx->m_active_btree_list) {
-                    cow_btree->flush_map_and_sb(cp_ctx);
+                    cow_btree->flush_map(cp_ctx);
                 }
             });
         }
     } else {
+#ifdef _PRERELEASE
+        if (iomgr_flip::instance()->test_flip("crash_before_incr_map_flush_commit")) {
+            LOGINFO("Simulating crash before we commit the incremental map flush (btree journal write)");
+            hs()->crash_simulator().start_crash();
+        }
+#endif
+
         auto sb = superblk< IndexStoreSuperBlock >{"index_store"};
         sb.load(cp_ctx->store_journal(), nullptr); // Load an empty meta_blk but with given buffer
         sb.write();                                // Write the metablk
@@ -263,12 +269,6 @@ void COWBtreeStore::flush_map(COWBtreeCPContext* cp_ctx) {
         // We only keep track of the metablk here, not buffer (so as to free after full map write)
         m_journals_by_cpid.emplace_back(std::move(sb));
 
-        {
-            std::unique_lock lg{cp_ctx->m_bt_list_mtx};
-            for (auto cow_btree : cp_ctx->m_active_btree_list) {
-                cow_btree->flush_sb(cp_ctx);
-            }
-        }
         CP_PERIODIC_LOG(INFO, cp_ctx->id(),
                         "CowBtree has completed flush of nodes across {} btrees and persisted incremental journal for "
                         "map, journal size={}",
@@ -288,10 +288,11 @@ void COWBtreeStore::load_journal(superblk< IndexStoreSuperBlock >& sb) {
         if (it == m_journals_by_btree.end()) {
             bool happened;
             std::tie(it, happened) =
-                m_journals_by_btree.insert(std::pair(cur_bj->ordinal, std::vector< sisl::byte_view >{}));
+                m_journals_by_btree.insert(std::pair(cur_bj->ordinal, std::vector< unique< COWBtree::Journal > >{}));
             HS_DBG_ASSERT(happened, "Insertion journal to journals list has failed for ordinal={}", cur_bj->ordinal);
         }
-        it->second.emplace_back(sisl::byte_view{sb.raw_buf(), cur_offset, cur_bj->size});
+        it->second.emplace_back(std::make_unique< COWBtree::Journal >(
+            sisl::byte_view{sb.raw_buf(), cur_offset, cur_bj->size}, store_journal->cp_id));
         cur_offset += cur_bj->size;
     }
 }

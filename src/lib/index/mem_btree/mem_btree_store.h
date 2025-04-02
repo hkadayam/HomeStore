@@ -35,6 +35,7 @@ public:
     btree_status_t transact_nodes(BtreeNodeList const& new_nodes, BtreeNodeList const& freed_nodes,
                                   BtreeNodePtr const& left_child_node, BtreeNodePtr const& parent_node,
                                   CPContext* context) override;
+    BtreeLinkInfo load_root_node_id() override;
     btree_status_t on_root_changed(BtreeNodePtr const&, CPContext*) override;
     uint64_t space_occupied() const override { return 0; }
 

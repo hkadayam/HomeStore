@@ -74,7 +74,7 @@ void COWBtreeCPContext::prepare_to_flush(bool full_map_flush) {
     m_all_btrees = std::move(hs()->index_service().get_all_index_tables());
 }
 
-void COWBtreeCPContext::flushed_a_btree(COWBtree* cow_btree, COWBtree::Journal const* journal, bool is_sb_changed) {
+void COWBtreeCPContext::flushed_a_btree(COWBtree* cow_btree, COWBtree::Journal const* journal) {
     std::unique_lock lg{m_bt_list_mtx};
     ++m_flushed_btrees_count;
 
@@ -87,7 +87,6 @@ void COWBtreeCPContext::flushed_a_btree(COWBtree* cow_btree, COWBtree::Journal c
         m_active_btree_list.emplace_back(cow_btree);
     } else {
         append_btree_journal(journal->m_base_buf);
-        if (is_sb_changed) { m_active_btree_list.emplace_back(cow_btree); }
     }
 }
 

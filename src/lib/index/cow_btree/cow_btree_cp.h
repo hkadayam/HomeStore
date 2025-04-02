@@ -73,7 +73,7 @@ public:
     void increment_pending_free_size(uint32_t size);
     void prepare_to_flush(bool full_map_flush);
 
-    void flushed_a_btree(COWBtree* cow_btree, COWBtree::Journal const* journal, bool is_sb_changed);
+    void flushed_a_btree(COWBtree* cow_btree, COWBtree::Journal const* journal);
     folly::Future< folly::Unit > add_to_destroyed_list(shared< Index > btree);
     void actual_destroy_btrees();
     bool any_dirty_nodes() const { return (!m_dirty_size.testz() || !m_pending_free_size.testz()); }

@@ -20,7 +20,7 @@ public:
 
 public:
     COWBtree(BtreeBase& bt, shared< VirtualDev > vdev, shared< sisl::SimpleCache< bnodeid_t, BtreeNodePtr > > cache,
-             std::vector< sisl::byte_view > journal_bufs, bool load_existing);
+             std::vector< unique< Journal > > journal_bufs, bool load_existing);
     virtual ~COWBtree() = default;
 
     // All overridden methods of UndelyingBtree class
@@ -32,6 +32,7 @@ public:
     btree_status_t transact_nodes(const BtreeNodeList& new_nodes, const BtreeNodeList& removed_nodes,
                                   const BtreeNodePtr& left_child_node, const BtreeNodePtr& parent_node,
                                   CPContext* context) override;
+    BtreeLinkInfo load_root_node_id() override;
     btree_status_t on_root_changed(BtreeNodePtr const& root, CPContext* context) override;
     uint64_t space_occupied() const override;
 
@@ -43,9 +44,10 @@ public:
     BlkId get_blkid_for_nodeid(bnodeid_t nodeid) const;
     uint64_t used_size() const;
     uint32_t align_size() const;
+    uint32_t ordinal() const { return m_btree_ordinal; }
 
-    std::tuple< bool, unique< Journal >, bool > flush_nodes(COWBtreeCPContext* cp_ctx);
-    void flush_map_and_sb(COWBtreeCPContext* cp_ctx);
+    std::tuple< bool, unique< Journal > > flush_nodes(COWBtreeCPContext* cp_ctx);
+    void flush_map(COWBtreeCPContext* cp_ctx);
     void flush_sb(COWBtreeCPContext* cp_ctx);
 
     static COWBtree* cast_to(BtreeBase& btree) { return r_cast< COWBtree* >(btree.underlying_btree()); }
@@ -114,16 +116,26 @@ public:
 #pragma pack()
 
         sisl::io_blob_safe m_base_buf;
+        sisl::byte_view m_loaded_journal_buf; // In case the journal was loaded, we use this
+        Header* m_header{nullptr};
         uint8_t* m_cur_ptr;
+        cp_id_t m_cp_id; // CP Id this journal is for (mainly useful while loading)
 
-        Journal(uint32_t ordinal, uint32_t initial_size) :
+        Journal(uint32_t ordinal, uint32_t initial_size, cp_id_t cp_id) :
                 m_base_buf{std::max(initial_size, uint32_cast(sizeof(Header))), meta_service().align_size(),
                            sisl::buftag::metablk} {
-            Header* hdr = new (m_base_buf.bytes()) Header();
-            hdr->size = initial_size;
-            hdr->ordinal = ordinal;
+            m_header = new (m_base_buf.bytes()) Header();
+            m_header->size = initial_size;
+            m_header->ordinal = ordinal;
             m_cur_ptr = m_base_buf.bytes() + sizeof(Header);
+            m_cp_id = cp_id;
         }
+
+        Journal(sisl::byte_view journal_buf, cp_id_t cp_id) :
+                m_loaded_journal_buf{journal_buf},
+                m_header{const_cast< Header* >(r_cast< Header const* >(m_loaded_journal_buf.bytes()))},
+                m_cur_ptr{const_cast< uint8_t* >(m_loaded_journal_buf.bytes()) + sizeof(Header)},
+                m_cp_id{cp_id} {}
 
         uint8_t* allocate(uint32_t num_bytes) {
             if (available_space() < num_bytes) {
@@ -155,7 +167,7 @@ public:
         }
 
         sisl::io_blob& raw_buf() { return m_base_buf; }
-        Header* header() { return r_cast< Header* >(m_base_buf.bytes()); }
+        Header* header() { return m_header; }
         uint32_t occupied_size() const { return m_cur_ptr - m_base_buf.cbytes(); }
         uint32_t available_space() const { return (m_base_buf.size() - occupied_size()); }
     };
@@ -227,7 +239,7 @@ public:
         bool prepare_to_flush_nodes(COWBtreeCPContext* cp_ctx);
         std::tuple< BlkId, DirtyNodeList::iterator, sisl::blob > next_dirty();
         std::tuple< DeletedNodeList::iterator, DeletedNodeList::iterator, sisl::blob > next_deleted();
-        bnodeid_t new_root();
+        bnodeid_t new_root_id();
         bool done_flushing_nodes();
 
         std::vector< std::pair< COWBtree::CompactNodeId, COWBtree::CompactBlkId > >
@@ -235,7 +247,6 @@ public:
         std::pair< bool, std::vector< std::vector< BlkId > > > done_flushing_map(std::vector< BlkId > map_locations,
                                                                                  size_t num_flushed_entries);
 
-        bool flush_sb(COWBtreeCPContext* cp_ctx);
         void finish();
     };
 
@@ -250,6 +261,7 @@ private:
 
     uint32_t m_btree_ordinal;
     uint64_t m_ordinal_shifted;
+    bnodeid_t m_root_node_id;
 
     // All dirty items for a btree for each cp is tracked here (instead in cp_ctx)
     std::array< unique< CPSession >, CPManager::max_concurent_cps > m_cp_sessions;
@@ -263,20 +275,12 @@ private:
     void delete_from_bnode_map(CompactNodeId nodeid, bool in_recovery);
     void recover_bnode_map(BlkId const& map_loc);
     BlkId lookup_bnode_map(CompactNodeId nodeid) const;
-    void apply_incremental_map(sisl::byte_view const& journal_buf);
+    void apply_incremental_map(Journal& journal);
 
     CPSession* cp_session(cp_id_t cp_id);
 
-    BtreeSuperBlock const& bt_super_blk() const {
-        return *(r_cast< BtreeSuperBlock const* >(m_base_btree.super_blk()->underlying_index_sb.data()));
-    }
-
-    BtreeSuperBlock& bt_super_blk() {
-        return const_cast< BtreeSuperBlock& >(s_cast< const COWBtree* >(this)->bt_super_blk());
-    }
-
     SuperBlock const& cow_bt_super_blk() const {
-        return *(r_cast< SuperBlock const* >(bt_super_blk().underlying_btree_sb.data()));
+        return *(r_cast< SuperBlock const* >(m_base_btree.bt_super_blk().underlying_btree_sb.data()));
     }
 
     SuperBlock& cow_bt_super_blk() {

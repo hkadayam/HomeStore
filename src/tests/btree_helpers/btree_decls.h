@@ -55,7 +55,7 @@ struct VarObjSizeBtree {
     using KeyType = TestVarLenKey;
     using ValueType = TestVarLenValue;
     static constexpr btree_node_type leaf_node_type = btree_node_type::VAR_OBJECT;
-    static constexpr btree_node_type interior_node_type = btree_node_type::VAR_OBJECT;
+    static constexpr btree_node_type interior_node_type = btree_node_type::VAR_KEY;
     static constexpr IndexStore::Type store_type = StoreType;
 };
 

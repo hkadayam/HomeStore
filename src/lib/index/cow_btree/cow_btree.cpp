@@ -738,16 +738,6 @@ COWBtree::CPSession* COWBtree::cp_session(cp_id_t cp_id) {
         session->m_state = CPSession::FlushState::DIRTYING;
         session->m_cp_id = cp_id;
     }
-#if 0
-    auto const slot_num = cp_id % CPManager::max_concurent_cps;
-    COWBtree::CPSession* session = m_cp_sessions[slot_num].get();
-    if (session == nullptr) {
-        m_cp_sessions[slot_num].reset(new CPSession(*this));
-        session = m_cp_sessions[slot_num].get();
-        session->m_state = CPSession::FlushState::DIRTYING;
-        session->m_cp_id = cp_id;
-    }
-#endif
     return session;
 }
 

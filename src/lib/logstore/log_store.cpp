@@ -26,7 +26,6 @@
 #include "log_dev.hpp"
 
 namespace homestore {
-SISL_LOGGING_DECL(logstore)
 
 #define THIS_LOGSTORE_LOG(level, msg, ...) HS_SUBMOD_LOG(level, logstore, , "log_store", m_fq_name, msg, __VA_ARGS__)
 #define THIS_LOGSTORE_PERIODIC_LOG(level, msg, ...)                                                                    \

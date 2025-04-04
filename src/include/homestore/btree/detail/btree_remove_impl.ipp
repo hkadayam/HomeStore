@@ -19,6 +19,75 @@
 namespace homestore {
 template < typename K, typename V >
 template < typename ReqT >
+btree_status_t Btree< K, V >::remove(ReqT& req) {
+    static_assert(std::is_same_v< ReqT, BtreeSingleRemoveRequest > ||
+                      std::is_same_v< ReqT, BtreeRangeRemoveRequest< K > > ||
+                      std::is_same_v< ReqT, BtreeRemoveAnyRequest< K > >,
+                  "remove api is called with non remove request type");
+
+    locktype_t acq_lock = locktype_t::READ;
+    m_btree_lock.lock_shared();
+
+retry:
+    btree_status_t ret = btree_status_t::success;
+    auto cpg = bt_cp_guard();
+    req.m_op_context = cpg.context(cp_consumer_t::INDEX_SVC);
+
+    BtreeNodePtr root;
+    ret = read_and_lock_node(m_root_node_info.bnode_id(), root, acq_lock, acq_lock, req.m_op_context);
+    if (ret == btree_status_t::cp_mismatch) {
+        goto retry;
+    } else if (ret != btree_status_t::success) {
+        goto out;
+    }
+
+    if (root->total_entries() == 0) {
+        if (root->is_leaf()) {
+            // There are no entries in btree.
+            unlock_node(root, acq_lock);
+            m_btree_lock.unlock_shared();
+            ret = btree_status_t::not_found;
+            goto out;
+        }
+
+        BT_NODE_LOG_ASSERT_EQ(root->has_valid_edge(), true, root, "Orphaned root with no entries and no edge");
+        unlock_node(root, acq_lock);
+        m_btree_lock.unlock_shared();
+
+        ret = check_collapse_root(req);
+        if (ret != btree_status_t::success && ret != btree_status_t::merge_not_required &&
+            ret != btree_status_t::cp_mismatch) {
+            LOGERROR("check collapse read failed btree name {}", m_bt_cfg.name());
+            goto out;
+        }
+
+        // We must have gotten a new root, need to start from scratch.
+        m_btree_lock.lock_shared();
+        goto retry;
+    } else if (root->is_leaf() && (acq_lock != locktype_t::WRITE)) {
+        // Root is a leaf, need to take write lock, instead of read, retry
+        unlock_node(root, acq_lock);
+        acq_lock = locktype_t::WRITE;
+        goto retry;
+    } else {
+        ret = do_remove(root, acq_lock, req);
+        if ((ret == btree_status_t::retry) || (ret == btree_status_t::cp_mismatch)) {
+            // Need to start from top down again, since there was a merge nodes in-between
+            acq_lock = locktype_t::READ;
+            goto retry;
+        }
+    }
+    m_btree_lock.unlock_shared();
+
+out:
+#ifndef NDEBUG
+    check_lock_debug();
+#endif
+    return ret;
+}
+
+template < typename K, typename V >
+template < typename ReqT >
 btree_status_t Btree< K, V >::do_remove(const BtreeNodePtr& my_node, locktype_t curlock, ReqT& req) {
     btree_status_t ret = btree_status_t::success;
     bool at_least_one_child_modified{false};
@@ -46,7 +115,7 @@ btree_status_t Btree< K, V >::do_remove(const BtreeNodePtr& my_node, locktype_t 
         if (modified) {
             write_node(my_node, req.m_op_context);
             COUNTER_DECREMENT(m_metrics, btree_obj_count, removed_count);
-            if (req.route_tracing) { append_route_trace(req, my_node, btree_event_t::REMOVE); }
+            if (req.m_route_tracing) { append_route_trace(req, my_node, btree_event_t::REMOVE); }
         }
 
         unlock_node(my_node, curlock);
@@ -85,7 +154,7 @@ retry:
         end_idx = start_idx = (end_idx - start_idx) / 2; // Pick the middle, TODO: Ideally we need to pick random
     }
 
-    if (req.route_tracing) { append_route_trace(req, my_node, btree_event_t::READ, start_idx, end_idx); }
+    if (req.m_route_tracing) { append_route_trace(req, my_node, btree_event_t::READ, start_idx, end_idx); }
     curr_idx = start_idx;
     while (curr_idx <= end_idx) {
         BtreeLinkInfo child_info;
@@ -113,7 +182,7 @@ retry:
                     unlock_lambda(child_node, child_cur_lock);
                     goto out_return;
                 } else if (ret == btree_status_t::success) {
-                    if (req.route_tracing) { append_route_trace(req, child_node, btree_event_t::MERGE); }
+                    if (req.m_route_tracing) { append_route_trace(req, child_node, btree_event_t::MERGE); }
                     unlock_lambda(child_node, child_cur_lock);
                     COUNTER_INCREMENT(m_metrics, btree_merge_count, 1);
                     goto retry;
@@ -199,16 +268,16 @@ btree_status_t Btree< K, V >::check_collapse_root(ReqT& req) {
         goto done;
     }
 
-    ret = on_root_changed(child, req.m_op_context);
+    ret = m_bt_private->on_root_changed(child, req.m_op_context);
     if (ret != btree_status_t::success) {
         unlock_node(child, locktype_t::WRITE);
         unlock_node(root, locktype_t::WRITE);
         goto done;
     }
 
-    if (req.route_tracing) { append_route_trace(req, root, btree_event_t::MERGE); }
+    if (req.m_route_tracing) { append_route_trace(req, root, btree_event_t::MERGE); }
 
-    free_node(root, locktype_t::WRITE, req.m_op_context);
+    remove_node(root, locktype_t::WRITE, req.m_op_context);
     m_root_node_info = child->link_info();
     unlock_node(child, locktype_t::WRITE);
     COUNTER_DECREMENT(m_metrics, btree_depth, 1);
@@ -220,7 +289,7 @@ done:
 
 template < typename K, typename V >
 btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const BtreeNodePtr& leftmost_node,
-                                          uint32_t start_idx, uint32_t end_idx, void* context) {
+                                          uint32_t start_idx, uint32_t end_idx, CPContext* context) {
     if (!m_bt_cfg.m_merge_turned_on) { return btree_status_t::merge_not_required; }
     btree_status_t ret{btree_status_t::success};
     BtreeNodeList old_nodes;
@@ -316,7 +385,7 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
     available_size = 0;
     while (src_cursor.ith_node < old_nodes.size()) {
         if (available_size == 0) {
-            new_node.reset(alloc_node(leftmost_node->is_leaf()).get());
+            new_node = leftmost_node->is_leaf() ? create_leaf_node(context) : create_interior_node(context);
             if (new_node == nullptr) {
                 ret = btree_status_t::merge_failed;
                 goto out;
@@ -477,7 +546,7 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
         }
 #endif
 
-        ret = transact_nodes(new_nodes, old_nodes, leftmost_node, parent_node, context);
+        ret = m_bt_private->transact_nodes(new_nodes, old_nodes, leftmost_node, parent_node, context);
     }
 
 out:
@@ -489,7 +558,7 @@ out:
         }
         for (auto it = new_nodes.rbegin(); it != new_nodes.rend(); ++it) {
             BT_NODE_LOG(DEBUG, (*it).get(), "Freeing this new node as part of unsuccessful merge");
-            free_node(*it, locktype_t::NONE, context);
+            remove_node(*it, locktype_t::NONE, context);
         }
     }
     return ret;

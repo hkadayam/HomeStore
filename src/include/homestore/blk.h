@@ -75,6 +75,7 @@ public:
     blk_count_t blk_count() const { return s.m_nblks; }
     chunk_num_t chunk_num() const { return s.m_chunk_num; }
     bool is_multi() const { return s.m_is_multi; }
+    std::pair< BlkId, BlkId > split(blk_count_t count) const;
 
     void invalidate();
     uint64_t to_integer() const;
@@ -117,6 +118,7 @@ public:
     void add(blk_num_t blk_num, blk_count_t nblks, chunk_num_t chunk_num);
     void add(BlkId const&);
 
+    std::pair< MultiBlkId, MultiBlkId > split(blk_count_t count) const;
     uint16_t num_pieces() const;
     blk_count_t blk_count() const;
     std::string to_string() const;
@@ -249,9 +251,9 @@ VENUM(BlkAllocStatus, uint32_t,
 
 struct blk_alloc_hints {
     blk_temp_t desired_temp{0};                  // Temperature hint for the device
-    std::optional< uint32_t > pdev_id_hint;      // which physical device to pick (hint if any) -1 for don't care
-    std::optional< chunk_num_t > chunk_id_hint;  // any specific chunk id to pick for this allocation
-    std::optional< stream_id_t > stream_id_hint; // any specific stream to pick
+    std::optional< uint32_t > pdev_id_hint{std::nullopt};      // which physical device to pick (hint if any)
+    std::optional< chunk_num_t > chunk_id_hint{std::nullopt};  // any specific chunk id to pick for this allocation
+    std::optional< stream_id_t > stream_id_hint{std::nullopt}; // any specific stream to pick
     bool can_look_for_other_chunk{true};         // If alloc on device not available can I pick other device
     bool is_contiguous{true};                    // Should the entire allocation be one contiguous block
     bool partial_alloc_ok{false};   // ok to allocate only portion of nblks? Mutually exclusive with is_contiguous

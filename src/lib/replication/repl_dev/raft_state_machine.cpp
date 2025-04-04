@@ -10,8 +10,6 @@
 #include <homestore/homestore.hpp>
 #include "common/homestore_config.hpp"
 
-SISL_LOGGING_DECL(replication)
-
 namespace homestore {
 
 RaftStateMachine::RaftStateMachine(RaftReplDev& rd) : m_rd{rd} {

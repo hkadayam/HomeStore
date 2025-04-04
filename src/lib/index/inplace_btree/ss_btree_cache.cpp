@@ -30,8 +30,6 @@
 #include "common/crash_simulator.hpp"
 #endif
 
-SISL_LOGGING_DECL(wbcache)
-
 namespace homestore {
 
 IndexWBCacheBase& wb_cache() {
@@ -42,7 +40,7 @@ IndexWBCacheBase& wb_cache() {
     }
 }
 
-IndexWBCache::IndexWBCache(const std::shared_ptr< VirtualDev >& vdev, std::pair< meta_blk*, sisl::byte_view > sb,
+SSBtreeCache::SSBtreeCache(const std::shared_ptr< VirtualDev >& vdev, std::pair< meta_blk*, sisl::byte_view > sb,
                            const std::shared_ptr< sisl::Evictor >& evictor, uint32_t node_size) :
         m_vdev{vdev},
         m_cache{evictor, 100000, node_size,
@@ -62,7 +60,7 @@ IndexWBCache::IndexWBCache(const std::shared_ptr< VirtualDev >& vdev, std::pair<
     cp_mgr().register_consumer(cp_consumer_t::INDEX_SVC, std::move(std::make_unique< IndexCPCallbacks >(this)));
 }
 
-void IndexWBCache::start_flush_threads() {
+void SSBtreeCache::start_flush_threads() {
     // Start WBCache flush threads
     struct Context {
         std::condition_variable cv;
@@ -92,7 +90,7 @@ void IndexWBCache::start_flush_threads() {
     }
 }
 
-BtreeNodePtr IndexWBCache::alloc_buf(node_initializer_t&& node_initializer) {
+BtreeNodePtr SSBtreeCache::alloc_buf(node_initializer_t&& node_initializer) {
     auto cpg = cp_mgr().cp_guard();
     auto cp_ctx = r_cast< IndexCPContext* >(cpg.context(cp_consumer_t::INDEX_SVC));
 
@@ -557,9 +555,9 @@ folly::Future< bool > IndexWBCache::async_cp_flush(IndexCPContext* cp_ctx) {
 void IndexWBCache::do_flush_one_buf(IndexCPContext* cp_ctx, IndexBufferPtr const& buf, bool part_of_batch) {
 #ifdef _PRERELEASE
     if (buf->m_crash_flag_on) {
-//        std::string filename = "crash_buf_" + std::to_string(cp_ctx->id()) + ".dot";
-//        LOGINFOMOD(wbcache, "Simulating crash while writing buffer {},  stored in file {}", buf->to_string(), filename);
-//        cp_ctx->to_string_dot(filename);
+        //        std::string filename = "crash_buf_" + std::to_string(cp_ctx->id()) + ".dot";
+        //        LOGINFOMOD(wbcache, "Simulating crash while writing buffer {},  stored in file {}", buf->to_string(),
+        //        filename); cp_ctx->to_string_dot(filename);
         LOGINFOMOD(wbcache, "Simulating crash while writing buffer {}", buf->to_string());
         hs()->crash_simulator().crash();
         cp_ctx->complete(true);
@@ -591,9 +589,7 @@ void IndexWBCache::do_flush_one_buf(IndexCPContext* cp_ctx, IndexBufferPtr const
                 try {
                     auto& pthis = s_cast< IndexWBCache& >(wb_cache());
                     pthis.process_write_completion(cp_ctx, buf);
-                } catch (const std::runtime_error& e) {
-                    LOGERROR("Failed to access write-back cache: {}", e.what());
-                }
+                } catch (const std::runtime_error& e) { LOGERROR("Failed to access write-back cache: {}", e.what()); }
             });
 
         if (!part_of_batch) { m_vdev->submit_batch(); }

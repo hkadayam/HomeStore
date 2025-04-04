@@ -53,17 +53,17 @@ set(HOMESTORE_OBJECTS
     $<TARGET_OBJECTS:hs_metablk>
     $<TARGET_OBJECTS:hs_checkpoint>
     $<TARGET_OBJECTS:hs_index>
+    $<TARGET_OBJECTS:hs_mem_btree>
+    $<TARGET_OBJECTS:hs_cow_btree>
     $<TARGET_OBJECTS:hs_datasvc>
     $<TARGET_OBJECTS:hs_replication>
     lib/homestore.cpp
     lib/crc.cpp
-    lib/logging.cpp
-    #$<TARGET_OBJECTS:hs_cp>
-    #$<TARGET_OBJECTS:indx_mgr>
 )
 #target_link_libraries(homestore_objs ${COMMON_DEPS})
 
 add_library(homestore STATIC 
     ${HOMESTORE_OBJECTS} 
 )
+target_compile_definitions (homestore PRIVATE LOG_MODS_V2_SUPPORT)
 target_link_libraries(homestore ${COMMON_DEPS})

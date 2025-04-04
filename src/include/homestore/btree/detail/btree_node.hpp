@@ -22,89 +22,98 @@
 #include <sisl/utility/atomic_counter.hpp>
 #include <sisl/utility/enum.hpp>
 #include <sisl/utility/obj_life_counter.hpp>
-#include "btree_internal.hpp"
+#include <homestore/btree/detail/btree_internal.hpp>
 #include <homestore/btree/btree_kv.hpp>
 #include <homestore/crc.h>
 
+#ifndef TEST_BNODE_ONLY
+#include <homestore/btree/btree_store.h>
+#include <homestore/index_service.hpp>
+#include <homestore/index/index_common.h>
+#endif
+
 namespace homestore {
 ENUM(locktype_t, uint8_t, NONE, READ, WRITE)
-
-#pragma pack(1)
-struct transient_hdr_t {
-    mutable iomgr::FiberManagerLib::shared_mutex lock;
-    sisl::atomic_counter< uint16_t > upgraders{0};
-
-    /* these variables are accessed without taking lock and are not expected to change after init */
-    uint8_t leaf_node{0};
-    uint64_t max_keys_in_node{0};
-
-    bool is_leaf() const { return (leaf_node != 0); }
-};
-#pragma pack()
-
-static constexpr uint8_t BTREE_NODE_VERSION = 1;
-static constexpr uint8_t BTREE_NODE_MAGIC = 0xab;
-
-#pragma pack(1)
-struct persistent_hdr_t {
-    uint8_t magic{BTREE_NODE_MAGIC};     // offset=0
-    uint8_t version{BTREE_NODE_VERSION}; // offset=1
-    uint16_t checksum{0};                // offset=2
-
-    uint32_t nentries : 30; // offset 4
-    uint32_t leaf : 1;
-    uint32_t node_deleted : 1;
-
-    bnodeid_t node_id{empty_bnodeid};   // offset=8
-    bnodeid_t next_node{empty_bnodeid}; // offset=16
-
-    uint64_t node_gen{0};     // offset=24: Generation of this node, incremented on every update
-    uint64_t link_version{0}; // offset=32: Version of the link between its parent, updated if structure changes
-    BtreeLinkInfo::bnode_link_info edge_info; // offset=40: Edge entry information
-
-    int64_t modified_cp_id{-1};   // offset=56: Checkpoint ID of the last modification of this node
-    uint16_t level;               // offset=64: Level of the node within the tree
-    uint16_t node_size;           // offset=66: Size of node, max 64K
-    uint8_t node_type;            // offset=68: Type of the node (simple vs varlen etc..)
-    uint8_t reserved[3]{0, 0, 0}; // offset=69-72: Reserved
-
-    persistent_hdr_t() : nentries{0}, leaf{0}, node_deleted{0} {}
-    std::string to_string() const {
-        auto snext = (next_node == empty_bnodeid) ? "" : " next=" + std::to_string(next_node);
-        auto sedge = (edge_info.m_bnodeid == empty_bnodeid)
-            ? ""
-            : fmt::format(" edge={}.{}", edge_info.m_bnodeid, edge_info.m_link_version);
-        return fmt::format("magic={} version={} csum={} node_id={}{} nentries={} node_type={} is_leaf={} "
-                           "node_deleted={} node_gen={} modified_cp_id={} link_version={}{} level={} ",
-                           magic, version, checksum, node_id, snext, nentries, node_type, leaf, node_deleted, node_gen,
-                           modified_cp_id, link_version, sedge, level);
-    }
-
-    std::string to_compact_string() const {
-        auto snext = (next_node == empty_bnodeid) ? "" : " next=" + std::to_string(next_node);
-        auto sedge = (edge_info.m_bnodeid == empty_bnodeid)
-            ? ""
-            : fmt::format(" edge={}.{}", edge_info.m_bnodeid, edge_info.m_link_version);
-        return fmt::format("id={}{}{} {} level={} nentries={}{} mod_cp={}", node_id, snext, sedge,
-                           leaf ? "LEAF" : "INTERIOR", level, nentries, (node_deleted == 0x1) ? "  Deleted" : "",
-                           modified_cp_id);
-    }
-};
-#pragma pack()
 
 class BtreeNode : public sisl::ObjLifeCounter< BtreeNode > {
     using node_find_result_t = std::pair< bool, uint32_t >;
 
 public:
+#pragma pack(1)
+    struct TransientHeader {
+        mutable iomgr::FiberManagerLib::shared_mutex lock;
+        sisl::atomic_counter< uint16_t > upgraders{0};
+
+        /* these variables are accessed without taking lock and are not expected to change after init */
+        uint8_t leaf_node{0};
+#ifndef TEST_BNODE_ONLY
+        IndexStore::Type store_type{IndexStore::Type::COPY_ON_WRITE_BTREE};
+#endif
+        uint64_t max_keys_in_node{0};
+
+        bool is_leaf() const { return (leaf_node != 0); }
+    };
+#pragma pack()
+
+    static constexpr uint8_t BTREE_NODE_VERSION = 1;
+    static constexpr uint8_t BTREE_NODE_MAGIC = 0xab;
+
+#pragma pack(1)
+    struct PersistentHeader {
+        uint8_t magic{BTREE_NODE_MAGIC};     // offset=0
+        uint8_t version{BTREE_NODE_VERSION}; // offset=1
+        uint16_t checksum{0};                // offset=2
+
+        uint32_t nentries : 30; // offset 4
+        uint32_t leaf : 1;
+        uint32_t node_deleted : 1;
+
+        bnodeid_t node_id{empty_bnodeid};   // offset=8
+        bnodeid_t next_node{empty_bnodeid}; // offset=16
+
+        uint64_t node_gen{0};     // offset=24: Generation of this node, incremented on every update
+        uint64_t link_version{0}; // offset=32: Version of the link between its parent, updated if structure changes
+        BtreeLinkInfo::bnode_link_info edge_info; // offset=40: Edge entry information
+
+        int64_t modified_cp_id{-1};   // offset=56: Checkpoint ID of the last modification of this node
+        uint16_t level;               // offset=64: Level of the node within the tree
+        uint16_t node_size;           // offset=66: Size of node, max 64K
+        uint8_t node_type;            // offset=68: Type of the node (simple vs varlen etc..)
+        uint8_t reserved[3]{0, 0, 0}; // offset=69-72: Reserved
+
+        PersistentHeader() : nentries{0}, leaf{0}, node_deleted{0} {}
+        std::string to_string() const {
+            auto snext = (next_node == empty_bnodeid) ? "" : " next=" + std::to_string(next_node);
+            auto sedge = (edge_info.m_bnodeid == empty_bnodeid)
+                ? ""
+                : fmt::format(" edge={}.{}", edge_info.m_bnodeid, edge_info.m_link_version);
+            return fmt::format("magic={} version={} csum={} node_id={}{} nentries={} node_type={} is_leaf={} "
+                               "node_deleted={} node_gen={} modified_cp_id={} link_version={}{} level={} ",
+                               magic, version, checksum, node_id, snext, nentries, node_type, leaf, node_deleted,
+                               node_gen, modified_cp_id, link_version, sedge, level);
+        }
+
+        std::string to_compact_string() const {
+            auto snext = (next_node == empty_bnodeid) ? "" : " next=" + std::to_string(next_node);
+            auto sedge = (edge_info.m_bnodeid == empty_bnodeid)
+                ? ""
+                : fmt::format(" edge={}.{}", edge_info.m_bnodeid, edge_info.m_link_version);
+            return fmt::format("id={}{}{} {} level={} nentries={}{} mod_cp={}", node_id, snext, sedge,
+                               leaf ? "LEAF" : "INTERIOR", level, nentries, (node_deleted == 0x1) ? "  Deleted" : "",
+                               modified_cp_id);
+        }
+    };
+#pragma pack()
+
     sisl::atomic_counter< int32_t > m_refcount{0};
-    transient_hdr_t m_trans_hdr;
+    TransientHeader m_trans_hdr;
     uint8_t* m_phys_node_buf;
 
 public:
     BtreeNode(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf, BtreeConfig const& cfg) :
             m_phys_node_buf{node_buf} {
         if (init_buf) {
-            new (node_buf) persistent_hdr_t{};
+            new (node_buf) PersistentHeader{};
             set_node_id(id);
             set_leaf(is_leaf);
             set_node_size(cfg.node_size());
@@ -117,38 +126,61 @@ public:
 #ifdef _PRERELEASE
         m_trans_hdr.max_keys_in_node = cfg.m_max_keys_in_node;
 #endif
-
     }
-    virtual ~BtreeNode() = default;
 
-    // Identify if a node is a leaf node or not, from raw buffer, by just reading persistent_hdr_t
-    static bool identify_leaf_node(uint8_t* buf) { return (r_cast< persistent_hdr_t* >(buf))->leaf; }
-    static std::string to_string_buf(uint8_t* buf) { return (r_cast< persistent_hdr_t* >(buf))->to_compact_string(); }
+    virtual ~BtreeNode() {
+#ifndef TEST_BNODE_ONLY
+        s_cast< BtreeStore* >(index_service().lookup_store(m_trans_hdr.store_type))->on_node_freed(this);
+#endif
+    }
+
+#ifndef TEST_BNODE_ONLY
+    void set_store_type(IndexStore::Type store) { m_trans_hdr.store_type = store; }
+#endif
+
+    // Identify if a node is a leaf node or not, from raw buffer, by just reading PersistentHeader
+    static bool identify_leaf_node(uint8_t* buf) { return (r_cast< PersistentHeader* >(buf))->leaf; }
+    static std::string to_string_buf(uint8_t* buf) { return (r_cast< PersistentHeader* >(buf))->to_compact_string(); }
     static BtreeLinkInfo::bnode_link_info identify_edge_info(uint8_t* buf) {
-        return (r_cast< persistent_hdr_t* >(buf))->edge_info;
+        return (r_cast< PersistentHeader* >(buf))->edge_info;
     }
 
     static bool is_valid_node(sisl::blob const& buf) {
-        auto phdr = r_cast< persistent_hdr_t const* >(buf.cbytes());
+        auto phdr = r_cast< PersistentHeader const* >(buf.cbytes());
         if ((phdr->magic != BTREE_NODE_MAGIC) || (phdr->version != BTREE_NODE_VERSION)) { return false; }
         if ((uint32_cast(phdr->node_size) + 1) != buf.size()) { return false; }
         if (phdr->node_id == empty_bnodeid) { return false; }
 
-        auto const exp_checksum = crc16_t10dif(bt_init_crc_16, (buf.cbytes() + sizeof(persistent_hdr_t)),
-                                               buf.size() - sizeof(persistent_hdr_t));
+        auto const exp_checksum = crc16_t10dif(bt_init_crc_16, (buf.cbytes() + sizeof(PersistentHeader)),
+                                               buf.size() - sizeof(PersistentHeader));
         if (phdr->checksum != exp_checksum) { return false; }
 
         return true;
     }
 
     static void revert_node_delete(uint8_t* buf) {
-        auto phdr = r_cast< persistent_hdr_t* >(buf);
+        auto phdr = r_cast< PersistentHeader* >(buf);
         phdr->node_deleted = 0x0;
     }
 
-    static int64_t get_modified_cp_id(uint8_t* buf) {
-        auto phdr = r_cast< persistent_hdr_t const* >(buf);
+    static void set_modified_cp_id(uint8_t* buf, int64_t cp_id) {
+        auto phdr = r_cast< PersistentHeader* >(buf);
+        phdr->modified_cp_id = cp_id;
+    }
+
+    static int64_t get_modified_cp_id(uint8_t const* buf) {
+        auto phdr = r_cast< PersistentHeader const* >(buf);
         return phdr->modified_cp_id;
+    }
+
+    static bool is_node_deleted(uint8_t const* buf) {
+        auto phdr = r_cast< PersistentHeader const* >(buf);
+        return phdr->node_deleted == 0x1;
+    }
+
+    static bnodeid_t get_node_id(uint8_t const* buf) {
+        auto phdr = r_cast< PersistentHeader const* >(buf);
+        return phdr->node_id;
     }
 
     /// @brief Finds the index of the entry with the specified key in the node.
@@ -302,6 +334,15 @@ public:
         return get_nth_key< K >(0, true);
     }
 
+    template < typename K, typename V >
+    void get_all_kvs(std::vector< std::pair< K, V > >& kvs) const {
+        for (uint32_t i{0}; i < total_entries(); ++i) {
+            V v;
+            get_nth_value(i, &v, true);
+            kvs.emplace_back(std::make_pair(get_nth_key< K >(i, true), v));
+        }
+    }
+
     template < typename K >
     bool validate_key_order() const {
         for (auto i = 1u; i < total_entries(); ++i) {
@@ -361,7 +402,10 @@ public:
     bool any_upgrade_waiters() const { return (!m_trans_hdr.upgraders.testz()); }
 
     template < typename K, typename V >
-    std::string to_custom_string(to_string_cb_t< K, V > const& cb) const {
+    using ToStringCallback = std::function< std::string(std::vector< std::pair< K, V > > const&) >;
+
+    template < typename K, typename V >
+    std::string to_custom_string(ToStringCallback< K, V > const& cb) const {
         std::string snext =
             (this->next_bnode() == empty_bnodeid) ? "" : fmt::format(" next_node={}", this->next_bnode());
         auto str = fmt::format("id={}.{} level={} nEntries={} {}{} node_gen={} ", this->node_id(), this->link_version(),
@@ -469,12 +513,16 @@ protected:
 
 public:
     void update_phys_buf(uint8_t* buf) { m_phys_node_buf = buf; }
-    persistent_hdr_t* get_persistent_header() { return r_cast< persistent_hdr_t* >(m_phys_node_buf); }
-    const persistent_hdr_t* get_persistent_header_const() const {
-        return r_cast< const persistent_hdr_t* >(m_phys_node_buf);
+    uint8_t* get_phys_buf() { return m_phys_node_buf; }
+
+    void set_phys_buf(uint8_t* buf) { m_phys_node_buf = buf; }
+
+    PersistentHeader* get_persistent_header() { return r_cast< PersistentHeader* >(m_phys_node_buf); }
+    const PersistentHeader* get_persistent_header_const() const {
+        return r_cast< const PersistentHeader* >(m_phys_node_buf);
     }
-    uint8_t* node_data_area() { return (m_phys_node_buf + sizeof(persistent_hdr_t)); }
-    const uint8_t* node_data_area_const() const { return (m_phys_node_buf + sizeof(persistent_hdr_t)); }
+    uint8_t* node_data_area() { return (m_phys_node_buf + sizeof(PersistentHeader)); }
+    const uint8_t* node_data_area_const() const { return (m_phys_node_buf + sizeof(PersistentHeader)); }
 
     uint8_t magic() const { return get_persistent_header_const()->magic; }
     void set_magic() { get_persistent_header()->magic = BTREE_NODE_MAGIC; }
@@ -485,6 +533,7 @@ public:
 
     void set_node_id(bnodeid_t id) { get_persistent_header()->node_id = id; }
     bnodeid_t node_id() const { return get_persistent_header_const()->node_id; }
+    int64_t get_modified_cp_id() const { return get_persistent_header_const()->modified_cp_id; }
 
     void set_checksum() {
         get_persistent_header()->checksum = crc16_t10dif(bt_init_crc_16, node_data_area_const(), node_data_size());
@@ -512,7 +561,7 @@ public:
     void set_node_size(uint32_t size) { get_persistent_header()->node_size = s_cast< uint16_t >(size - 1); }
     uint64_t node_gen() const { return get_persistent_header_const()->node_gen; }
     uint32_t node_size() const { return s_cast< uint32_t >(get_persistent_header_const()->node_size) + 1; }
-    uint32_t node_data_size() const { return node_size() - sizeof(persistent_hdr_t); }
+    uint32_t node_data_size() const { return node_size() - sizeof(PersistentHeader); }
 
     void inc_gen() { get_persistent_header()->node_gen++; }
     void set_gen(uint64_t g) { get_persistent_header()->node_gen = g; }
@@ -562,17 +611,12 @@ public:
     friend void intrusive_ptr_add_ref(BtreeNode* node) { node->m_refcount.increment(1); }
 
     friend void intrusive_ptr_release(BtreeNode* node) {
-        if (node->m_refcount.decrement_testz(1)) { delete node; }
+        if (node->m_refcount.decrement_testz(1)) {
+            // Do not delete it here, since node is generally an offset inside actual allocation and delete will fail
+            // here (with asan). So let the on_node_freed from the underlying store delete the allocation.
+            node->~BtreeNode();
+        }
     }
-};
-
-struct btree_locked_node_info {
-    BtreeNode* node;
-    Clock::time_point start_time;
-    const char* fname;
-    int line;
-
-    void dump() const { LOGINFO("node locked by file: {}, line: {}", fname, line); }
 };
 
 } // namespace homestore

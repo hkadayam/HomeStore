@@ -57,6 +57,18 @@ table Btree {
     max_nodes_to_rebalance: uint32 = 3;
 
     mem_btree_page_size: uint32 = 8192;
+
+    /* Maximum number of btree pages to persist per IO */
+    max_btree_write_size_per_io: uint64 = 16777216; /* 16 MB */
+
+    // Maximum number of incremental map cp's flushed for cowbtree before we do a forcible full map flush during CP. This 
+    // is a maximum, but in reality on a lively written system, we might do full map flushes much sooner.
+    cow_max_incremental_map_flushes: uint64 = 10000 (hotswap); 
+
+    // Percentage of metablk filled size, upto which we can do incremental map. Once it reaches this threshold on metablk, we
+    // will do a force full map flush on all btrees. Force full map flush should free up the space once CP is completely. So 
+    // setting this is higher is reasonable to prevent full map flushes. 
+    cow_full_map_flush_size_threshold_pct: double = 80 (hotswap);
 }
 
 table Cache {
@@ -123,8 +135,9 @@ table Generic {
     // cp timer in us
     cp_timer_us: uint64 = 60000000 (hotswap);
 
-    // writeback cache flush threads
-    cache_flush_threads : int32 = 1;
+    // Btree CP flush threads and fibers per thread. So effectively it will be threads * fibers concurrent IOs
+    btree_cp_flush_threads : uint32 = 2;
+    btree_cp_flush_fibers_per_thread : uint32 = 8; 
 
     cp_watchdog_timer_sec : uint32 = 10; // it checks if cp stuck every 10 seconds
 
@@ -154,7 +167,14 @@ table Generic {
 
 table ResourceLimits {
     /* it is going to use 2 times of this space because of two concurrent cps */
-    dirty_buf_percent: uint32 = 1 (hotswap);
+
+    // Percentage of Total IO Memory size with which we can have dirty buffer, beyond which it will force flush by
+    // triggering Checkpoint
+    index_max_dirty_memory_percent: double = 1 (hotswap);
+
+    // Percentage of Index VDev space upto which we allow freed space are allowed to be made pending, after which a 
+    // checkpoint is triggered and capture the free space.
+    index_max_free_space_accumulate_percent: double = 1 (hotswap);
 
     /* it is going to use 2 times of this space because of two concurrent cps */
     free_blk_cnt: uint32 = 10000000 (hotswap);

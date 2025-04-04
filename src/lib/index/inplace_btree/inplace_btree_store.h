@@ -26,9 +26,32 @@
 #include <homestore/btree/detail/btree_internal.hpp>
 #include <iomgr/iomgr_flip.hpp>
 
-SISL_LOGGING_DECL(wbcache)
-
 namespace homestore {
+
+class BtreeStoreBase;
+
+#pragma pack(1)
+struct index_table_sb {
+    uint64_t magic{indx_sb_magic};
+    uint32_t version{indx_sb_version};
+    uuid_t uuid;        // UUID of the index
+    uuid_t parent_uuid; // UUID of the parent container of index (controlled by user)
+
+    struct btree_sb_t {
+        bnodeid_t root_node{empty_bnodeid}; // Btree Root Node ID
+        uint64_t root_link_version{0};      // Link version to btree root node
+        int64_t index_size{0};              // Size of the Index
+        // seq_id_t last_seq_id{-1};           // TODO: See if this is needed
+
+        uint32_t ordinal{0};     // Ordinal of the Index
+        BlkId full_map_location; // Location of any btree map (applicable for COWBtree only so far)
+    };
+
+    btree_sb_t btree_sb;
+    uint32_t user_sb_size; // Size of the user superblk
+    uint8_t user_sb_bytes[0];
+};
+#pragma pack()
 
 template < typename K, typename V >
 class IndexTable : public IndexTableBase, public Btree< K, V > {
@@ -142,7 +165,7 @@ public:
 
 protected:
     ////////////////// Override Implementation of underlying store requirements //////////////////
-    BtreeNodePtr alloc_node(bool is_leaf) override {
+    BtreeNodePtr create_node(bool is_leaf) override {
         return wb_cache().alloc_buf([this, is_leaf](const IndexBufferPtr& idx_buf) -> BtreeNodePtr {
             BtreeNode* n = this->init_node(idx_buf->raw_buffer(), idx_buf->blkid().to_integer(), true, is_leaf);
             static_cast< IndexBtreeNode* >(n)->attach_buf(idx_buf);
@@ -190,7 +213,7 @@ protected:
         IndexBufferPtrList freed_node_bufs;
         for (const auto& freed_node : freed_nodes) {
             freed_node_bufs.push_back(s_cast< IndexBtreeNode* >(freed_node.get())->m_idx_buf);
-            this->free_node(freed_node, locktype_t::WRITE, context);
+            this->remove_node(freed_node, locktype_t::WRITE, context);
         }
 
         wb_cache().transact_bufs(
@@ -293,7 +316,7 @@ protected:
             if (!cur_parent->has_room_for_put(btree_put_type::INSERT, K::get_max_size(),
                                               BtreeLinkInfo::get_fixed_size())) {
                 // No room in the parent_node, let us split the parent_node and continue
-                auto new_parent = this->alloc_interior_node();
+                auto new_parent = this->create_interior_node();
                 if (new_parent == nullptr) {
                     ret = btree_status_t::space_not_avail;
                     break;

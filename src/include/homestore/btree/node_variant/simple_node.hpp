@@ -16,14 +16,11 @@
 #pragma once
 
 #include <homestore/btree/btree_kv.hpp>
-#include <homestore/btree/detail/variant_node.hpp>
+#include <homestore/btree/node_variant/variant_node.hpp>
 #include <homestore/btree/detail/btree_internal.hpp>
-#include "homestore/index/index_internal.hpp"
 
 using namespace std;
 using namespace boost;
-
-SISL_LOGGING_DECL(btree)
 
 namespace homestore {
 
@@ -34,6 +31,8 @@ public:
             VariantNode< K, V >(node_buf, id, init, is_leaf, cfg) {
         this->set_node_type(btree_node_type::FIXED);
     }
+
+    virtual ~SimpleNode() = default;
 
     using BtreeNode::get_nth_key_internal;
     using BtreeNode::get_nth_key_size;
@@ -204,7 +203,7 @@ public:
     bool has_room_for_put(btree_put_type put_type, uint32_t key_size, uint32_t value_size) const override {
 #ifdef _PRERELEASE
         auto max_keys = max_keys_in_node();
-            if(max_keys) {return (this->total_entries() < max_keys);}
+        if (max_keys) { return (this->total_entries() < max_keys); }
 #endif
         return ((put_type == btree_put_type::UPSERT) || (put_type == btree_put_type::INSERT))
             ? (get_available_entries() > 0)
@@ -229,13 +228,9 @@ public:
         }
         return str;
     }
-    std::string to_dot_keys() const override {
-        return to_dot_keys_impl(std::is_same<K, uint64_t>{});
-    }
+    std::string to_dot_keys() const override { return to_dot_keys_impl(std::is_same< K, uint64_t >{}); }
 
-    std::string to_dot_keys_impl(std::false_type) const {
-        return "";
-    }
+    std::string to_dot_keys_impl(std::false_type) const { return ""; }
 
     std::string to_dot_keys_impl(std::true_type) const {
         std::string str;

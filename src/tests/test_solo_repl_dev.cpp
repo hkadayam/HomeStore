@@ -47,9 +47,8 @@
 using namespace homestore;
 using namespace test_common;
 
-SISL_LOGGING_INIT(HOMESTORE_LOG_MODS)
+ 
 SISL_OPTIONS_ENABLE(logging, test_solo_repl_dev, iomgr, test_common_setup)
-SISL_LOGGING_DECL(test_solo_repl_dev)
 
 static thread_local std::random_device g_rd{};
 static thread_local std::default_random_engine g_re{g_rd()};

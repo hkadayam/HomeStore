@@ -45,9 +45,6 @@
 
 using namespace homestore;
 
-SISL_LOGGING_DEF(test_raft_repl_dev)
-SISL_LOGGING_INIT(HOMESTORE_LOG_MODS, nuraft_mesg)
-
 SISL_OPTION_GROUP(test_raft_repl_dev,
                   (block_size, "", "block_size", "block size to io",
                    ::cxxopts::value< uint32_t >()->default_value("4096"), "number"),

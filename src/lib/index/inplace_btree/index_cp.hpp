@@ -24,8 +24,6 @@
 #include <homestore/btree/detail/btree_node.hpp>
 #include "device/virtual_dev.hpp"
 
-SISL_LOGGING_DECL(wbcache)
-
 namespace homestore {
 class BtreeNode;
 struct IndexCPContext : public VDevCPContext {

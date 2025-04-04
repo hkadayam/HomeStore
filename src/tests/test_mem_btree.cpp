@@ -22,17 +22,15 @@
 #include <sisl/utility/enum.hpp>
 #include <boost/algorithm/string.hpp>
 
-#include <homestore/btree/mem_btree.hpp>
 #include "test_common/range_scheduler.hpp"
-#include <homestore/btree/mem_btree.hpp>
-#include <homestore/btree/detail/simple_node.hpp>
-#include <homestore/btree/detail/varlen_node.hpp>
-#include <homestore/btree/detail/prefix_node.hpp>
+#include <homestore/homestore.hpp>
+#include <homestore/btree/node_variant/simple_node.hpp>
+#include <homestore/btree/node_variant/varlen_node.hpp>
+#include <homestore/btree/node_variant/prefix_node.hpp>
 #include "btree_helpers/btree_test_helper.hpp"
 
 using namespace homestore;
-SISL_LOGGING_DEF(btree)
-SISL_LOGGING_INIT(btree)
+ 
 
 SISL_OPTIONS_ENABLE(logging, test_mem_btree)
 SISL_OPTION_GROUP(
@@ -53,43 +51,43 @@ SISL_OPTION_GROUP(
     (run_time, "", "run_time", "run time for io", ::cxxopts::value< uint32_t >()->default_value("360000"), "seconds"))
 
 struct FixedLenBtreeTest {
-    using BtreeType = MemBtree< TestFixedKey, TestFixedValue >;
     using KeyType = TestFixedKey;
     using ValueType = TestFixedValue;
     static constexpr btree_node_type leaf_node_type = btree_node_type::FIXED;
     static constexpr btree_node_type interior_node_type = btree_node_type::FIXED;
+    static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };
 
 struct VarKeySizeBtreeTest {
-    using BtreeType = MemBtree< TestVarLenKey, TestFixedValue >;
     using KeyType = TestVarLenKey;
     using ValueType = TestFixedValue;
     static constexpr btree_node_type leaf_node_type = btree_node_type::VAR_KEY;
     static constexpr btree_node_type interior_node_type = btree_node_type::VAR_KEY;
+    static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };
 
 struct VarValueSizeBtreeTest {
-    using BtreeType = MemBtree< TestFixedKey, TestVarLenValue >;
     using KeyType = TestFixedKey;
     using ValueType = TestVarLenValue;
     static constexpr btree_node_type leaf_node_type = btree_node_type::VAR_VALUE;
     static constexpr btree_node_type interior_node_type = btree_node_type::FIXED;
+    static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };
 
 struct VarObjSizeBtreeTest {
-    using BtreeType = MemBtree< TestVarLenKey, TestVarLenValue >;
     using KeyType = TestVarLenKey;
     using ValueType = TestVarLenValue;
     static constexpr btree_node_type leaf_node_type = btree_node_type::VAR_OBJECT;
     static constexpr btree_node_type interior_node_type = btree_node_type::VAR_OBJECT;
+    static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };
 
 struct PrefixIntervalBtreeTest {
-    using BtreeType = MemBtree< TestIntervalKey, TestIntervalValue >;
     using KeyType = TestIntervalKey;
     using ValueType = TestIntervalValue;
     static constexpr btree_node_type leaf_node_type = btree_node_type::PREFIX;
     static constexpr btree_node_type interior_node_type = btree_node_type::FIXED;
+    static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };
 
 template < typename TestType >
@@ -102,7 +100,7 @@ struct BtreeTest : public BtreeTestHelper< TestType >, public ::testing::Test {
 
     void SetUp() override {
         BtreeTestHelper< TestType >::SetUp();
-        this->m_bt = std::make_shared< typename T::BtreeType >(this->m_cfg);
+        this->m_bt = std::make_shared< Btree< K, V > >(this->m_cfg);
     }
 };
 
@@ -300,7 +298,7 @@ struct BtreeConcurrentTest : public BtreeTestHelper< TestType >, public ::testin
                                                      .hugepage_size_mb = 0});
 
         BtreeTestHelper< TestType >::SetUp();
-        this->m_bt = std::make_shared< typename T::BtreeType >(this->m_cfg);
+        this->m_bt = std::make_shared< Btree< K, V > >(this->m_cfg);
     }
 
     void TearDown() override {

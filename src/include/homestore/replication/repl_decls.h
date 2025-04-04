@@ -10,10 +10,6 @@
 #include <homestore/blk.h>
 #include <sisl/fds/buffer.hpp>
 
-SISL_LOGGING_DECL(replication)
-
-#define REPL_LOG_MODS grpc_server, HOMESTORE_LOG_MODS, nuraft_mesg, nuraft, replication
-
 namespace homestore {
 // clang-format off
 VENUM(ReplServiceError, int32_t,

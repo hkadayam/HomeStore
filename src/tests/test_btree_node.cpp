@@ -15,14 +15,14 @@
  *********************************************************************************/
 #include <gtest/gtest.h>
 
-#define StoreSpecificBtreeNode homestore::BtreeNode
+#define TEST_BNODE_ONLY
 
 #include <sisl/options/options.h>
 #include <sisl/logging/logging.h>
 #include <sisl/utility/enum.hpp>
-#include <homestore/btree/detail/simple_node.hpp>
-#include <homestore/btree/detail/varlen_node.hpp>
-#include <homestore/btree/detail/prefix_node.hpp>
+#include <homestore/btree/node_variant/simple_node.hpp>
+#include <homestore/btree/node_variant/varlen_node.hpp>
+#include <homestore/btree/node_variant/prefix_node.hpp>
 #include "btree_helpers/btree_test_kvs.hpp"
 
 static constexpr uint32_t g_node_size{4096};
@@ -30,8 +30,6 @@ static constexpr uint32_t g_max_keys{6000};
 static std::uniform_int_distribution< uint32_t > g_randkey_generator{0, g_max_keys - 1};
 
 using namespace homestore;
-SISL_LOGGING_DEF(btree)
-SISL_LOGGING_INIT(HOMESTORE_LOG_MODS)
 
 struct FixedLenNodeTest {
     using NodeType = SimpleNode< TestFixedKey, TestFixedValue >;
@@ -74,12 +72,13 @@ struct NodeTest : public testing::Test {
     std::unique_ptr< typename T::NodeType > m_node1;
     std::unique_ptr< typename T::NodeType > m_node2;
     std::map< K, V > m_shadow_map;
-    BtreeConfig m_cfg{g_node_size};
+    BtreeConfig m_cfg;
 
     void SetUp() override {
         m_node1_buf = std::unique_ptr< uint8_t[] >(new uint8_t[g_node_size]);
         m_node2_buf = std::unique_ptr< uint8_t[] >(new uint8_t[g_node_size]);
 
+        m_cfg.m_node_size = g_node_size;
         m_node1 = std::make_unique< typename T::NodeType >(m_node1_buf.get(), 1ul, true, true, m_cfg);
         m_node2 = std::make_unique< typename T::NodeType >(m_node2_buf.get(), 2ul, true, true, m_cfg);
     }

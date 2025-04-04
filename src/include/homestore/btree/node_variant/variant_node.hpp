@@ -15,7 +15,7 @@
 #pragma once
 
 #include <homestore/btree/detail/btree_node.hpp>
-#include <homestore/btree/btree_req.hpp>
+#include <homestore/btree/btree_kv.hpp>
 
 namespace homestore {
 template < typename K >
@@ -25,13 +25,15 @@ template < typename V >
 static V dummy_value;
 
 template < typename K, typename V >
-class VariantNode : public StoreSpecificBtreeNode {
+class VariantNode : public BtreeNode {
 public:
     using BtreeNode::get_nth_key_size;
     using BtreeNode::get_nth_value;
 
     VariantNode(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf, BtreeConfig const& cfg) :
-            StoreSpecificBtreeNode(node_buf, id, init_buf, is_leaf, cfg) {}
+            BtreeNode(node_buf, id, init_buf, is_leaf, cfg) {}
+
+    virtual ~VariantNode() = default;
 
     ///////////////////////////////////////// Get related APIs of the node /////////////////////////////////////////
 

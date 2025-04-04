@@ -86,14 +86,68 @@ void Btree< K, V >::get_all_kvs(std::vector< std::pair< K, V > >& kvs) const {
 }
 
 template < typename K, typename V >
-btree_status_t Btree< K, V >::do_destroy(uint64_t& n_freed_nodes, void* context) {
-    return post_order_traversal(locktype_t::WRITE,
-                                [this, &n_freed_nodes, context](const auto& node, bool is_leaf) -> btree_status_t {
-                                    free_node(node, locktype_t::WRITE, context);
-                                    ++n_freed_nodes;
-                                    return btree_status_t::node_freed;
-                                });
+folly::Future< folly::Unit > Btree< K, V >::destroy() {
+    bool expected = false;
+    if (!m_destroyed.compare_exchange_strong(expected, true)) {
+        BT_LOG(DEBUG, "Btree is already being destroyed, ignoring this request");
+        return folly::makeFuture< folly::Unit >(folly::Unit{});
+    }
+
+    if (m_store->is_ephemeral()) {
+        post_order_traversal(locktype_t::WRITE, [this](const auto& node, bool is_leaf) -> btree_status_t {
+            // On ephemeral btree, we can directly remove the node, however on non-ephemeral btree, we need to do so
+            // only at checkpoint time, which should be handled by the store themselves.
+            remove_node(node, locktype_t::WRITE, nullptr);
+            return btree_status_t::node_freed;
+        });
+    } else if (!m_store->is_fast_destroy_supported()) {
+        // TODO: Need to be implemented. We need to create a BtreeRangeRemoveRequest and put the entire range in the
+        // request, which should naturally collapse the tree and remove all the nodes. To generate the entire range we
+        // have 2 choices:
+        // a) Do a traversal to the left most and right most and implement a btree node method to get first and last key
+        // from leaf node and put that in range and traverse again.
+        // b) Generate a magical BtreeKey called "min" and "max" and put that in the range. However the user of the
+        // Btree should understand this and should handle in their compare function.
+    } else {
+        // Let the store handle the fast delete of btree as part of the destroy_underlying_btree() call.
+    }
+
+    BT_LOG(DEBUG, "btree(root: {}) destroyed successfully", m_root_node_info.bnode_id());
+    return m_store->destroy_underlying_btree(*this);
 }
+
+#if 0
+template < typename K, typename V >
+btree_status_t Btree< K, V >::do_destroy(std::function< void(BtreeKey const&, BtreeValue const&) > cb) {
+    if (m_store->is_fast_destroy_supported()) {
+        return post_order_traversal(locktype_t::WRITE, [this, &cb](const auto& node, bool is_leaf) -> btree_status_t {
+            // If callback is defined, then call it for each key-value pair before deleting. It is typically used in
+            // case the index stores some indirect data and that needs to be freed.
+            if (cb != nullptr) {
+                std::vector< std::pair< K, V > > kvs;
+                node->get_all_kvs([this, &cb](const auto& kvs) {
+                    for (const auto& kv : kvs) {
+                        cb(kv.first, kv.second);
+                    }
+                });
+            }
+
+            // On ephemeral btree, we can directly remove the node, however on non-ephemeral btree, we need to do so
+            // only at checkpoint time, which should be handled by the store themselves.
+            if (m_store->is_ephemeral()) { remove_node(node, locktype_t::WRITE, context); }
+            return btree_status_t::success;
+        });
+    } else {
+        // TODO: Need to be implemented. We need to create a BtreeRangeRemoveRequest and put the entire range in the
+        // request, which should naturally collapse the tree and remove all the nodes. To generate the entire range we
+        // have 2 choices:
+        // a) Do a traversal to the left most and right most and implement a btree node method to get first and last key
+        // from leaf node and put that in range and traverse again.
+        // b) Generate a magical BtreeKey called "min" and "max" and put that in the range. However the user of the
+        // Btree should understand this and should handle in their compare function.
+    }
+}
+#endif
 
 template < typename K, typename V >
 uint64_t Btree< K, V >::get_btree_node_cnt() const {
@@ -125,7 +179,7 @@ uint64_t Btree< K, V >::get_child_node_cnt(bnodeid_t bnodeid) const {
 }
 
 template < typename K, typename V >
-void Btree< K, V >::to_string(bnodeid_t bnodeid, std::string& buf) const {
+void Btree< K, V >::to_string_internal(bnodeid_t bnodeid, std::string& buf) const {
     BtreeNodePtr node;
 
     locktype_t acq_lock = locktype_t::READ;
@@ -138,17 +192,17 @@ void Btree< K, V >::to_string(bnodeid_t bnodeid, std::string& buf) const {
         while (i < node->total_entries()) {
             BtreeLinkInfo p;
             node->get_nth_value(i, &p, false);
-            to_string(p.bnode_id(), buf);
+            to_string_internal(p.bnode_id(), buf);
             ++i;
         }
-        if (node->has_valid_edge()) { to_string(node->edge_id(), buf); }
+        if (node->has_valid_edge()) { to_string_internal(node->edge_id(), buf); }
     }
     unlock_node(node, acq_lock);
 }
 
 template < typename K, typename V >
 void Btree< K, V >::to_custom_string_internal(bnodeid_t bnodeid, std::string& buf,
-                                              to_string_cb_t< K, V > const& cb) const {
+                                              BtreeNode::ToStringCallback< K, V > const& cb) const {
     BtreeNodePtr node;
 
     locktype_t acq_lock = locktype_t::READ;
@@ -200,28 +254,6 @@ void Btree< K, V >::to_dot_keys(bnodeid_t bnodeid, std::string& buf,
 }
 
 template < typename K, typename V >
-uint64_t Btree< K, V >::count_keys(bnodeid_t bnodeid) const {
-    BtreeNodePtr node;
-    locktype_t acq_lock = locktype_t::READ;
-    if (read_and_lock_node(bnodeid, node, acq_lock, acq_lock, nullptr) != btree_status_t::success) { return 0; }
-    uint64_t result = 0;
-    if (!node->is_leaf()) {
-        uint32_t i = 0;
-        while (i < node->total_entries()) {
-            BtreeLinkInfo p;
-            node->get_nth_value(i, &p, false);
-            result += count_keys(p.bnode_id());
-            ++i;
-        }
-        if (node->has_valid_edge()) { result += count_keys(node->edge_id()); }
-    } else {
-        result = node->total_entries();
-    }
-    unlock_node(node, acq_lock);
-    return result;
-}
-
-template < typename K, typename V >
 void Btree< K, V >::validate_sanity_child(const BtreeNodePtr& parent_node, uint32_t ind) const {
     BtreeLinkInfo child_info;
     K child_first_key;
@@ -230,7 +262,7 @@ void Btree< K, V >::validate_sanity_child(const BtreeNodePtr& parent_node, uint3
 
     parent_node->get_nth_value(ind, &child_info, false /* copy */);
     BtreeNodePtr child_node = nullptr;
-    auto ret = read_node_impl(child_info.bnode_id(), child_node);
+    auto ret = m_bt_private->read_node(child_info.bnode_id(), child_node);
     BT_REL_ASSERT_EQ(ret, btree_status_t::success, "read failed, reason: {}", ret);
     if (child_node->total_entries() == 0) {
         auto parent_entries = parent_node->total_entries();
@@ -277,7 +309,7 @@ void Btree< K, V >::validate_sanity_next_child(const BtreeNodePtr& parent_node, 
     parent_node->get_nth_value(ind + 1, &child_info, false /* copy */);
 
     BtreeNodePtr child_node = nullptr;
-    auto ret = read_node_impl(child_info.bnode_id(), child_node);
+    auto ret = m_bt_private->read_node(child_info.bnode_id(), child_node);
     BT_REL_ASSERT_EQ(ret, btree_status_t::success, "read failed, reason: {}", ret);
 
     if (child_node->total_entries() == 0) {
@@ -316,15 +348,15 @@ done:
 template < typename K, typename V >
 void Btree< K, V >::append_route_trace(BtreeRequest& req, const BtreeNodePtr& node, btree_event_t event,
                                        uint32_t start_idx, uint32_t end_idx) const {
-    if (req.route_tracing) {
-        req.route_tracing->emplace_back(trace_route_entry{.node_id = node->node_id(),
-                                                          .node = node.get(),
-                                                          .start_idx = start_idx,
-                                                          .end_idx = end_idx,
-                                                          .num_entries = node->total_entries(),
-                                                          .level = node->level(),
-                                                          .is_leaf = node->is_leaf(),
-                                                          .event = event});
+    if (req.m_route_tracing) {
+        req.m_route_tracing->emplace_back(trace_route_entry{.node_id = node->node_id(),
+                                                            .node = node.get(),
+                                                            .start_idx = start_idx,
+                                                            .end_idx = end_idx,
+                                                            .num_entries = node->total_entries(),
+                                                            .level = node->level(),
+                                                            .is_leaf = node->is_leaf(),
+                                                            .event = event});
     }
 }
 } // namespace homestore

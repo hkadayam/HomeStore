@@ -19,11 +19,9 @@ public:
     virtual unique< UnderlyingBtree > create_underlying_btree(BtreeBase& btree, bool load_existing) = 0;
     virtual folly::Future< folly::Unit > destroy_underlying_btree(BtreeBase& btree) = 0;
 
-#if 0
     // Called whenever a particular btree node has been freed. The underlying implementation could use this oppurtunity
     // to free any contexts stored for this node.
     virtual void on_node_freed(BtreeNode* node) = 0;
-#endif
 
     // When a particular btree is to be destroyed, some stores can support fast destroy mechanism, where all the btree
     // nodes can be freed in one go (in a single Checkpoint) without merging the tree and collapsing the tree. This

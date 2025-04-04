@@ -26,6 +26,12 @@
 #include <homestore/btree/btree_kv.hpp>
 #include <homestore/crc.h>
 
+#ifndef TEST_BNODE_ONLY
+#include <homestore/btree/btree_store.h>
+#include <homestore/index_service.hpp>
+#include <homestore/index/index_common.h>
+#endif
+
 namespace homestore {
 ENUM(locktype_t, uint8_t, NONE, READ, WRITE)
 

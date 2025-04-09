@@ -273,7 +273,7 @@ private:
 
 private:
     /////////////////////////////// Internal Node Management Methods ////////////////////////////////////
-    BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf,
+    BtreeNode* init_node(BtreeNode::Buffer node_buf, bnodeid_t id, bool init_buf, bool is_leaf,
                          uint32_t ctx_size) const override;
 
     /////////////////////////////////// Helper Methods ///////////////////////////////////////

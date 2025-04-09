@@ -30,8 +30,9 @@ public:
     using BtreeNode::get_nth_key_size;
     using BtreeNode::get_nth_value;
 
-    VariantNode(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf, BtreeConfig const& cfg) :
-            BtreeNode(node_buf, id, init_buf, is_leaf, cfg) {}
+    VariantNode(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf, uint32_t node_size,
+                bool is_temp_node = false) :
+            BtreeNode(node_buf, id, init_buf, is_leaf, node_size, is_temp_node) {}
 
     virtual ~VariantNode() = default;
 

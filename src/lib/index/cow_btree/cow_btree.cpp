@@ -81,7 +81,7 @@ static inline COWBtreeCPContext* to_my_cp_ctx(CPContext* context) {
 BtreeNodePtr COWBtree::create_node(bool is_leaf, CPContext* context) {
     auto buf = hs_utils::iobuf_alloc(m_base_btree.node_size(), sisl::buftag::btree_node, m_vdev->align_size());
     auto n = BtreeNodePtr{
-        m_base_btree.init_node(buf, generate_node_id(), true /* init_buf */, is_leaf, sizeof(COWBtreeNode))};
+        m_base_btree.construct_node(buf, generate_node_id(), true /* init_buf */, is_leaf, sizeof(COWBtreeNode))};
     COWBtreeNode::construct(n);
 
     // Add the node to the cache
@@ -90,7 +90,7 @@ BtreeNodePtr COWBtree::create_node(bool is_leaf, CPContext* context) {
                      "Unable to add alloc'd node to cache, low memory or duplicate inserts?");
 
     n->set_modified_cp_id(context->id());
-    add_to_dirty_list(n, to_my_cp_ctx(context));
+    add_to_dirty_list(COWBtreeNode::prepare_to_flush(n, context->id()), to_my_cp_ctx(context));
     return n;
 }
 
@@ -145,8 +145,7 @@ btree_status_t COWBtree::refresh_node(BtreeNodePtr const& node, bool for_read_mo
         return btree_status_t::cp_mismatch; // We are asked to provide the buffer of an older CP, which is not
                                             // possible
     } else {
-        COWBtreeNode::convert(node)->copy_buf_if_needed(*this, cur_cp_id);
-        add_to_dirty_list(node, cp_ctx);
+        add_to_dirty_list(COWBtreeNode::prepare_to_flush(node, cur_cp_id), cp_ctx);
     }
     return btree_status_t::success;
 }
@@ -241,14 +240,14 @@ bnodeid_t COWBtree::generate_node_id() {
 
 BlkId COWBtree::get_blkid_for_nodeid(bnodeid_t nodeid) const { return lookup_bnode_map(to_compact_nodeid(nodeid)); }
 
-void COWBtree::add_to_dirty_list(BtreeNodePtr const& node, COWBtreeCPContext* cp_ctx) {
-    cp_session(cp_ctx->id())->m_modified_nodes.push_back(node);
-    cp_ctx->increment_dirty_size(node->node_size());
+void COWBtree::add_to_dirty_list(COWBtreeNode::Buffer nbuf, COWBtreeCPContext* cp_ctx) {
+    cp_ctx->increment_dirty_size(nbuf->node->node_size());
+    cp_session(cp_ctx->id())->m_modified_nodes.push_back(std::move(nbuf));
 }
 
 void COWBtree::add_to_remove_list(bnodeid_t node_id, COWBtreeCPContext* cp_ctx) {
-    cp_session(cp_ctx->id())->m_deleted_nodes.push_back(node_id);
     cp_ctx->increment_pending_free_size(m_base_btree.node_size());
+    cp_session(cp_ctx->id())->m_deleted_nodes.push_back(node_id);
 }
 
 // FlushUnit represents one contiguous block where all btree nodes that can be packed are done and written at once
@@ -270,7 +269,6 @@ struct NodeFlushUnit {
     COWBtreeCPContext* m_cp_ctx;
     JournalEntry* m_jentry{nullptr};
     std::vector< iovec > m_iovs;
-    std::vector< COWBtreeNodeBuffer > m_node_bufs;
     BlkId m_nodes_location;
     uint32_t m_nodes_count{0};
 
@@ -281,16 +279,14 @@ struct NodeFlushUnit {
             m_jentry->nodes_location = location;
         }
         m_iovs.reserve(location.blk_count());
-        m_node_bufs.reserve(location.blk_count());
     }
 
-    void add(COWBtreeNode* cow_node) {
+    void add(COWBtreeNode::Buffer& nbuf) {
         HS_DBG_ASSERT_LT(m_nodes_count, m_nodes_location.blk_count(), "Adding more nodes than node allocated for");
-        m_node_bufs.emplace_back(cow_node->get_flush_version_buf(m_cp_ctx->id()));
-        m_iovs.emplace_back(
-            iovec{.iov_base = m_node_bufs.back().bytes(), .iov_len = cow_node->to_btree_node()->node_size()});
+        // m_node_bufs.emplace_back(cow_node->get_flush_version_buf(m_cp_ctx->id()));
+        m_iovs.emplace_back(iovec{.iov_base = nbuf.bytes(), .iov_len = nbuf.node->node_size()});
         ++m_nodes_count;
-        if (m_jentry) { m_jentry->nodes[m_jentry->n_nodes++] = get_compact_nodeid(cow_node); }
+        if (m_jentry) { m_jentry->nodes[m_jentry->n_nodes++] = to_compact_nodeid(nbuf.node->node_id()); }
     }
 };
 

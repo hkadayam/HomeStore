@@ -146,8 +146,9 @@ private:
     sisl::CompactBitSet prefix_bitset_;
 
 public:
-    FixedPrefixNode(uint8_t* node_buf, bnodeid_t id, bool init, bool is_leaf, const BtreeConfig& cfg) :
-            VariantNode< K, V >(node_buf, id, init, is_leaf, cfg),
+    FixedPrefixNode(uint8_t* node_buf, bnodeid_t id, bool init, bool is_leaf, uint32_t node_size,
+                    bool is_temp_node = false) :
+            VariantNode< K, V >(node_buf, id, init, is_leaf, node_size, is_temp_node),
             prefix_bitset_{sisl::blob{bitset_area(), reqd_bitset_size(this->node_data_size())}, init} {
         if (init) {
             auto phdr = prefix_header();
@@ -345,15 +346,15 @@ public:
 
     uint32_t get_nth_value_size(uint32_t) const override { return dummy_value< V >.serialized_size(); }
 
-    uint32_t move_out_to_right_by_size(const BtreeConfig& cfg, BtreeNode& on, uint32_t size_to_move) override {
-        return move_out_to_right_internal(cfg, on, true /* by_size*/, size_to_move);
+    uint32_t move_out_to_right_by_size(BtreeNode& on, uint32_t size_to_move) override {
+        return move_out_to_right_internal(on, true /* by_size*/, size_to_move);
     }
 
-    uint32_t move_out_to_right_by_entries(const BtreeConfig& cfg, BtreeNode& on, uint32_t num_entries) override {
-        return move_out_to_right_internal(cfg, on, false /* by_size*/, num_entries);
+    uint32_t move_out_to_right_by_entries(BtreeNode& on, uint32_t num_entries) override {
+        return move_out_to_right_internal(on, false /* by_size*/, num_entries);
     }
 
-    uint32_t move_out_to_right_internal(const BtreeConfig& cfg, BtreeNode& on, bool by_size, uint32_t limit) {
+    uint32_t move_out_to_right_internal(BtreeNode& on, bool by_size, uint32_t limit) {
         FixedPrefixNode& dst_node = s_cast< FixedPrefixNode& >(on);
 
         uint32_t dst_node_size = dst_node.occupied_size();
@@ -509,7 +510,7 @@ public:
         }
     }
 
-    void remove_all(BtreeConfig const& cfg) override {
+    void remove_all() override {
         this->sub_entries(this->total_entries());
         this->invalidate_edge();
         this->inc_gen();
@@ -541,17 +542,15 @@ public:
         return num_entries;
     }
 
-    uint32_t copy_by_size(BtreeConfig const& cfg, BtreeNode const& o, uint32_t start_idx, uint32_t size) override {
-        return copy_internal(cfg, o, start_idx, true /* by_size*/, size);
+    uint32_t copy_by_size(BtreeNode const& o, uint32_t start_idx, uint32_t size) override {
+        return copy_internal(o, start_idx, true /* by_size*/, size);
     }
 
-    uint32_t copy_by_entries(BtreeConfig const& cfg, BtreeNode const& o, uint32_t start_idx,
-                             uint32_t nentries) override {
-        return copy_internal(cfg, o, start_idx, false /* by_size*/, nentries);
+    uint32_t copy_by_entries(BtreeNode const& o, uint32_t start_idx, uint32_t nentries) override {
+        return copy_internal(o, start_idx, false /* by_size*/, nentries);
     }
 
-    uint32_t copy_internal(BtreeConfig const& cfg, BtreeNode const& o, uint32_t start_idx, bool by_size,
-                           uint32_t limit) {
+    uint32_t copy_internal(BtreeNode const& o, uint32_t start_idx, bool by_size, uint32_t limit) {
         FixedPrefixNode const& src_node = s_cast< FixedPrefixNode const& >(o);
 
         // Adjust the size_to_move to cover the new node's reqd header space.

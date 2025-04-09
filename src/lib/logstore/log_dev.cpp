@@ -65,7 +65,7 @@ void LogDev::start(bool format, std::shared_ptr< JournalVirtualDev > vdev) {
     // First read the info block
     if (format) {
         HS_LOG_ASSERT(m_logdev_meta.is_empty(), "Expected meta to be not present");
-        m_logdev_meta.create(m_logdev_id);
+        m_logdev_meta.create(m_logdev_id, m_flush_mode);
         m_vdev_jd->update_data_start_offset(0);
     } else {
         HS_LOG_ASSERT(!m_logdev_meta.is_empty(), "Expected meta data to be read already before loading");
@@ -145,9 +145,30 @@ void LogDev::stop() {
     m_hs.reset();
 }
 
-bool LogDev::is_stopped() {
-    std::unique_lock lg = flush_guard();
-    return m_stopped;
+void LogDev::stop() {
+    start_stopping();
+    while (true) {
+        if (!get_pending_request_num()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+    {
+        std::unique_lock lg = flush_guard();
+        // waiting under lock to make sure no new flush is started
+        while (m_pending_callback.load() > 0) {
+            THIS_LOGDEV_LOG(INFO, "Waiting for pending callbacks to complete, pending callbacks {}",
+                            m_pending_callback.load());
+            std::this_thread::sleep_for(std::chrono::milliseconds{1000});
+        }
+    }
+
+    folly::SharedMutexWritePriority::ReadHolder holder(m_store_map_mtx);
+    for (auto& [_, store] : m_id_logstore_map)
+        store.log_store->stop();
+
+    // after we call stop, we need to do any pending device truncations
+    truncate();
+    m_id_logstore_map.clear();
+    if (allow_timer_flush()) stop_timer();
 }
 
 void LogDev::destroy() {
@@ -504,7 +525,7 @@ void LogDev::on_flush_completion(LogGroup* lg) {
     // since we support out-of-order lsn write, so no need to guarantee the order of logstore write completion
     for (auto const& [idx, req] : req_map) {
         m_pending_callback++;
-        iomanager.run_on_forget(iomgr::reactor_regex::random_worker, iomgr::fiber_regex::syncio_only,
+        iomanager.run_on_forget(iomgr::reactor_regex::random_worker, /* iomgr::fiber_regex::syncio_only, */
                                 [this, dev_offset, idx, req]() {
                                     auto ld_key = logdev_key{idx, dev_offset};
                                     auto comp_cb = req->log_store->get_comp_cb();
@@ -544,11 +565,13 @@ uint64_t LogDev::truncate() {
         // Persist the logstore superblock to ensure correct start LSN during recovery. Avoid such scenario:
         // 1. Follower1 appends logs up to 100, then is stopped by a sigkill.
         // 2. Upon restart, a baseline resync is triggered using snapshot 2000.
-        // 3. Baseline resync completed with start_lsn=2001, but m_trunc_ld_key remains {0,0} since we cannot get a valid
+        // 3. Baseline resync completed with start_lsn=2001, but m_trunc_ld_key remains {0,0} since we cannot get a
+        // valid
         //    device offset for LSN 2000 to update it.
         // 4. Follower1 appends logs from 2001 to 2500, making tail_lsn > 2000.
         // 5. Get m_trunc_ld_key={0,0}, goto here and return 0 without persist.
-        // 6. Follower1 is killed again, after restart, its start index remains 0, misinterpreting the range as [1,2500].
+        // 6. Follower1 is killed again, after restart, its start index remains 0, misinterpreting the range as
+        // [1,2500].
         m_logdev_meta.persist();
         return 0;
     }
@@ -750,7 +773,7 @@ nlohmann::json LogDev::get_status(int verbosity) const {
 /////////////////////////////// LogDevMetadata Section ///////////////////////////////////////
 LogDevMetadata::LogDevMetadata() : m_sb{logdev_sb_meta_name}, m_rollback_sb{logdev_rollback_sb_meta_name} {}
 
-logdev_superblk* LogDevMetadata::create(logdev_id_t id) {
+logdev_superblk* LogDevMetadata::create(logdev_id_t id, flush_mode_t flush_mode) {
     logdev_superblk* sb = m_sb.create(logdev_sb_size_needed(0));
     rollback_superblk* rsb = m_rollback_sb.create(rollback_superblk::size_needed(1));
 
@@ -759,6 +782,7 @@ logdev_superblk* LogDevMetadata::create(logdev_id_t id) {
 
     m_id_reserver = std::make_unique< sisl::IDReserver >();
     m_sb->logdev_id = id;
+    m_sb->flush_mode = flush_mode;
     m_sb.write();
 
     m_rollback_sb->logdev_id = id;

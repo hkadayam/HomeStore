@@ -34,18 +34,35 @@ private:
 
 struct COWBtreeNode {
 public:
-    std::atomic< uint8_t* > m_copied_version_buf{nullptr};
+    // Is the buffer for the node is exclusive contained in the node or shared
+    std::atomic< bool > m_is_buf_exclusive{true};
+
+    struct Buffer {
+        BtreeNodePtr node;
+        uint8_t* buf;
+
+        Buffer(BtreeNodePtr n, uint8_t* b) : node{std::move(n)}, buf{b} {}
+        Buffer& operator=(Buffer&& other) {
+            node = std::move(other.node);
+            buf = other.buf;
+            other.buf = nullptr;
+            return *this;
+        }
+        uint8_t* bytes() { return buf; }
+    };
+
     static COWBtreeNode* construct(BtreeNodePtr const& node);
     static void destruct(BtreeNode* node);
     static COWBtreeNode* convert(BtreeNodePtr const& node);
+    static Buffer prepare_flush_buf(BtreeNode node, cp_id_t cur_cp_id);
 
 private:
     COWBtreeNode() = default;
-    ~COWBtreeNode();
+    ~COWBtreeNode() = default;
 
 public:
-    bool copy_buf_if_needed(COWBtree const& bt, cp_id_t cp_id);
-    COWBtreeNodeBuffer get_flush_version_buf(cp_id_t cp_id);
+    uint8_t* share_buf();
+    void release_buf(uint8_t* buf);
     BtreeNode* to_btree_node();
 };
 

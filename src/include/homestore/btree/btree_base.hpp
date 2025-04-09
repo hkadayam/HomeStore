@@ -80,7 +80,7 @@ public:
         return const_cast< BtreeSuperBlock& >(s_cast< const BtreeBase* >(this)->bt_super_blk());
     }
 
-    virtual BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf,
+    virtual BtreeNode* init_node(BtreeNode::Buffer node_buf, bnodeid_t id, bool init_buf, bool is_leaf,
                                  uint32_t ctx_size) const = 0;
 
     uint64_t space_occupied() const override;

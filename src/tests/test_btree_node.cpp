@@ -79,8 +79,10 @@ struct NodeTest : public testing::Test {
         m_node2_buf = std::unique_ptr< uint8_t[] >(new uint8_t[g_node_size]);
 
         m_cfg.m_node_size = g_node_size;
-        m_node1 = std::make_unique< typename T::NodeType >(m_node1_buf.get(), 1ul, true, true, m_cfg);
-        m_node2 = std::make_unique< typename T::NodeType >(m_node2_buf.get(), 2ul, true, true, m_cfg);
+        m_node1 = std::make_unique< typename T::NodeType >(m_node1_buf.get(), 1ul, true, true, g_node_size,
+                                                           true /* temp_node */);
+        m_node2 = std::make_unique< typename T::NodeType >(m_node2_buf.get(), 2ul, true, true, g_node_size,
+                                                           true /* temp_node */);
     }
 
     void put(uint32_t k, btree_put_type put_type) {

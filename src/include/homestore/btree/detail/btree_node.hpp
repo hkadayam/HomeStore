@@ -39,22 +39,6 @@ class BtreeNode : public sisl::ObjLifeCounter< BtreeNode > {
     using node_find_result_t = std::pair< bool, uint32_t >;
 
 public:
-#pragma pack(1)
-    struct TransientHeader {
-        mutable iomgr::FiberManagerLib::shared_mutex lock;
-        sisl::atomic_counter< uint16_t > upgraders{0};
-
-        /* these variables are accessed without taking lock and are not expected to change after init */
-        uint8_t leaf_node{0};
-#ifndef TEST_BNODE_ONLY
-        IndexStore::Type store_type{IndexStore::Type::COPY_ON_WRITE_BTREE};
-#endif
-        uint64_t max_keys_in_node{0};
-
-        bool is_leaf() const { return (leaf_node != 0); }
-    };
-#pragma pack()
-
     static constexpr uint8_t BTREE_NODE_VERSION = 1;
     static constexpr uint8_t BTREE_NODE_MAGIC = 0xab;
 
@@ -105,37 +89,47 @@ public:
     };
 #pragma pack()
 
-    sisl::atomic_counter< int32_t > m_refcount{0};
-    TransientHeader m_trans_hdr;
-    uint8_t* m_phys_node_buf;
+#pragma pack(1)
+    sisl::atomic_counter< int32_t > m_refcount{0}; // Refcount of the node
+
+#ifndef TEST_BNODE_ONLY
+    IndexStore::Type m_store_type{IndexStore::Type::COPY_ON_WRITE_BTREE};
+#else
+    uint8_t dummy{0}; // Dummy variable to round it off
+#endif
+    uint8_t m_is_temp_node : 1 {0};            // Is this a temporary node, not attached to any btree?
+    uint8_t m_reserved1{0};                    // Dummy variable to round it off
+    std::atomic< uint8_t > m_buf_ref_count{0}; // The underlying buffer reference count
+    uint8_t* m_phys_node_buf;                  // Pointer to the physical node buffer
+    mutable iomgr::FiberManagerLib::shared_mutex m_lock;
+
+#pragma pack()
 
 public:
-    BtreeNode(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf, BtreeConfig const& cfg) :
+    BtreeNode(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf, uint32_t node_size,
+              bool is_temp_node = false) :
             m_phys_node_buf{node_buf} {
         if (init_buf) {
             new (node_buf) PersistentHeader{};
             set_node_id(id);
             set_leaf(is_leaf);
-            set_node_size(cfg.node_size());
+            set_node_size(node_size);
         } else {
             DEBUG_ASSERT_EQ(node_id(), id);
             DEBUG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC);
             DEBUG_ASSERT_EQ(version(), BTREE_NODE_VERSION);
         }
-        m_trans_hdr.leaf_node = is_leaf;
-#ifdef _PRERELEASE
-        m_trans_hdr.max_keys_in_node = cfg.m_max_keys_in_node;
-#endif
+        m_is_temp_node = is_temp_node;
     }
 
     virtual ~BtreeNode() {
 #ifndef TEST_BNODE_ONLY
-        s_cast< BtreeStore* >(index_service().lookup_store(m_trans_hdr.store_type))->on_node_freed(this);
+        if (!m_is_temp_node) { s_cast< BtreeStore* >(index_service().lookup_store(m_store_type))->on_node_freed(this); }
 #endif
     }
 
 #ifndef TEST_BNODE_ONLY
-    void set_store_type(IndexStore::Type store) { m_trans_hdr.store_type = store; }
+    void set_store_type(IndexStore::Type store) { m_store_type = store; }
 #endif
 
     // Identify if a node is a leaf node or not, from raw buffer, by just reading PersistentHeader
@@ -373,33 +367,27 @@ public:
     uint16_t level() const { return get_persistent_header_const()->level; }
 
     // uint32_t total_entries() const { return (has_valid_edge() ? total_entries() + 1 : total_entries()); }
-    uint64_t max_keys_in_node() const { return m_trans_hdr.max_keys_in_node; }
 
     void lock(locktype_t l) const {
         if (l == locktype_t::READ) {
-            m_trans_hdr.lock.lock_shared();
+            m_lock.lock_shared();
         } else if (l == locktype_t::WRITE) {
-            m_trans_hdr.lock.lock();
+            m_lock.lock();
         }
     }
 
     void unlock(locktype_t l) const {
         if (l == locktype_t::READ) {
-            m_trans_hdr.lock.unlock_shared();
+            m_lock.unlock_shared();
         } else if (l == locktype_t::WRITE) {
-            m_trans_hdr.lock.unlock();
+            m_lock.unlock();
         }
     }
 
     void lock_upgrade() {
-        m_trans_hdr.upgraders.increment(1);
         this->unlock(locktype_t::READ);
         this->lock(locktype_t::WRITE);
-        m_trans_hdr.upgraders.decrement(1);
     }
-
-    void lock_acknowledge() { m_trans_hdr.upgraders.decrement(1); }
-    bool any_upgrade_waiters() const { return (!m_trans_hdr.upgraders.testz()); }
 
     template < typename K, typename V >
     using ToStringCallback = std::function< std::string(std::vector< std::pair< K, V > > const&) >;
@@ -444,19 +432,14 @@ public:
     virtual btree_status_t insert(uint32_t ind, const BtreeKey& key, const BtreeValue& val) = 0;
     virtual void remove(uint32_t ind) { remove(ind, ind); }
     virtual void remove(uint32_t ind_s, uint32_t ind_e) = 0;
-    virtual void remove_all(const BtreeConfig& cfg) = 0;
+    virtual void remove_all() = 0;
     virtual void update(uint32_t ind, const BtreeValue& val) = 0;
     virtual void update(uint32_t ind, const BtreeKey& key, const BtreeValue& val) = 0;
 
-    virtual uint32_t move_out_to_right_by_entries(const BtreeConfig& cfg, BtreeNode& other_node, uint32_t nentries) = 0;
-    virtual uint32_t move_out_to_right_by_size(const BtreeConfig& cfg, BtreeNode& other_node, uint32_t size) = 0;
-    virtual uint32_t copy_by_size(const BtreeConfig& cfg, const BtreeNode& other_node, uint32_t start_idx,
-                                  uint32_t size) = 0;
-    virtual uint32_t copy_by_entries(const BtreeConfig& cfg, const BtreeNode& other_node, uint32_t start_idx,
-                                     uint32_t nentries) = 0;
-    /*virtual uint32_t move_in_from_right_by_entries(const BtreeConfig& cfg, BtreeNode& other_node,
-                                                   uint32_t nentries) = 0;
-    virtual uint32_t move_in_from_right_by_size(const BtreeConfig& cfg, BtreeNode& other_node, uint32_t size) = 0;*/
+    virtual uint32_t move_out_to_right_by_entries(BtreeNode& other_node, uint32_t nentries) = 0;
+    virtual uint32_t move_out_to_right_by_size(BtreeNode& other_node, uint32_t size) = 0;
+    virtual uint32_t copy_by_size(const BtreeNode& other_node, uint32_t start_idx, uint32_t size) = 0;
+    virtual uint32_t copy_by_entries(const BtreeNode& other_node, uint32_t start_idx, uint32_t nentries) = 0;
 
     virtual uint32_t available_size() const = 0;
     virtual bool has_room_for_put(btree_put_type put_type, uint32_t key_size, uint32_t value_size) const = 0;
@@ -617,6 +600,8 @@ public:
             node->~BtreeNode();
         }
     }
+
+    friend void intrusive_ptr_add_ref(BtreeNode::Buffer* buf) { node.m_refcount.increment(1); }
 };
 
 } // namespace homestore

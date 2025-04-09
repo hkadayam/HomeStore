@@ -37,7 +37,7 @@ public:
     uint64_t space_occupied() const override;
 
     bnodeid_t generate_node_id();
-    void add_to_dirty_list(BtreeNodePtr const& node, COWBtreeCPContext* cp_ctx);
+    void add_to_dirty_list(COWBtreeNode::Buffer nbuf, COWBtreeCPContext* cp_ctx);
     void add_to_remove_list(bnodeid_t node_id, COWBtreeCPContext* cp_ctx);
     void destroy();
 
@@ -201,7 +201,7 @@ public:
 
     // using DirtyNodeList = sisl::ConcurrentInsertVector< BtreeNodePtr >;
     // using DeletedNodeList = sisl::ConcurrentInsertVector< CompactNodeId >;
-    using DirtyNodeList = ConcurrentVector< BtreeNodePtr >;
+    using DirtyNodeList = ConcurrentVector< COWBtreeNode::Buffer >;
     using DeletedNodeList = ConcurrentVector< CompactNodeId >;
 
     struct CPSession {

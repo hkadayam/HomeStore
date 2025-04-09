@@ -343,7 +343,7 @@ btree_status_t Btree< K, V >::split_node(const BtreeNodePtr& parent_node, const 
     uint32_t child1_filled_size = child_node1->node_data_size() - child_node1->available_size();
 
     auto split_size = m_bt_cfg.split_size(child1_filled_size);
-    uint32_t res = child_node1->move_out_to_right_by_size(m_bt_cfg, *child_node2, split_size);
+    uint32_t res = child_node1->move_out_to_right_by_size(*child_node2, split_size);
 
     BT_NODE_REL_ASSERT_GT(res, 0, child_node1,
                           "Unable to split entries in the child node"); // means cannot split entries

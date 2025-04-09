@@ -13,6 +13,10 @@ COWBtreeNode* COWBtreeNode::construct(BtreeNodePtr const& node) {
 }
 
 void COWBtreeNode::destruct(BtreeNode* node) {
+    HS_DBG_ASSERT_EQ(m_is_buf_exclusive.load(), true,
+                     "A destructing node shouldn't be sharing the buffer with cp, but here it is shared.",
+                     fmt::ptr(node->get_phys_buf()));
+
     // Release the node buffer
     hs_utils::iobuf_free(node->get_phys_buf(), sisl::buftag::btree_node);
 
@@ -26,9 +30,51 @@ COWBtreeNode* COWBtreeNode::convert(BtreeNodePtr const& n) {
     return r_cast< COWBtreeNode* >(uintptr_cast(n.get()) - sizeof(COWBtreeNode));
 }
 
-COWBtreeNode::~COWBtreeNode() {
-    auto buf = m_copied_version_buf.load();
-    if (buf != nullptr) { hs_utils::iobuf_free(buf, sisl::buftag::btree_node); }
+COWBtreeNode::Buffer COWBtreeNode::prepare_flush_buf(BtreeNode node, cp_id_t cur_cp_id) {
+    COWBtreeNode* cow_node = convert(node);
+    uint8_t* ret_buf = cow_node->try_share_buf();
+
+    // If the buffer for the current version was written as part of previous cp (exactly 1 behind requested cp), then we
+    // need to check if previous cp is still in flushing the but. If so, we have to make a copy and use new version to
+    // write. We preserve existing version until it is flushed.
+    auto const node_cp_id = node->get_modified_cp_id();
+    if (node_cp_id == (cur_cp_id - 1)) {
+        // We tried to see if the buffer can be shared. If it possible that the flush of previous cp is completed and
+        // the flushing thread released the buffer. In that case it is safe to share it.
+        if (ret_buf == nullptr) {
+            // We couldn't share the buffer, so we need to make a copy of it.
+            ret_buf = hs_utils::iobuf_alloc(node->node_size(), sisl::buftag::btree_node, node->align_size());
+            std::memcpy(ret_buf, node->get_phys_buf(), node->node_size());
+        }
+    } else {
+        HS_DBG_ASSERT_NE(ret_buf, (void*)nullptr,
+                         "Node={} was modified by earlier cp_id, but we couldn't share the buffer.", node->to_string());
+    }
+    node->set_modified_cp_id(cur_cp_id);
+    return Buffer{std::move(node), ret_buf};
+}
+
+uint8_t* COWBtreeNode::try_share_buf() {
+    uint8_t* buf = to_btree_node()->get_phys_node_buf();
+
+    bool expected = true;
+    if (!m_is_buf_exclusive.compare_exchange_strong(expected, false)) {
+        // The buffer is already shared, so we can't share it again.
+        return nullptr;
+    }
+    return buf;
+}
+
+void COWBtreeNode::release_buf(uint8_t* buf) {
+    auto is_exclusive = m_is_buf_exclusive.exchange(true);
+    if (is_exclusive == true) {
+        // Looks like the earlier buffer which was shared to us has been released and a new copy was used. So we
+        // need to free the buffer
+        hs_utils::iobuf_free(buf, sisl::buftag::btree_node);
+    } else {
+        HS_DBG_ASSERT_EQ(buf, to_btree_node()->get_phys_node_buf(), "Buffer is not same as the one we shared. buf={}",
+                         fmt::ptr(buf));
+    }
 }
 
 bool COWBtreeNode::copy_buf_if_needed(COWBtree const& bt, cp_id_t cur_cp_id) {

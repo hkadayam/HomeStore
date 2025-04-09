@@ -27,8 +27,9 @@ namespace homestore {
 template < typename K, typename V >
 class SimpleNode : public VariantNode< K, V > {
 public:
-    SimpleNode(uint8_t* node_buf, bnodeid_t id, bool init, bool is_leaf, const BtreeConfig& cfg) :
-            VariantNode< K, V >(node_buf, id, init, is_leaf, cfg) {
+    SimpleNode(uint8_t* node_buf, bnodeid_t id, bool init, bool is_leaf, uint32_t node_size,
+               bool is_temp_node = false) :
+            VariantNode< K, V >(node_buf, id, init, is_leaf, node_size, is_temp_node) {
         this->set_node_type(btree_node_type::FIXED);
     }
 
@@ -41,7 +42,6 @@ public:
     using BtreeNode::get_nth_value_size;
     using BtreeNode::to_string;
     using VariantNode< K, V >::get_nth_value;
-    using VariantNode< K, V >::max_keys_in_node;
 
     // Insert the key and value in provided index
     // Assumption: Node lock is already taken
@@ -106,7 +106,7 @@ public:
 #endif
     }
 
-    void remove_all(const BtreeConfig&) override {
+    void remove_all() override {
         this->sub_entries(this->total_entries());
         this->invalidate_edge();
         this->inc_gen();
@@ -115,7 +115,7 @@ public:
 #endif
     }
 
-    uint32_t move_out_to_right_by_entries(const BtreeConfig& cfg, BtreeNode& o, uint32_t nentries) override {
+    uint32_t move_out_to_right_by_entries(BtreeNode& o, uint32_t nentries) override {
         auto& other_node = s_cast< SimpleNode< K, V >& >(o);
 
         // Minimum of whats to be moved out and how many slots available in other node
@@ -146,21 +146,20 @@ public:
         return nentries;
     }
 
-    uint32_t move_out_to_right_by_size(const BtreeConfig& cfg, BtreeNode& o, uint32_t size) override {
-        return (get_nth_obj_size(0) * move_out_to_right_by_entries(cfg, o, size / get_nth_obj_size(0)));
+    uint32_t move_out_to_right_by_size(BtreeNode& o, uint32_t size) override {
+        return (get_nth_obj_size(0) * move_out_to_right_by_entries(o, size / get_nth_obj_size(0)));
     }
 
     uint32_t num_entries_by_size(uint32_t start_idx, uint32_t size) const override {
         return std::min(size / get_nth_obj_size(0), this->total_entries() - start_idx);
     }
 
-    uint32_t copy_by_size(const BtreeConfig& cfg, const BtreeNode& o, uint32_t start_idx, uint32_t size) override {
+    uint32_t copy_by_size(const BtreeNode& o, uint32_t start_idx, uint32_t size) override {
         auto& other = s_cast< const SimpleNode< K, V >& >(o);
-        return copy_by_entries(cfg, o, start_idx, other.num_entries_by_size(start_idx, size));
+        return copy_by_entries(o, start_idx, other.num_entries_by_size(start_idx, size));
     }
 
-    uint32_t copy_by_entries(const BtreeConfig& cfg, const BtreeNode& o, uint32_t start_idx,
-                             uint32_t nentries) override {
+    uint32_t copy_by_entries(const BtreeNode& o, uint32_t start_idx, uint32_t nentries) override {
         auto& other = s_cast< const SimpleNode< K, V >& >(o);
 
         nentries = std::min(nentries, other.total_entries() - start_idx);
@@ -201,10 +200,6 @@ public:
     }
 
     bool has_room_for_put(btree_put_type put_type, uint32_t key_size, uint32_t value_size) const override {
-#ifdef _PRERELEASE
-        auto max_keys = max_keys_in_node();
-        if (max_keys) { return (this->total_entries() < max_keys); }
-#endif
         return ((put_type == btree_put_type::UPSERT) || (put_type == btree_put_type::INSERT))
             ? (get_available_entries() > 0)
             : true;

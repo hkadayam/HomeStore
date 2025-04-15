@@ -9,6 +9,7 @@
 
 #include "common/large_id_reserver.hpp"
 #include "common/concurrent_vector.hpp"
+#include "index/cow_btree/cow_btree_node.h"
 
 namespace homestore {
 class COWBtreeCPContext;
@@ -37,7 +38,7 @@ public:
     uint64_t space_occupied() const override;
 
     bnodeid_t generate_node_id();
-    void add_to_dirty_list(COWBtreeNode::Buffer nbuf, COWBtreeCPContext* cp_ctx);
+    void add_to_dirty_list(COWBtreeNode::FlushInfo fentity, COWBtreeCPContext* cp_ctx);
     void add_to_remove_list(bnodeid_t node_id, COWBtreeCPContext* cp_ctx);
     void destroy();
 
@@ -201,7 +202,7 @@ public:
 
     // using DirtyNodeList = sisl::ConcurrentInsertVector< BtreeNodePtr >;
     // using DeletedNodeList = sisl::ConcurrentInsertVector< CompactNodeId >;
-    using DirtyNodeList = ConcurrentVector< COWBtreeNode::Buffer >;
+    using DirtyNodeList = ConcurrentVector< COWBtreeNode::FlushInfo >;
     using DeletedNodeList = ConcurrentVector< CompactNodeId >;
 
     struct CPSession {

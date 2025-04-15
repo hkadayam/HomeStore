@@ -89,21 +89,14 @@ public:
     };
 #pragma pack()
 
-#pragma pack(1)
+    uint8_t* m_phys_node_buf; // Pointer to the physical node buffer
+    mutable iomgr::FiberManagerLib::shared_mutex m_lock;
     sisl::atomic_counter< int32_t > m_refcount{0}; // Refcount of the node
 
 #ifndef TEST_BNODE_ONLY
     IndexStore::Type m_store_type{IndexStore::Type::COPY_ON_WRITE_BTREE};
-#else
-    uint8_t dummy{0}; // Dummy variable to round it off
 #endif
-    uint8_t m_is_temp_node : 1 {0};            // Is this a temporary node, not attached to any btree?
-    uint8_t m_reserved1{0};                    // Dummy variable to round it off
-    std::atomic< uint8_t > m_buf_ref_count{0}; // The underlying buffer reference count
-    uint8_t* m_phys_node_buf;                  // Pointer to the physical node buffer
-    mutable iomgr::FiberManagerLib::shared_mutex m_lock;
-
-#pragma pack()
+    uint8_t m_is_temp_node : 1 {0}; // Is this a temporary node, not attached to any btree?
 
 public:
     BtreeNode(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf, uint32_t node_size,
@@ -123,8 +116,13 @@ public:
     }
 
     virtual ~BtreeNode() {
+        if (m_is_temp_node) {
+            delete[] m_phys_node_buf;
+        }
 #ifndef TEST_BNODE_ONLY
-        if (!m_is_temp_node) { s_cast< BtreeStore* >(index_service().lookup_store(m_store_type))->on_node_freed(this); }
+        else {
+            s_cast< BtreeStore* >(index_service().lookup_store(m_store_type))->on_node_freed(this);
+        }
 #endif
     }
 
@@ -150,11 +148,6 @@ public:
         if (phdr->checksum != exp_checksum) { return false; }
 
         return true;
-    }
-
-    static void revert_node_delete(uint8_t* buf) {
-        auto phdr = r_cast< PersistentHeader* >(buf);
-        phdr->node_deleted = 0x0;
     }
 
     static void set_modified_cp_id(uint8_t* buf, int64_t cp_id) {
@@ -283,6 +276,11 @@ public:
             LOGMSG_ASSERT((magic() == BTREE_NODE_MAGIC), "{}", get_persistent_header_const()->to_string());
         }
         return found;
+    }
+
+    virtual void overwrite(const BtreeNode& other_node) {
+        DEBUG_ASSERT_EQ(node_size(), other_node.node_size(), "{}", get_persistent_header_const()->to_string());
+        std::memcpy(m_phys_node_buf, other_node.m_phys_node_buf, other_node.node_size());
     }
 
     void get_adjacent_indicies(uint32_t cur_ind, std::vector< uint32_t >& indices_list, uint32_t max_indices) const {
@@ -438,12 +436,31 @@ public:
 
     virtual uint32_t move_out_to_right_by_entries(BtreeNode& other_node, uint32_t nentries) = 0;
     virtual uint32_t move_out_to_right_by_size(BtreeNode& other_node, uint32_t size) = 0;
+
+    /// @brief Appends entries copied from another SimpleNode into this node, up to a specified size limit.
+    ///
+    /// Copies entries starting from the `other_cursor` index in `other` node and appends them
+    /// to the current node (`this`). Copying stops when either the source node runs out of entries
+    /// starting from the cursor, or the occupied size of the current node reaches `upto_size`,
+    /// or the current node runs out of available entry slots.
+    ///
+    /// @param o The source BtreeNode (expected to be a SimpleNode) to copy entries from.
+    /// @param other_cursor [in, out] The starting index within `other` node to begin copying.
+    ///                     This cursor is advanced by the number of entries successfully copied.
+    /// @param upto_size The target maximum occupied size for the current node after appending.
+    /// @note Assumes appropriate node locks are held externally. This implementation does not
+    ///       support the `must_fit_all` parameter from the base class.
+    virtual bool append_copy_in_upto_size(const BtreeNode& other_node, uint32_t& other_cursor, uint32_t upto_size,
+                                          bool must_fit_all) = 0;
+
+#if 0
     virtual uint32_t copy_by_size(const BtreeNode& other_node, uint32_t start_idx, uint32_t size) = 0;
     virtual uint32_t copy_by_entries(const BtreeNode& other_node, uint32_t start_idx, uint32_t nentries) = 0;
+    virtual uint32_t num_entries_by_size(uint32_t start_idx, uint32_t size) const = 0;
+#endif
 
     virtual uint32_t available_size() const = 0;
     virtual bool has_room_for_put(btree_put_type put_type, uint32_t key_size, uint32_t value_size) const = 0;
-    virtual uint32_t num_entries_by_size(uint32_t start_idx, uint32_t size) const = 0;
 
     virtual int compare_nth_key(const BtreeKey& cmp_key, uint32_t ind) const = 0;
     virtual void get_nth_key_internal(uint32_t ind, BtreeKey& out_key, bool copykey) const = 0;
@@ -495,10 +512,8 @@ protected:
     }
 
 public:
-    void update_phys_buf(uint8_t* buf) { m_phys_node_buf = buf; }
-    uint8_t* get_phys_buf() { return m_phys_node_buf; }
-
-    void set_phys_buf(uint8_t* buf) { m_phys_node_buf = buf; }
+    uint8_t* get_phys_node_buf() { return m_phys_node_buf; }
+    void set_phys_node_buf(uint8_t* buf) { m_phys_node_buf = buf; }
 
     PersistentHeader* get_persistent_header() { return r_cast< PersistentHeader* >(m_phys_node_buf); }
     const PersistentHeader* get_persistent_header_const() const {
@@ -533,11 +548,8 @@ public:
     }
 
     void set_total_entries(uint32_t n) { get_persistent_header()->nentries = n; }
-    void inc_entries() { ++get_persistent_header()->nentries; }
-    void dec_entries() { --get_persistent_header()->nentries; }
-
-    void add_entries(uint32_t addn) { get_persistent_header()->nentries += addn; }
-    void sub_entries(uint32_t subn) { get_persistent_header()->nentries -= subn; }
+    void add_entries(uint32_t addn = 1u) { get_persistent_header()->nentries += addn; }
+    void sub_entries(uint32_t subn = 1u) { get_persistent_header()->nentries -= subn; }
 
     void set_leaf(bool leaf) { get_persistent_header()->leaf = leaf; }
     void set_node_type(btree_node_type t) { get_persistent_header()->node_type = uint32_cast(t); }
@@ -600,8 +612,6 @@ public:
             node->~BtreeNode();
         }
     }
-
-    friend void intrusive_ptr_add_ref(BtreeNode::Buffer* buf) { node.m_refcount.increment(1); }
 };
 
 } // namespace homestore

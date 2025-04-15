@@ -33,44 +33,45 @@ static BtreeNode* do_create_node(uint32_t ctx_size, Args&&... args) {
 }
 
 template < typename K, typename V >
-BtreeNode* Btree< K, V >::init_node(BtreeNode::Buffer node_buf, bnodeid_t id, bool init_buf, bool is_leaf,
-                                    uint32_t ctx_size) const {
+BtreeNode* Btree< K, V >::init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf, uint32_t ctx_size,
+                                    bool is_temp_node) const {
     BtreeNode* n{nullptr};
     btree_node_type node_type = is_leaf ? m_bt_cfg.leaf_node_type() : m_bt_cfg.interior_node_type();
 
     switch (node_type) {
     case btree_node_type::VAR_OBJECT:
-        n = is_leaf
-            ? do_create_node< VarObjSizeNode< K, V > >(ctx_size, node_buf, id, init_buf, true, m_bt_cfg.node_size())
-            : do_create_node< VarObjSizeNode< K, BtreeLinkInfo > >(ctx_size, node_buf, id, init_buf, false,
-                                                                   m_bt_cfg.node_size());
+        n = is_leaf ? do_create_node< VarObjSizeNode< K, V > >(ctx_size, node_buf, id, init_buf, true,
+                                                               m_bt_cfg.node_size(), is_temp_node)
+                    : do_create_node< VarObjSizeNode< K, BtreeLinkInfo > >(ctx_size, node_buf, id, init_buf, false,
+                                                                           m_bt_cfg.node_size(), is_temp_node);
         break;
 
     case btree_node_type::FIXED:
-        n = is_leaf ? do_create_node< SimpleNode< K, V > >(ctx_size, node_buf, id, init_buf, true, m_bt_cfg.node_size())
+        n = is_leaf ? do_create_node< SimpleNode< K, V > >(ctx_size, node_buf, id, init_buf, true, m_bt_cfg.node_size(),
+                                                           is_temp_node)
                     : do_create_node< SimpleNode< K, BtreeLinkInfo > >(ctx_size, node_buf, id, init_buf, false,
-                                                                       m_bt_cfg.node_size());
+                                                                       m_bt_cfg.node_size(), is_temp_node);
         break;
 
     case btree_node_type::VAR_VALUE:
-        n = is_leaf
-            ? do_create_node< VarValueSizeNode< K, V > >(ctx_size, node_buf, id, init_buf, true, m_bt_cfg.node_size())
-            : do_create_node< VarValueSizeNode< K, BtreeLinkInfo > >(ctx_size, node_buf, id, init_buf, false,
-                                                                     m_bt_cfg.node_size());
+        n = is_leaf ? do_create_node< VarValueSizeNode< K, V > >(ctx_size, node_buf, id, init_buf, true,
+                                                                 m_bt_cfg.node_size(), is_temp_node)
+                    : do_create_node< VarValueSizeNode< K, BtreeLinkInfo > >(ctx_size, node_buf, id, init_buf, false,
+                                                                             m_bt_cfg.node_size(), is_temp_node);
         break;
 
     case btree_node_type::VAR_KEY:
-        n = is_leaf
-            ? do_create_node< VarKeySizeNode< K, V > >(ctx_size, node_buf, id, init_buf, true, m_bt_cfg.node_size())
-            : do_create_node< VarKeySizeNode< K, BtreeLinkInfo > >(ctx_size, node_buf, id, init_buf, false,
-                                                                   m_bt_cfg.node_size());
+        n = is_leaf ? do_create_node< VarKeySizeNode< K, V > >(ctx_size, node_buf, id, init_buf, true,
+                                                               m_bt_cfg.node_size(), is_temp_node)
+                    : do_create_node< VarKeySizeNode< K, BtreeLinkInfo > >(ctx_size, node_buf, id, init_buf, false,
+                                                                           m_bt_cfg.node_size(), is_temp_node);
         break;
 
     case btree_node_type::PREFIX:
-        n = is_leaf
-            ? do_create_node< FixedPrefixNode< K, V > >(ctx_size, node_buf, id, init_buf, true, m_bt_cfg.node_size())
-            : do_create_node< FixedPrefixNode< K, BtreeLinkInfo > >(ctx_size, node_buf, id, init_buf, false,
-                                                                    m_bt_cfg.node_size());
+        n = is_leaf ? do_create_node< FixedPrefixNode< K, V > >(ctx_size, node_buf, id, init_buf, true,
+                                                                m_bt_cfg.node_size(), is_temp_node)
+                    : do_create_node< FixedPrefixNode< K, BtreeLinkInfo > >(ctx_size, node_buf, id, init_buf, false,
+                                                                            m_bt_cfg.node_size(), is_temp_node);
         break;
 
     default:

@@ -293,21 +293,28 @@ public:
         return nmoved;
     }
 
-    uint32_t num_entries_by_size(uint32_t start_idx, uint32_t size) const override {
-        auto idx = start_idx;
+    uint32_t get_entries_size(uint32_t start_idx, uint32_t end_idx) const override {
+        if ((start_idx == 0) && (end_idx == total_entries())) { return this->occupied_size(); }
         uint32_t cum_size{0};
-
-        while (idx < this->total_entries()) {
-            uint32_t const rec_size = this->get_record_size() + get_nth_key_size(idx) + get_nth_value_size(idx);
-            cum_size += rec_size;
-            if (cum_size > size) { break; }
-            ++idx;
+        for (uint32_t i = start_idx; i < end_idx; ++i) {
+            cum_size += get_nth_key_size(i) + get_nth_value_size(i) + this->get_record_size();
         }
-
-        return idx - start_idx;
+        return cum_size;
     }
 
-    uint32_t copy_by_size(const BtreeNode& o, uint32_t start_idx, uint32_t copy_size) override {
+    bool append_copy_in_upto_size(const BtreeNode& o, uint32_t& other_cursor, uint32_t upto_size,
+                                  bool must_fit_all) override {
+        if (occupied_size() >= upto_size) { return false; }
+
+        if (must_fit_all) {
+            if (available_size() < o->get_entries_size(other_cursor, o->total_entries())) { return false; }
+        }
+        auto const ncopied = copy_by_size(o, other_cursor, upto_size - occupied_size());
+        other_cursor += ncopied;
+        return true;
+    }
+
+    uint32_t copy_by_size(const BtreeNode& o, uint32_t start_idx, uint32_t copy_size) {
         auto& other = static_cast< const VariableNode& >(o);
         auto this_gen = this->node_gen();
 
@@ -335,6 +342,7 @@ public:
         return n;
     }
 
+#if 0
     uint32_t copy_by_entries(const BtreeNode& o, uint32_t start_idx, uint32_t nentries) override {
         auto& other = static_cast< const VariableNode& >(o);
         auto this_gen = this->node_gen();
@@ -359,6 +367,21 @@ public:
         }
         return n;
     }
+
+        uint32_t num_entries_by_size(uint32_t start_idx, uint32_t size) const override {
+        auto idx = start_idx;
+        uint32_t cum_size{0};
+
+        while (idx < this->total_entries()) {
+            uint32_t const rec_size = this->get_record_size() + get_nth_key_size(idx) + get_nth_value_size(idx);
+            cum_size += rec_size;
+            if (cum_size > size) { break; }
+            ++idx;
+        }
+
+        return idx - start_idx;
+    }
+#endif
 
     uint32_t available_size() const override { return get_var_node_header_const()->m_available_space; }
 
@@ -466,7 +489,7 @@ protected:
         memcpy(raw_data_ptr, val_blob.cbytes(), val_blob.size());
 
         // Increment the entries and generation number
-        this->inc_entries();
+        this->add_entries(1);
         this->inc_gen();
 
 #ifndef NDEBUG

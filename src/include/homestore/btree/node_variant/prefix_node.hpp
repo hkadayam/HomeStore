@@ -33,6 +33,7 @@ class FixedPrefixNode : public VariantNode< K, V > {
     using BtreeNode::get_nth_obj_size;
     using BtreeNode::get_nth_value;
     using BtreeNode::get_nth_value_size;
+    using BtreeNode::occupied_size;
     using BtreeNode::to_string;
     using VariantNode< K, V >::get_nth_value;
 
@@ -222,7 +223,7 @@ public:
                     } else {
                         std::memmove(get_suffix_entry(idx + 1), get_suffix_entry(idx),
                                      (this->total_entries() - idx) * suffix_entry::size());
-                        this->inc_entries();
+                        this->add_entries(1);
                     }
                 }
 
@@ -291,7 +292,7 @@ public:
                     deref_remove_prefix(sentry->prefix_slot);
                     std::memmove(uintptr_cast(sentry), uintptr_cast(get_suffix_entry(idx + 1)),
                                  (this->total_entries() - idx - 1) * suffix_entry::size());
-                    this->dec_entries();
+                    this->sub_entries(1);
                     ++num_removed;
                 } else {
                     ++idx;
@@ -444,7 +445,7 @@ public:
                      (this->total_entries() - idx) * suffix_entry::size());
 
         write_suffix(idx, add_prefix(key, val), key, val);
-        this->inc_entries();
+        this->add_entries(1);
         this->inc_gen();
 
 #ifndef NDEBUG
@@ -499,7 +500,7 @@ public:
             deref_remove_prefix(sentry->prefix_slot);
             std::memmove(uintptr_cast(sentry), uintptr_cast(get_suffix_entry(idx + 1)),
                          (this->total_entries() - idx - 1) * suffix_entry::size());
-            this->dec_entries();
+            this->sub_entries(1);
         }
         this->inc_gen();
     }
@@ -523,6 +524,7 @@ public:
 
     uint32_t get_nth_obj_size(uint32_t) const override { return get_key_size() + get_value_size(); }
 
+#if 0
     uint32_t num_entries_by_size(uint32_t start_idx, uint32_t size) const {
         uint32_t num_entries{0};
         uint32_t cum_size{0};
@@ -542,12 +544,20 @@ public:
         return num_entries;
     }
 
-    uint32_t copy_by_size(BtreeNode const& o, uint32_t start_idx, uint32_t size) override {
+    uint32_t copy_by_size(BtreeNode const& o, uint32_t start_idx, uint32_t size) {
         return copy_internal(o, start_idx, true /* by_size*/, size);
     }
 
-    uint32_t copy_by_entries(BtreeNode const& o, uint32_t start_idx, uint32_t nentries) override {
+    uint32_t copy_by_entries(BtreeNode const& o, uint32_t start_idx, uint32_t nentries) {
         return copy_internal(o, start_idx, false /* by_size*/, nentries);
+    }
+
+#endif
+
+    void append_copy_in_upto_size(const BtreeNode& other_node, uint32_t& other_cursor, uint32_t upto_size) override {
+        if (occupied_size() >= upto_size) { return; }
+        auto const ncopied = copy_internal(other_node, other_cursor, true /* by_size*/, upto_size - occupied_size());
+        other_cursor += ncopied;
     }
 
     uint32_t copy_internal(BtreeNode const& o, uint32_t start_idx, bool by_size, uint32_t limit) {

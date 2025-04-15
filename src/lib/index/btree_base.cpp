@@ -285,6 +285,13 @@ BtreeNodePtr BtreeBase::create_interior_node(CPContext* context) {
     return n;
 }
 
+BtreeNodePtr BtreeBase::clone_temp_node(const BtreeNode& node) {
+    BtreeNode* tmp_node = init_node(new uint8_t[node.node_size()], node.node_id(), true /* init_buf*/, node.is_leaf(),
+                                    0 /*  ctx_size*/, true /* temp_node*/);
+    tmp_node->overwrite(node);
+    return BtreeNodePtr{tmp_node};
+}
+
 [[nodiscard]] CPGuard BtreeBase::bt_cp_guard() { return CPGuard{is_ephemeral() ? nullptr : &(cp_mgr())}; }
 
 BtreeRouteTracer& BtreeBase::route_tracer() { return m_route_tracer; }

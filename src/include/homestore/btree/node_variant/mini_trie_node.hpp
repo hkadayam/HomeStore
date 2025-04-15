@@ -769,7 +769,7 @@ protected:
         memcpy(raw_data_ptr, val_blob.cbytes(), val_blob.size());
 
         // Increment the entries and generation number
-        this->inc_entries();
+        this->add_entries(1);
         this->inc_gen();
 
 #ifndef NDEBUG

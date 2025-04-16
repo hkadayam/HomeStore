@@ -154,10 +154,19 @@ public:
         return (get_nth_obj_size(0) * move_out_to_right_by_entries(o, size / get_nth_obj_size(0)));
     }
 
-    void append_copy_in_upto_size(const BtreeNode& o, uint32_t& other_cursor, uint32_t upto_size) override {
+    uint32_t get_entries_size(uint32_t start_idx, uint32_t end_idx) const override {
+        return get_nth_obj_size(0) * (end_idx - start_idx);
+    }
+
+    bool append_copy_in_upto_size(const BtreeNode& o, uint32_t& other_cursor, uint32_t upto_size,
+                                  bool copy_only_if_fits) override {
         auto& other = s_cast< const SimpleNode< K, V >& >(o);
         auto const filled_size = this->occupied_size();
-        if (filled_size >= upto_size) { return; }
+        if (filled_size >= upto_size) { return false; }
+
+        if (copy_only_if_fits) {
+            if (available_size() < other.get_entries_size(other_cursor, other.total_entries())) { return false; }
+        }
 
         DEBUG_ASSERT_LT(other_cursor, other.total_entries(), "Invalid cursor pointed in src node={}",
                         other.to_string());
@@ -173,6 +182,12 @@ public:
         if (other.has_valid_edge() && (other_cursor == other.total_entries())) {
             this->set_edge_info(other.edge_info());
         }
+
+        if (copy_only_if_fits) {
+            DEBUG_ASSERT_EQ(other_cursor, other.total_entries(),
+                            "We proceeded to copy after it checking size, but end up not copying all");
+        }
+        return true;
     }
 
 #if 0

@@ -30,10 +30,6 @@ struct btree_obj_record {
 struct var_node_header {
     uint16_t m_tail_arena_offset; // Tail side of the arena where new keys are inserted
     uint16_t m_available_space;
-    uint16_t m_init_available_space; // remember initial node area size to later use for compaction
-    // TODO:
-    // We really dont require storing m_init_available_space in each node.
-    // Instead add method in variant node to fetch config
 
     uint16_t tail_offset() const { return m_tail_arena_offset; }
     uint16_t available_space() const { return m_available_space; }
@@ -51,6 +47,7 @@ public:
     using BtreeNode::get_nth_obj_size;
     using BtreeNode::get_nth_value;
     using BtreeNode::get_nth_value_size;
+    using BtreeNode::occupied_size;
     using BtreeNode::to_string;
     using VariantNode< K, V >::get_nth_value;
 
@@ -60,7 +57,6 @@ public:
         if (init) {
             // Tail arena points to the edge of the node as data arena grows backwards. Entire space is now available
             // except for the header itself
-            get_var_node_header()->m_init_available_space = this->node_data_size();
             get_var_node_header()->m_tail_arena_offset = this->node_data_size();
             get_var_node_header()->m_available_space =
                 get_var_node_header()->m_tail_arena_offset - sizeof(var_node_header);
@@ -68,10 +64,6 @@ public:
     }
 
     virtual ~VariableNode() = default;
-
-    uint32_t occupied_size() const override {
-        return (get_var_node_header_const()->m_init_available_space - sizeof(var_node_header) - available_size());
-    }
 
     /* Insert the key and value in provided index
      * Assumption: Node lock is already taken */
@@ -192,7 +184,6 @@ public:
         this->sub_entries(this->total_entries());
         this->invalidate_edge();
         this->inc_gen();
-        get_var_node_header()->m_init_available_space = this->node_data_size();
         get_var_node_header()->m_tail_arena_offset = this->node_data_size();
         get_var_node_header()->m_available_space = get_var_node_header()->m_tail_arena_offset - sizeof(var_node_header);
 #ifndef NDEBUG
@@ -294,7 +285,10 @@ public:
     }
 
     uint32_t get_entries_size(uint32_t start_idx, uint32_t end_idx) const override {
-        if ((start_idx == 0) && (end_idx == total_entries())) { return this->occupied_size(); }
+        if ((start_idx == 0) && (end_idx == this->total_entries())) {
+            return (this->occupied_size() - sizeof(var_node_header));
+        }
+
         uint32_t cum_size{0};
         for (uint32_t i = start_idx; i < end_idx; ++i) {
             cum_size += get_nth_key_size(i) + get_nth_value_size(i) + this->get_record_size();
@@ -303,14 +297,19 @@ public:
     }
 
     bool append_copy_in_upto_size(const BtreeNode& o, uint32_t& other_cursor, uint32_t upto_size,
-                                  bool must_fit_all) override {
+                                  bool copy_only_if_fits) override {
         if (occupied_size() >= upto_size) { return false; }
 
-        if (must_fit_all) {
-            if (available_size() < o->get_entries_size(other_cursor, o->total_entries())) { return false; }
+        if (copy_only_if_fits) {
+            if (available_size() < o.get_entries_size(other_cursor, o.total_entries())) { return false; }
         }
         auto const ncopied = copy_by_size(o, other_cursor, upto_size - occupied_size());
         other_cursor += ncopied;
+
+        if (copy_only_if_fits) {
+            DEBUG_ASSERT_EQ(other_cursor, o.total_entries(),
+                            "We proceeded to copy after it checking size, but end up not copying all");
+        }
         return true;
     }
 
@@ -516,7 +515,7 @@ protected:
         uint32_t no_of_entries = this->total_entries();
         if (no_of_entries == 0) {
             // this happens when  there is only entry and in update, we first remove and than insert
-            get_var_node_header()->m_tail_arena_offset = get_var_node_header()->m_init_available_space;
+            get_var_node_header()->m_tail_arena_offset = this->node_data_size();
             LOGTRACEMOD(btree, "Full available size reclaimed");
             return;
         }
@@ -535,7 +534,7 @@ protected:
         std::sort(rec.begin(), rec.begin() + no_of_entries,
                   [](Record const& a, Record const& b) -> bool { return b.m_obj_offset < a.m_obj_offset; });
 
-        uint16_t last_offset = get_var_node_header()->m_init_available_space;
+        uint16_t last_offset = this->node_data_size();
 
         ind = 0;
         uint16_t sparce_space = 0;

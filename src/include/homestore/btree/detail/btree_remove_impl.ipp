@@ -292,6 +292,34 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
                                           uint32_t start_idx, uint32_t end_idx, CPContext* context) {
     if (!m_bt_cfg.m_merge_turned_on) { return btree_status_t::merge_not_required; }
 
+    auto read_child_node = [this, context](BtreeNodePtr const& parent_node, uint32_t idx,
+                                           BtreeNodePtr& child_node) -> btree_status_t {
+        if (idx == parent_node->total_entries()) {
+            BT_NODE_LOG_ASSERT(parent_node->has_valid_edge(), parent_node,
+                               "Assertion failure, expected valid edge for parent node");
+        }
+
+        BtreeLinkInfo child_info;
+        parent_node->get_nth_value(idx, &child_info, false /* copy */);
+
+        auto const ret =
+            read_and_lock_node(child_info.bnode_id(), child_node, locktype_t::WRITE, locktype_t::WRITE, context);
+        if (ret == btree_status_t::success) { BT_NODE_LOG_ASSERT_EQ(child_node->is_node_deleted(), false, child_node); }
+        return ret;
+    };
+
+    enum class Position : uint8_t { first, last };
+    auto erase_node_in_list = [this, &leftmost_node](Position pos, BtreeNodeList& list, bool node_removal,
+                                                     CPContext* context) {
+        auto& node = (pos == Position::first) ? list.front() : list.back();
+        if (node_removal) {
+            remove_node(node, locktype_t::WRITE, context);
+        } else {
+            if (node != leftmost_node) { unlock_node(node, locktype_t::WRITE); }
+        }
+        pos == Position::first ? list.erase(list.end() - 1) : list.erase(list.begin());
+    };
+
     btree_status_t ret{btree_status_t::success};
     BtreeNodeList old_nodes;
     old_nodes.reserve(3);
@@ -303,7 +331,7 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
     // Loop variables
     BtreeNodePtr old_node{leftmost_node};
     BtreeNodePtr new_node{nullptr};
-    uint32_t idx = start_idx + 1;
+    uint32_t idx = start_idx;
     uint32_t src_cursor{0};
     bool dst_filled{false};
     BtreeNodePtr last_new_node{nullptr};
@@ -311,20 +339,10 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
 
     while (idx <= end_idx) {
         if (old_node == nullptr) {
-            if (idx == parent_node->total_entries()) {
-                BT_NODE_LOG_ASSERT(parent_node->has_valid_edge(), parent_node,
-                                   "Assertion failure, expected valid edge for parent node");
-            }
-
-            BtreeLinkInfo child_info;
-            parent_node->get_nth_value(idx, &child_info, false /* copy */);
-
-            ret = read_and_lock_node(child_info.bnode_id(), old_node, locktype_t::WRITE, locktype_t::WRITE, context);
+            ret = read_child_node(parent_node, idx, old_node);
             if (ret != btree_status_t::success) { goto out; }
 
-            BT_NODE_LOG_ASSERT_EQ(old_node->is_node_deleted(), false, old_node);
             old_nodes.push_back(old_node);
-            idx++;
             src_cursor = 0;
         }
 
@@ -333,13 +351,40 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
             new_nodes.emplace_back(new_node);
         }
 
-        new_node->append_copy_in_upto_size(*old_node, src_cursor, m_bt_cfg.ideal_fill_size());
-        if (src_cursor == old_node->total_entries()) {
-            // We have copied all the entries from old_node, so we can move onto next old node
-            old_node = nullptr;
+        if (idx == end_idx) {
+            // Special handling for the last node, we will do the merge of last old node, only if that node can be
+            // completely placed/appended into the new node.
+            auto const copied = new_node->append_copy_in_upto_size(*old_node, src_cursor, m_bt_cfg.ideal_fill_size(),
+                                                                   /*copy_only_if_fits=*/true);
+            if (copied) {
+                // Last old node has been copied to new node, but if that is the only thing the new node has, it means
+                // that we had an empty new node and copied old node into new node (i.e old_node = new_node), so no
+                // point in writing the same node again. We don't need to create new node and don't remove old node
+                if (new_node->total_entries() == old_node->total_entries()) {
+                    erase_node_in_list(Position::last, new_nodes, /*node_removal=*/true, context);
+                    erase_node_in_list(Position::last, old_nodes, /*node_removal=*/false, context);
+                }
+            } else {
+                // Last node doesn't fit into the new node, it is possible that previous old nodes fits into one new
+                // node and we created a second new node, but the last old node doesn't completely fit into the new last
+                // node and hence did not move anything. In that case, we can skip the empty new node.
+                if (new_node->total_entries() == 0) {
+                    erase_node_in_list(Position::last, new_nodes, /*node_removal=*/true, context);
+                }
+                erase_node_in_list(Position::last, old_nodes, /*node_removal=*/false, context);
+            }
+            break;
         } else {
-            // Looks like we have filled the new node, so we need to create a new one
-            new_node = nullptr;
+            new_node->append_copy_in_upto_size(*old_node, src_cursor, m_bt_cfg.ideal_fill_size(),
+                                               /*copy_only_if_fits=*/false);
+            if (src_cursor == old_node->total_entries()) {
+                // We have copied all the entries from old_node, so we can move onto next old node
+                old_node = nullptr;
+                ++idx;
+            } else {
+                // Looks like we have filled the new node, so we need to create a new one
+                new_node = nullptr;
+            }
         }
     }
 
@@ -349,16 +394,8 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
         goto out;
     }
 
-    // First remove the excess entries between new nodes and old nodes
-    {
-        auto const excess = old_nodes.size() - new_nodes.size();
-        if (excess) {
-            parent_node->remove(end_idx + 1 - excess, end_idx);
-            end_idx -= excess;
-        }
-    }
-
-    idx = end_idx;
+    // First remove all old entries for the parent node
+    parent_node->remove(start_idx, start_idx + old_nodes.size() - 1);
     next_node_id = old_nodes.back()->next_bnode();
 
     // Update all the new node entries to parent and while iterating update their node links.
@@ -366,31 +403,34 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
         (*it)->set_next_bnode(next_node_id);
         auto this_node_id = (*it)->node_id();
         if ((*it)->total_entries()) {
-            parent_node->update(idx--, (*it)->get_last_key< K >(), BtreeLinkInfo{this_node_id, 0});
+            parent_node->insert(start_idx, (*it)->get_last_key< K >(), BtreeLinkInfo{this_node_id, 0});
         }
         next_node_id = this_node_id;
     }
 
     // We have cloned the leftmost node and put in as first new node, we need to remove that from list and also copy the
-    // temp node contents back to leftmost_node
+    // temp node contents back to leftmost_node. First old not is nothing but leftmost node, remove that from list.
     leftmost_node->overwrite(*new_nodes[0]);
-    new_nodes.erase(new_nodes.begin());
-    old_nodes.erase(old_nodes.begin());
+    erase_node_in_list(Position::first, new_nodes, /*node_removal=*/true, context);
+    erase_node_in_list(Position::first, old_nodes, /*node_removal=*/false, context);
 
     ret = m_bt_private->transact_nodes(new_nodes, old_nodes, leftmost_node, parent_node, context);
 
 out:
     // Do free/unlock based on success/failure in reverse order
-    if (ret != btree_status_t::success) {
-        for (auto it = old_nodes.rbegin(); it != old_nodes.rend(); ++it) {
-            BT_NODE_LOG(DEBUG, (*it).get(), "Unlocking this node as part of unsuccessful merge");
-            unlock_node(*it, locktype_t::WRITE);
-        }
-        for (auto it = new_nodes.rbegin(); it != new_nodes.rend(); ++it) {
-            BT_NODE_LOG(DEBUG, (*it).get(), "Freeing this new node as part of unsuccessful merge");
-            remove_node(*it, locktype_t::NONE, context);
+    for (auto it = old_nodes.rbegin(); it != old_nodes.rend(); ++it) {
+        if (ret != btree_status_t::success) {
+            if (*it != leftmost_node) { unlock_node(*it, locktype_t::WRITE); }
         }
     }
+    for (auto it = new_nodes.rbegin(); it != new_nodes.rend(); ++it) {
+        if (ret != btree_status_t::success) {
+            remove_node(*it, locktype_t::WRITE, context);
+        } else {
+            unlock_node(*it, locktype_t::WRITE);
+        }
+    }
+
     return ret;
 }
 

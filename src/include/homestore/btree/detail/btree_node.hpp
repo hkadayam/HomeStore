@@ -444,14 +444,16 @@ public:
     /// starting from the cursor, or the occupied size of the current node reaches `upto_size`,
     /// or the current node runs out of available entry slots.
     ///
-    /// @param o The source BtreeNode (expected to be a SimpleNode) to copy entries from.
+    /// @param o The source BtreeNode (expected to be the same variant as this) to copy entries from.
     /// @param other_cursor [in, out] The starting index within `other` node to begin copying.
     ///                     This cursor is advanced by the number of entries successfully copied.
     /// @param upto_size The target maximum occupied size for the current node after appending.
-    /// @note Assumes appropriate node locks are held externally. This implementation does not
-    ///       support the `must_fit_all` parameter from the base class.
+    /// @param copy_only_if_fits Should the copy happen only if all entries from cursor till end fits to `this` node.
+    ///
+    /// @return If any entries have been copied.
+    /// @note Assumes appropriate node locks are held externally.
     virtual bool append_copy_in_upto_size(const BtreeNode& other_node, uint32_t& other_cursor, uint32_t upto_size,
-                                          bool must_fit_all) = 0;
+                                          bool copy_only_if_fits) = 0;
 
 #if 0
     virtual uint32_t copy_by_size(const BtreeNode& other_node, uint32_t start_idx, uint32_t size) = 0;
@@ -461,6 +463,7 @@ public:
 
     virtual uint32_t available_size() const = 0;
     virtual bool has_room_for_put(btree_put_type put_type, uint32_t key_size, uint32_t value_size) const = 0;
+    virtual uint32_t get_entries_size(uint32_t start_idx, uint32_t end_idx) const = 0;
 
     virtual int compare_nth_key(const BtreeKey& cmp_key, uint32_t ind) const = 0;
     virtual void get_nth_key_internal(uint32_t ind, BtreeKey& out_key, bool copykey) const = 0;

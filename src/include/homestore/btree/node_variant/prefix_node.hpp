@@ -554,10 +554,26 @@ public:
 
 #endif
 
-    void append_copy_in_upto_size(const BtreeNode& other_node, uint32_t& other_cursor, uint32_t upto_size) override {
-        if (occupied_size() >= upto_size) { return; }
-        auto const ncopied = copy_internal(other_node, other_cursor, true /* by_size*/, upto_size - occupied_size());
+    uint32_t get_entries_size(uint32_t start_idx, uint32_t end_idx) const override {
+        return get_nth_obj_size(0) * (end_idx - start_idx);
+    }
+
+    bool append_copy_in_upto_size(const BtreeNode& other, uint32_t& other_cursor, uint32_t upto_size,
+                                  bool copy_only_if_fits) override {
+        if (occupied_size() >= upto_size) { return false; }
+
+        if (copy_only_if_fits) {
+            if (available_size() < other.get_entries_size(other_cursor, other.total_entries())) { return false; }
+        }
+
+        auto const ncopied = copy_internal(other, other_cursor, true /* by_size*/, upto_size - occupied_size());
         other_cursor += ncopied;
+
+        if (copy_only_if_fits) {
+            DEBUG_ASSERT_EQ(other_cursor, other.total_entries(),
+                            "We proceeded to copy after it checking size, but end up not copying all");
+        }
+        return true;
     }
 
     uint32_t copy_internal(BtreeNode const& o, uint32_t start_idx, bool by_size, uint32_t limit) {

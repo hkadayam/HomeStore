@@ -313,11 +313,11 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
                                                      CPContext* context) {
         auto& node = (pos == Position::first) ? list.front() : list.back();
         if (node_removal) {
-            remove_node(node, locktype_t::WRITE, context);
+            remove_node(node, locktype_t::NONE, context);
         } else {
             if (node != leftmost_node) { unlock_node(node, locktype_t::WRITE); }
         }
-        pos == Position::first ? list.erase(list.end() - 1) : list.erase(list.begin());
+        pos == Position::first ? list.erase(list.begin()) : list.erase(list.end() - 1);
     };
 
     btree_status_t ret{btree_status_t::success};
@@ -394,11 +394,16 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
         goto out;
     }
 
-    // First remove all old entries for the parent node
-    parent_node->remove(start_idx, start_idx + old_nodes.size() - 1);
-    next_node_id = old_nodes.back()->next_bnode();
+    // First remove all old entries to be removed for the parent node
+    parent_node->remove(start_idx + 1, start_idx + old_nodes.size() - 1);
+
+    // We have cloned the leftmost node and put in as first new node, we need to remove that from list and also copy the
+    // temp node contents back to leftmost_node.
+    leftmost_node->overwrite(*new_nodes[0]);
+    erase_node_in_list(Position::first, new_nodes, /*node_removal=*/true, context);
 
     // Update all the new node entries to parent and while iterating update their node links.
+    next_node_id = old_nodes.back()->next_bnode();
     for (auto it = new_nodes.rbegin(); it != new_nodes.rend(); ++it) {
         (*it)->set_next_bnode(next_node_id);
         auto this_node_id = (*it)->node_id();
@@ -408,10 +413,14 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
         next_node_id = this_node_id;
     }
 
-    // We have cloned the leftmost node and put in as first new node, we need to remove that from list and also copy the
-    // temp node contents back to leftmost_node. First old not is nothing but leftmost node, remove that from list.
-    leftmost_node->overwrite(*new_nodes[0]);
-    erase_node_in_list(Position::first, new_nodes, /*node_removal=*/true, context);
+    // Finally update the leftmost node with latest key
+    leftmost_node->set_next_bnode(next_node_id);
+    if (leftmost_node->total_entries()) {
+        leftmost_node->inc_link_version();
+        parent_node->update(start_idx, leftmost_node->get_last_key< K >(), leftmost_node->link_info());
+    }
+
+    // First old not is nothing but leftmost node, remove that from list.
     erase_node_in_list(Position::first, old_nodes, /*node_removal=*/false, context);
 
     ret = m_bt_private->transact_nodes(new_nodes, old_nodes, leftmost_node, parent_node, context);
@@ -425,7 +434,7 @@ out:
     }
     for (auto it = new_nodes.rbegin(); it != new_nodes.rend(); ++it) {
         if (ret != btree_status_t::success) {
-            remove_node(*it, locktype_t::WRITE, context);
+            remove_node(*it, locktype_t::NONE, context);
         } else {
             unlock_node(*it, locktype_t::WRITE);
         }

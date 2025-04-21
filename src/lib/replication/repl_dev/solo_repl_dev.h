@@ -40,7 +40,7 @@ public:
     virtual ~SoloReplDev() = default;
 
     void async_alloc_write(sisl::blob const& header, sisl::blob const& key, sisl::sg_list const& value,
-                           repl_req_ptr_t ctx, trace_id_t tid = 0) override;
+                           repl_req_ptr_t ctx, bool part_of_batch = false, trace_id_t tid = 0) override;
 
     folly::Future< std::error_code > async_read(MultiBlkId const& bid, sisl::sg_list& sgs, uint32_t size,
                                                 bool part_of_batch = false, trace_id_t tid = 0) override;

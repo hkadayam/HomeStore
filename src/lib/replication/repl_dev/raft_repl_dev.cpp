@@ -319,7 +319,7 @@ void RaftReplDev::on_create_snapshot(nuraft::snapshot& s, nuraft::async_result< 
 }
 
 void RaftReplDev::async_alloc_write(sisl::blob const& header, sisl::blob const& key, sisl::sg_list const& data,
-                                    repl_req_ptr_t rreq, trace_id_t tid) {
+                                    repl_req_ptr_t rreq, bool part_of_batch, trace_id_t tid) {
     if (!rreq) { auto rreq = repl_req_ptr_t(new repl_req_ctx{}); }
 
     {

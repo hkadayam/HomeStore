@@ -27,10 +27,14 @@ namespace homestore {
 template < typename K, typename V >
 class SimpleNode : public VariantNode< K, V > {
 public:
-    SimpleNode(uint8_t* node_buf, bnodeid_t id, bool init, bool is_leaf, uint32_t node_size,
-               bool is_temp_node = false) :
-            VariantNode< K, V >(node_buf, id, init, is_leaf, node_size, is_temp_node) {
+    SimpleNode(bnodeid_t id, bool is_leaf, uint32_t node_size, BtreeNode::Allocator::Token token) :
+            VariantNode< K, V >(id, is_leaf, node_size, token) {
         this->set_node_type(btree_node_type::FIXED);
+    }
+
+    SimpleNode(uint8_t* node_buf, bnodeid_t id, BtreeNode::Allocator::Token token) :
+            VariantNode< K, V >(node_buf, id, token) {
+        DEBUG_ASSERT_EQ(this->get_node_type(), btree_node_type::FIXED);
     }
 
     virtual ~SimpleNode() = default;
@@ -42,6 +46,7 @@ public:
     using BtreeNode::get_nth_value;
     using BtreeNode::get_nth_value_size;
     using BtreeNode::inc_gen;
+    using BtreeNode::occupied_size;
     using BtreeNode::sub_entries;
     using BtreeNode::to_string;
     using BtreeNode::total_entries;
@@ -161,17 +166,20 @@ public:
     bool append_copy_in_upto_size(const BtreeNode& o, uint32_t& other_cursor, uint32_t upto_size,
                                   bool copy_only_if_fits) override {
         auto& other = s_cast< const SimpleNode< K, V >& >(o);
-        auto const filled_size = this->occupied_size();
-        if (filled_size >= upto_size) { return false; }
+        if (occupied_size() >= upto_size) { return false; }
+        if (other.total_entries() == 0) { return true; }
+        auto const room = upto_size - occupied_size();
 
         if (copy_only_if_fits) {
-            if (available_size() < other.get_entries_size(other_cursor, other.total_entries())) { return false; }
+            // Whats going to come in is more than what we are supposed to accept or what has been available. std::min
+            // check here is to ensure that even though we have available space, but if it exceeds requested upto_size,
+            // then bail out.
+            if (other.get_entries_size(other_cursor, other.total_entries()) > room) { return false; }
         }
 
         DEBUG_ASSERT_LT(other_cursor, other.total_entries(), "Invalid cursor pointed in src node={}",
                         other.to_string());
-        auto const nentries =
-            std::min((upto_size - filled_size) / get_nth_obj_size(0), other.total_entries() - other_cursor);
+        auto const nentries = std::min(room / get_nth_obj_size(0), other.total_entries() - other_cursor);
         std::memcpy(get_nth_obj(total_entries()), other.get_nth_obj_const(other_cursor),
                     nentries * get_nth_obj_size(0));
         other_cursor += nentries;

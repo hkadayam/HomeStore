@@ -15,8 +15,8 @@
  *********************************************************************************/
 
 #pragma once
-#include <iostream>
-#include <queue>
+#include <cstdint>
+#include <functional>
 #include <iomgr/fiber_lib.hpp>
 
 #include <sisl/utility/atomic_counter.hpp>
@@ -25,12 +25,6 @@
 #include <homestore/btree/detail/btree_internal.hpp>
 #include <homestore/btree/btree_kv.hpp>
 #include <homestore/crc.h>
-
-#ifndef TEST_BNODE_ONLY
-#include <homestore/btree/btree_store.h>
-#include <homestore/index_service.hpp>
-#include <homestore/index/index_common.h>
-#endif
 
 namespace homestore {
 ENUM(locktype_t, uint8_t, NONE, READ, WRITE)
@@ -89,46 +83,91 @@ public:
     };
 #pragma pack()
 
-    uint8_t* m_phys_node_buf; // Pointer to the physical node buffer
-    mutable iomgr::FiberManagerLib::shared_mutex m_lock;
+    struct Allocator {
+        using Token = uint8_t;
+        std::function< uint8_t*(uint32_t size) > alloc_btree_node;
+        std::function< void(BtreeNode* node) > free_btree_node;
+        std::function< uint8_t*(uint32_t size) > alloc_node_buf;
+        std::function< void(uint8_t*) > free_node_buf;
+        static constexpr Token default_token = 0;
+
+        Allocator() :
+                alloc_btree_node{[](uint32_t size) -> uint8_t* { return new uint8_t[size]; }},
+                free_btree_node{[](BtreeNode* node) { delete[] uintptr_cast(node); }},
+                alloc_node_buf{[](uint32_t size) { return new uint8_t[size]; }},
+                free_node_buf{[](uint8_t* buf) { delete[] buf; }} {}
+
+        Allocator(std::function< uint8_t*(uint32_t size) > alloc_node_cb,
+                  std::function< void(BtreeNode* node) > free_node_cb,
+                  std::function< uint8_t*(uint32_t size) > alloc_buf_cb, std::function< void(uint8_t*) > free_buf_cb) :
+                alloc_btree_node{std::move(alloc_node_cb)},
+                free_btree_node{std::move(free_node_cb)},
+                alloc_node_buf{std::move(alloc_buf_cb)},
+                free_node_buf{std::move(free_buf_cb)} {}
+        Allocator(const Allocator& b) = default;
+        Allocator(Allocator&& b) = default;
+        Allocator& operator=(const Allocator& b) = default;
+        Allocator& operator=(Allocator&& b) = default;
+        ~Allocator() = default;
+
+        struct List {
+            std::vector< Allocator > vec;
+            std::mutex mtx;
+            List() : vec{1, Allocator{}} {}
+        };
+
+        static List& allocators() {
+            static List s_allocators;
+            return s_allocators;
+        }
+
+        static Allocator& get(Allocator::Token token) { return allocators().vec[token]; }
+        static Token add(Allocator a) {
+            std::unique_lock lg{allocators().mtx};
+            allocators().vec.emplace_back(std::move(a));
+            return s_cast< Allocator::Token >(allocators().vec.size() - 1);
+        }
+
+        static void remove(Token t) {
+            std::unique_lock lg{allocators().mtx};
+            if (t == allocators().vec.size() - 1) {
+                allocators().vec.erase(allocators().vec.end() - 1);
+            } else {
+                allocators().vec[t] = Allocator{};
+            }
+        }
+    };
+
+    uint8_t* m_phys_node_buf;                      // Pointer to the physical node buffer
     sisl::atomic_counter< int32_t > m_refcount{0}; // Refcount of the node
 
-#ifndef TEST_BNODE_ONLY
-    IndexStore::Type m_store_type{IndexStore::Type::COPY_ON_WRITE_BTREE};
-#endif
-    uint8_t m_is_temp_node : 1 {0}; // Is this a temporary node, not attached to any btree?
+    Allocator::Token m_token;
+    std::atomic< uint8_t > m_phys_buf_share_count{0};
+    uint16_t m_variant_private_data{0}; // Data specific to variant (to reuse this wasted 16 bit space)
+
+    mutable iomgr::FiberManagerLib::shared_mutex m_lock;
 
 public:
-    BtreeNode(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf, uint32_t node_size,
-              bool is_temp_node = false) :
-            m_phys_node_buf{node_buf} {
-        if (init_buf) {
-            new (node_buf) PersistentHeader{};
-            set_node_id(id);
-            set_leaf(is_leaf);
-            set_node_size(node_size);
-        } else {
-            DEBUG_ASSERT_EQ(node_id(), id);
-            DEBUG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC);
-            DEBUG_ASSERT_EQ(version(), BTREE_NODE_VERSION);
-        }
-        m_is_temp_node = is_temp_node;
+    BtreeNode(bnodeid_t id, bool is_leaf, uint32_t node_size, Allocator::Token token) :
+            m_phys_node_buf{Allocator::get(token).alloc_node_buf(node_size)}, m_token{token} {
+        new (m_phys_node_buf) PersistentHeader{};
+        set_node_id(id);
+        set_leaf(is_leaf);
+        set_node_size(node_size);
+    }
+
+    BtreeNode(uint8_t* node_buf, bnodeid_t id, Allocator::Token token) : m_phys_node_buf{node_buf}, m_token{token} {
+        DEBUG_ASSERT_EQ(node_id(), id);
+        DEBUG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC);
+        DEBUG_ASSERT_EQ(version(), BTREE_NODE_VERSION);
     }
 
     virtual ~BtreeNode() {
-        if (m_is_temp_node) {
-            delete[] m_phys_node_buf;
-        }
-#ifndef TEST_BNODE_ONLY
-        else {
-            s_cast< BtreeStore* >(index_service().lookup_store(m_store_type))->on_node_freed(this);
-        }
-#endif
+        DEBUG_ASSERT_EQ(m_phys_buf_share_count.load(), 0,
+                        "We are being asked to destruct node while its buffer is still shared");
+        Allocator::get(m_token).free_node_buf(m_phys_node_buf);
+        if (Allocator::get(m_token).free_btree_node) { Allocator::get(m_token).free_btree_node(this); }
     }
-
-#ifndef TEST_BNODE_ONLY
-    void set_store_type(IndexStore::Type store) { m_store_type = store; }
-#endif
 
     // Identify if a node is a leaf node or not, from raw buffer, by just reading PersistentHeader
     static bool identify_leaf_node(uint8_t* buf) { return (r_cast< PersistentHeader* >(buf))->leaf; }
@@ -515,8 +554,37 @@ protected:
     }
 
 public:
-    uint8_t* get_phys_node_buf() { return m_phys_node_buf; }
-    void set_phys_node_buf(uint8_t* buf) { m_phys_node_buf = buf; }
+    uint8_t* share_phys_node_buf() {
+        uint8_t* old_phys_buf{nullptr};
+        auto share_count = m_phys_buf_share_count.load();
+        if (share_count != 0) {
+            // Buffer was already shared with another party, we need to make a copy and share the new one
+            auto new_buf = Allocator::get(m_token).alloc_node_buf(node_size());
+            std::memcpy(new_buf, m_phys_node_buf, node_size());
+            old_phys_buf = m_phys_node_buf;
+            m_phys_node_buf = new_buf;
+        }
+        share_count = m_phys_buf_share_count.fetch_add(1);
+        if (old_phys_buf && (share_count == 0)) {
+            // We have checked if buffer was shared and actually copied the buffer, but before we increment the counter,
+            // release_buf has been called and reduced the count to 1. If thats the case, we have 2 unshared buffers and
+            // one of them has to be freed
+            Allocator::get(m_token).free_node_buf(old_phys_buf);
+        }
+        return m_phys_node_buf;
+    }
+
+    void release_phys_node_buf(uint8_t* buf) {
+        auto const cur_count = m_phys_buf_share_count.fetch_sub(1);
+        if (cur_count > 1) {
+            // After sharing, the phys_node_buf was copied and modified, this release is not for the buf that is
+            // currently held, so we have to free the buf
+            DEBUG_ASSERT_NE((void*)buf, (void*)m_phys_node_buf,
+                            "We are asked to release current version buf, but with shared count more than 1, which "
+                            "means there is some out-of-order release going on");
+            Allocator::get(m_token).free_node_buf(buf);
+        }
+    }
 
     PersistentHeader* get_persistent_header() { return r_cast< PersistentHeader* >(m_phys_node_buf); }
     const PersistentHeader* get_persistent_header_const() const {
@@ -613,6 +681,7 @@ public:
             // Do not delete it here, since node is generally an offset inside actual allocation and delete will fail
             // here (with asan). So let the on_node_freed from the underlying store delete the allocation.
             node->~BtreeNode();
+            // delete node;
         }
     }
 };

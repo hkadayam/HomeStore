@@ -15,6 +15,7 @@
  *********************************************************************************/
 #pragma once
 #include <homestore/btree/btree.hpp>
+#include <homestore/btree/btree_store.h>
 
 namespace homestore {
 

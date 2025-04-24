@@ -286,10 +286,9 @@ BtreeNodePtr BtreeBase::create_interior_node(CPContext* context) {
 }
 
 BtreeNodePtr BtreeBase::clone_temp_node(const BtreeNode& node) {
-    BtreeNode* tmp_node = init_node(new uint8_t[node.node_size()], node.node_id(), true /* init_buf*/, node.is_leaf(),
-                                    0 /*  ctx_size*/, true /* temp_node*/);
+    BtreeNodePtr tmp_node = new_node(node.node_id(), node.is_leaf(), BtreeNode::Allocator::default_token);
     tmp_node->overwrite(node);
-    return BtreeNodePtr{tmp_node};
+    return tmp_node;
 }
 
 [[nodiscard]] CPGuard BtreeBase::bt_cp_guard() { return CPGuard{is_ephemeral() ? nullptr : &(cp_mgr())}; }

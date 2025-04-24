@@ -51,17 +51,14 @@ public:
     using BtreeNode::to_string;
     using VariantNode< K, V >::get_nth_value;
 
-    VariableNode(uint8_t* node_buf, bnodeid_t id, bool init, bool is_leaf, uint32_t node_size,
-                 bool is_temp_node = false) :
-            VariantNode< K, V >(node_buf, id, init, is_leaf, node_size, is_temp_node) {
-        if (init) {
-            // Tail arena points to the edge of the node as data arena grows backwards. Entire space is now available
-            // except for the header itself
-            get_var_node_header()->m_tail_arena_offset = this->node_data_size();
-            get_var_node_header()->m_available_space =
-                get_var_node_header()->m_tail_arena_offset - sizeof(var_node_header);
-        }
+    VariableNode(bnodeid_t id, bool is_leaf, uint32_t node_size, BtreeNode::Allocator::Token token) :
+            VariantNode< K, V >(id, is_leaf, node_size, token) {
+        get_var_node_header()->m_tail_arena_offset = this->node_data_size();
+        get_var_node_header()->m_available_space = get_var_node_header()->m_tail_arena_offset - sizeof(var_node_header);
     }
+
+    VariableNode(uint8_t* node_buf, bnodeid_t id, BtreeNode::Allocator::Token token) :
+            VariantNode< K, V >(node_buf, id, token) {}
 
     virtual ~VariableNode() = default;
 
@@ -299,11 +296,13 @@ public:
     bool append_copy_in_upto_size(const BtreeNode& o, uint32_t& other_cursor, uint32_t upto_size,
                                   bool copy_only_if_fits) override {
         if (occupied_size() >= upto_size) { return false; }
+        if (o.total_entries() == 0) { return true; }
+        auto const room = upto_size - occupied_size();
 
         if (copy_only_if_fits) {
-            if (available_size() < o.get_entries_size(other_cursor, o.total_entries())) { return false; }
+            if (o.get_entries_size(other_cursor, o.total_entries()) > room) { return false; }
         }
-        auto const ncopied = copy_by_size(o, other_cursor, upto_size - occupied_size());
+        auto const ncopied = copy_by_size(o, other_cursor, room);
         other_cursor += ncopied;
 
         if (copy_only_if_fits) {
@@ -607,11 +606,16 @@ protected:
 template < typename K, typename V >
 class VarKeySizeNode : public VariableNode< K, V > {
 public:
-    VarKeySizeNode(uint8_t* node_buf, bnodeid_t id, bool init, bool is_leaf, uint32_t node_size,
-                   bool is_temp_node = false) :
-            VariableNode< K, V >(node_buf, id, init, is_leaf, node_size, is_temp_node) {
+    VarKeySizeNode(bnodeid_t id, bool is_leaf, uint32_t node_size, BtreeNode::Allocator::Token token) :
+            VariableNode< K, V >(id, is_leaf, node_size, token) {
         this->set_node_type(btree_node_type::VAR_KEY);
     }
+
+    VarKeySizeNode(uint8_t* node_buf, bnodeid_t id, BtreeNode::Allocator::Token token) :
+            VariableNode< K, V >(node_buf, id, token) {
+        DEBUG_ASSERT_EQ(this->get_node_type(), btree_node_type::VAR_KEY);
+    }
+
     virtual ~VarKeySizeNode() = default;
 
     uint32_t get_nth_key_size(uint32_t ind) const override {
@@ -640,11 +644,16 @@ private:
 template < typename K, typename V >
 class VarValueSizeNode : public VariableNode< K, V > {
 public:
-    VarValueSizeNode(uint8_t* node_buf, bnodeid_t id, bool init, bool is_leaf, uint32_t node_size,
-                     bool is_temp_node = false) :
-            VariableNode< K, V >(node_buf, id, init, is_leaf, node_size, is_temp_node) {
+    VarValueSizeNode(bnodeid_t id, bool is_leaf, uint32_t node_size, BtreeNode::Allocator::Token token) :
+            VariableNode< K, V >(id, is_leaf, node_size, token) {
         this->set_node_type(btree_node_type::VAR_VALUE);
     }
+
+    VarValueSizeNode(uint8_t* node_buf, bnodeid_t id, BtreeNode::Allocator::Token token) :
+            VariableNode< K, V >(node_buf, id, token) {
+        DEBUG_ASSERT_EQ(this->get_node_type(), btree_node_type::VAR_VALUE);
+    }
+
     virtual ~VarValueSizeNode() = default;
 
     uint32_t get_nth_key_size(uint32_t ind) const override { return dummy_key< K >.serialized_size(); }
@@ -673,11 +682,16 @@ private:
 template < typename K, typename V >
 class VarObjSizeNode : public VariableNode< K, V > {
 public:
-    VarObjSizeNode(uint8_t* node_buf, bnodeid_t id, bool init, bool is_leaf, uint32_t node_size,
-                   bool is_temp_node = false) :
-            VariableNode< K, V >(node_buf, id, init, is_leaf, node_size, is_temp_node) {
+    VarObjSizeNode(bnodeid_t id, bool is_leaf, uint32_t node_size, BtreeNode::Allocator::Token token) :
+            VariableNode< K, V >(id, is_leaf, node_size, token) {
         this->set_node_type(btree_node_type::VAR_OBJECT);
     }
+
+    VarObjSizeNode(uint8_t* node_buf, bnodeid_t id, BtreeNode::Allocator::Token token) :
+            VariableNode< K, V >(node_buf, id, token) {
+        DEBUG_ASSERT_EQ(this->get_node_type(), btree_node_type::VAR_OBJECT);
+    }
+
     virtual ~VarObjSizeNode() = default;
 
     uint32_t get_nth_key_size(uint32_t ind) const override {

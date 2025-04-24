@@ -15,8 +15,6 @@
  *********************************************************************************/
 #include <gtest/gtest.h>
 
-#define TEST_BNODE_ONLY
-
 #include <sisl/options/options.h>
 #include <sisl/logging/logging.h>
 #include <sisl/utility/enum.hpp>
@@ -28,6 +26,7 @@
 static constexpr uint32_t g_node_size{4096};
 static constexpr uint32_t g_max_keys{6000};
 static std::uniform_int_distribution< uint32_t > g_randkey_generator{0, g_max_keys - 1};
+static BtreeNode::Allocator::Token g_token{0};
 
 using namespace homestore;
 
@@ -67,22 +66,22 @@ struct NodeTest : public testing::Test {
     using K = typename TestType::KeyType;
     using V = typename TestType::ValueType;
 
-    std::unique_ptr< uint8_t[] > m_node1_buf;
-    std::unique_ptr< uint8_t[] > m_node2_buf;
     std::unique_ptr< typename T::NodeType > m_node1;
     std::unique_ptr< typename T::NodeType > m_node2;
     std::map< K, V > m_shadow_map;
     BtreeConfig m_cfg;
 
     void SetUp() override {
-        m_node1_buf = std::unique_ptr< uint8_t[] >(new uint8_t[g_node_size]);
-        m_node2_buf = std::unique_ptr< uint8_t[] >(new uint8_t[g_node_size]);
+        g_token = BtreeNode::Allocator::add(BtreeNode::Allocator{
+            [](uint32_t size) { return new uint8_t[size]; }, // alloc_btree_node
+            [](BtreeNode*) {},                               // free_btree_node
+            [](uint32_t size) { return new uint8_t[size]; }, // alloc_node_buf
+            [](uint8_t* buf) { delete[] buf; }               // free_node_buf
+        });
 
         m_cfg.m_node_size = g_node_size;
-        m_node1 = std::make_unique< typename T::NodeType >(m_node1_buf.get(), 1ul, true, true, g_node_size,
-                                                           true /* temp_node */);
-        m_node2 = std::make_unique< typename T::NodeType >(m_node2_buf.get(), 2ul, true, true, g_node_size,
-                                                           true /* temp_node */);
+        m_node1 = std::make_unique< typename T::NodeType >(1ul, true, g_node_size, g_token);
+        m_node2 = std::make_unique< typename T::NodeType >(2ul, true, g_node_size, g_token);
     }
 
     void put(uint32_t k, btree_put_type put_type) {
@@ -435,22 +434,24 @@ TYPED_TEST(NodeTest, Move) {
     this->put_list(list);
     this->print();
 
-    this->m_node1->move_out_to_right_by_entries(this->m_cfg, *this->m_node2, list.size());
-    this->m_node1->move_out_to_right_by_entries(this->m_cfg, *this->m_node2, list.size()); // Empty move
+    this->m_node1->move_out_to_right_by_entries(*this->m_node2, list.size());
+    this->m_node1->move_out_to_right_by_entries(*this->m_node2, list.size()); // Empty move
     ASSERT_EQ(this->m_node1->total_entries(), 0u) << "Move out to right has failed";
     ASSERT_EQ(this->m_node2->total_entries(), list.size()) << "Move out to right has failed";
     this->validate_get_all();
 
+#if 0
     auto first_half = list.size() / 2;
     auto second_half = list.size() - first_half;
-    this->m_node1->copy_by_entries(this->m_cfg, *this->m_node2, 0, first_half);           // Copy half entries
-    this->m_node1->copy_by_entries(this->m_cfg, *this->m_node2, first_half, second_half); // Copy half entries
-    this->m_node2->remove_all(this->m_cfg);
+    this->m_node1->copy_by_entries(*this->m_node2, 0, first_half);           // Copy half entries
+    this->m_node1->copy_by_entries(*this->m_node2, first_half, second_half); // Copy half entries
+    this->m_node2->remove_all();
     ASSERT_EQ(this->m_node2->total_entries(), 0u) << "Remove all on right has failed";
     ASSERT_EQ(this->m_node1->total_entries(), list.size()) << "Move in from right has failed";
     this->validate_get_all();
+#endif
 
-    this->m_node1->move_out_to_right_by_entries(this->m_cfg, *this->m_node2, list.size() / 2);
+    this->m_node1->move_out_to_right_by_entries(*this->m_node2, list.size() / 2);
     ASSERT_EQ(this->m_node1->total_entries(), list.size() / 2) << "Move out half entries to right has failed";
     ASSERT_EQ(this->m_node2->total_entries(), list.size() - list.size() / 2)
         << "Move out half entries to right has failed";

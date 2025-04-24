@@ -50,10 +50,6 @@ COWBtreeNode::FlushInfo COWBtreeNode::prepare_flush_buf(COWBtree const& bt, Btre
             auto new_buf = hs_utils::iobuf_alloc(node->node_size(), sisl::buftag::btree_node, bt.align_size());
             std::memcpy(new_buf, node->get_phys_node_buf(), node->node_size());
             ret_buf = new_buf;
-
-            // Release the existing buffer, which should free them if it is not shared. If it is shared, the one
-            // which switch from shared to exclusive will free the buffer
-            release_buf(node->get_phys_node_buf());
             node->set_phys_node_buf(new_buf);
         }
     } else {

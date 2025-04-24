@@ -74,7 +74,7 @@ public:
     ////////////////// Override Implementation of underlying store requirements //////////////////
     unique< UnderlyingBtree > create_underlying_btree(BtreeBase& btree, bool load_existing) override;
     folly::Future< folly::Unit > destroy_underlying_btree(BtreeBase& bt) override;
-    void on_node_freed(BtreeNode* node) override;
+    // void on_node_freed(BtreeNode* node) override;
     bool is_fast_destroy_supported() const override { return true; }
     bool is_ephemeral() const { return false; }
     uint32_t max_node_size() const override;

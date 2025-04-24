@@ -9,7 +9,7 @@
 
 #include "common/large_id_reserver.hpp"
 #include "common/concurrent_vector.hpp"
-#include "index/cow_btree/cow_btree_node.h"
+//#include "index/cow_btree/cow_btree_node.h"
 
 namespace homestore {
 class COWBtreeCPContext;
@@ -18,10 +18,36 @@ class VirtualDev;
 class COWBtree : public UnderlyingBtree {
 public:
     struct Journal;
+    struct FlushNodeInfo {
+        BtreeNodePtr node;
+        uint8_t* buf{nullptr};
+
+        FlushNodeInfo() = default;
+        FlushNodeInfo(BtreeNodePtr n) : node{std::move(n)}, buf{node->share_phys_node_buf()} {}
+        FlushNodeInfo(FlushNodeInfo const& other) = delete;
+        FlushNodeInfo& operator=(FlushNodeInfo const& other) = delete;
+        FlushNodeInfo(FlushNodeInfo&& other) {
+            node = std::move(other.node);
+            buf = other.buf;
+            other.buf = nullptr;
+        }
+
+        FlushNodeInfo& operator=(FlushNodeInfo&& other) {
+            node = std::move(other.node);
+            buf = other.buf;
+            other.buf = nullptr;
+            return *this;
+        }
+
+        ~FlushNodeInfo() {
+            if (node) { node->release_phys_node_buf(buf); }
+        }
+        uint8_t* bytes() { return buf; }
+    };
 
 public:
     COWBtree(BtreeBase& bt, shared< VirtualDev > vdev, shared< sisl::SimpleCache< bnodeid_t, BtreeNodePtr > > cache,
-             std::vector< unique< Journal > > journal_bufs, bool load_existing);
+             std::vector< unique< Journal > > journal_bufs, BtreeNode::Allocator::Token token, bool load_existing);
     virtual ~COWBtree() = default;
 
     // All overridden methods of UndelyingBtree class
@@ -38,7 +64,7 @@ public:
     uint64_t space_occupied() const override;
 
     bnodeid_t generate_node_id();
-    void add_to_dirty_list(COWBtreeNode::FlushInfo fentity, COWBtreeCPContext* cp_ctx);
+    void add_to_dirty_list(FlushNodeInfo finfo, COWBtreeCPContext* cp_ctx);
     void add_to_remove_list(bnodeid_t node_id, COWBtreeCPContext* cp_ctx);
     void destroy();
 
@@ -202,7 +228,7 @@ public:
 
     // using DirtyNodeList = sisl::ConcurrentInsertVector< BtreeNodePtr >;
     // using DeletedNodeList = sisl::ConcurrentInsertVector< CompactNodeId >;
-    using DirtyNodeList = ConcurrentVector< COWBtreeNode::FlushInfo >;
+    using DirtyNodeList = ConcurrentVector< FlushNodeInfo >;
     using DeletedNodeList = ConcurrentVector< CompactNodeId >;
 
     struct CPSession {
@@ -275,6 +301,7 @@ private:
     // Flush related structures
     iomgr::FiberManagerLib::mutex m_flush_mtx;
     iomgr::FiberManagerLib::mutex m_id_mtx;
+    BtreeNode::Allocator::Token m_bufalloc_token;
 
 private:
     void update_bnode_map(CompactNodeId nodeid, CompactBlkId blkid, bool in_recovery);

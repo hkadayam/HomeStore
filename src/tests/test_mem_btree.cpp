@@ -85,7 +85,7 @@ struct VarObjSizeBtreeTest {
 struct PrefixIntervalBtreeTest {
     using KeyType = TestIntervalKey;
     using ValueType = TestIntervalValue;
-    static constexpr btree_node_type leaf_node_type = btree_node_type::PREFIX;
+    static constexpr btree_node_type leaf_node_type = btree_node_type::FIXED_PREFIX;
     static constexpr btree_node_type interior_node_type = btree_node_type::FIXED;
     static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };

@@ -53,7 +53,7 @@ class HomestoreConan(ConanFile):
 
     def requirements(self):
         self.requires("iomgr/[^12.1]@oss/master", transitive_headers=True)
-        self.requires("sisl/[^13.2]@oss/master", transitive_headers=True)
+        self.requires("sisl/[^13.3]@oss/master", transitive_headers=True)
         self.requires("nuraft_mesg/[^4.1]@oss/main", transitive_headers=True)
 
         self.requires("farmhash/cci.20190513@", transitive_headers=True)

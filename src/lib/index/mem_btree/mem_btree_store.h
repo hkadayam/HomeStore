@@ -18,7 +18,7 @@ public:
 
     unique< UnderlyingBtree > create_underlying_btree(BtreeBase& btree, bool load_existing) override;
     folly::Future< folly::Unit > destroy_underlying_btree(BtreeBase&) override { return folly::makeFuture(); }
-    void on_node_freed(BtreeNode* node) override;
+    // void on_node_freed(BtreeNode* node) override;
     bool is_fast_destroy_supported() const override { return true; }
     bool is_ephemeral() const override { return true; }
     uint32_t max_node_size() const override { return 4096u; }
@@ -41,7 +41,7 @@ public:
 
 private:
     BtreeBase& m_base_btree;
-    std::vector< std::shared_ptr< uint8_t[] > > node_buf_ptr_vec;
+    // std::vector< std::shared_ptr< uint8_t[] > > node_buf_ptr_vec;
 };
 
 } // namespace homestore

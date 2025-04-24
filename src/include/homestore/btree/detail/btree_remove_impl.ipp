@@ -308,30 +308,27 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
         return ret;
     };
 
-    enum class Position : uint8_t { first, last };
-    auto erase_node_in_list = [this, &leftmost_node](Position pos, BtreeNodeList& list, bool node_removal,
-                                                     CPContext* context) {
-        auto& node = (pos == Position::first) ? list.front() : list.back();
+    auto erase_last_node_in_list = [this, &leftmost_node](BtreeNodeList& list, bool node_removal, CPContext* context) {
+        auto& node = list.back();
         if (node_removal) {
             remove_node(node, locktype_t::NONE, context);
         } else {
-            if (node != leftmost_node) { unlock_node(node, locktype_t::WRITE); }
+            unlock_node(node, locktype_t::WRITE);
         }
-        pos == Position::first ? list.erase(list.begin()) : list.erase(list.end() - 1);
+        list.erase(list.end() - 1);
     };
 
     btree_status_t ret{btree_status_t::success};
     BtreeNodeList old_nodes;
-    old_nodes.reserve(3);
-    old_nodes.push_back(leftmost_node);
-
     BtreeNodeList new_nodes;
+    old_nodes.reserve(3);
     new_nodes.reserve(3);
 
     // Loop variables
-    BtreeNodePtr old_node{leftmost_node};
-    BtreeNodePtr new_node{nullptr};
-    uint32_t idx = start_idx;
+    BtreeNodePtr old_node{nullptr};
+    BtreeNodePtr cloned_new_node{clone_temp_node(*leftmost_node)};
+    BtreeNodePtr new_node{cloned_new_node};
+    uint32_t idx = start_idx + 1;
     uint32_t src_cursor{0};
     bool dst_filled{false};
     BtreeNodePtr last_new_node{nullptr};
@@ -356,22 +353,14 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
             // completely placed/appended into the new node.
             auto const copied = new_node->append_copy_in_upto_size(*old_node, src_cursor, m_bt_cfg.ideal_fill_size(),
                                                                    /*copy_only_if_fits=*/true);
-            if (copied) {
-                // Last old node has been copied to new node, but if that is the only thing the new node has, it means
-                // that we had an empty new node and copied old node into new node (i.e old_node = new_node), so no
-                // point in writing the same node again. We don't need to create new node and don't remove old node
-                if (new_node->total_entries() == old_node->total_entries()) {
-                    erase_node_in_list(Position::last, new_nodes, /*node_removal=*/true, context);
-                    erase_node_in_list(Position::last, old_nodes, /*node_removal=*/false, context);
-                }
-            } else {
-                // Last node doesn't fit into the new node, it is possible that previous old nodes fits into one new
-                // node and we created a second new node, but the last old node doesn't completely fit into the new last
-                // node and hence did not move anything. In that case, we can skip the empty new node.
+            if (!copied) {
+                // Last old node doesn't fit fully into the new node, it is possible that previous old nodes fits into
+                // one new node and we created a second new node, but the last old node doesn't completely fit into the
+                // new last node and hence did not move anything. In that case, we can skip the empty new node.
                 if (new_node->total_entries() == 0) {
-                    erase_node_in_list(Position::last, new_nodes, /*node_removal=*/true, context);
+                    erase_last_node_in_list(new_nodes, /*node_removal=*/true, context);
                 }
-                erase_node_in_list(Position::last, old_nodes, /*node_removal=*/false, context);
+                erase_last_node_in_list(old_nodes, /*node_removal=*/false, context);
             }
             break;
         } else {
@@ -394,49 +383,42 @@ btree_status_t Btree< K, V >::merge_nodes(const BtreeNodePtr& parent_node, const
         goto out;
     }
 
-    // First remove all old entries to be removed for the parent node
-    parent_node->remove(start_idx + 1, start_idx + old_nodes.size() - 1);
+    // Remove excess entries from the parent node
+    parent_node->remove(start_idx + new_nodes.size() + 1, start_idx + old_nodes.size());
 
-    // We have cloned the leftmost node and put in as first new node, we need to remove that from list and also copy the
-    // temp node contents back to leftmost_node.
-    leftmost_node->overwrite(*new_nodes[0]);
-    erase_node_in_list(Position::first, new_nodes, /*node_removal=*/true, context);
+    // parent_node->remove(start_idx + 1, start_idx + old_nodes.size());
 
     // Update all the new node entries to parent and while iterating update their node links.
+    idx = start_idx + new_nodes.size();
     next_node_id = old_nodes.back()->next_bnode();
     for (auto it = new_nodes.rbegin(); it != new_nodes.rend(); ++it) {
         (*it)->set_next_bnode(next_node_id);
         auto this_node_id = (*it)->node_id();
         if ((*it)->total_entries()) {
-            parent_node->insert(start_idx, (*it)->get_last_key< K >(), BtreeLinkInfo{this_node_id, 0});
+            parent_node->update(idx--, (*it)->get_last_key< K >(), BtreeLinkInfo{this_node_id, 0});
         }
         next_node_id = this_node_id;
     }
 
-    // Finally update the leftmost node with latest key
+    // We need to copy the cloned node back to leftmost_node and update it with latest next node
+    leftmost_node->overwrite(*cloned_new_node);
     leftmost_node->set_next_bnode(next_node_id);
     if (leftmost_node->total_entries()) {
         leftmost_node->inc_link_version();
         parent_node->update(start_idx, leftmost_node->get_last_key< K >(), leftmost_node->link_info());
     }
 
-    // First old not is nothing but leftmost node, remove that from list.
-    erase_node_in_list(Position::first, old_nodes, /*node_removal=*/false, context);
-
     ret = m_bt_private->transact_nodes(new_nodes, old_nodes, leftmost_node, parent_node, context);
 
 out:
     // Do free/unlock based on success/failure in reverse order
-    for (auto it = old_nodes.rbegin(); it != old_nodes.rend(); ++it) {
-        if (ret != btree_status_t::success) {
-            if (*it != leftmost_node) { unlock_node(*it, locktype_t::WRITE); }
-        }
-    }
-    for (auto it = new_nodes.rbegin(); it != new_nodes.rend(); ++it) {
-        if (ret != btree_status_t::success) {
-            remove_node(*it, locktype_t::NONE, context);
-        } else {
+    if (ret != btree_status_t::success) {
+        for (auto it = old_nodes.rbegin(); it != old_nodes.rend(); ++it) {
             unlock_node(*it, locktype_t::WRITE);
+        }
+
+        for (auto it = new_nodes.rbegin(); it != new_nodes.rend(); ++it) {
+            remove_node(*it, locktype_t::NONE, context);
         }
     }
 

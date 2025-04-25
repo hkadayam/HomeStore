@@ -15,7 +15,7 @@ jobs:
         build-type: ["Debug", "Release"]
         malloc-impl: ["libc", "tcmalloc"]
         prerelease: ["True", "False"]
-        tooling: ["Sanitize", "Coverage", "None"]
+        tooling: ["Sanitize", "None"]
         exclude:
           - build-type: Debug
             prerelease: "False"
@@ -27,8 +27,6 @@ jobs:
             malloc-impl: libc
           - build-type: Release
             tooling: Sanitize
-          - build-type: Release
-            tooling: Coverage
     uses: ./.github/workflows/build_commit.yml
     with:
       platform: ${{ matrix.platform }}
@@ -36,3 +34,4 @@ jobs:
       malloc-impl: ${{ matrix.malloc-impl }}
       prerelease: ${{ matrix.prerelease }}
       tooling: ${{ matrix.tooling }}
+      build-level: 'Testing'

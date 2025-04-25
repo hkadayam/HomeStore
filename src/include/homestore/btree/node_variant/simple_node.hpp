@@ -156,7 +156,7 @@ public:
     }
 
     uint32_t move_out_to_right_by_size(BtreeNode& o, uint32_t size) override {
-        return (get_nth_obj_size(0) * move_out_to_right_by_entries(o, size / get_nth_obj_size(0)));
+        return move_out_to_right_by_entries(o, size / get_nth_obj_size(0));
     }
 
     uint32_t get_entries_size(uint32_t start_idx, uint32_t end_idx) const override {

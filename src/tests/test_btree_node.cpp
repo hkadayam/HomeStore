@@ -430,34 +430,56 @@ TYPED_TEST(NodeTest, RandomInsertRemoveUpdate) {
 }
 
 TYPED_TEST(NodeTest, Move) {
-    std::vector< uint32_t > list{0, 1, 2, g_max_keys / 2 - 1};
+    std::vector< uint32_t > list{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, g_max_keys / 2 - 1};
     this->put_list(list);
     this->print();
 
-    this->m_node1->move_out_to_right_by_entries(*this->m_node2, list.size());
+    // Full node move to right and validate its correctness.
+    this->m_node1->move_out_to_right_by_entries(*this->m_node2, list.size()); // Full move
     this->m_node1->move_out_to_right_by_entries(*this->m_node2, list.size()); // Empty move
     ASSERT_EQ(this->m_node1->total_entries(), 0u) << "Move out to right has failed";
     ASSERT_EQ(this->m_node2->total_entries(), list.size()) << "Move out to right has failed";
     this->validate_get_all();
+    auto filled_size = this->m_node2->occupied_size();
 
-#if 0
-    auto first_half = list.size() / 2;
-    auto second_half = list.size() - first_half;
-    this->m_node1->copy_by_entries(*this->m_node2, 0, first_half);           // Copy half entries
-    this->m_node1->copy_by_entries(*this->m_node2, first_half, second_half); // Copy half entries
+    // Full copy in and validate its correctness
+    uint32_t cursor{0};
+    auto has_copied = this->m_node1->append_copy_in_upto_size(*this->m_node2, cursor, filled_size,
+                                                              /*copy_only_if_fits=*/true); // Full copy in
+    ASSERT_EQ(has_copied, true) << "Append copy in has failed";
+    ASSERT_EQ(cursor, this->m_node2->total_entries()) << "Append copy cursor not updated";
+    ASSERT_EQ(this->m_node1->total_entries(), list.size()) << "Move out to right has failed";
+    ASSERT_EQ(this->m_node2->total_entries(), list.size()) << "Move out to right has failed";
+
+    // Make the node2 clean slate
     this->m_node2->remove_all();
-    ASSERT_EQ(this->m_node2->total_entries(), 0u) << "Remove all on right has failed";
-    ASSERT_EQ(this->m_node1->total_entries(), list.size()) << "Move in from right has failed";
+    ASSERT_EQ(this->m_node2->total_entries(), 0) << "Remove all failed";
     this->validate_get_all();
-#endif
 
-    this->m_node1->move_out_to_right_by_entries(*this->m_node2, list.size() / 2);
-    ASSERT_EQ(this->m_node1->total_entries(), list.size() / 2) << "Move out half entries to right has failed";
-    ASSERT_EQ(this->m_node2->total_entries(), list.size() - list.size() / 2)
-        << "Move out half entries to right has failed";
+    // Move roughly half of the size to the right node (node2)
+    filled_size = this->m_node1->occupied_size();
+    auto const nmoved = this->m_node1->move_out_to_right_by_size(*this->m_node2, filled_size / 2);
+    ASSERT_NE(nmoved, 0u) << "Move out didn't move any keys";
+    ASSERT_EQ(this->m_node1->total_entries(), list.size() - nmoved)
+        << "Move out roughly half size to right has failed on left node";
+    ASSERT_EQ(this->m_node2->total_entries(), nmoved) << "Move out half entries to right has failed on right node";
     this->validate_get_all();
     this->print();
     this->validate_key_order();
+
+    // Full copy back in to node1 and now it should be back to original full node
+    cursor = 0;
+    has_copied = this->m_node1->append_copy_in_upto_size(*this->m_node2, cursor, this->m_node1->node_data_size(),
+                                                         /*copy_only_if_fits=*/true); // Full copy in
+    ASSERT_EQ(has_copied, true) << "Append copy in has failed";
+    ASSERT_EQ(cursor, this->m_node2->total_entries()) << "Append copy cursor not updated";
+    ASSERT_EQ(this->m_node1->total_entries(), list.size()) << "Move out to right has failed";
+    this->print();
+
+    // Overwrite the node to right and check its equality.
+    this->m_node2->overwrite(*this->m_node1);
+    ASSERT_EQ(this->m_node1->total_entries(), list.size()) << "Move out to right has failed";
+    ASSERT_EQ(this->m_node2->total_entries(), list.size()) << "Move out to right has failed";
 }
 
 SISL_OPTIONS_ENABLE(logging, test_btree_node)

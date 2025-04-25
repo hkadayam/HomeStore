@@ -641,19 +641,7 @@ public:
     BtreeLinkInfo link_info() const { return BtreeLinkInfo{node_id(), link_version()}; }
 
     virtual uint32_t occupied_size() const { return (node_data_size() - available_size()); }
-    bool is_merge_needed(const BtreeConfig& cfg) const {
-#if 0
-#ifdef _PRERELEASE
-       if (iomgr_flip::instance()->test_flip("btree_merge_node") && occupied_size() < node_data_size) {
-           return true;
-       }
-
-       auto ret = iomgr_flip::instance()->get_test_flip< uint64_t >("btree_merge_node_pct");
-       if (ret && occupied_size() < (ret.get() * node_data_size() / 100)) { return true; }
-#endif
-#endif
-        return (occupied_size() < cfg.suggested_min_size());
-    }
+    bool is_merge_needed(const BtreeConfig& cfg) const { return (occupied_size() < cfg.suggested_min_size()); }
 
     bnodeid_t next_bnode() const { return get_persistent_header_const()->next_node; }
     void set_next_bnode(bnodeid_t b) { get_persistent_header()->next_node = b; }

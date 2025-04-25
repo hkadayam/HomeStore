@@ -28,6 +28,7 @@ namespace homestore {
 //
 template < typename K, typename V >
 class FixedPrefixNode : public VariantNode< K, V > {
+public:
     using BtreeNode::get_nth_key_internal;
     using BtreeNode::get_nth_key_size;
     using BtreeNode::get_nth_obj_size;
@@ -40,8 +41,8 @@ class FixedPrefixNode : public VariantNode< K, V > {
 private:
 #pragma pack(1)
     struct prefix_node_header {
-        uint16_t used_slots; // Number of slots actually used. TODO: We can deduce from set_bit_count of bitset
-        uint16_t tail_slot;  // What is the tail slot number being used
+        uint16_t used_slots{0}; // Number of slots actually used. TODO: We can deduce from set_bit_count of bitset
+        uint16_t tail_slot{0};  // What is the tail slot number being used
 
         std::string to_string() const { return fmt::format("slots_used={} tail_slot={} ", used_slots, tail_slot); }
 
@@ -152,10 +153,7 @@ public:
             prefix_bitset_{sisl::blob{bitset_area(), reqd_bitset_size(this->node_data_size())}, /*init=*/true} {
         this->set_node_type(btree_node_type::FIXED_PREFIX);
         this->m_variant_private_data = reqd_bitset_size(this->node_data_size());
-
-        auto phdr = prefix_header();
-        phdr->used_slots = 0;
-        phdr->tail_slot = 0;
+        new (this->node_data_area()) prefix_node_header();
     }
 
     FixedPrefixNode(uint8_t* node_buf, bnodeid_t id, BtreeNode::Allocator::Token token) :
@@ -442,7 +440,7 @@ public:
         validate_sanity();
         dst_node.validate_sanity();
 #endif
-        return by_size ? num_moved : dst_node_size;
+        return num_moved;
     }
 
     btree_status_t insert(uint32_t idx, BtreeKey const& key, BtreeValue const& val) override {
@@ -524,6 +522,7 @@ public:
         this->inc_gen();
         prefix_bitset_ = sisl::CompactBitSet{bitset_blob(), true};
 
+        new (this->node_data_area()) prefix_node_header();
 #ifndef NDEBUG
         validate_sanity();
 #endif

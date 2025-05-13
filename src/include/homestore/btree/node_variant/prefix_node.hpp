@@ -346,6 +346,11 @@ public:
         }
     }
 
+    uint32_t occupied_size() const override {
+        return (this->node_data_size() - sizeof(prefix_node_header) - (prefix_bitset_.size() / 8) -
+                this->available_size());
+    }
+
     bool has_room_for_put(btree_put_type, uint32_t, uint32_t) const override { return has_room(1u); }
 
     uint32_t get_nth_key_size(uint32_t) const override { return dummy_key< K >.serialized_size(); }

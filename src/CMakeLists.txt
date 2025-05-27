@@ -44,7 +44,10 @@ add_subdirectory(lib/index)
 add_subdirectory(lib/blkdata_svc/)
 add_subdirectory(lib/replication/)
 
-add_subdirectory(tests)
+if(NOT DEFINED BUILD_TESTING OR BUILD_TESTING)
+    add_subdirectory(tests)
+endif()
+
 set(HOMESTORE_OBJECTS
     $<TARGET_OBJECTS:hs_common> 
     $<TARGET_OBJECTS:hs_device> 

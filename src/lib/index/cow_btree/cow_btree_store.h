@@ -48,6 +48,8 @@ private:
     // Total number of incremental cp flushes since last full flushes
     uint32_t m_num_incremental_flushes{0};
 
+    BtreeNode::Allocator::Token m_bufalloc_token;
+
 public:
     COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< IndexStoreSuperBlock > > store_sbs);
     virtual ~COWBtreeStore() = default;
@@ -60,7 +62,7 @@ public:
     ////////////////// Override Implementation of underlying store requirements //////////////////
     unique< UnderlyingBtree > create_underlying_btree(BtreeBase& btree, bool load_existing) override;
     folly::Future< folly::Unit > destroy_underlying_btree(BtreeBase& bt) override;
-    void on_node_freed(BtreeNode* node) override;
+    // void on_node_freed(BtreeNode* node) override;
     bool is_fast_destroy_supported() const override { return true; }
     bool is_ephemeral() const { return false; }
     uint32_t max_node_size() const override;

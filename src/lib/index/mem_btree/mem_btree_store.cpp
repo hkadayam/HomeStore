@@ -8,21 +8,15 @@ unique< UnderlyingBtree > MemBtreeStore::create_underlying_btree(BtreeBase& btre
     return std::make_unique< MemBtree >(btree);
 }
 
-void MemBtreeStore::on_node_freed(BtreeNode* node) {
-    uint8_t* ptr = uintptr_cast(node);
-    delete[] ptr;
-}
-
 MemBtree::MemBtree(BtreeBase& btree) : m_base_btree{btree} {}
 
 BtreeNodePtr MemBtree::create_node(bool is_leaf, CPContext*) {
-    std::shared_ptr< uint8_t[] > ptr(new uint8_t[m_base_btree.node_size()]);
-    node_buf_ptr_vec.emplace_back(ptr);
-
-    auto new_node = m_base_btree.init_node(ptr.get(), bnodeid_t{0}, true, is_leaf, 0 /* context_size */);
-    new_node->set_node_id(bnodeid_t{r_cast< std::uintptr_t >(new_node)});
-    new_node->m_refcount.increment();
-    return BtreeNodePtr{new_node};
+    // std::shared_ptr< uint8_t[] > ptr(new uint8_t[m_base_btree.node_size()]);
+    // node_buf_ptr_vec.emplace_back(ptr);
+    auto node = m_base_btree.new_node(bnodeid_t{0}, is_leaf, BtreeNode::Allocator::default_token);
+    node->set_node_id(bnodeid_t{r_cast< std::uintptr_t >(node.get())});
+    node->m_refcount.increment();
+    return node;
 }
 
 btree_status_t MemBtree::write_node(BtreeNodePtr const& node, CPContext*) { return btree_status_t::success; }

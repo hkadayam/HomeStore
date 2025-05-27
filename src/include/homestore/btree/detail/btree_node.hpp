@@ -15,8 +15,8 @@
  *********************************************************************************/
 
 #pragma once
-#include <iostream>
-#include <queue>
+#include <cstdint>
+#include <functional>
 #include <iomgr/fiber_lib.hpp>
 
 #include <sisl/utility/atomic_counter.hpp>
@@ -26,12 +26,6 @@
 #include <homestore/btree/btree_kv.hpp>
 #include <homestore/crc.h>
 
-#ifndef TEST_BNODE_ONLY
-#include <homestore/btree/btree_store.h>
-#include <homestore/index_service.hpp>
-#include <homestore/index/index_common.h>
-#endif
-
 namespace homestore {
 ENUM(locktype_t, uint8_t, NONE, READ, WRITE)
 
@@ -39,22 +33,6 @@ class BtreeNode : public sisl::ObjLifeCounter< BtreeNode > {
     using node_find_result_t = std::pair< bool, uint32_t >;
 
 public:
-#pragma pack(1)
-    struct TransientHeader {
-        mutable iomgr::FiberManagerLib::shared_mutex lock;
-        sisl::atomic_counter< uint16_t > upgraders{0};
-
-        /* these variables are accessed without taking lock and are not expected to change after init */
-        uint8_t leaf_node{0};
-#ifndef TEST_BNODE_ONLY
-        IndexStore::Type store_type{IndexStore::Type::COPY_ON_WRITE_BTREE};
-#endif
-        uint64_t max_keys_in_node{0};
-
-        bool is_leaf() const { return (leaf_node != 0); }
-    };
-#pragma pack()
-
     static constexpr uint8_t BTREE_NODE_VERSION = 1;
     static constexpr uint8_t BTREE_NODE_MAGIC = 0xab;
 
@@ -105,38 +83,91 @@ public:
     };
 #pragma pack()
 
-    sisl::atomic_counter< int32_t > m_refcount{0};
-    TransientHeader m_trans_hdr;
-    uint8_t* m_phys_node_buf;
+    struct Allocator {
+        using Token = uint8_t;
+        std::function< uint8_t*(uint32_t size) > alloc_btree_node;
+        std::function< void(BtreeNode* node) > free_btree_node;
+        std::function< uint8_t*(uint32_t size) > alloc_node_buf;
+        std::function< void(uint8_t*) > free_node_buf;
+        static constexpr Token default_token = 0;
+
+        Allocator() :
+                alloc_btree_node{[](uint32_t size) -> uint8_t* { return new uint8_t[size]; }},
+                free_btree_node{[](BtreeNode* node) { delete[] uintptr_cast(node); }},
+                alloc_node_buf{[](uint32_t size) { return new uint8_t[size]; }},
+                free_node_buf{[](uint8_t* buf) { delete[] buf; }} {}
+
+        Allocator(std::function< uint8_t*(uint32_t size) > alloc_node_cb,
+                  std::function< void(BtreeNode* node) > free_node_cb,
+                  std::function< uint8_t*(uint32_t size) > alloc_buf_cb, std::function< void(uint8_t*) > free_buf_cb) :
+                alloc_btree_node{std::move(alloc_node_cb)},
+                free_btree_node{std::move(free_node_cb)},
+                alloc_node_buf{std::move(alloc_buf_cb)},
+                free_node_buf{std::move(free_buf_cb)} {}
+        Allocator(const Allocator& b) = default;
+        Allocator(Allocator&& b) = default;
+        Allocator& operator=(const Allocator& b) = default;
+        Allocator& operator=(Allocator&& b) = default;
+        ~Allocator() = default;
+
+        struct List {
+            std::vector< Allocator > vec;
+            std::mutex mtx;
+            List() : vec{1, Allocator{}} {}
+        };
+
+        static List& allocators() {
+            static List s_allocators;
+            return s_allocators;
+        }
+
+        static Allocator& get(Allocator::Token token) { return allocators().vec[token]; }
+        static Token add(Allocator a) {
+            std::unique_lock lg{allocators().mtx};
+            allocators().vec.emplace_back(std::move(a));
+            return s_cast< Allocator::Token >(allocators().vec.size() - 1);
+        }
+
+        static void remove(Token t) {
+            std::unique_lock lg{allocators().mtx};
+            if (t == allocators().vec.size() - 1) {
+                allocators().vec.erase(allocators().vec.end() - 1);
+            } else {
+                allocators().vec[t] = Allocator{};
+            }
+        }
+    };
+
+    uint8_t* m_phys_node_buf;                      // Pointer to the physical node buffer
+    sisl::atomic_counter< int32_t > m_refcount{0}; // Refcount of the node
+
+    Allocator::Token m_token;
+    std::atomic< uint8_t > m_phys_buf_share_count{0};
+    uint16_t m_variant_private_data{0}; // Data specific to variant (to reuse this wasted 16 bit space)
+
+    mutable iomgr::FiberManagerLib::shared_mutex m_lock;
 
 public:
-    BtreeNode(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf, BtreeConfig const& cfg) :
-            m_phys_node_buf{node_buf} {
-        if (init_buf) {
-            new (node_buf) PersistentHeader{};
-            set_node_id(id);
-            set_leaf(is_leaf);
-            set_node_size(cfg.node_size());
-        } else {
-            DEBUG_ASSERT_EQ(node_id(), id);
-            DEBUG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC);
-            DEBUG_ASSERT_EQ(version(), BTREE_NODE_VERSION);
-        }
-        m_trans_hdr.leaf_node = is_leaf;
-#ifdef _PRERELEASE
-        m_trans_hdr.max_keys_in_node = cfg.m_max_keys_in_node;
-#endif
+    BtreeNode(bnodeid_t id, bool is_leaf, uint32_t node_size, Allocator::Token token) :
+            m_phys_node_buf{Allocator::get(token).alloc_node_buf(node_size)}, m_token{token} {
+        new (m_phys_node_buf) PersistentHeader{};
+        set_node_id(id);
+        set_leaf(is_leaf);
+        set_node_size(node_size);
+    }
+
+    BtreeNode(uint8_t* node_buf, bnodeid_t id, Allocator::Token token) : m_phys_node_buf{node_buf}, m_token{token} {
+        DEBUG_ASSERT_EQ(node_id(), id);
+        DEBUG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC);
+        DEBUG_ASSERT_EQ(version(), BTREE_NODE_VERSION);
     }
 
     virtual ~BtreeNode() {
-#ifndef TEST_BNODE_ONLY
-        s_cast< BtreeStore* >(index_service().lookup_store(m_trans_hdr.store_type))->on_node_freed(this);
-#endif
+        DEBUG_ASSERT_EQ(m_phys_buf_share_count.load(), 0,
+                        "We are being asked to destruct node while its buffer is still shared");
+        Allocator::get(m_token).free_node_buf(m_phys_node_buf);
+        if (Allocator::get(m_token).free_btree_node) { Allocator::get(m_token).free_btree_node(this); }
     }
-
-#ifndef TEST_BNODE_ONLY
-    void set_store_type(IndexStore::Type store) { m_trans_hdr.store_type = store; }
-#endif
 
     // Identify if a node is a leaf node or not, from raw buffer, by just reading PersistentHeader
     static bool identify_leaf_node(uint8_t* buf) { return (r_cast< PersistentHeader* >(buf))->leaf; }
@@ -156,11 +187,6 @@ public:
         if (phdr->checksum != exp_checksum) { return false; }
 
         return true;
-    }
-
-    static void revert_node_delete(uint8_t* buf) {
-        auto phdr = r_cast< PersistentHeader* >(buf);
-        phdr->node_deleted = 0x0;
     }
 
     static void set_modified_cp_id(uint8_t* buf, int64_t cp_id) {
@@ -291,6 +317,11 @@ public:
         return found;
     }
 
+    virtual void overwrite(const BtreeNode& other_node) {
+        DEBUG_ASSERT_EQ(node_size(), other_node.node_size(), "{}", get_persistent_header_const()->to_string());
+        std::memcpy(m_phys_node_buf, other_node.m_phys_node_buf, other_node.node_size());
+    }
+
     void get_adjacent_indicies(uint32_t cur_ind, std::vector< uint32_t >& indices_list, uint32_t max_indices) const {
         uint32_t i = 0;
         uint32_t start_ind;
@@ -373,33 +404,27 @@ public:
     uint16_t level() const { return get_persistent_header_const()->level; }
 
     // uint32_t total_entries() const { return (has_valid_edge() ? total_entries() + 1 : total_entries()); }
-    uint64_t max_keys_in_node() const { return m_trans_hdr.max_keys_in_node; }
 
     void lock(locktype_t l) const {
         if (l == locktype_t::READ) {
-            m_trans_hdr.lock.lock_shared();
+            m_lock.lock_shared();
         } else if (l == locktype_t::WRITE) {
-            m_trans_hdr.lock.lock();
+            m_lock.lock();
         }
     }
 
     void unlock(locktype_t l) const {
         if (l == locktype_t::READ) {
-            m_trans_hdr.lock.unlock_shared();
+            m_lock.unlock_shared();
         } else if (l == locktype_t::WRITE) {
-            m_trans_hdr.lock.unlock();
+            m_lock.unlock();
         }
     }
 
     void lock_upgrade() {
-        m_trans_hdr.upgraders.increment(1);
         this->unlock(locktype_t::READ);
         this->lock(locktype_t::WRITE);
-        m_trans_hdr.upgraders.decrement(1);
     }
-
-    void lock_acknowledge() { m_trans_hdr.upgraders.decrement(1); }
-    bool any_upgrade_waiters() const { return (!m_trans_hdr.upgraders.testz()); }
 
     template < typename K, typename V >
     using ToStringCallback = std::function< std::string(std::vector< std::pair< K, V > > const&) >;
@@ -444,23 +469,40 @@ public:
     virtual btree_status_t insert(uint32_t ind, const BtreeKey& key, const BtreeValue& val) = 0;
     virtual void remove(uint32_t ind) { remove(ind, ind); }
     virtual void remove(uint32_t ind_s, uint32_t ind_e) = 0;
-    virtual void remove_all(const BtreeConfig& cfg) = 0;
+    virtual void remove_all() = 0;
     virtual void update(uint32_t ind, const BtreeValue& val) = 0;
     virtual void update(uint32_t ind, const BtreeKey& key, const BtreeValue& val) = 0;
 
-    virtual uint32_t move_out_to_right_by_entries(const BtreeConfig& cfg, BtreeNode& other_node, uint32_t nentries) = 0;
-    virtual uint32_t move_out_to_right_by_size(const BtreeConfig& cfg, BtreeNode& other_node, uint32_t size) = 0;
-    virtual uint32_t copy_by_size(const BtreeConfig& cfg, const BtreeNode& other_node, uint32_t start_idx,
-                                  uint32_t size) = 0;
-    virtual uint32_t copy_by_entries(const BtreeConfig& cfg, const BtreeNode& other_node, uint32_t start_idx,
-                                     uint32_t nentries) = 0;
-    /*virtual uint32_t move_in_from_right_by_entries(const BtreeConfig& cfg, BtreeNode& other_node,
-                                                   uint32_t nentries) = 0;
-    virtual uint32_t move_in_from_right_by_size(const BtreeConfig& cfg, BtreeNode& other_node, uint32_t size) = 0;*/
+    virtual uint32_t move_out_to_right_by_entries(BtreeNode& other_node, uint32_t nentries) = 0;
+    virtual uint32_t move_out_to_right_by_size(BtreeNode& other_node, uint32_t size) = 0;
+
+    /// @brief Appends entries copied from another SimpleNode into this node, up to a specified size limit.
+    ///
+    /// Copies entries starting from the `other_cursor` index in `other` node and appends them
+    /// to the current node (`this`). Copying stops when either the source node runs out of entries
+    /// starting from the cursor, or the occupied size of the current node reaches `upto_size`,
+    /// or the current node runs out of available entry slots.
+    ///
+    /// @param o The source BtreeNode (expected to be the same variant as this) to copy entries from.
+    /// @param other_cursor [in, out] The starting index within `other` node to begin copying.
+    ///                     This cursor is advanced by the number of entries successfully copied.
+    /// @param upto_size The target maximum occupied size for the current node after appending.
+    /// @param copy_only_if_fits Should the copy happen only if all entries from cursor till end fits to `this` node.
+    ///
+    /// @return If any entries have been copied.
+    /// @note Assumes appropriate node locks are held externally.
+    virtual bool append_copy_in_upto_size(const BtreeNode& other_node, uint32_t& other_cursor, uint32_t upto_size,
+                                          bool copy_only_if_fits) = 0;
+
+#if 0
+    virtual uint32_t copy_by_size(const BtreeNode& other_node, uint32_t start_idx, uint32_t size) = 0;
+    virtual uint32_t copy_by_entries(const BtreeNode& other_node, uint32_t start_idx, uint32_t nentries) = 0;
+    virtual uint32_t num_entries_by_size(uint32_t start_idx, uint32_t size) const = 0;
+#endif
 
     virtual uint32_t available_size() const = 0;
     virtual bool has_room_for_put(btree_put_type put_type, uint32_t key_size, uint32_t value_size) const = 0;
-    virtual uint32_t num_entries_by_size(uint32_t start_idx, uint32_t size) const = 0;
+    virtual uint32_t get_entries_size(uint32_t start_idx, uint32_t end_idx) const = 0;
 
     virtual int compare_nth_key(const BtreeKey& cmp_key, uint32_t ind) const = 0;
     virtual void get_nth_key_internal(uint32_t ind, BtreeKey& out_key, bool copykey) const = 0;
@@ -512,10 +554,37 @@ protected:
     }
 
 public:
-    void update_phys_buf(uint8_t* buf) { m_phys_node_buf = buf; }
-    uint8_t* get_phys_buf() { return m_phys_node_buf; }
+    uint8_t* share_phys_node_buf() {
+        uint8_t* old_phys_buf{nullptr};
+        auto share_count = m_phys_buf_share_count.load();
+        if (share_count != 0) {
+            // Buffer was already shared with another party, we need to make a copy and share the new one
+            auto new_buf = Allocator::get(m_token).alloc_node_buf(node_size());
+            std::memcpy(new_buf, m_phys_node_buf, node_size());
+            old_phys_buf = m_phys_node_buf;
+            m_phys_node_buf = new_buf;
+        }
+        share_count = m_phys_buf_share_count.fetch_add(1);
+        if (old_phys_buf && (share_count == 0)) {
+            // We have checked if buffer was shared and actually copied the buffer, but before we increment the counter,
+            // release_buf has been called and reduced the count to 1. If thats the case, we have 2 unshared buffers and
+            // one of them has to be freed
+            Allocator::get(m_token).free_node_buf(old_phys_buf);
+        }
+        return m_phys_node_buf;
+    }
 
-    void set_phys_buf(uint8_t* buf) { m_phys_node_buf = buf; }
+    void release_phys_node_buf(uint8_t* buf) {
+        auto const cur_count = m_phys_buf_share_count.fetch_sub(1);
+        if (cur_count > 1) {
+            // After sharing, the phys_node_buf was copied and modified, this release is not for the buf that is
+            // currently held, so we have to free the buf
+            DEBUG_ASSERT_NE((void*)buf, (void*)m_phys_node_buf,
+                            "We are asked to release current version buf, but with shared count more than 1, which "
+                            "means there is some out-of-order release going on");
+            Allocator::get(m_token).free_node_buf(buf);
+        }
+    }
 
     PersistentHeader* get_persistent_header() { return r_cast< PersistentHeader* >(m_phys_node_buf); }
     const PersistentHeader* get_persistent_header_const() const {
@@ -550,11 +619,8 @@ public:
     }
 
     void set_total_entries(uint32_t n) { get_persistent_header()->nentries = n; }
-    void inc_entries() { ++get_persistent_header()->nentries; }
-    void dec_entries() { --get_persistent_header()->nentries; }
-
-    void add_entries(uint32_t addn) { get_persistent_header()->nentries += addn; }
-    void sub_entries(uint32_t subn) { get_persistent_header()->nentries -= subn; }
+    void add_entries(uint32_t addn = 1u) { get_persistent_header()->nentries += addn; }
+    void sub_entries(uint32_t subn = 1u) { get_persistent_header()->nentries -= subn; }
 
     void set_leaf(bool leaf) { get_persistent_header()->leaf = leaf; }
     void set_node_type(btree_node_type t) { get_persistent_header()->node_type = uint32_cast(t); }
@@ -575,19 +641,7 @@ public:
     BtreeLinkInfo link_info() const { return BtreeLinkInfo{node_id(), link_version()}; }
 
     virtual uint32_t occupied_size() const { return (node_data_size() - available_size()); }
-    bool is_merge_needed(const BtreeConfig& cfg) const {
-#if 0
-#ifdef _PRERELEASE
-       if (iomgr_flip::instance()->test_flip("btree_merge_node") && occupied_size() < node_data_size) {
-           return true;
-       }
-
-       auto ret = iomgr_flip::instance()->get_test_flip< uint64_t >("btree_merge_node_pct");
-       if (ret && occupied_size() < (ret.get() * node_data_size() / 100)) { return true; }
-#endif
-#endif
-        return (occupied_size() < cfg.suggested_min_size());
-    }
+    bool is_merge_needed(const BtreeConfig& cfg) const { return (occupied_size() < cfg.suggested_min_size()); }
 
     bnodeid_t next_bnode() const { return get_persistent_header_const()->next_node; }
     void set_next_bnode(bnodeid_t b) { get_persistent_header()->next_node = b; }
@@ -615,6 +669,7 @@ public:
             // Do not delete it here, since node is generally an offset inside actual allocation and delete will fail
             // here (with asan). So let the on_node_freed from the underlying store delete the allocation.
             node->~BtreeNode();
+            // delete node;
         }
     }
 };

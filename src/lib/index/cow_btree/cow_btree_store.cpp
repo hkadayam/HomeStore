@@ -1,7 +1,7 @@
 #include <memory>
 #include <homestore/btree/detail/btree_node.hpp>
 #include "index/cow_btree/cow_btree_store.h"
-#include "index/cow_btree/cow_btree_node.h"
+//#include "index/cow_btree/cow_btree_node.h"
 #include "index/cow_btree/cow_btree.h"
 #include "index/cow_btree/cow_btree_cp.h"
 #include "index/index_cp.h"
@@ -54,6 +54,14 @@ COWBtreeStore::COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< I
                 const auto& hnode = (sisl::SingleEntryHashNode< BtreeNodePtr >&)rec;
                 return (hnode.m_value->m_refcount.test_le(1));
             })} {
+    m_bufalloc_token = BtreeNode::Allocator::add(BtreeNode::Allocator{
+        [](uint32_t size) { return new uint8_t[size]; },      // alloc_btree_node
+        [](BtreeNode* node) { delete[] uintptr_cast(node); }, // free_btree_node
+        [this](uint32_t node_size) -> uint8_t* {              // alloc_node_buf
+            return hs_utils::iobuf_alloc(node_size, sisl::buftag::btree_node, m_vdev->align_size());
+        },
+        [](uint8_t* buf) { hs_utils::iobuf_free(buf, sisl::buftag::btree_node); }});
+
     if (store_sbs.size()) {
         // There can be multiple sbs, each sb containing a journal for a particular cp. We need to sort based on
         // cp_id and then split them as
@@ -73,7 +81,10 @@ COWBtreeStore::COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< I
         ->register_consumer(IndexStore::Type::COPY_ON_WRITE_BTREE, std::make_unique< COWBtreeCPCallbacks >(this));
 }
 
-void COWBtreeStore::stop() { m_cache.reset(); }
+void COWBtreeStore::stop() {
+    m_cache.reset();
+    BtreeNode::Allocator::remove(m_bufalloc_token);
+}
 
 uint32_t COWBtreeStore::max_capacity() const { return m_vdev->size(); }
 uint32_t COWBtreeStore::max_node_size() const { return m_vdev->atomic_page_size(); }
@@ -98,10 +109,11 @@ unique< UnderlyingBtree > COWBtreeStore::create_underlying_btree(BtreeBase& btre
     auto it = m_journals_by_btree.find(btree.ordinal());
     if (it == m_journals_by_btree.end()) {
         cbtree = std::make_unique< COWBtree >(btree, m_vdev, m_cache, std::vector< unique< COWBtree::Journal > >{},
-                                              load_existing);
+                                              m_bufalloc_token, load_existing);
     } else {
         HS_DBG_ASSERT_EQ(load_existing, true, "Btree is found, but we are asked to create a new one");
-        cbtree = std::make_unique< COWBtree >(btree, m_vdev, m_cache, std::move(it->second), load_existing);
+        cbtree = std::make_unique< COWBtree >(btree, m_vdev, m_cache, std::move(it->second), m_bufalloc_token,
+                                              load_existing);
         m_journals_by_btree.erase(it); // We no longer need btree specific journal records after it is created.
     }
     return cbtree;
@@ -114,7 +126,7 @@ folly::Future< folly::Unit > COWBtreeStore::destroy_underlying_btree(BtreeBase& 
     return cp_ctx->add_to_destroyed_list(bt.shared_from_this());
 }
 
-void COWBtreeStore::on_node_freed(BtreeNode* node) { COWBtreeNode::destruct(node); }
+// void COWBtreeStore::on_node_freed(BtreeNode* node) { COWBtreeNode::destruct(node); }
 
 class FlushGuard {
 public:
@@ -185,6 +197,11 @@ folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
 
     auto on_flush_nodes_done = [this](COWBtreeCPContext* cp_ctx) {
         cp_ctx->actual_destroy_btrees();
+
+        CP_PERIODIC_LOG(
+            INFO, cp_ctx->id(),
+            "CowBtreeStore has {} btrees destroyed in this cp, destroyed all persistent structures for them",
+            cp_ctx->m_destroyed_btrees.size());
 
         // All dirty nodes from all btrees have been flushed, now we can flush the full map or journal
         // (depending on cp type) for each of the modified btree

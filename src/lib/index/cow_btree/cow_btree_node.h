@@ -3,49 +3,50 @@
 #include <homestore/btree/detail/btree_internal.hpp>
 
 namespace homestore {
-class COWBtreeCPContext;
 class COWBtree;
-
-class COWBtreeNodeBuffer {
-public:
-    COWBtreeNodeBuffer(uint8_t* buf, bool allocated = false) : m_buf{buf}, m_allocated{allocated} {}
-    ~COWBtreeNodeBuffer();
-    COWBtreeNodeBuffer(COWBtreeNodeBuffer const&) = delete;
-    COWBtreeNodeBuffer& operator=(COWBtreeNodeBuffer const&) = delete;
-    COWBtreeNodeBuffer(COWBtreeNodeBuffer&& other) {
-        m_buf = other.m_buf;
-        m_allocated = other.m_allocated;
-        other.m_buf = nullptr;
-        other.m_allocated = false;
-    }
-    COWBtreeNodeBuffer& operator=(COWBtreeNodeBuffer&& other) {
-        m_buf = other.m_buf;
-        m_allocated = other.m_allocated;
-        other.m_buf = nullptr;
-        other.m_allocated = false;
-        return *this;
-    }
-    uint8_t* bytes() { return m_buf; }
-
-private:
-    uint8_t* m_buf;
-    bool m_allocated;
-};
 
 struct COWBtreeNode {
 public:
-    std::atomic< uint8_t* > m_copied_version_buf{nullptr};
+    // Is the buffer for the node is currently being flushed
+    std::atomic< bool > m_is_buf_flushing{false};
+
+    struct FlushInfo {
+        BtreeNodePtr node;
+        uint8_t* buf{nullptr};
+
+        FlushInfo() = default;
+        FlushInfo(BtreeNodePtr n, uint8_t* b) : node{std::move(n)}, buf{b} {}
+        FlushInfo(FlushInfo const& other) = delete;
+        FlushInfo& operator=(FlushInfo const& other) = delete;
+        ~FlushInfo();
+
+        FlushInfo(FlushInfo&& other) {
+            node = std::move(other.node);
+            buf = other.buf;
+            other.buf = nullptr;
+        }
+
+        FlushInfo& operator=(FlushInfo&& other) {
+            node = std::move(other.node);
+            buf = other.buf;
+            other.buf = nullptr;
+            return *this;
+        }
+        uint8_t* bytes() { return buf; }
+    };
+
     static COWBtreeNode* construct(BtreeNodePtr const& node);
     static void destruct(BtreeNode* node);
     static COWBtreeNode* convert(BtreeNodePtr const& node);
+    static COWBtreeNode* convert(BtreeNode* node);
 
 private:
     COWBtreeNode() = default;
-    ~COWBtreeNode();
+    ~COWBtreeNode() = default;
 
 public:
-    bool copy_buf_if_needed(COWBtree const& bt, cp_id_t cp_id);
-    COWBtreeNodeBuffer get_flush_version_buf(cp_id_t cp_id);
+    FlushInfo prepare_flush_buf(COWBtree const& bt, BtreeNodePtr node, cp_id_t cur_cp_id);
+    void release_buf(uint8_t* buf);
     BtreeNode* to_btree_node();
 };
 

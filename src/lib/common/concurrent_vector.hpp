@@ -51,6 +51,7 @@ public:
 
         T const& operator*() const { return vec->at(slot_num); }
         T const* operator->() const { return &(vec->at(slot_num)); }
+        T&& operator*() { return std::move(vec->at(slot_num)); }
     };
 
 public:
@@ -64,7 +65,10 @@ public:
     ConcurrentVector& operator=(ConcurrentVector&&) noexcept = delete;
     ~ConcurrentVector() = default;
 
-    void push_back(T const& ele) { *(data(get_next_slot())) = ele; }
+    template < typename U = T >
+    std::enable_if_t< std::is_copy_constructible_v< U >, void > push_back(U const& ele) {
+        *(data(get_next_slot())) = ele;
+    }
     void emplace_back(T&& ele) { *(data(get_next_slot())) = std::move(ele); }
 
     T& at(size_t slot) { return *(data(slot)); }

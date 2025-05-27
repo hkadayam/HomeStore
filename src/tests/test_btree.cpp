@@ -248,10 +248,12 @@ TYPED_TEST(BtreeTest, SequentialRemove) {
     this->do_query(0, g_opts.num_entries - 1, 75);
 
     const auto entries_iter1 = g_opts.num_entries / 2;
-    LOGINFO("Step 3: Do Forward sequential remove for {} entries", entries_iter1);
-    for (uint32_t i{0}; i < entries_iter1; ++i) {
-        this->remove_one(i);
-    }
+    try {
+        LOGINFO("Step 3: Do Forward sequential remove for {} entries", entries_iter1);
+        for (uint32_t i{0}; i < entries_iter1; ++i) {
+            this->remove_one(i);
+        }
+    } catch (std::exception& e) { assert(false); }
     LOGINFO("Step 4: Query {} entries and validate with pagination of 75 entries", entries_iter1);
     this->do_query(0, entries_iter1 - 1, 75);
     this->do_query(entries_iter1, g_opts.num_entries - 1, 75);

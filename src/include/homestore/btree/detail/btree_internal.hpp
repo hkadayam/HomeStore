@@ -200,7 +200,7 @@ using bnodeid_t = uint64_t;
 static constexpr bnodeid_t empty_bnodeid = std::numeric_limits< bnodeid_t >::max();
 static constexpr uint16_t bt_init_crc_16 = 0x8005;
 
-VENUM(btree_node_type, uint32_t, FIXED = 0, VAR_VALUE = 1, VAR_KEY = 2, VAR_OBJECT = 3, PREFIX = 4, COMPACT = 5)
+VENUM(btree_node_type, uint32_t, FIXED = 0, VAR_VALUE = 1, VAR_KEY = 2, VAR_OBJECT = 3, FIXED_PREFIX = 4, COMPACT = 5)
 
 ENUM(btree_status_t, uint32_t, success, not_found, retry, has_more, node_read_failed, put_failed, space_not_avail,
      cp_mismatch, merge_not_required, merge_failed, crc_mismatch, not_supported, node_freed)
@@ -236,9 +236,6 @@ struct BtreeConfig {
     uint8_t m_suggested_min_pct{30};
     uint8_t m_split_pct{50};
     uint32_t m_max_merge_nodes{3};
-#ifdef _PRERELEASE
-    uint64_t m_max_keys_in_node{0};
-#endif
     bool m_rebalance_turned_on{false};
     bool m_merge_turned_on{true};
 

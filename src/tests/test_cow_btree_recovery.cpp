@@ -350,7 +350,9 @@ private:
         });
         if (crash) {
             test_common::HSTestHelper::trigger_cp(false /* wait */);
+#ifdef _PRERELEASE
             this->wait_for_crash_recovery();
+#endif
         } else {
             test_common::HSTestHelper::trigger_cp(true /* wait */);
             for (auto& [_, bt_helper] : this->m_bt_helpers) {

@@ -233,11 +233,7 @@ bnodeid_t COWBtree::generate_node_id() {
     return (m_ordinal_shifted | m_nodeid_generator.reserve());
 }
 
-BtreeNodePtr COWBtree::create_node(bool is_leaf, CPContext* context) {
-    auto buf = hs_utils::iobuf_alloc(node_size(), sisl::buftag::btree_node, m_vdev->align_size());
-    auto n = BtreeNodePtr{
-        m_base_btree.init_node(buf, generate_node_id(), true /* init_buf */, is_leaf, sizeof(COWBtreeNode))};
-    new (uintptr_cast(n.get()) - sizeof(COWBtreeNode)) COWBtreeNode();
+BlkId COWBtree::get_blkid_for_nodeid(bnodeid_t nodeid) const { return lookup_bnode_map(to_compact_nodeid(nodeid)); }
 
 void COWBtree::add_to_dirty_list(FlushNodeInfo finfo, COWBtreeCPContext* cp_ctx) {
     cp_ctx->increment_dirty_size(finfo.node->node_size());
@@ -646,7 +642,6 @@ void COWBtree::update_bnode_map(CompactNodeId nodeid, CompactBlkId cblkid, bool 
         std::unique_lock< iomgr::FiberManagerLib::shared_mutex > lg(m_bnodeid_map.m_mtx);
         do_update(nodeid, cblkid);
     }
-    m_bnodeid_map.m_updates_since_last_flush.store(0); // Reset the count, as we just flushed the full map
 }
 
 void COWBtree::delete_from_bnode_map(CompactNodeId nodeid, bool in_recovery) {

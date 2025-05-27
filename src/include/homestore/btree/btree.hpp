@@ -43,8 +43,6 @@ using RemovePaginateCookie = unique< BtreeRangeRemoveRequest< K > >;
 template < typename K >
 using QueryPaginateCookie = unique< BtreeQueryRequest< K > >;
 
-class BtreeStore;
-
 template < typename K, typename V >
 class Btree : public BtreeBase {
 public:

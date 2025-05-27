@@ -34,11 +34,11 @@ retry:
     auto cpg = bt_cp_guard();
     put_req.m_op_context = cpg.context(cp_consumer_t::INDEX_SVC);
 
-#ifndef NDEBUG
+#ifdef _DEBUG
     check_lock_debug();
-#endif
     BT_LOG_ASSERT_EQ(BtreeBase::thread_vars()->rd_locked_nodes.size(), 0);
     BT_LOG_ASSERT_EQ(BtreeBase::thread_vars()->wr_locked_nodes.size(), 0);
+#endif
 
     BtreeNodePtr root;
     ret = read_and_lock_node(m_root_node_info.bnode_id(), root, acq_lock, acq_lock, put_req.m_op_context);
@@ -50,8 +50,8 @@ retry:
         unlock_node(root, acq_lock);
         m_btree_lock.unlock_shared();
         ret = check_split_root(put_req);
-        BT_LOG_ASSERT_EQ(BtreeBase::thread_vars()->rd_locked_nodes.size(), 0);
-        BT_LOG_ASSERT_EQ(BtreeBase::thread_vars()->wr_locked_nodes.size(), 0);
+        BT_DBG_ASSERT_EQ(BtreeBase::thread_vars()->rd_locked_nodes.size(), 0);
+        BT_DBG_ASSERT_EQ(BtreeBase::thread_vars()->wr_locked_nodes.size(), 0);
 
         // We must have gotten a new root, need to start from scratch.
         m_btree_lock.lock_shared();
@@ -73,8 +73,8 @@ retry:
             // Need to start from top down again, since there was a split or we have more to insert in case of range put
             acq_lock = locktype_t::READ;
             BT_LOG(TRACE, "retrying put operation because btree reported retriable status {}", ret);
-            BT_LOG_ASSERT_EQ(BtreeBase::thread_vars()->rd_locked_nodes.size(), 0);
-            BT_LOG_ASSERT_EQ(BtreeBase::thread_vars()->wr_locked_nodes.size(), 0);
+            BT_DBG_ASSERT_EQ(BtreeBase::thread_vars()->rd_locked_nodes.size(), 0);
+            BT_DBG_ASSERT_EQ(BtreeBase::thread_vars()->wr_locked_nodes.size(), 0);
             goto retry;
         }
     }

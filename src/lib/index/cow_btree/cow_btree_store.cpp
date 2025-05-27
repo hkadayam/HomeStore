@@ -163,8 +163,6 @@ private:
     std::function< void(COWBtreeCPContext* ctx) > m_done_cb;
 };
 
-uint64_t COWBtreeStore::used_size(BtreeBase const& btree) const { return to_cow_btree_const(btree)->used_size(); }
-
 folly::Future< bool > COWBtreeStore::async_cp_flush(COWBtreeCPContext* cp_ctx) {
     CP_PERIODIC_LOG(DEBUG, cp_ctx->id(), "Starting COWBtree CP Flush with cp context={}", cp_ctx->to_string());
     if (!cp_ctx->any_dirty_nodes()) {

@@ -14,8 +14,6 @@
 #include "common/homestore_utils.hpp"
 #include "index/cow_btree/cow_btree.h"
 
-#include "common/homestore_utils.hpp"
-
 namespace homestore {
 class COWBtreeCPContext;
 class VirtualDev;
@@ -50,17 +48,7 @@ private:
     // Total number of incremental cp flushes since last full flushes
     uint32_t m_num_incremental_flushes{0};
 
-    // List of fibers to flush (note that this could be on multiple threads)
-    std::vector< iomgr::io_fiber_t > m_cp_flush_fibers;
-
-    // All loaded journals arranged by the btree ordinals
-    std::unordered_map< uint32_t, std::vector< sisl::byte_view > > m_journals_by_btree;
-
-    // All journals maintained (sorted) by its cp_id
-    std::vector< superblk< IndexStoreSuperBlock > > m_journals_by_cpid;
-
-    // Total number of incremental cp flushes since last full flushes
-    uint32_t m_num_incremental_flushes{0};
+    BtreeNode::Allocator::Token m_bufalloc_token;
 
 public:
     COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< IndexStoreSuperBlock > > store_sbs);

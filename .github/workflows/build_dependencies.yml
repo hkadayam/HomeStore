@@ -23,10 +23,10 @@ on:
         required: false
         type: string
         default: 'None'
-      testing:
+      build-level:
         required: false
         type: string
-        default: 'False'
+        default: 'Packaging'
   workflow_dispatch:
     inputs:
       platform:
@@ -71,14 +71,15 @@ on:
           - 'Coverage'
           - 'None'
         default: 'None'
-      testing:
-        description: 'Build and Run'
+      build-level:
+        description: 'Level to build'
         required: true
         type: choice
         options:
-          - 'True'
-          - 'False'
-        default: 'True'
+          - 'Dependencies'
+          - 'Packaging'
+          - 'Testing'
+        default: 'Testing'
 
 jobs:
   BuildHomestore:
@@ -97,14 +98,14 @@ jobs:
       uses: actions/checkout@main
       with:
         ref: ${{ inputs.branch }}
-      if: ${{ inputs.testing == 'True' }}
+      if: ${{ inputs.build-level == 'Testing' }}
 
     - name: Retrieve Recipe
       uses: actions/checkout@main
       with:
         repository: hkadayam/Homestore
         ref: ${{ inputs.branch }}
-      if: ${{ inputs.testing == 'False' }}
+      if: ${{ inputs.build-level != 'Testing' }}
 
     - name: Restore Dependency Cache
       id: restore-cache

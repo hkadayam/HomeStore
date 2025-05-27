@@ -80,8 +80,11 @@ public:
         return const_cast< BtreeSuperBlock& >(s_cast< const BtreeBase* >(this)->bt_super_blk());
     }
 
-    virtual BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf,
-                                 uint32_t ctx_size) const = 0;
+    virtual BtreeNodePtr new_node(bnodeid_t id, bool is_leaf, BtreeNode::Allocator::Token token) const = 0;
+    virtual BtreeNodePtr load_node(uint8_t* node_buf, bnodeid_t id, BtreeNode::Allocator::Token token) const = 0;
+
+    // virtual BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf,
+    //                              BtreeNode::Allocator::Token token) const = 0;
 
     uint64_t space_occupied() const override;
     uint32_t ordinal() const override;
@@ -101,6 +104,7 @@ public:
 
 protected:
     virtual btree_status_t create_root_node();
+    virtual BtreeNodePtr clone_temp_node(BtreeNode const& node);
     virtual btree_status_t read_and_lock_node(bnodeid_t id, BtreeNodePtr& node_ptr, locktype_t int_lock_type,
                                               locktype_t leaf_lock_type, CPContext* context) const;
     virtual btree_status_t get_child_and_lock_node(const BtreeNodePtr& node, uint32_t index, BtreeLinkInfo& child_info,

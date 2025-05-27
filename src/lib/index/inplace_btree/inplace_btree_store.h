@@ -610,7 +610,7 @@ protected:
         uint8_t* tmp_buffer = new uint8_t[this->m_node_size];
 
         // Remove all the entries in parent_node and let walk across child_nodes rebuild this node
-        parent_node->remove_all(this->m_bt_cfg);
+        parent_node->remove_all();
 
         // Walk across all child nodes until it gets the last_parent_key and keep fixing them.
         auto cur_parent = parent_node;

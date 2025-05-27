@@ -469,8 +469,10 @@ private:
 
 private:
     /////////////////////////////// Internal Node Management Methods ////////////////////////////////////
-    BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf,
-                         uint32_t ctx_size) const override;
+    // BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf,
+    //                      BtreeNode::Allocator::Token token) const override;
+    virtual BtreeNodePtr new_node(bnodeid_t id, bool is_leaf, BtreeNode::Allocator::Token token) const override;
+    virtual BtreeNodePtr load_node(uint8_t* node_buf, bnodeid_t id, BtreeNode::Allocator::Token token) const override;
 
     /////////////////////////////////// Helper Methods ///////////////////////////////////////
     btree_status_t post_order_traversal(locktype_t acq_lock, const auto& cb);

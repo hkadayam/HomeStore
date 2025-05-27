@@ -18,6 +18,9 @@ on:
       tooling:
         required: true
         type: string
+      build-level:
+        required: true
+        type: string
 
 jobs:
   HomestorePRBuild:

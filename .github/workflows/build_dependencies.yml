@@ -23,10 +23,10 @@ on:
         required: false
         type: string
         default: 'None'
-      build-level:
+      testing:
         required: false
         type: string
-        default: 'Packaging'
+        default: 'False'
   workflow_dispatch:
     inputs:
       platform:
@@ -71,15 +71,14 @@ on:
           - 'Coverage'
           - 'None'
         default: 'None'
-      build-level:
-        description: 'Level to build'
+      testing:
+        description: 'Build and Run'
         required: true
         type: choice
         options:
-          - 'Dependencies'
-          - 'Packaging'
-          - 'Testing'
-        default: 'Testing'
+          - 'True'
+          - 'False'
+        default: 'True'
 
 jobs:
   BuildHomestore:
@@ -90,14 +89,14 @@ jobs:
       uses: actions/checkout@main
       with:
         ref: ${{ inputs.branch }}
-      if: ${{ inputs.build-level == 'Testing' }}
+      if: ${{ inputs.testing == 'True' }}
 
     - name: Retrieve Recipe
       uses: actions/checkout@main
       with:
         repository: hkadayam/Homestore
         ref: ${{ inputs.branch }}
-      if: ${{ inputs.build-level != 'Testing' }}
+      if: ${{ inputs.testing == 'False' }}
 
     - name: Restore Dependency Cache
       id: restore-cache
@@ -162,6 +161,7 @@ jobs:
         conan remove -c -p "build_type=${{ inputs.build-type }}" '*:*#!latest'
         du -sh ~/.conan2/p | awk '{printf("size=%d\n", $1)}' > $GITHUB_OUTPUT
         rm -rf ~/.conan2/p/*/b ~/.conan2/p/*/s
+        rm -rf ~/.conan2/p/b/*/b
 
     - name: Save Cache
       uses: actions/cache/save@v4
@@ -176,11 +176,12 @@ jobs:
       with:
         limit-access-to-actor: true
         detached: true
+      if: ${{ inputs.testing == 'True' || inputs.tooling == 'Coverage' }}
 
     - name: Create and Test Package
       run: |
         sanitize=$([[ "${{ inputs.tooling }}" == "Sanitize" ]] && echo "True" || echo "False")
-        skip_test=$([[ "${{ inputs.build-level }}" == "Testing" ]] && echo "False" || echo "True") 
+        skip_test=$([[ "${{ inputs.testing }}" == "True" ]] && echo "False" || echo "True") 
         conan create \
             -o "sisl/*:prerelease=${{ inputs.prerelease }}" \
             -o "sisl/*:malloc_impl=${{ inputs.malloc-impl }}" \
@@ -189,13 +190,17 @@ jobs:
             -s build_type=${{ inputs.build-type }} \
             --build missing \
             .
+      if: ${{ inputs.tooling != 'Coverage' }}
 
     - name: Code Coverage Run
       run: |
+        du -sh ~/.conan2/p/*
+        df -h
         conan build \
             -o "sisl/*:prerelease=${{ inputs.prerelease }}" \
             -o "sisl/*:malloc_impl=${{ inputs.malloc-impl }}" \
-            -c tools.build:skip_test=True \
+            -o coverage=True \
+            -c tools.build:skip_test=False \
             -s build_type=${{ inputs.build-type }} \
             --build missing \
             .
@@ -207,171 +212,3 @@ jobs:
         token: ${{ secrets.CODECOV_TOKEN }}
         gcov: true
       if: ${{ inputs.tooling == 'Coverage' }}
-
-
-# jobs:
-#   BuildHomestore:
-#     runs-on: ${{ inputs.platform }}
-#     timeout-minutes: 1440
-#     steps:
-#     - name: Retrieve Code
-#       uses: actions/checkout@main
-#       with:
-#         ref: ${{ inputs.branch }}
-#       if: ${{ inputs.build-level == 'Testing' }}
-
-#     - name: Retrieve Recipe
-#       uses: actions/checkout@main
-#       with:
-#         repository: hkadayam/Homestore
-#         ref: ${{ inputs.branch }}
-#       if: ${{ inputs.build-level != 'Testing' }}
-
-#     - name: Load HomestoreDeps Cache
-#       id: restore-cache
-#       uses: hkadayam/sisl/.github/actions/load_conan@master
-#       with:
-#         key_prefix: HomestoreDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
-
-#     - name: Load SislDeps Cache
-#       uses: hkadayam/sisl/.github/actions/load_conan@master
-#       with:
-#         load_any: 'True'
-#         key_prefix: SislDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
-#         fail_on_cache_miss: false
-#       if: ${{ steps.restore-cache.outputs.cache-hit != 'true' }}
-
-#     - name: Retrieve Dependencies
-#       uses: actions/checkout@main
-#       with:
-#         repository: hkadayam/iomanager
-#         path: import/iomgr
-#         ref: master
-#       if: ${{ steps.restore-cache.outputs.cache-hit != 'true' || inputs.build-level != 'Dependencies' }}
-
-#     - name: Retrieve Dependencies
-#       uses: actions/checkout@main
-#       with:
-#         repository: hkadayam/nuraft_mesg
-#         path: import/nuraft_mesg
-#         ref: main
-#       if: ${{ steps.restore-cache.outputs.cache-hit != 'true' || inputs.build-level != 'Dependencies' }}
-
-#     - name: Load IOMgr Cache
-#       uses: hkadayam/sisl/.github/actions/load_conan@master
-#       with:
-#         path: import/iomgr
-#         key_prefix: IOMgrDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
-#         fail_on_cache_miss: false
-#       if: ${{ steps.restore-cache.outputs.cache-hit != 'true' }}
-
-#     - name: Load NuraftMesgDeps Cache
-#       uses: hkadayam/sisl/.github/actions/load_conan@master
-#       with:
-#         path: import/nuraft_mesg
-#         key_prefix: NuMesgDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
-#         fail_on_cache_miss: false
-#       if: ${{ steps.restore-cache.outputs.cache-hit != 'true' }}
-
-#     - name: Setup Conan
-#       uses: hkadayam/sisl/.github/actions/setup_conan@master
-#       with:
-#         platform: ${{ inputs.platform }}
-#       if: ${{ steps.restore-cache.outputs.cache-hit != 'true' || inputs.build-level != 'Dependencies' }}
-
-#     - name: Export Recipes
-#       run: |
-#         sudo apt-get install -y python3-pyelftools libaio-dev
-#         sudo rm -rf $ANDROID_HOME
-#         python -m pip install pyelftools
-#         conan export import/iomgr oss/master
-#         conan export import/nuraft_mesg oss/main
-#         cached_pkgs=$(ls -1d ~/.conan/data/*/*/*/*/package | sed 's,.*data/,,' | cut -d'/' -f1,2 | paste -sd',' - -)
-#         echo "::info:: Pre-cached: ${cached_pkgs}"
-#       if: ${{ steps.restore-cache.outputs.cache-hit != 'true' || inputs.build-level != 'Dependencies' }}
-
-#     - name: Build Homestore Deps Cache
-#       run: |
-#         pre=$([[ "${{ inputs.build-type }}" != "Debug" ]] && echo "-o sisl/*:prerelease=${{ inputs.prerelease }}" || echo "")
-#         conan install \
-#             -c tools.build:skip_test=True \
-#             ${pre} \
-#             -o sisl:malloc_impl=${{ inputs.malloc-impl }} \
-#             -o iomgr:testing=off \
-#             -o testing=off \
-#             -s build_type=${{ inputs.build-type }} \
-#             --build missing \
-#             .
-#       if: ${{ steps.restore-cache.outputs.cache-hit != 'true' }}
-
-#     - name: Save Homestore Deps Cache
-#       uses: hkadayam/sisl/.github/actions/store_conan@master
-#       with:
-#         key_prefix: HomestoreDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
-#       if: ${{ steps.restore-cache.outputs.cache-hit != 'true' }}
-
-#     - name: Reload Sisl Cache
-#       uses: hkadayam/sisl/.github/actions/load_conan@master
-#       with:
-#         load_any: 'True'
-#         key_prefix: SislDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
-#       if: ${{ inputs.build-level != 'Dependencies' && steps.restore-cache.outputs.cache-hit != 'true' }}
-
-#     - name: Reload IOMgr Cache
-#       uses: hkadayam/sisl/.github/actions/load_conan@master
-#       with:
-#         path: import/iomgr
-#         key_prefix: IOMgrDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
-#         fail_on_cache_miss: true
-#       if: ${{ inputs.build-level != 'Dependencies' && steps.restore-cache.outputs.cache-hit != 'true' }}
-
-#     - name: Reload NuraftMesg Cache
-#       uses: hkadayam/sisl/.github/actions/load_conan@master
-#       with:
-#         path: import/nuraft_mesg
-#         key_prefix: NuMesgDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
-#         fail_on_cache_miss: true
-#       if: ${{ inputs.build-level != 'Dependencies' && steps.restore-cache.outputs.cache-hit != 'true' }}
-
-#     - uses: actions/checkout@main
-#     - name: Setup tmate session
-#       uses: mxschmitt/action-tmate@v3
-#       with:
-#         limit-access-to-actor: true
-#         detached: true
-#       if: ${{ inputs.build-level != 'Dependencies' }}
-
-#     - name: Create and Test Package
-#       run: |
-#         sanitize=$([[ "${{ inputs.tooling }}" == "Sanitize" ]] && echo "True" || echo "False")
-#         pre=$([[ "${{ inputs.build-type }}" != "Debug" ]] && echo "-o sisl:prerelease=${{ inputs.prerelease }}" || echo "")
-#         conan create \
-#             ${pre} \
-#             -o "sisl/*:malloc_impl=${{ inputs.malloc-impl }}"" \
-#             -o "iomgr/*:testing=off" \
-#             -o "homestore/*:sanitize=${sanitize}"" \
-#             -s build_type=${{ inputs.build-type }} \
-#             --build missing \
-#             .
-#       if: ${{ inputs.build-level != 'Dependencies' && inputs.tooling != 'Coverage' }}
-
-#     - name: Code Coverage Run
-#       run: |
-#         pre=$([[ "${{ inputs.build-type }}" != "Debug" ]] && echo "-o sisl:prerelease=${{ inputs.prerelease }}" || echo "")
-#         conan install \
-#             ${pre} \
-#             -o "sisl/*:malloc_impl=${{ inputs.malloc-impl }}"" \
-#             -o "iomgr/*:testing=off" \
-#             -o coverage=True \
-#             -s build_type=${{ inputs.build-type }} \
-#             --build missing \
-#             .
-#         conan build .
-#       if: ${{ inputs.build-level != 'Dependencies' && inputs.tooling == 'Coverage' }}
-
-#     - name: Upload coverage reports to Codecov
-#       uses: codecov/codecov-action@v4
-#       with:
-#         token: ${{ secrets.CODECOV_TOKEN }}
-#         gcov: true
-#       if: ${{ inputs.build-level != 'Dependencies' && inputs.tooling == 'Coverage' }}

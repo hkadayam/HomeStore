@@ -23,10 +23,10 @@ on:
         required: false
         type: string
         default: 'None'
-      build-level:
+      testing:
         required: false
         type: string
-        default: 'Packaging'
+        default: 'False'
   workflow_dispatch:
     inputs:
       platform:
@@ -71,15 +71,14 @@ on:
           - 'Coverage'
           - 'None'
         default: 'None'
-      build-level:
-        description: 'Level to build'
+      testing:
+        description: 'Build and Run'
         required: true
         type: choice
         options:
-          - 'Dependencies'
-          - 'Packaging'
-          - 'Testing'
-        default: 'Testing'
+          - 'True'
+          - 'False'
+        default: 'True'
 
 jobs:
   BuildHomestore:
@@ -98,14 +97,14 @@ jobs:
       uses: actions/checkout@main
       with:
         ref: ${{ inputs.branch }}
-      if: ${{ inputs.build-level == 'Testing' }}
+      if: ${{ inputs.testing == 'True' }}
 
     - name: Retrieve Recipe
       uses: actions/checkout@main
       with:
         repository: hkadayam/Homestore
         ref: ${{ inputs.branch }}
-      if: ${{ inputs.build-level != 'Testing' }}
+      if: ${{ inputs.testing == 'False' }}
 
     - name: Restore Dependency Cache
       id: restore-cache
@@ -212,6 +211,8 @@ jobs:
 
     - name: Code Coverage Run
       run: |
+        du -sh ~/.conan2/p/*
+        df -h
         conan build \
             -o "sisl/*:prerelease=${{ inputs.prerelease }}" \
             -o "sisl/*:malloc_impl=${{ inputs.malloc-impl }}" \

@@ -27,7 +27,7 @@ public:
 // Btree based implementations superblock area
 struct BtreeSuperBlock {
     static constexpr size_t underlying_btree_sb_size =
-        IndexSuperBlock::index_impl_sb_size - sizeof(bnodeid_t) - sizeof(uint32_t);
+        IndexSuperBlock::index_impl_sb_size - sizeof(bnodeid_t) - sizeof(uint64_t) - sizeof(uint32_t);
 
     bnodeid_t root_node_id{empty_bnodeid}; // Btree Root Node ID
     uint64_t root_link_version{0};

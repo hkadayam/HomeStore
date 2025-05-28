@@ -55,9 +55,12 @@ COWBtreeStore::COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< I
                 return (hnode.m_value->m_refcount.test_le(1));
             })} {
     m_bufalloc_token = BtreeNode::Allocator::add(BtreeNode::Allocator{
-        [](uint32_t size) { return new uint8_t[size]; },      // alloc_btree_node
-        [](BtreeNode* node) { delete[] uintptr_cast(node); }, // free_btree_node
-        [this](uint32_t node_size) -> uint8_t* {              // alloc_node_buf
+        [](uint32_t size) { return new uint8_t[size]; }, // alloc_btree_node
+        [](BtreeNode* node) {
+            node->~BtreeNode();
+            delete[] uintptr_cast(node);
+        },                                       // free_btree_node
+        [this](uint32_t node_size) -> uint8_t* { // alloc_node_buf
             return hs_utils::iobuf_alloc(node_size, sisl::buftag::btree_node, m_vdev->align_size());
         },
         [](uint8_t* buf) { hs_utils::iobuf_free(buf, sisl::buftag::btree_node); }});

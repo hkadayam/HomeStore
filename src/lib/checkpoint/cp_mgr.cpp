@@ -270,6 +270,7 @@ void CPManager::on_cp_flush_done(CP* cp) {
         // checking if shutdown has been initiated or not.
         auto promise = std::move(cp->m_comp_promise);
         m_wd_cp->reset_cp();
+        bool is_shutdown_cp = cp->m_is_on_shutdown;
         delete cp;
 
         bool trigger_back_2_back_cp{false};
@@ -281,7 +282,7 @@ void CPManager::on_cp_flush_done(CP* cp) {
         }
 
         promise.setValue(true);
-        if (!cp->m_is_on_shutdown) { // No need of back_2_back cp etc on shutdown.
+        if (!is_shutdown_cp) { // No need of back_2_back cp etc on shutdown.
             // Dont access any cp state after this, in case trigger_back_2_back_cp is false, because its false on
             // cp_shutdown_initated and setting this promise could destruct the CPManager itself.
             if (trigger_back_2_back_cp) {

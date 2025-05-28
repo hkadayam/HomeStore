@@ -93,7 +93,10 @@ public:
 
         Allocator() :
                 alloc_btree_node{[](uint32_t size) -> uint8_t* { return new uint8_t[size]; }},
-                free_btree_node{[](BtreeNode* node) { delete[] uintptr_cast(node); }},
+                free_btree_node{[](BtreeNode* node) {
+                    node->~BtreeNode();
+                    delete[] uintptr_cast(node);
+                }},
                 alloc_node_buf{[](uint32_t size) { return new uint8_t[size]; }},
                 free_node_buf{[](uint8_t* buf) { delete[] buf; }} {}
 
@@ -166,7 +169,6 @@ public:
         DEBUG_ASSERT_EQ(m_phys_buf_share_count.load(), 0,
                         "We are being asked to destruct node while its buffer is still shared");
         Allocator::get(m_token).free_node_buf(m_phys_node_buf);
-        if (Allocator::get(m_token).free_btree_node) { Allocator::get(m_token).free_btree_node(this); }
     }
 
     // Identify if a node is a leaf node or not, from raw buffer, by just reading PersistentHeader
@@ -668,8 +670,11 @@ public:
         if (node->m_refcount.decrement_testz(1)) {
             // Do not delete it here, since node is generally an offset inside actual allocation and delete will fail
             // here (with asan). So let the on_node_freed from the underlying store delete the allocation.
-            node->~BtreeNode();
-            // delete node;
+            if (Allocator::get(node->m_token).free_btree_node) {
+                Allocator::get(node->m_token).free_btree_node(node);
+            } else {
+                delete node;
+            }
         }
     }
 };

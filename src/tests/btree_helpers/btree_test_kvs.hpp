@@ -60,6 +60,17 @@ static std::string gen_random_string(size_t len, uint32_t preamble = std::numeri
     }
     return str;
 }
+template < typename T >
+static bool willAdditionOverflow(T a, int b) {
+    static_assert(std::is_integral< T >::value, "Template parameter must be an integral type.");
+
+    if (b > 0) {
+        return a > std::numeric_limits< T >::max() - b;
+    } else if (b < 0) {
+        return a < std::numeric_limits< T >::min() - b;
+    }
+    return false;
+}
 
 using namespace homestore;
 
@@ -310,7 +321,7 @@ public:
         m_offset = other->m_offset;
     }
 
-    std::string to_string() const override { return fmt::format("{}.{}", m_base, m_offset); }
+    std::string to_string() const override { return fmt::format("{}", key()); }
 
     static uint32_t get_max_size() { return sizeof(TestIntervalKey); }
 
@@ -323,9 +334,10 @@ public:
 
     int distance(BtreeKey const& f) const override {
         TestIntervalKey const& from = s_cast< TestIntervalKey const& >(f);
-        DEBUG_ASSERT_EQ(m_base, from.m_base, "Invalid from key for distance");
-        DEBUG_ASSERT_GE(m_offset, from.m_offset, "Invalid from key for distance");
-        return m_offset - from.m_offset;
+        uint64_t this_val = (uint64_cast(m_base) << 32) | m_offset;
+        uint64_t from_val = (uint64_cast(from.m_base) << 32) | from.m_offset;
+        DEBUG_ASSERT_GE(this_val, from_val, "Invalid from key for distance");
+        return static_cast< int >(this_val - from_val);
     }
 
     bool is_interval_key() const override { return true; }
@@ -519,7 +531,8 @@ public:
         m_offset = other->m_offset;
     }
 
-    std::string to_string() const override { return fmt::format("{}.{}", m_base_val, m_offset); }
+    std::string to_string() const override { return fmt::format("{}", value()); }
+    uint64_t value() const { return (uint64_cast(m_base_val) << 16) | m_offset; }
 
     friend std::ostream& operator<<(std::ostream& os, const TestIntervalValue& v) {
         os << v.to_string();

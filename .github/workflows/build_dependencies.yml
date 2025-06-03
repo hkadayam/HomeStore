@@ -85,6 +85,14 @@ jobs:
     runs-on: ${{ inputs.platform }}
     timeout-minutes: 1440
     steps:
+    - name: Recover space
+      run: |
+        df -h
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        sudo docker builder prune -a
+        df -h
+
     - name: Retrieve Code
       uses: actions/checkout@main
       with:
@@ -147,7 +155,6 @@ jobs:
       run: |
         du -sh ~/.conan2/p | awk '{printf("size=%d\n", $1)}' > $GITHUB_OUTPUT
         conan install \
-            -u \
             -o "sisl/*:prerelease=${{ inputs.prerelease }}" \
             -o "sisl/*:malloc_impl=${{ inputs.malloc-impl }}" \
             -c tools.build:skip_test=True \
@@ -159,17 +166,27 @@ jobs:
       id : remove-prior-deps
       run: |
         conan remove -c -p "build_type=${{ inputs.build-type }}" '*:*#!latest'
-        du -sh ~/.conan2/p | awk '{printf("size=%d\n", $1)}' > $GITHUB_OUTPUT
-        rm -rf ~/.conan2/p/*/b ~/.conan2/p/*/s
         rm -rf ~/.conan2/p/b/*/b
+        rm -rf ~/.conan2/p/*/b ~/.conan2/p/*/s
+        du -sh ~/.conan2/p | awk '{printf("size=%d\n", $1)}' > $GITHUB_OUTPUT
+        df -h
 
-    - name: Save Cache
+    - name: Delete Previous Cache
+      continue-on-error: true
+      run: |
+        gh extension install actions/gh-actions-cache
+        gh actions-cache delete "HomestoreDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}" --confirm
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      if: ${{ github.event_name != 'pull_request' && steps.build-deps.outputs.size != steps.remove-prior-deps.outputs.size }}
+
+    - name: Save Dependency Cache
       uses: actions/cache/save@v4
       with:
         path: |
           ~/.conan2/p
         key: HomestoreDeps-${{ inputs.platform }}-${{ inputs.build-type }}-${{ inputs.malloc-impl }}-${{ inputs.prerelease }}
-      if: ${{ steps.build-deps.outputs.size != steps.remove-prior-deps.outputs.size }}
+      if: ${{ github.event_name != 'pull_request' && steps.build-deps.outputs.size != steps.remove-prior-deps.outputs.size }}
 
     - name: Setup tmate session
       uses: mxschmitt/action-tmate@v3
@@ -194,8 +211,6 @@ jobs:
 
     - name: Code Coverage Run
       run: |
-        du -sh ~/.conan2/p/*
-        df -h
         conan build \
             -o "sisl/*:prerelease=${{ inputs.prerelease }}" \
             -o "sisl/*:malloc_impl=${{ inputs.malloc-impl }}" \

@@ -64,9 +64,15 @@ set(HOMESTORE_OBJECTS
     lib/crc.cpp
 )
 #target_link_libraries(homestore_objs ${COMMON_DEPS})
+if (${CMAKE_BUILD_TYPE} STREQUAL "Debug")
+    add_library(homestore STATIC
+        ${HOMESTORE_OBJECTS} 
+    )
+else()
+    add_library(homestore STATIC 
+        ${HOMESTORE_OBJECTS} 
+    )
+endif()
 
-add_library(homestore STATIC 
-    ${HOMESTORE_OBJECTS} 
-)
 target_compile_definitions (homestore PRIVATE LOG_MODS_V2_SUPPORT)
-target_link_libraries(homestore ${COMMON_DEPS})
+target_link_libraries(homestore PRIVATE ${COMMON_DEPS})

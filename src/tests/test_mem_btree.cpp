@@ -332,6 +332,10 @@ int main(int argc, char* argv[]) {
         auto seed = SISL_OPTIONS["seed"].as< uint64_t >();
         LOGINFO("Using seed {} to sow the random generation", seed);
         g_re.seed(seed);
+    } else {
+        auto seed = std::chrono::system_clock::now().time_since_epoch().count();
+        LOGINFO("No seed provided. Using randomly generated seed: {}", seed);
+        g_re.seed(seed);
     }
     auto ret = RUN_ALL_TESTS();
     return ret;

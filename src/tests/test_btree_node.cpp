@@ -341,6 +341,39 @@ TYPED_TEST(NodeTest, SequentialInsert) {
     this->validate_get_any(98, 102);
 }
 
+TYPED_TEST(NodeTest, SimpleInsert) {
+    auto oc = this->m_node1->occupied_size();
+    this->put(1, btree_put_type::INSERT);
+    this->put(2, btree_put_type::INSERT);
+    this->put(3, btree_put_type::INSERT);
+    this->remove(2);
+    this->remove(1);
+    this->remove(3);
+    auto oc2 = this->m_node1->occupied_size();
+    ASSERT_EQ(oc, oc2) << "Occupied size cannot be more than original size";
+    this->put(1, btree_put_type::INSERT);
+    this->put(2, btree_put_type::INSERT);
+    this->put(3, btree_put_type::INSERT);
+    this->remove(3);
+    this->remove(2);
+    this->remove(1);
+    ASSERT_EQ(oc, oc2) << "Occupied size must be the same as original size";
+
+    this->put(2, btree_put_type::INSERT);
+    this->put(1, btree_put_type::INSERT);
+    this->put(4, btree_put_type::INSERT);
+    this->put(3, btree_put_type::INSERT);
+    for (uint32_t i = 5; i <= 50; ++i) {
+        this->put(i, btree_put_type::INSERT);
+    }
+    LOGDEBUG("Creating a hole with size of 11 for prefix compaction usecase");
+    for (uint32_t i = 10; i <= 20; ++i) {
+        this->remove(i);
+    }
+    this->m_node1->move_out_to_right_by_entries(this->m_cfg, *this->m_node2, 20);
+    this->m_node1->copy_by_entries(this->m_cfg, *this->m_node2, 0, std::numeric_limits< uint32_t >::max());
+}
+
 TYPED_TEST(NodeTest, ReverseInsert) {
     for (uint32_t i{100}; (i > 0 && this->has_room()); --i) {
         this->put(i - 1, btree_put_type::INSERT);

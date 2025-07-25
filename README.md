@@ -31,7 +31,7 @@ Free flat-allocation space. Hooks are provided if a particular allocation patter
 ### LogSvc (std::list)
 Random Access circular buffer. Typically not used directly but levaraged by other Services to provide crash-resiliency.
 
-## Application Diagram
+## Architecture Diagram
 
 ![HomeObject Overview](docs/imgs/HomeStore.png)
 

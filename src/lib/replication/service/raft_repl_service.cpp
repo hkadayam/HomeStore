@@ -197,12 +197,14 @@ void RaftReplService::start() {
 }
 
 void RaftReplService::stop() {
+#if 0
     start_stopping();
     while (true) {
         auto pending_request_num = get_pending_request_num();
         if (!pending_request_num) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
+#endif
 
     // stop all repl_devs
     {
@@ -409,7 +411,7 @@ folly::SemiFuture< ReplServiceError > RaftReplService::remove_repl_dev(group_id_
 
     auto ret = std::dynamic_pointer_cast< RaftReplDev >(rdev_result.value())->destroy_group();
 
-    decr_pending_request_num();
+    // decr_pending_request_num();
     return ret;
 }
 
@@ -466,8 +468,8 @@ void RaftReplService::load_repl_dev(sisl::byte_view const& buf, void* meta_cooki
 AsyncReplResult<> RaftReplService::replace_member(group_id_t group_id, const replica_member_info& member_out,
                                                   const replica_member_info& member_in, uint32_t commit_quorum,
                                                   uint64_t trace_id) const {
-    if (is_stopping()) return make_async_error<>(ReplServiceError::STOPPING);
-    incr_pending_request_num();
+    // if (is_stopping()) return make_async_error<>(ReplServiceError::STOPPING);
+    // incr_pending_request_num();
     auto rdev_result = get_repl_dev(group_id);
     if (!rdev_result) { return make_async_error<>(ReplServiceError::SERVER_NOT_FOUND); }
 
@@ -476,21 +478,21 @@ AsyncReplResult<> RaftReplService::replace_member(group_id_t group_id, const rep
         .via(&folly::InlineExecutor::instance())
         .thenValue([this](auto&& e) mutable {
             if (e.hasError()) {
-                decr_pending_request_num();
+                // decr_pending_request_num();
                 return make_async_error<>(e.error());
             }
-            decr_pending_request_num();
+            // decr_pending_request_num();
             return make_async_success<>();
         });
 }
 
 AsyncReplResult<> RaftReplService::flip_learner_flag(group_id_t group_id, const replica_member_info& member, bool target, uint32_t commit_quorum,
                                     bool wait_and_verify, uint64_t trace_id) const {
-    if (is_stopping()) return make_async_error<>(ReplServiceError::STOPPING);
-    incr_pending_request_num();
+    // if (is_stopping()) return make_async_error<>(ReplServiceError::STOPPING);
+    // incr_pending_request_num();
     auto rdev_result = get_repl_dev(group_id);
     if (!rdev_result) {
-        decr_pending_request_num();
+        // decr_pending_request_num();
         return make_async_error<>(ReplServiceError::SERVER_NOT_FOUND);
     }
     return std::dynamic_pointer_cast< RaftReplDev >(rdev_result.value())
@@ -586,13 +588,13 @@ void RaftReplService::gc_repl_reqs() {
 }
 
 void RaftReplService::gc_repl_devs() {
-    incr_pending_request_num();
+    /* incr_pending_request_num();
     // Skip gc when raft repl service is stopping to avoid concurrency issues between repl_dev's stop and destroy ops.
     if (is_stopping()) {
         LOGINFOMOD(replication, "ReplSvc is stopping, skipping GC");
         decr_pending_request_num();
         return;
-    }
+    } */
 
     std::vector< group_id_t > groups_to_leave;
     {
@@ -622,7 +624,7 @@ void RaftReplService::gc_repl_devs() {
             m_rd_map.erase(group_id);
         }
     }
-    decr_pending_request_num();
+    // decr_pending_request_num();
 }
 
 void RaftReplService::flush_durable_commit_lsn() {

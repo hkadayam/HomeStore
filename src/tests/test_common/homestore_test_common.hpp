@@ -472,7 +472,9 @@ private:
             } else if ((svc == ServiceType::LOG)) {
                 hsi->with_log_service();
             } else if (svc == ServiceType::REPLICATION) {
+#ifdef REPLICATION_SUPPORT
                 hsi->with_repl_data_service(tp.repl_app, tp.custom_chunk_selector);
+#endif
             }
         }
 #ifdef _PRERELEASE

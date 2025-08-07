@@ -131,7 +131,9 @@ private:
     std::unique_ptr< MetaBlkService > m_meta_service;
     std::unique_ptr< LogStoreService > m_log_service;
     std::unique_ptr< IndexService > m_index_service;
+#ifdef REPLICATION_SUPPORT
     std::shared_ptr< ReplicationService > m_repl_service;
+#endif
 
     std::unique_ptr< DeviceManager > m_dev_mgr;
     shared< sisl::logging::logger_t > m_periodic_logger;
@@ -163,8 +165,10 @@ public:
     HomeStore& with_log_service();
     HomeStore& with_index_service(std::unique_ptr< IndexServiceCallbacks > cbs,
                                   std::vector< ServiceSubType > sub_types);
+#ifdef REPLICATION_SUPPORT
     HomeStore& with_repl_data_service(cshared< ReplApplication >& repl_app,
                                       cshared< ChunkSelector >& custom_chunk_selector = nullptr);
+#endif
 
     bool start(const hs_input_params& input, hs_before_services_starting_cb_t svcs_starting_cb = nullptr);
     void format_and_start(std::map< ServiceId, hs_format_params >&& format_opts);
@@ -189,7 +193,9 @@ public:
         if (!m_index_service) { throw std::runtime_error("index_service is nullptr"); }
         return *m_index_service;
     }
+#ifdef REPLICATION_SUPPORT
     ReplicationService& repl_service() { return *m_repl_service; }
+#endif
     DeviceManager* device_mgr() { return m_dev_mgr.get(); }
     ResourceMgr& resource_mgr() { return *m_resource_mgr.get(); }
     CPManager& cp_mgr() { return *m_cp_mgr.get(); }

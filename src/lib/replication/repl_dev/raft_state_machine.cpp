@@ -404,7 +404,7 @@ void RaftStateMachine::save_logical_snp_obj(nuraft::snapshot& s, ulong& obj_id, 
 #ifdef _PRERELEASE
     if (iomgr_flip::instance()->test_flip("baseline_resync_restart_new_follower")) {
         LOGINFO("Hit flip baseline_resync_restart_new_follower crashing");
-        hs()->crash_simulator().crash();
+        hs()->crash_simulator().crash_now();
     }
 #endif
 }

@@ -146,6 +146,7 @@ void LogDev::stop() {
     m_hs.reset();
 }
 
+#if 0
 void LogDev::stop() {
     start_stopping();
     while (true) {
@@ -175,6 +176,7 @@ void LogDev::stop() {
         std::move(f).get();
     }
 }
+#endif
 
 void LogDev::destroy() {
     THIS_LOGDEV_LOG(INFO, "Logdev destroy metablks log_dev={}", m_logdev_id);

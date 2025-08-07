@@ -40,7 +40,9 @@
 #include "device/virtual_dev.hpp"
 #include "common/resource_mgr.hpp"
 #include "meta/meta_sb.hpp"
+#ifdef REPLICATION_SUPPORT
 #include "replication/service/generic_repl_svc.h"
+#endif
 #include "common/crash_simulator.hpp"
 
 /*
@@ -94,6 +96,7 @@ HomeStore& HomeStore::with_log_service() {
     return *this;
 }
 
+#ifdef REPLICATION_SUPPORT
 HomeStore& HomeStore::with_repl_data_service(cshared< ReplApplication >& repl_app,
                                              cshared< ChunkSelector >& custom_chunk_selector) {
     m_services[uint32_cast(ServiceType::REPLICATION)] = std::vector< ServiceSubType >{1u, ServiceSubType::DEFAULT};
@@ -103,6 +106,7 @@ HomeStore& HomeStore::with_repl_data_service(cshared< ReplApplication >& repl_ap
     s_custom_chunk_selector = std::move(custom_chunk_selector);
     return *this;
 }
+#endif
 
 #ifdef _PRERELEASE
 HomeStore& HomeStore::with_crash_simulator(std::function< void(void) > cb) {
@@ -192,7 +196,9 @@ bool HomeStore::start(const hs_input_params& input, hs_before_services_starting_
     if (has_repl_data_service()) {
         m_log_service = std::make_unique< LogStoreService >();
         m_data_service = std::make_unique< BlkDataService >(std::move(s_custom_chunk_selector));
+#ifdef REPLICATION_SUPPORT
         m_repl_service = GenericReplService::create(std::move(s_repl_app));
+#endif
     } else {
         if (has_log_service()) { m_log_service = std::make_unique< LogStoreService >(); }
         if (has_data_service()) {
@@ -300,7 +306,9 @@ void HomeStore::do_start() {
     if (has_index_service()) { m_index_service->start(); }
 
     if (has_repl_data_service()) {
+#ifdef REPLICATION_SUPPORT
         s_cast< GenericReplService* >(m_repl_service.get())->start(); // Replservice starts logstore & data service
+#endif
     } else {
         if (has_data_service()) { m_data_service->start(); }
         if (has_log_service() && inp_params.auto_recovery) {
@@ -338,11 +346,13 @@ void HomeStore::shutdown() {
     m_resource_mgr->stop();
 
     if (has_repl_data_service()) {
+#ifdef REPLICATION_SUPPORT
         // Log and Data services are stopped by repl service
         s_cast< GenericReplService* >(m_repl_service.get())->stop();
         m_log_service.reset();
         m_data_service.reset();
         m_repl_service.reset();
+#endif
     } else {
         if (has_log_service()) {
             m_log_service->stop();

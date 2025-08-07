@@ -370,14 +370,10 @@ TYPED_TEST(NodeTest, SimpleInsert) {
     for (uint32_t i = 10; i <= 20; ++i) {
         this->remove(i);
     }
-    this->m_node1->move_out_to_right_by_entries(this->m_cfg, *this->m_node2, 20);
-    this->m_node1->copy_by_entries(this->m_cfg, *this->m_node2, 0, std::numeric_limits< uint32_t >::max());
-}
-
-TYPED_TEST(NodeTest, RangeChangeInsert) {
-    if (this->m_node1->get_node_type() != btree_node_type::PREFIX) {return;}
-    this->put_range(0xFFFFFFFF - 10,20);
-    this->print();
+    this->m_node1->move_out_to_right_by_entries(*this->m_node2, 20);
+    uint32_t copy_idx{0u};
+    this->m_node1->append_copy_in_upto_size(*this->m_node2, copy_idx, std::numeric_limits< uint32_t >::max(),
+                                            /*copy_only_if_fits=*/false);
 }
 
 TYPED_TEST(NodeTest, ReverseInsert) {

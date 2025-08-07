@@ -254,15 +254,6 @@ public:
      */
     HSDevType get_dev_type() const;
 
-    /**
-     * @brief Gets the drive type of the data service.
-     *
-     * Data Service doesn't support mixed drive types.
-     *
-     * @return The drive type of the data service, HDD or NVME.
-     */
-    HSDevType get_dev_type() const;
-
     void stop();
 
 private:

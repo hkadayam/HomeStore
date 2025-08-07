@@ -24,8 +24,6 @@
 #include <iomgr/iomgr_flip.hpp>
 #include <homestore/homestore.hpp>
 #include <homestore/logstore_service.hpp>
-#include <homestore/replication_service.hpp>
-#include "replication/repl_dev/raft_repl_dev.h"
 #include "device/chunk.h"
 #include "device/device.h"
 #include "device/physical_dev.hpp"

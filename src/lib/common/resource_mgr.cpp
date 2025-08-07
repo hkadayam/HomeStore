@@ -15,13 +15,15 @@
  *********************************************************************************/
 #include <homestore/homestore.hpp>
 #include <homestore/logstore_service.hpp>
-#include <homestore/replication_service.hpp>
 #include <homestore/checkpoint/cp_mgr.hpp>
 #include <iomgr/iomgr_flip.hpp>
 #include "resource_mgr.hpp"
 #include "homestore_assert.hpp"
-#include "replication/repl_dev/raft_repl_dev.h"
 
+#ifdef REPLICATION_SUPPORT
+#include <homestore/replication_service.hpp>
+#include "replication/repl_dev/raft_repl_dev.h"
+#endif
 namespace homestore {
 ResourceMgr& resource_mgr() { return hs()->resource_mgr(); }
 

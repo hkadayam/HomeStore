@@ -559,6 +559,7 @@ public:
 
     // we have no shutdown for repl_dev, since shutdown repl_dev is done by repl_service
     void stop() {
+#if 0
         start_stopping();
         while (true) {
             auto pending_request_num = get_pending_request_num();
@@ -566,6 +567,7 @@ public:
 
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
         }
+#endif
     }
 
     // complete all the requests that are in progress and start refusing new reqs

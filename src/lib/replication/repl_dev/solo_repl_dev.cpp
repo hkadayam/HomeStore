@@ -35,7 +35,7 @@ void SoloReplDev::async_alloc_write(sisl::blob const& header, sisl::blob const& 
                                     repl_req_ptr_t rreq, bool part_of_batch, trace_id_t tid) {
     if (!rreq) { auto rreq = repl_req_ptr_t(new repl_req_ctx{}); }
 
-    incr_pending_request_num();
+    // incr_pending_request_num();
     auto status = rreq->init(repl_key{.server_id = 0, .term = 1, .dsn = 1, .traceID = tid},
                              value.size ? journal_type_t::HS_DATA_LINKED : journal_type_t::HS_DATA_INLINED, true,
                              header, key, value.size, m_listener);
@@ -79,38 +79,38 @@ void SoloReplDev::write_journal(repl_req_ptr_t rreq) {
                 data_service().commit_blk(blkid);
             }
             m_listener->on_commit(rreq->lsn(), rreq->header(), rreq->key(), rreq->local_blkids(), rreq);
-            decr_pending_request_num();
+            // decr_pending_request_num();
         });
 }
 
 std::error_code SoloReplDev::alloc_blks(uint32_t data_size, const blk_alloc_hints& hints,
                                         std::vector< MultiBlkId >& out_blkids) {
-    if (is_stopping()) { return std::make_error_code(std::errc::operation_canceled); }
+    // if (is_stopping()) { return std::make_error_code(std::errc::operation_canceled); }
 
-    incr_pending_request_num();
+    // incr_pending_request_num();
     std::vector< BlkId > blkids;
     auto status =
         data_service().alloc_blks(sisl::round_up(uint32_cast(data_size), data_service().get_blk_size()), hints, blkids);
     if (status != BlkAllocStatus::SUCCESS) {
         DEBUG_ASSERT_EQ(status, BlkAllocStatus::SUCCESS, "Unable to allocate blks");
-        decr_pending_request_num();
+        // decr_pending_request_num();
         return std::make_error_code(std::errc::no_space_on_device);
     }
     for (auto& blkid : blkids) {
         out_blkids.emplace_back(blkid);
     }
-    decr_pending_request_num();
+    // decr_pending_request_num();
     return std::error_code{};
 }
 
 folly::Future< std::error_code > SoloReplDev::async_write(const std::vector< MultiBlkId >& blkids,
                                                           sisl::sg_list const& value, bool part_of_batch,
                                                           trace_id_t tid) {
-    if (is_stopping()) {
+    /*if (is_stopping()) {
         return folly::makeFuture< std::error_code >(std::make_error_code(std::errc::operation_canceled));
-    }
+    }*/
 
-    incr_pending_request_num();
+    // incr_pending_request_num();
     HS_REL_ASSERT_GT(blkids.size(), 0, "Empty blkid vec");
     std::vector< folly::Future< std::error_code > > futs;
     futs.reserve(blkids.size());
@@ -138,15 +138,15 @@ folly::Future< std::error_code > SoloReplDev::async_write(const std::vector< Mul
             }
         }
 
-        decr_pending_request_num();
+        // decr_pending_request_num();
         return folly::makeFuture< std::error_code >(std::error_code{});
     });
 }
 
 void SoloReplDev::async_write_journal(const std::vector< MultiBlkId >& blkids, sisl::blob const& header,
                                       sisl::blob const& key, uint32_t data_size, repl_req_ptr_t rreq, trace_id_t tid) {
-    if (is_stopping()) { return; }
-    incr_pending_request_num();
+    // if (is_stopping()) { return; }
+    // incr_pending_request_num();
 
     // We expect clients to provide valid repl req ctx with blocks allocated.
     HS_REL_ASSERT(rreq, "Invalid repl req ctx");
@@ -198,22 +198,22 @@ void SoloReplDev::on_log_found(logstore_seq_num_t lsn, log_buffer buf, void* ctx
 
 folly::Future< std::error_code > SoloReplDev::async_read(MultiBlkId const& bid, sisl::sg_list& sgs, uint32_t size,
                                                          bool part_of_batch, trace_id_t tid) {
-    if (is_stopping()) {
+    /*if (is_stopping()) {
         return folly::makeFuture< std::error_code >(std::make_error_code(std::errc::operation_canceled));
-    }
-    incr_pending_request_num();
+    }*/
+    // incr_pending_request_num();
     auto result = data_service().async_read(bid, sgs, size, part_of_batch);
-    decr_pending_request_num();
+    // decr_pending_request_num();
     return result;
 }
 
 folly::Future< std::error_code > SoloReplDev::async_free_blks(int64_t, MultiBlkId const& bid, trace_id_t tid) {
-    if (is_stopping()) {
+    /*if (is_stopping()) {
         return folly::makeFuture< std::error_code >(std::make_error_code(std::errc::operation_canceled));
-    }
-    incr_pending_request_num();
+    }*/
+    // incr_pending_request_num();
     auto result = data_service().async_free_blk(bid);
-    decr_pending_request_num();
+    // decr_pending_request_num();
     return result;
 }
 

@@ -136,8 +136,6 @@ logdev_id_t LogStoreService::get_next_logdev_id() {
 }
 
 logdev_id_t LogStoreService::create_new_logdev(flush_mode_t flush_mode) {
-    if (is_stopping()) return 0;
-    incr_pending_request_num();
     folly::SharedMutexWritePriority::WriteHolder holder(m_logdev_map_mtx);
     logdev_id_t logdev_id = get_next_logdev_id();
     auto logdev = create_new_logdev_internal(logdev_id, flush_mode);
@@ -148,9 +146,8 @@ logdev_id_t LogStoreService::create_new_logdev(flush_mode_t flush_mode) {
 }
 
 void LogStoreService::destroy_log_dev(logdev_id_t logdev_id) {
-    if (is_stopping()) return;
     HS_LOG(INFO, logstore, "Destroying logdev {}", logdev_id);
-    incr_pending_request_num();
+
     folly::SharedMutexWritePriority::WriteHolder holder(m_logdev_map_mtx);
     const auto it = m_id_logdev_map.find(logdev_id);
     if (it == m_id_logdev_map.end()) {
@@ -160,20 +157,20 @@ void LogStoreService::destroy_log_dev(logdev_id_t logdev_id) {
 
     // Stop the logdev and release all the chunks from the journal vdev.
     auto& logdev = it->second;
-    if (!logdev->is_stopped()) {
-        // Stop the logdev if its started.
-        logdev->stop();
-    }
+    // if (!logdev->is_stopped()) {
+    //  Stop the logdev if its started.
+    logdev->stop();
+        //}
 
-    // First release all chunks.
-    m_logdev_vdev->destroy(logdev_id);
+        // First release all chunks.
+        m_logdev_vdev->destroy(logdev_id);
 
-    // Destroy the metablks for logdev.
-    logdev->destroy();
+        // Destroy the metablks for logdev.
+        logdev->destroy();
 
-    m_id_logdev_map.erase(it);
-    COUNTER_DECREMENT(m_metrics, logdevs_count, 1);
-    HS_LOG(INFO, logstore, "Removed log_dev={}", logdev_id);
+        m_id_logdev_map.erase(it);
+        COUNTER_DECREMENT(m_metrics, logdevs_count, 1);
+        HS_LOG(INFO, logstore, "Removed log_dev={}", logdev_id);
 }
 
 void LogStoreService::delete_unopened_logdevs() {
@@ -289,9 +286,8 @@ folly::Future< shared< HomeLogStore > > LogStoreService::open_log_store(logdev_i
 }
 
 void LogStoreService::remove_log_store(logdev_id_t logdev_id, logstore_id_t store_id) {
-    if (is_stopping()) return;
     HS_LOG(INFO, logstore, "Removing logstore {} from logdev {}", store_id, logdev_id);
-    incr_pending_request_num();
+
     folly::SharedMutexWritePriority::WriteHolder holder(m_logdev_map_mtx);
     COUNTER_INCREMENT(m_metrics, logstores_count, 1);
     const auto it = m_id_logdev_map.find(logdev_id);
@@ -301,7 +297,7 @@ void LogStoreService::remove_log_store(logdev_id_t logdev_id, logstore_id_t stor
     }
     it->second->remove_log_store(store_id);
     HS_LOG(INFO, logstore, "Successfully removed logstore {} from logdev {}", store_id, logdev_id);
-    decr_pending_request_num();
+
     COUNTER_DECREMENT(m_metrics, logstores_count, 1);
 }
 

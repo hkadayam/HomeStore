@@ -81,7 +81,6 @@ hs_stats GenericReplService::get_cap_stats() const {
 
 ///////////////////// SoloReplService specializations and CP Callbacks /////////////////////////////
 SoloReplService::SoloReplService(cshared< ReplApplication >& repl_app) : GenericReplService{repl_app} {}
-SoloReplService::~SoloReplService(){};
 
 void SoloReplService::start() {
     for (auto const& [buf, mblk] : m_sb_bufs) {
@@ -100,12 +99,12 @@ void SoloReplService::start() {
 }
 
 void SoloReplService::stop() {
-    start_stopping();
+    /*start_stopping();
     while (true) {
         auto pending_request_num = get_pending_request_num();
         if (!pending_request_num) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-    }
+    }*/
 
     // stop all repl_devs
     {
@@ -129,7 +128,7 @@ AsyncReplResult< shared< ReplDev > > SoloReplService::create_repl_dev(group_id_t
     auto listener = m_repl_app->create_repl_dev_listener(group_id);
     listener->set_repl_dev(rdev);
     rdev->attach_listener(std::move(listener));
-    incr_pending_request_num();
+    // incr_pending_request_num();
 
     {
         std::unique_lock lg(m_rd_map_mtx);
@@ -137,12 +136,12 @@ AsyncReplResult< shared< ReplDev > > SoloReplService::create_repl_dev(group_id_t
         if (!happened) {
             // We should never reach here, as we have failed to emplace in map, but couldn't find entry
             DEBUG_ASSERT(false, "Unable to put the repl_dev in rd map");
-            decr_pending_request_num();
+            // decr_pending_request_num();
             return make_async_error< shared< ReplDev > >(ReplServiceError::SERVER_ALREADY_EXISTS);
         }
     }
 
-    decr_pending_request_num();
+    // decr_pending_request_num();
     return make_async_success< shared< ReplDev > >(rdev);
 }
 

@@ -62,11 +62,6 @@ using HomeStoreSafePtr = std::shared_ptr< HomeStore >;
 
 using hs_before_services_starting_cb_t = std::function< void(void) >;
 
-struct hs_stats {
-    uint64_t total_capacity{0ul};
-    uint64_t used_capacity{0ul};
-};
-
 ENUM(ServiceType, uint32_t, // List of all services we support
      META = 0,              // Meta Service
      LOG = 1,               // Log Service
@@ -82,6 +77,13 @@ ENUM(ServiceSubType, uint32_t,      // All sub types within services. At this po
      INDEX_BTREE_INPLACE = 2,       // LInplace Btree based index
      INDEX_BTREE_MEMORY = 3,        // Memory based index
 );
+
+using hs_before_services_starting_cb_t = std::function< void(void) >;
+
+struct hs_stats {
+    uint64_t total_capacity{0ul};
+    uint64_t used_capacity{0ul};
+};
 
 VENUM(hs_vdev_type_t, uint32_t, DATA_VDEV = 1, INDEX_VDEV = 2, META_VDEV = 3, LOGDEV_VDEV = 4);
 

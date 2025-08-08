@@ -555,15 +555,16 @@ public:
         }
         return num_entries;
     }
+
+    uint32_t copy_by_size(BtreeNode const& o, uint32_t start_idx, uint32_t size) {
+        return copy_internal(o, start_idx, true /* by_size*/, size);
+    }
+
     uint32_t copy_by_entries(BtreeNode const& o, uint32_t start_idx, uint32_t nentries) {
         return copy_internal(o, start_idx, false /* by_size*/, nentries);
     }
 
 #endif
-
-    uint32_t copy_by_size(BtreeNode const& o, uint32_t start_idx, uint32_t size) {
-        return copy_internal(o, start_idx, true /* by_size*/, size);
-    }
 
     uint32_t get_entries_size(uint32_t start_idx, uint32_t end_idx) const override {
         return (prefix_entry::size() + suffix_entry::size()) * (end_idx - start_idx);

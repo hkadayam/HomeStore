@@ -590,8 +590,6 @@ void IndexWBCache::recover(sisl::byte_view sb) {
                 if (buf->m_created_cp_id == icp_ctx->id()) {
                     // New nodes need to be commited first
                     m_vdev->commit_blk(buf->m_blkid);
-<<<<<<< HEAD:src/lib/index/inplace_btree/wb_cache.cpp
-=======
                     // it can happen when children moved to one of right parent sibling and then the previous node is
                     // deleted but not commited during crash (upbuffer is not committed). but its children already
                     // committed. and freed (or changed)
@@ -616,7 +614,6 @@ void IndexWBCache::recover(sisl::byte_view sb) {
                         update_up_buffer_counters(buf->m_up_buffer /*,visited_bufs*/);
                     }
                     buf->m_up_buffer = nullptr;
->>>>>>> f30f0d44 (Issue 713: Fix index table destroy race with wb_cache cp flush (#714)):src/lib/index/wb_cache.cpp
                 }
                 pending_bufs.push_back(buf);
                 buf->m_wait_for_down_buffers.increment(1); // Purely for recover_buf() counter consistency
@@ -635,10 +632,23 @@ void IndexWBCache::recover(sisl::byte_view sb) {
                     // if up buffer has upbuffer, then we need to decrement its wait_for_down_buffers
                     update_up_buffer_counters(buf->m_up_buffer);
                 }
-<<<<<<< HEAD:src/lib/index/inplace_btree/wb_cache.cpp
-=======
-                //                buf->m_up_buffer = nullptr;
->>>>>>> f30f0d44 (Issue 713: Fix index table destroy race with wb_cache cp flush (#714)):src/lib/index/wb_cache.cpp
+
+    // On the second pass, we only take the new nodes/bufs and then repair their up buffers, if needed.
+    std::vector< IndexBufferPtr > l0_bufs;
+    for (auto const& [_, buf] : bufs) {
+        if (buf->m_node_freed || (buf->m_created_cp_id == icp_ctx->id())) {
+            if (was_node_committed(buf)) {
+                if (was_node_committed(buf->m_up_buffer)) {
+                    if (buf->m_node_freed) {
+                        // Up buffer was written, so this buffer can be freed and thus can free the blk.
+                        m_vdev->free_blk(buf->m_blkid, s_cast< VDevCPContext* >(icp_ctx));
+                    } else {
+                        m_vdev->commit_blk(buf->m_blkid);
+                    }
+                    l0_bufs.push_back(buf);
+                } else {
+                    buf->m_up_buffer->m_wait_for_down_buffers.decrement();
+                }
             }
         }
     }
@@ -649,14 +659,7 @@ void IndexWBCache::recover(sisl::byte_view sb) {
     LOGTRACEMOD(wbcache, "All unclean bufs list\n{}", detailed_log(bufs, pending_bufs));
     LOGTRACEMOD(wbcache, "After recovery: {}", to_string_dag_bufs(dags, icp_ctx->id()));
 #endif
-<<<<<<< HEAD:src/lib/index/inplace_btree/wb_cache.cpp
 
-    for (auto const& buf : pending_bufs) {
-        recover_buf(buf);
-        if (buf->m_bytes != nullptr && r_cast< persistent_hdr_t* >(buf->m_bytes)->node_deleted) {
-            // This buffer was marked as deleted during repair, so we also need to free it
-            deleted_bufs.push_back(buf);
-=======
     uint32_t cnt = 0;
     LOGTRACEMOD(wbcache, "Potential parent recovered bufs (#of bufs = {})", potential_parent_recovered_bufs.size());
     for (auto const& buf : potential_parent_recovered_bufs) {
@@ -675,7 +678,6 @@ void IndexWBCache::recover(sisl::byte_view sb) {
         } else {
             // This buffer was not marked as deleted during repair, so we need to repair it
             buffers_to_repair.push_back(buf);
->>>>>>> f30f0d44 (Issue 713: Fix index table destroy race with wb_cache cp flush (#714)):src/lib/index/wb_cache.cpp
         }
     }
 

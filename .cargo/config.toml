@@ -1,0 +1,4 @@
+# Cargo configuration
+# Note: default-features and features cannot be set globally in config.toml
+# They must be specified in Cargo.toml dependencies instead
+

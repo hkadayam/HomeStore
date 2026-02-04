@@ -1,0 +1,260 @@
+/***************************************************************************
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *    https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
+ ***************************************************************************/
+
+//! Btree Node Manager - Lock upgrade and node management operations
+//!
+//! This module corresponds to btree_node_mgr.ipp in the C++ implementation.
+//! It contains:
+//! - Lock upgrade functions (standalone)
+//! - Node management methods (additional impl block for Btree)
+
+use super::btree_node::{Node, LockType, InternalLockGuard, BNodeId};
+use super::btree_kvs::{BtreeKey, BtreeValue};
+use super::btree::{BtreeError, Btree};
+
+//================================================================================
+// Btree Node Management Methods
+//================================================================================
+
+impl<K, V> Btree<K, V>
+where
+    K: BtreeKey + 'static,
+    V: BtreeValue + 'static,
+{
+    //================================================================================
+    // Tree-level Locking
+    //================================================================================
+
+    /// Acquire shared tree lock (for normal operations)
+    ///
+    /// **MUST hold returned guard for entire operation!**
+    ///
+    /// Used for normal operations (GET/PUT/REMOVE) that don't modify root.
+    pub(super) async fn lock_tree_shared(&self) -> super::btree::TreeLockGuard<'_> {
+        super::btree::TreeLockGuard {
+            _guard: self.btree_lock.read_lock().await,
+        }
+    }
+
+    /// Acquire exclusive tree lock (for root split/collapse)
+    ///
+    /// **MUST hold returned guard for entire operation!**
+    ///
+    /// Used for operations that modify the root node (split/collapse).
+    pub(super) async fn lock_tree_exclusive(&self) -> super::btree::TreeLockGuardExclusive<'_> {
+        super::btree::TreeLockGuardExclusive {
+            _guard: self.btree_lock.write_lock().await,
+        }
+    }
+
+    //================================================================================
+    // Node Reading and Locking
+    //================================================================================
+
+    /// Get root node ID (must be called under tree lock)
+    pub(crate) fn root_node_id(&self) -> BNodeId {
+        self.root_node_id.get()
+    }
+
+    /// Read node from storage and lock it (matches C++ read_and_lock_node)
+    ///
+    /// This is the main entry point for getting locked nodes.
+    /// Implementation in btree_node_mgr.rs (like C++ btree_node_mgr.ipp).
+    ///
+    /// # Process
+    /// 1. Get UNLOCKED node from storage (storage handles persistence only)
+    /// 2. Lock it based on lock_type (node manager handles locking)
+    /// 3. Return locked Node guard
+    ///
+    /// # Arguments
+    /// * `id` - Node ID to read
+    /// * `lock_type` - Type of lock to acquire (Read/Write/ReadInteriorWriteLeaf)
+    ///
+    /// # Returns
+    /// * Locked Node guard
+    pub async fn read_and_lock_node(
+        &self,
+        id: BNodeId,
+        lock_type: LockType,
+    ) -> Result<Node, BtreeError> {
+        // Get UNLOCKED node from storage (storage layer handles persistence only)
+        let node_core = self.storage.read_node(id).await?;
+
+        // Lock it (node manager handles all locking)
+        Ok(node_core.lock(lock_type).await)
+    }
+
+    /// Create a new leaf node
+    pub(crate) async fn create_leaf_node(&self, node_type: u8) -> Result<Node, BtreeError> {
+        let node_core = self.storage.create_node(true, node_type).await?;
+        init_new_variant_node(node_core, node_type).await
+    }
+
+    /// Create a new interior node
+    pub(crate) async fn create_interior_node(&self, node_type: u8) -> Result<Node, BtreeError> {
+        let node_core = self.storage.create_node(false, node_type).await?;
+        init_new_variant_node(node_core, node_type).await
+    }
+
+    /// Get child node and lock it (common pattern in tree traversal)
+    ///
+    /// Convenience method that reads the child ID from parent and locks the child.
+    ///
+    /// # Arguments
+    /// * `parent` - Parent node (already locked)
+    /// * `idx` - Child index in parent
+    /// * `lock_type` - Type of lock for child
+    ///
+    /// # Returns
+    /// * Locked child Node guard
+    pub async fn get_child_and_lock(
+        &self,
+        parent: &Node,
+        idx: u32,
+        lock_type: LockType,
+    ) -> Result<Node, BtreeError> {
+        let child_id = if idx == parent.total_entries() {
+            debug_assert!(parent.has_valid_edge(), "Child index {} does not have valid bnode_id", idx);
+            parent.get_edge_value()
+        } else {
+            debug_assert!(idx < parent.total_entries(), "Index {} >= total_entries {}", idx, parent.total_entries());
+            parent.get_nth_value::<K, BNodeId>(idx, /*copy=*/false)
+        };
+        
+        self.read_and_lock_node(child_id, lock_type).await
+    }
+
+    /// Upgrade single node lock from READ to WRITE (matches C++ upgrade_node_lock)
+    ///
+    /// # Process
+    /// 1. Drop current lock
+    /// 2. Reacquire WRITE lock
+    /// 3. Validate node wasn't modified (check node_gen and deleted flag)
+    /// 4. Return Retry error if validation fails
+    pub async fn upgrade_node_lock(&self, guard: Node) -> Result<Node, BtreeError> {
+        let core = guard.core().clone();
+        let prev_gen = core.node_gen();
+
+        // Drop current lock
+        drop(guard);
+
+        // Acquire WRITE lock
+        let write_guard = core.lock.write_lock().await;
+
+        // Validate node wasn't modified
+        if core.is_node_deleted() || core.node_gen() != prev_gen {
+            return Err(BtreeError::Retry);
+        }
+
+        // Create new guard with WRITE lock
+        // SAFETY: Arc<NodeCore> in Node keeps the lock alive, so 'static transmute is safe
+        let write_guard = unsafe { std::mem::transmute(write_guard) };
+        Ok(Node {
+            core,
+            lock_type: LockType::Write,
+            _guard: InternalLockGuard::Write(write_guard),
+        })
+    }
+
+    /// Upgrade parent and child node locks to WRITE (matches C++ upgrade_node_locks)
+    ///
+    /// Upgrades both nodes atomically.
+    ///
+    /// # Process
+    /// 1. Drop both current locks
+    /// 2. Reacquire WRITE locks for both (parent first, then child)
+    /// 3. Validate both nodes weren't modified
+    /// 4. Return Retry error if either validation fails
+    pub(crate) async fn upgrade_node_locks(&self, parent_guard: Node, child_guard: Node) 
+        -> Result<(Node, Node), BtreeError> {
+        let parent_core = parent_guard.core().clone();
+        let child_core = child_guard.core().clone();
+        let parent_prev_gen = parent_core.node_gen();
+        let child_prev_gen = child_core.node_gen();
+
+        // Drop both locks
+        drop(child_guard);
+        drop(parent_guard);
+
+        // Acquire WRITE locks (parent first, then child - matches C++ ordering)
+        let parent_write = parent_core.lock.write_lock().await;
+        let child_write = child_core.lock.write_lock().await;
+
+        // Validate both nodes
+        if parent_core.is_node_deleted() || parent_core.node_gen() != parent_prev_gen
+            || child_core.is_node_deleted() || child_core.node_gen() != child_prev_gen {
+            return Err(BtreeError::Retry);
+        }
+
+        // Create new guards with WRITE locks
+        // SAFETY: Arc<NodeCore> in Node keeps the lock alive, so 'static transmute is safe
+        let parent_write = unsafe { std::mem::transmute(parent_write) };
+        let child_write = unsafe { std::mem::transmute(child_write) };
+
+        Ok((
+            Node {
+                core: parent_core,
+                lock_type: LockType::Write,
+                _guard: InternalLockGuard::Write(parent_write),
+            },
+            Node {
+                core: child_core,
+                lock_type: LockType::Write,
+                _guard: InternalLockGuard::Write(child_write),
+            },
+        ))
+    }
+}
+
+//================================================================================
+// Helper Functions
+//================================================================================
+
+/// Initialize a newly created node based on its variant type
+/// Sets node_variant, calls NodeOps::init_new_node(), acquires write lock, returns Node
+async fn init_new_variant_node(node_core: std::sync::Arc<super::btree_node::NodeCore>, node_variant: u8) 
+    -> Result<Node, BtreeError> {
+    // Set the node variant in persistent header
+    {
+        let header = node_core.get_persistent_header_mut();
+        header.node_variant = node_variant;
+    }
+    
+    // Dispatch to appropriate NodeOps based on variant for initialization
+    use super::btree_node::NodeOps;
+    match node_variant {
+        0 => { (&super::btree_node::SIMPLE_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
+        1 => { (&super::btree_node::VAR_KEY_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
+        _ => {
+            return Err(BtreeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Unknown node variant: {}", node_variant)
+            )));
+        }
+    }
+    
+    // Acquire write lock on initialized node
+    let write_guard = node_core.lock.write_lock().await;
+    
+    // SAFETY: Arc<NodeCore> in Node keeps the lock alive, so 'static transmute is safe
+    let write_guard = unsafe { std::mem::transmute(write_guard) };
+    
+    Ok(Node {
+        core: node_core,
+        lock_type: LockType::Write,
+        _guard: InternalLockGuard::Write(write_guard),
+    })
+}

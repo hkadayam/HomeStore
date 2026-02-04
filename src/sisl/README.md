@@ -1,6 +1,6 @@
 # SISL Rust - Bitset and Bitword Implementation
 
-This is a Rust translation of the SISL (eBay's Systems Infrastructure Software Library) bitset and bitword data structures from the original C++ implementation.
+This is a Rust translation of the SISL (Systems Infrastructure Software Library) bitset and bitword data structures from the original C++ implementation.
 
 ## Overview
 

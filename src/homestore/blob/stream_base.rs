@@ -14,6 +14,17 @@
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
  ***************************************************************************/
 
+use std::collections::HashMap;
+use std::io;
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use parking_lot::Mutex;
+
+use crate::common::managers;
+use crate::device::{Chunk, VirtualDev};
+use crate::meta::meta_blk::MetaBlk;
+
 // Import StreamMetadata from new_blob_dev
 use super::new_blob_dev::StreamMetadata;
 
@@ -24,14 +35,14 @@ pub const MAX_FLUSH_SESSIONS: usize = 2;
 /// StreamChunk - encapsulates a chunk with optional per-chunk metadata
 pub struct StreamChunk {
     /// The underlying chunk (from VDev)
-    pub base_chunk: Arc<crate::homestore::device::Chunk>,
+    pub base_chunk: Arc<Chunk>,
     
     /// Optional per-chunk metadata (can be None for append-only chunks)
     pub chunk_meta_blk: Option<MetaBlk>,
 }
 
 impl StreamChunk {
-    pub fn new(base_chunk: Arc<crate::homestore::device::Chunk>, chunk_meta_blk: Option<MetaBlk>) -> Self {
+    pub fn new(base_chunk: Arc<Chunk>, chunk_meta_blk: Option<MetaBlk>) -> Self {
         Self {
             base_chunk,
             chunk_meta_blk,
@@ -248,7 +259,7 @@ impl StreamBase {
                         ))?
                 } else {
                     // Allocate new chunk using singleton device_mgr
-                    let device_mgr = crate::homestore::common::managers::device_mgr();
+                    let device_mgr = managers::device_mgr();
                     device_mgr
                         .expand_vdev(&self.vdev, self.stream_id, self.metadata.chunk_size)
                         .await?
@@ -306,7 +317,7 @@ impl StreamBase {
     /// 3. Removes all chunks from VDev
     pub async fn destroy(
         &self,
-        meta_client: &Arc<crate::homestore::meta::meta_client::MetaClient>,
+        meta_client: &Arc<crate::meta::meta_client::MetaClient>,
     ) -> io::Result<()> {
         // 1. Delete stream metadata (remove_meta_blk already calls free)
         meta_client.remove_meta_blk(&self.stream_mblk).await?;

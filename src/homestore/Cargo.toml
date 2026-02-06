@@ -15,6 +15,8 @@ sisl = { path = "../sisl" }
 aligned-vec = "0.6"
 uuid = { version = "1.18.1", features = ["v4"] }
 log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 iomgr = { path = "../iomanager" }
 parking_lot = "0.12"
 crossbeam = { workspace = true }

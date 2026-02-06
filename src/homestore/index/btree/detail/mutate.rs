@@ -49,8 +49,8 @@ where
     //================================================================================
     
     /// Single-key PUT request with retry loop
-    pub(in super::super) async fn put_single_request<'a>(&self, req: &'a BtreeSinglePutRequest<'a, K, V>) 
-        -> Result<PutResult, BtreeError> {
+    pub(in super::super) async fn put_one_internal<'a>(&self, req: &'a BtreeSinglePutRequest<'a, K, V>) 
+        -> Result<(), BtreeError> {
         loop {
             let tree_lock = self.lock_tree_shared().await;
             let root_id = self.root_node_id();
@@ -63,46 +63,50 @@ where
                 continue; // Retry from root
             }
 
-            match self.do_put_single(root, req).await {
-                Ok(()) => return Ok(PutResult::Success),
+            match self.put_one_walk(root, req).await {
+                Ok(()) => return Ok(()),
                 Err(BtreeError::Retry) => continue, // Retriable errors
                 Err(e) => return Err(e), // Non-retriable errors
             }
         }
     }
 
-    /// Recursive PUT for single-key requests (matches C++ do_put)
-    async fn do_put_single<'a>(&self, mut my_node: Node, req: &'a BtreeSinglePutRequest<'a, K, V>) 
+    /// Recursive PUT for single-key requests
+    async fn put_one_walk<'a>(&self, mut my_node: Node, req: &'a BtreeSinglePutRequest<'a, K, V>) 
         -> Result<(), BtreeError> {
         if my_node.is_leaf() {
-            return self.mutate_write_leaf_single(&my_node, req).await;
+            return self.put_one_in_leaf(&my_node, req).await;
         }
 
         // Interior node: find child and traverse
         loop {
             let (_, idx) = my_node.find::<K, V>(req.key());
-            let mut child = self.get_child_node_locked(&my_node, idx, LockType::ReadInteriorWriteLeaf).await?;
+            let mut child = self.get_child_and_lock(&my_node, idx, LockType::ReadInteriorWriteLeaf).await?;
 
             if self.is_split_needed(&child, req) {
+                tracing::debug!(parent=my_node.node_id(), child=child.node_id(), idx=idx,
+                                "Child needs split");
                 // Upgrade both the locks - if it fails, retry from root
                 (my_node, child) = self.upgrade_node_locks(my_node, child).await?;
 
                 // Perform split - if it fails, propagate error to retry from root
                 let _split_key = self.split_child_node(&my_node, &child, idx).await?;
+                tracing::debug!(split_key=?_split_key, "Split completed, retrying");
                 continue; // After successful split, retry search from this node
             }
 
             drop(my_node); // Can unlock the parent node now
-            return self.do_put_single(child, req).await;
+            return Box::pin(self.put_one_walk(child, req)).await;
         }
     }
 
     /// Write to leaf node for single-key request (matches C++ mutate_write_leaf_node lines 259-269)
-    async fn mutate_write_leaf_single<'a>(&self, my_node: &Node, req: &'a BtreeSinglePutRequest<'a, K, V>) 
+    async fn put_one_in_leaf<'a>(&self, my_node: &Node, req: &'a BtreeSinglePutRequest<'a, K, V>) 
         -> Result<(), BtreeError> {
         // Call node's put method - node variant handles the actual insertion logic
-        // TODO: Replace None with filter_cb result when filter_cb is implemented
-        my_node.put(req.key(), req.value(), req.put_type())?;
+        tracing::trace!(node=my_node.node_id(), key=?req.key(), "Leaf mutation");
+        my_node.put(req.key(), req.value(), req.put_type(), req.filter_fn())?;
+        tracing::debug!(node=my_node.node_id(), entries=my_node.total_entries(), "Mutation done");
         self.storage.write_node(my_node).await?;
         Ok(())
     }
@@ -112,21 +116,21 @@ where
     //================================================================================
     
     /// Range PUT request with retry loop (matches C++ lines 71-78 for has_more handling)
-    pub(in super::super) async fn put_range_request<'a>(&self, req: &'a BtreeRangePutRequest<'a, K, V>) 
-        -> Result<PutResult, BtreeError> {
+    pub(in super::super) async fn put_range_internal<'a>(&self, mut req: BtreeRangePutRequest<'a, K, V>) 
+        -> Result<(), BtreeError> {
         loop {
             let tree_lock = self.lock_tree_shared().await;
             let root_id = self.root_node_id();
             let root = self.read_and_lock_node(root_id, LockType::ReadInteriorWriteLeaf).await?;
 
-            if self.is_split_needed(&root, req) {
+            if self.is_split_needed(&root, &req) {
                 drop(root); 
                 drop(tree_lock);
-                self.check_split_root(req).await?;
+                self.check_split_root(&req).await?;
                 continue; // Retry from root after split
             }
 
-            match self.do_put_range(root, req).await {
+            match self.put_range_walk(root, &mut req).await {
                 Ok(result) => return Ok(result),
                 Err(BtreeError::Retry) => continue, // Retriable errors
                 Err(e) => return Err(e), // Non-retriable errors
@@ -135,10 +139,10 @@ where
     }
     
     /// Main PUT recursive traversal for range operations (matches C++ Btree::do_put lines 108-243)
-    async fn do_put_range<'a>(&self, mut my_node: Node, req: &'a BtreeRangePutRequest<'a, K, V>) 
-        -> Result<PutResult, BtreeError> {
+    async fn put_range_walk<'a>(&self, mut my_node: Node, req: &mut BtreeRangePutRequest<'a, K, V>) 
+        -> Result<(), BtreeError> {
         if my_node.is_leaf() {
-            return self.mutate_write_leaf_node_range(&my_node, req).await;
+            return self.put_range_in_leaf(&my_node, req).await;
         }
 
         // Interior node: traverse to child(ren)
@@ -154,7 +158,7 @@ where
             // Iterate all matched children
             let mut curr_idx = start_idx;
             while curr_idx <= end_idx {
-                let mut child = self.get_child_node_locked(&my_node, curr_idx, LockType::ReadInteriorWriteLeaf).await?;
+                let mut child = self.get_child_and_lock(&my_node, curr_idx, LockType::ReadInteriorWriteLeaf).await?;
 
                 // Check if split needed
                 if self.is_split_needed(&child, req) {
@@ -173,25 +177,25 @@ where
 
                 if curr_idx == end_idx {
                     drop(my_node);
-                    return self.do_put_range(child, req).await;
+                    return self.put_range_walk(child, req).await;
                 } else {
-                    self.do_put_range(child, req).await?;
+                    self.put_range_walk(child, req).await?;
                     curr_idx += 1;
                 }
             }
 
-            return Ok(PutResult::Success);
+            return Ok(());
         }
     }
 
     /// Write to leaf node for range operations (matches C++ lines 250-257)
-    async fn mutate_write_leaf_node_range<'a>(&self, my_node: &Node, req: &'a BtreeRangePutRequest<'a, K, V>) 
-        -> Result<PutResult, BtreeError> {
+    async fn put_range_in_leaf<'a>(&self, my_node: &Node, req: &mut BtreeRangePutRequest<'a, K, V>) 
+        -> Result<(), BtreeError> {
         // Call node's multi_put method - node variant handles the actual insertion logic (line 251-252)
         let mut last_failed_key: Option<K> = None;
         let put_type = super::btree_req::BtreePutType::Update; // Range operations always update
         match my_node.multi_put::<K, V>(&*req.working_range(), req.value(), put_type, 
-                                        last_failed_key.as_mut()) {
+                                        req.filter_fn(), last_failed_key.as_mut()) {
             Err(BtreeError::HasMore) => {
                 // Shift to working range starting from the last failed key
                 req.shift_working_range(last_failed_key);
@@ -205,7 +209,7 @@ where
         
         // Write the modified node to storage (matches C++ line 268)
         self.storage.write_node(my_node).await?;
-        Ok(PutResult::Success)
+        Ok(())
     }
 
     //================================================================================
@@ -237,12 +241,17 @@ where
 
         // Double-check split still needed, possibly some one else concurrently split the root already.
         if !self.is_split_needed(&root, req) {
+            tracing::debug!(node_id=root_id, "Root split no longer needed");
             return Ok(());
         }
+
+        tracing::debug!(root_id=root_id, level=root.level(), entries=root.total_entries(),
+                        "Root is full, creating new root");
 
         // Create new interior node to put the new root
         let new_root = self.create_interior_node(root.node_variant()).await?;
         new_root.set_level(root.level() + 1);
+        tracing::debug!(new_root_id=new_root.node_id(), "Created new root");
 
         // Old root becomes child_node, new_root becomes root
         let child_node = root;
@@ -251,11 +260,14 @@ where
         let split_result = self.split_child_node(&new_root, &child_node, new_root.total_entries()).await;
         match split_result {
             Ok(_split_key) => {
-                self.root_node_id.set(new_root.node_id()); // Update root node ID
+                tracing::info!(old_root=root_id, new_root=new_root.node_id(), 
+                               split_key=?_split_key, "Root split successful");
+                self.root_node_id.store(new_root.node_id(), std::sync::atomic::Ordering::Relaxed); // Update root node ID
                 self.storage.on_root_changed(new_root.node_id()).await?;
                 return Ok(());
             }
             Err(e) => {
+                tracing::error!(error=?e, "Root split failed");
                 self.storage.delete_node(new_root.node_id()).await?;
                 return Err(e);
             }
@@ -292,6 +304,11 @@ where
         // Get the split key - last key in left child (auto-dispatches to correct value type)
         let split_key: K = child_node1.get_last_key::<K, V>()
             .expect("Child node1 should have entries after split");
+        
+        tracing::debug!(parent=parent_node.node_id(), idx=parent_idx, 
+                        child1=child_node1.node_id(), child2=child_node2.node_id(),
+                        split_key=?split_key, c1_entries=child_node1.total_entries(),
+                        c2_entries=child_node2.total_entries(), moved=moved, "Split done");
 
         // Update parent: first update existing entry to point to second child, then insert split key (C++ lines 360-366)
         // Don't change the order. First update the parent node and then insert the new key. This is important for
@@ -301,6 +318,11 @@ where
         // In case of empty parent (i.e., new root) or updating the edge, this order made sure that edge is updated.
         parent_node.update_child::<K>(parent_idx, &child_node2.node_id())?;
         parent_node.insert_child::<K>(parent_idx, &split_key, &child_node1.node_id())?;
+        tracing::trace!(idx=parent_idx, key=?split_key, child1=child_node1.node_id(),
+                        child2=child_node2.node_id(), "Updated parent: insert+update done");
+        tracing::debug!("Child1 after split: {}", child_node1.dump::<K, V>());
+        tracing::debug!("Child2 after split: {}", child_node2.dump::<K, V>());
+        tracing::debug!("Parent after split: {}", parent_node.dump::<K, BNodeId>());
 
         // Write all three nodes
         self.storage.write_node(child_node1).await?;
@@ -308,12 +330,5 @@ where
         self.storage.write_node(parent_node).await?;
 
         Ok(split_key)
-    }
-
-    /// Get child node and lock it (combines get_nth_child_id + read_and_lock_node)
-    async fn get_child_node_locked(&self, parent: &Node, idx: u32, lock_type: LockType) 
-        -> Result<Node, BtreeError> {
-        let child_id = parent.get_nth_child_id::<K>(idx);
-        self.read_and_lock_node(child_id, lock_type).await
     }
 }

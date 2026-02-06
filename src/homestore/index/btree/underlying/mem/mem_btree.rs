@@ -74,7 +74,7 @@ impl MemBtree {
     /// # Arguments
     /// * `node_size` - Size of each node in bytes (e.g., 4096)
     pub fn new(node_size: u32) -> Self {
-        println!("MemBtree: Creating in-memory btree with node_size={}", node_size);
+        tracing::info!("MemBtree: Creating in-memory btree with node_size={}", node_size);
 
         Self {
             nodes: RwLock::new(HashMap::new()),
@@ -162,7 +162,7 @@ impl UnderlyingBtree for MemBtree {
         let mut nodes = self.nodes.write().unwrap();
         nodes.insert(node_id, Arc::clone(&core));
 
-        println!("MemBtree: Created node {} (is_leaf={}, node_type={})",
+        tracing::info!("MemBtree: Created node {} (is_leaf={}, node_type={})",
                  node_id, is_leaf, node_type);
 
         Ok(core)
@@ -181,7 +181,7 @@ impl UnderlyingBtree for MemBtree {
         let mut nodes = self.nodes.write().unwrap();
         nodes.remove(&id);
 
-        println!("MemBtree: Deleted node {}", id);
+        tracing::info!("MemBtree: Deleted node {}", id);
 
         Ok(())
     }
@@ -198,7 +198,7 @@ impl UnderlyingBtree for MemBtree {
     /// # Returns
     /// * `Ok(())` - Always succeeds (no-op for MemBtree)
     async fn on_root_changed(&self, root_node_id: BNodeId) -> Result<(), BtreeError> {
-        println!("MemBtree: Root changed to node {}", root_node_id);
+        tracing::info!("MemBtree: Root changed to node {}", root_node_id);
         Ok(())
     }
 }

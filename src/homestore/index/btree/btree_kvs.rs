@@ -34,7 +34,8 @@ use iomgr::IOBuffer;
 /// - Clone: Can be copied
 /// - Serializable: Can convert to/from bytes
 /// - Comparable: Can be ordered
-pub trait BtreeKey: Sized + Send + Sync + Clone + Ord + PartialOrd + Eq + PartialEq {
+/// - Debug: Can be formatted for logging/tracing
+pub trait BtreeKey: Sized + Send + Sync + Clone + Ord + PartialOrd + Eq + PartialEq + std::fmt::Debug {
     /// Fixed serialized size for this type (None for variable-sized keys)
     /// SimpleNode requires Some(size) - it only works with fixed-size keys
     const FIXED_SERIALIZED_SIZE: Option<u32>;
@@ -53,7 +54,7 @@ pub trait BtreeKey: Sized + Send + Sync + Clone + Ord + PartialOrd + Eq + Partia
     ///
     /// # Returns
     /// * Number of bytes written
-    fn serialize_to(&self, buf: &mut [u8], copy: bool) -> io::Result<usize>;
+    fn serialize_to(&self, buf: &mut [u8], copy: bool) -> io::Result<u32>;
 
     /// Deserialize key from buffer (buffer already sliced to source position)
     ///
@@ -79,7 +80,8 @@ pub trait BtreeKey: Sized + Send + Sync + Clone + Ord + PartialOrd + Eq + Partia
 /// - Send + Sync: Thread-safe
 /// - Clone: Can be copied
 /// - Serializable: Can convert to/from bytes
-pub trait BtreeValue: Sized + Send + Sync + Clone {
+/// - Debug: Can be formatted for logging/tracing
+pub trait BtreeValue: Sized + Send + Sync + Clone + std::fmt::Debug {
     /// Fixed serialized size for this type (None for variable-sized values)
     /// SimpleNode requires Some(size) - it only works with fixed-size values
     const FIXED_SERIALIZED_SIZE: Option<u32>;
@@ -98,7 +100,7 @@ pub trait BtreeValue: Sized + Send + Sync + Clone {
     ///
     /// # Returns
     /// * Number of bytes written
-    fn serialize_to(&self, buf: &mut [u8], copy: bool) -> io::Result<usize>;
+    fn serialize_to(&self, buf: &mut [u8], copy: bool) -> io::Result<u32>;
 
     /// Deserialize value from buffer (buffer already sliced to source position)
     ///
@@ -139,7 +141,7 @@ impl BtreeKey for u64 {
     }
 
     #[inline]
-    fn serialize_to(&self, buf: &mut [u8], copy: bool) -> io::Result<usize> {
+    fn serialize_to(&self, buf: &mut [u8], copy: bool) -> io::Result<u32> {
         if copy {
             // Safe path: proper endianness handling
             buf[..8].copy_from_slice(&self.to_le_bytes());
@@ -181,7 +183,7 @@ impl BtreeValue for u64 {
     }
 
     #[inline]
-    fn serialize_to(&self, buf: &mut [u8], copy: bool) -> io::Result<usize> {
+    fn serialize_to(&self, buf: &mut [u8], copy: bool) -> io::Result<u32> {
         if copy {
             buf[..8].copy_from_slice(&self.to_le_bytes());
         } else {
@@ -216,7 +218,7 @@ impl BtreeKey for u32 {
     }
 
     #[inline]
-    fn serialize_to(&self, buf: &mut [u8], copy: bool) -> io::Result<usize> {
+    fn serialize_to(&self, buf: &mut [u8], copy: bool) -> io::Result<u32> {
         if copy {
             buf[..4].copy_from_slice(&self.to_le_bytes());
         } else {
@@ -255,7 +257,7 @@ impl BtreeValue for u32 {
     }
 
     #[inline]
-    fn serialize_to(&self, buf: &mut [u8], copy: bool) -> io::Result<usize> {
+    fn serialize_to(&self, buf: &mut [u8], copy: bool) -> io::Result<u32> {
         if copy {
             buf[..4].copy_from_slice(&self.to_le_bytes());
         } else {
@@ -318,7 +320,7 @@ mod tests {
     fn test_u64_iobuffer() {
         let key: u64 = 42;
         let iobuf = <u64 as BtreeValue>::serialize_to_iobuffer(&key).unwrap();
-        assert_eq!(iobuf.len(), 8);
+        assert_eq!(iobuf.len(), 4096); // IOBuffer aligns to 4096 bytes
 
         let restored = <u64 as BtreeValue>::deserialize_from(iobuf.as_slice(), true).unwrap();
         assert_eq!(key, restored);

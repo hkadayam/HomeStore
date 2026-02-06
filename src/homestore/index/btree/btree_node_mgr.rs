@@ -66,7 +66,7 @@ where
 
     /// Get root node ID (must be called under tree lock)
     pub(crate) fn root_node_id(&self) -> BNodeId {
-        self.root_node_id.get()
+        self.root_node_id.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Read node from storage and lock it (matches C++ read_and_lock_node)
@@ -97,6 +97,14 @@ where
         Ok(node_core.lock(lock_type).await)
     }
 
+    pub(crate) async fn create_new_node(&self, is_leaf: bool, node_type: u8) -> Result<Node, BtreeError> {
+        if is_leaf {
+            self.create_leaf_node(node_type).await
+        } else {
+            self.create_interior_node(node_type).await
+        }
+    }
+
     /// Create a new leaf node
     pub(crate) async fn create_leaf_node(&self, node_type: u8) -> Result<Node, BtreeError> {
         let node_core = self.storage.create_node(true, node_type).await?;
@@ -120,12 +128,7 @@ where
     ///
     /// # Returns
     /// * Locked child Node guard
-    pub async fn get_child_and_lock(
-        &self,
-        parent: &Node,
-        idx: u32,
-        lock_type: LockType,
-    ) -> Result<Node, BtreeError> {
+    pub async fn get_child_and_lock(&self, parent: &Node, idx: u32, lock_type: LockType) -> Result<Node, BtreeError> {
         let child_id = if idx == parent.total_entries() {
             debug_assert!(parent.has_valid_edge(), "Child index {} does not have valid bnode_id", idx);
             parent.get_edge_value()

@@ -154,7 +154,7 @@ impl BlobDeviceManager {
         
         // Load each BlobDevice with its metablks
         let mut devices = HashMap::new();
-        let device_mgr = crate::homestore::common::managers::device_mgr();
+        let device_mgr = crate::common::managers::device_mgr();
         
         for (device_type, bdev_info) in bdev_info_map {
             println!("Loading BlobDevice '{}' with {} streams", device_type, bdev_info.streams.len());
@@ -196,7 +196,7 @@ impl BlobDeviceManager {
         vdev_params: VDevParameters,
     ) -> io::Result<Arc<BlobDevice>> {
         // Get singleton DeviceManager
-        let device_mgr = crate::homestore::common::managers::device_mgr();
+        let device_mgr = crate::common::managers::device_mgr();
         
         // Create VirtualDev for this BlobDevice (1:1 relationship)
         let vdev = device_mgr.create_vdev(vdev_params).await?;

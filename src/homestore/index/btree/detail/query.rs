@@ -34,19 +34,19 @@ where
     //================================================================================
     
     /// Single key GET (public API wrapper)
-    pub(in super::super) async fn get_one_request<'a>(&self, req: &'a BtreeGetRequest<'a, K>) 
+    pub(in super::super) async fn get_one_internal<'a>(&self, req: &'a BtreeGetRequest<'a, K>) 
         -> Result<Option<V>, BtreeError> {
         let _tree_lock = self.lock_tree_shared().await;
         let root_id = self.root_node_id();
         let root = self.read_and_lock_node(root_id, LockType::Read).await?;
         
-        self.do_get(root, req).await
+        self.get_one_walk(root, req).await
     }
     
     /// Recursive GET traversal
-    async fn do_get<'a>(&self, node: Node, req: &'a BtreeGetRequest<'a, K>) -> Result<Option<V>, BtreeError> {
+    async fn get_one_walk<'a>(&self, node: Node, req: &'a BtreeGetRequest<'a, K>) -> Result<Option<V>, BtreeError> {
         if node.is_leaf() {
-            return self.get_from_leaf(&node, req.key());
+            return self.get_one_in_leaf(&node, req.key());
         }
         
         // Interior node: find child and traverse
@@ -55,11 +55,11 @@ where
         let child = self.read_and_lock_node(child_id, LockType::Read).await?;
         
         drop(node); // Release parent lock
-        Box::pin(self.do_get(child, req)).await
+        Box::pin(self.get_one_walk(child, req)).await
     }
     
     /// Read value from leaf node
-    fn get_from_leaf(&self, node: &Node, key: &K) -> Result<Option<V>, BtreeError> {
+    fn get_one_in_leaf(&self, node: &Node, key: &K) -> Result<Option<V>, BtreeError> {
         debug_assert!(node.is_leaf());
         
         let (found, idx) = node.find::<K, V>(key);
@@ -76,19 +76,19 @@ where
     //================================================================================
     
     /// Get any key in range (returns first found)
-    pub(in super::super) async fn get_any_request(&self, req: &BtreeGetAnyRequest<K>) 
+    pub(in super::super) async fn get_any_internal(&self, req: &BtreeGetAnyRequest<K>) 
         -> Result<Option<(K, V)>, BtreeError> {
         let _tree_lock = self.lock_tree_shared().await;
         let root_id = self.root_node_id();
         let root = self.read_and_lock_node(root_id, LockType::Read).await?;
         
-        self.do_get_any(root, req).await
+        self.get_any_walk(root, req).await
     }
     
     /// Recursive GET_ANY traversal
-    async fn do_get_any(&self, node: Node, req: &BtreeGetAnyRequest<K>) -> Result<Option<(K, V)>, BtreeError> {
+    async fn get_any_walk(&self, node: Node, req: &BtreeGetAnyRequest<K>) -> Result<Option<(K, V)>, BtreeError> {
         if node.is_leaf() {
-            return self.get_any_from_leaf(&node, req.range());
+            return self.get_any_in_leaf(&node, req.range());
         }
         
         // Interior node: match range and pick first child
@@ -101,11 +101,11 @@ where
         let child = self.read_and_lock_node(child_id, LockType::Read).await?;
         
         drop(node);
-        Box::pin(self.do_get_any(child, req)).await
+        Box::pin(self.get_any_walk(child, req)).await
     }
     
     /// Get any key-value from leaf in range
-    fn get_any_from_leaf(&self, node: &Node, range: &BtreeKeyRange<K>) -> Result<Option<(K, V)>, BtreeError> {
+    fn get_any_in_leaf(&self, node: &Node, range: &BtreeKeyRange<K>) -> Result<Option<(K, V)>, BtreeError> {
         debug_assert!(node.is_leaf());
         
         let (matched, start_idx, _) = node.match_range::<K, V>(range);
@@ -132,8 +132,8 @@ where
     /// # Returns
     /// * `Ok(QueryResultHandle)` - Handle with results and has_more() indicator
     /// * `Err(BtreeError)` - Internal errors (not HasMore, which is converted to handle.has_more())
-    pub(in super::super) async fn query_request(&self, req: BtreeQueryRequest<K>) 
-        -> Result<QueryResultHandle<K, V>, BtreeError> {       
+    pub(in super::super) async fn query_internal<'a>(&self, mut req: BtreeQueryRequest<'a, K, V>) 
+        -> Result<QueryResultHandle<'a, K, V>, BtreeError> {       
         if req.batch_size() == 0 {
             return Ok(QueryResultHandle::new(Vec::new(), req, false));
         }
@@ -143,7 +143,7 @@ where
         let root = self.read_and_lock_node(root_id, LockType::Read).await?;
         
         let mut results = Vec::new();
-        let ret = self.do_sweep_query(root, &req, &mut results).await;
+        let ret = self.sweep_query_walk(root, &mut req, &mut results).await;
         
         // Determine if there are more results
         let has_more = matches!(ret, Ok(true));
@@ -163,13 +163,12 @@ where
         Ok(QueryResultHandle::new(results, req, has_more))
     }
    
-    /// Sweep query implementation - follows C++ do_sweep_query
+    /// Sweep query implementation - 
     /// 
-    /// Corresponds to C++ btree_query_impl.ipp::do_sweep_query() (lines 72-130)
     /// 
     /// Recursively descends to leaf level, then uses multi_get() to extract entries
     /// and follows sibling links to collect up to batch_size results.
-    async fn do_sweep_query(&self, mut my_node: Node, req: &BtreeQueryRequest<K>, 
+    async fn sweep_query_walk<'a>(&self, mut my_node: Node, req: &mut BtreeQueryRequest<'a, K, V>, 
                             out_values: &mut Vec<(K, V)>) -> Result<bool, BtreeError> {
         if my_node.is_leaf() {
             // Leaf node: use multi_get and follow sibling links (C++ lines 75-116)
@@ -179,7 +178,7 @@ where
                 // Call multi_get on current leaf
                 let remaining = req.batch_size().saturating_sub(count);
                 let (cur_count, pagination_status) = my_node.multi_get::<K, V>(&req.working_range().clone(),
-                                                           remaining, out_values, /*filter_fn=*/None);
+                                                           remaining, out_values, req.filter_fn());
                 count += cur_count;
                 
                 // Handle pagination status
@@ -222,6 +221,6 @@ where
         let child = self.read_and_lock_node(child_id, LockType::Read).await?;
         
         drop(my_node); // Release parent lock
-        Box::pin(self.do_sweep_query(child, req, out_values)).await
+        Box::pin(self.sweep_query_walk(child, req, out_values)).await
     }
 }

@@ -30,14 +30,26 @@
 
 use std::io;
 use std::sync::Arc;
-use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use iomgr::{AsyncRwLock, AsyncRwReadGuard, AsyncRwWriteGuard};
+use tracing;
+
+//================================================================================
+// Global Operation Counter for Tracing
+//================================================================================
+
+/// Global operation counter for sequential operation IDs across all btree instances
+static GLOBAL_OP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 use super::btree_node::{BNodeId, Node, NodeCore};
 use super::btree_kvs::{BtreeKey, BtreeValue};
-use super::detail::{BtreeSinglePutRequest, BtreePutType};
-pub use super::detail::btree_req::{BtreeKeyRange, QueryResultHandle};
+use super::detail::btree_req::{
+    BtreeKeyRange,
+    BtreeRemoveRequest, BtreeRemoveAnyRequest, BtreeRangeRemoveRequest, RemoveFilterFn,
+    BtreeGetRequest, BtreeGetAnyRequest, BtreeQueryRequest, QueryResultHandle, GetFilterFn,
+    BtreeSinglePutRequest,BtreeRangePutRequest, BtreePutType, PutFilterFn,
+};
 
 //================================================================================
 // Error Types
@@ -73,8 +85,8 @@ pub struct BtreeConfig {
     pub btree_name: String,
     
     // Precomputed values
-    suggested_min_size: u32,
-    ideal_fill_size: u32,
+    pub suggested_min_size: u32,
+    pub ideal_fill_size: u32,
 }
 
 impl BtreeConfig {
@@ -200,8 +212,8 @@ where
     /// pub(super) allows btree_node_mgr.rs to access for method implementations
     pub(super) storage: Box<dyn UnderlyingBtree>,
 
-    /// Root node ID (Cell for interior mutability, protected by tree lock)
-    pub(super) root_node_id: Cell<BNodeId>,
+    /// Root node ID (AtomicU64 for thread-safe interior mutability)
+    pub(super) root_node_id: AtomicU64,
 
     _phantom: std::marker::PhantomData<(K, V)>,
 }
@@ -229,7 +241,7 @@ where
             btree_lock: AsyncRwLock::new(()),
             config,
             storage,
-            root_node_id: Cell::new(root_id),
+            root_node_id: AtomicU64::new(root_id),
             _phantom: std::marker::PhantomData,
         })
     }
@@ -238,7 +250,7 @@ where
     async fn create_root_node(&self) -> Result<BNodeId, BtreeError> {
         let root_core = self.storage.create_node(true, self.config.leaf_node_type).await?;
         let root_id = root_core.node_id();
-        self.root_node_id.set(root_id);
+        self.root_node_id.store(root_id, Ordering::Relaxed);
         self.storage.on_root_changed(root_id).await?;
         Ok(root_id)
     }
@@ -252,9 +264,16 @@ where
     /// Returns:
     /// - PutResult::Success if new key was inserted
     /// - PutResult::Updated if existing key was updated
-    pub async fn put_one(&self, key: &K, value: &V) -> Result<super::detail::mutate::PutResult, BtreeError> {
-        let req = BtreeSinglePutRequest::new(key, value, BtreePutType::Upsert);
-        self.put_single_request(&req).await
+    #[tracing::instrument(
+        skip(self, key, value, filter_fn), 
+        fields(op_id=GLOBAL_OP_COUNTER.fetch_add(1, Ordering::Relaxed), btree=%self.config.btree_name, key=?key))]
+    pub async fn put_one(&self, key: &K, value: &V, filter_fn: Option<&PutFilterFn<K, V>>) 
+        -> Result<(), BtreeError> {
+        tracing::debug!("Starting put operation");
+        let req = BtreeSinglePutRequest::new(key, value, BtreePutType::Upsert, filter_fn);
+        let result = self.put_one_internal(&req).await;
+        if result.is_ok() { tracing::info!("Put completed"); } else { tracing::warn!(?result, "Put failed"); }
+        result
     }
 
     /// Range PUT - Update multiple keys in a range with the same value
@@ -265,15 +284,22 @@ where
     /// * `start` - Start key (inclusive)
     /// * `end` - End key (exclusive)
     /// * `value` - Value to insert/update for all keys in range
+    /// * `filter_fn` - Optional filter function for conditional updates
     ///
     /// Returns:
     /// - PutResult::Success if operation completed successfully
-    pub async fn put_range(&self, start: &K, end: &K, value: &V) -> Result<super::detail::mutate::PutResult, BtreeError> {
-        use super::detail::btree_req::{BtreeKeyRange, BtreeRangePutRequest};
-        
+    #[tracing::instrument(skip(self, start, end, value, filter_fn), 
+        fields(op_id = GLOBAL_OP_COUNTER.fetch_add(1, Ordering::Relaxed), 
+               btree=%self.config.btree_name, start=?start, end=?end))]
+
+    pub async fn put_range(&self, start: &K, end: &K, value: &V, filter_fn: Option<&PutFilterFn<K, V>>)
+        -> Result<(), BtreeError> {
+        tracing::debug!("Starting range put");
         let range = BtreeKeyRange::new(start.clone(), true, end.clone(), false);
-        let req = BtreeRangePutRequest::new(range, BtreePutType::Upsert, value, 1000);
-        self.put_range_request(&req).await
+        let req = BtreeRangePutRequest::new(range, BtreePutType::Upsert, value, 1000, filter_fn);
+        let result = self.put_range_internal(req).await;
+        if result.is_ok() { tracing::info!("Range put completed"); } else { tracing::warn!("Range put failed"); }
+        result
     }
 
     /// Get value for a single key (matches C++ Btree::get)
@@ -281,12 +307,100 @@ where
     /// Returns:
     /// - Some(value) if key exists
     /// - None if key not found
+    #[tracing::instrument(
+        skip(self, key), 
+        fields(op_id=GLOBAL_OP_COUNTER.fetch_add(1, Ordering::Relaxed), btree=%self.config.btree_name, key=?key))]
+
     pub async fn get(&self, key: &K) -> Result<Option<V>, BtreeError> {
-        use super::detail::btree_req::BtreeGetRequest;
+        tracing::debug!("Starting get operation");
         let req = BtreeGetRequest::new(key);
-        self.get_one_request(&req).await
+        let result = self.get_one_internal(&req).await;
+        match &result { 
+            Ok(Some(_)) => tracing::debug!("Key found"), 
+            Ok(None) => tracing::debug!("Key not found"), 
+            Err(_) => tracing::warn!("Get failed") 
+        }
+        result
     }
     
+    //================================================================================
+    // Remove Operations
+    //================================================================================
+
+    /// Remove a single key-value pair
+    ///
+    /// # Arguments
+    /// * `key` - Key to remove
+    ///
+    /// # Returns
+    /// * `Ok(Some(value))` - Key found and removed, returns the value
+    /// * `Ok(None)` - Key not found
+    /// * `Err(BtreeError)` - Error occurred
+    #[tracing::instrument(
+        skip(self, key), 
+        fields(op_id=GLOBAL_OP_COUNTER.fetch_add(1, Ordering::Relaxed), btree=%self.config.btree_name, key=?key))]
+
+    pub async fn remove_one(&self, key: &K) -> Result<Option<V>, BtreeError> {
+        tracing::debug!("Starting remove operation");
+        let req = BtreeRemoveRequest::new(key);
+        let result = self.remove_one_internal(req).await;
+        match &result { Ok(Some(_)) => tracing::info!("Key removed successfully"), Ok(None) => tracing::debug!("Key not found"), Err(_) => tracing::warn!("Remove failed") }
+        result
+    }
+
+    /// Remove any one key-value pair in the given range
+    ///
+    /// If the range matches multiple keys, randomly picks one and removes it.
+    ///
+    /// # Arguments
+    /// * `range` - Key range to search
+    ///
+    /// # Returns
+    /// * `Ok(Some((key, value)))` - Found and removed a key-value pair
+    /// * `Ok(None)` - No keys found in range
+    /// * `Err(BtreeError)` - Error occurred
+    #[tracing::instrument(
+        skip(self, range), 
+        fields(op_id = GLOBAL_OP_COUNTER.fetch_add(1, Ordering::Relaxed), btree = %self.config.btree_name))]
+
+    pub async fn remove_any(&self, range: BtreeKeyRange<K>) -> Result<Option<(K, V)>, BtreeError> {
+        tracing::debug!("Starting remove_any operation");
+        let req = BtreeRemoveAnyRequest::new(range);
+        let result = self.remove_any_internal(req).await;
+        match &result { Ok(Some((k, _))) => tracing::info!(key = ?k, "Removed one key from range"), Ok(None) => tracing::debug!("No keys in range"), Err(_) => tracing::warn!("Remove_any failed") }
+        result
+    }
+
+    /// Remove all keys in the given range (with pagination)
+    ///
+    /// # Arguments
+    /// * `range` - Key range to remove
+    /// * `batch_size` - Maximum number of keys to remove per batch
+    /// * `filter_fn` - Optional filter function to select which entries to remove
+    ///
+    /// # Returns
+    /// * `Ok(count)` - Number of keys removed
+    /// * `Err(BtreeError::HasMore)` - More keys to remove (call again)
+    /// * `Err(BtreeError)` - Error occurred
+    #[tracing::instrument(
+        skip(self, range, filter_fn), 
+        fields(op_id=GLOBAL_OP_COUNTER.fetch_add(1, Ordering::Relaxed), 
+                 btree=%self.config.btree_name, batch_size=batch_size))]
+
+    pub async fn remove_range(&self, range: BtreeKeyRange<K>, batch_size: u32,
+                              filter_fn: Option<&RemoveFilterFn<K, V>>) 
+        -> Result<u32, BtreeError> {
+        tracing::debug!("Starting range remove");
+        let req = BtreeRangeRemoveRequest::new(range, batch_size, filter_fn);
+        let result = self.remove_range_internal(req).await;
+        match &result { 
+            Ok(count) => tracing::info!(removed_count = count, "Range remove completed"), 
+            Err(BtreeError::HasMore) => tracing::debug!("Range remove: more entries to remove"), 
+            Err(_) => tracing::warn!("Range remove failed") 
+        }
+        result
+    }
+
     /// Get any key-value pair in the given range (optimization, matches C++ Btree::get_any)
     /// 
     /// Returns the first match found during traversal.
@@ -299,16 +413,26 @@ where
     /// Returns:
     /// - Some((key, value)) if any key exists in range
     /// - None if range is empty
+    #[tracing::instrument(
+        skip(self, start, end), 
+        fields(op_id=GLOBAL_OP_COUNTER.fetch_add(1, Ordering::Relaxed), 
+               btree=%self.config.btree_name, start=?start, end=?end))]
+
     pub async fn get_any(&self, start: &K, end: &K) -> Result<Option<(K, V)>, BtreeError> {
-        use super::detail::btree_req::{BtreeKeyRange, BtreeGetAnyRequest};
+        tracing::debug!(start = ?start, end = ?end, "Starting get_any");
         let range = BtreeKeyRange::new(start.clone(), true, end.clone(), false);
         let req = BtreeGetAnyRequest::new(range);
-        self.get_any_request(&req).await
+        let result = self.get_any_internal(&req).await;
+        match &result { 
+            Ok(Some((k, _))) => tracing::debug!(key = ?k, "Found key in range"), 
+            Ok(None) => tracing::debug!("No keys in range"), 
+            Err(_) => tracing::warn!("Get_any failed") 
+        }
+        result
     }
 
     /// Sweep query - returns multiple key-value pairs in range
     /// 
-    /// Corresponds to C++ Btree::query() with SWEEP_NON_INTRUSIVE_PAGINATION_QUERY
     /// 
     /// Efficiently collects key-value pairs by following leaf node sibling links.
     /// Returns up to `batch_size` results. Use `query_next()` for pagination if has_more() is true.
@@ -335,19 +459,32 @@ where
     ///     // Process next batch...
     /// }
     /// ```
-    pub async fn query(&self, range: BtreeKeyRange<K>, batch_size: u32) 
-        -> Result<super::detail::btree_req::QueryResultHandle<K, V>, BtreeError> {
-        use super::detail::btree_req::BtreeQueryRequest;
-        let req = BtreeQueryRequest::new(range, batch_size);
-        self.query_request(req).await
+    #[tracing::instrument(
+        skip(self, range, filter_fn), 
+        fields(op_id=GLOBAL_OP_COUNTER.fetch_add(1, Ordering::Relaxed), 
+               btree=%self.config.btree_name, range=?range))]
+
+    pub async fn query<'a>(&self, range: BtreeKeyRange<K>, batch_size: u32,
+                       filter_fn: Option<&'a GetFilterFn<K, V>>) 
+        -> Result<QueryResultHandle<'a, K, V>, BtreeError> {
+        tracing::debug!("Starting query");
+        let req = BtreeQueryRequest::new(range, batch_size, filter_fn);
+        let result = self.query_internal(req).await;
+        if let Ok(ref handle) = result { tracing::debug!(result_count = handle.results.len(), has_more = handle.has_more(), "Query completed"); }
+        result
     }
 
     /// Paginate for next batch of results on previous query result handle.
     /// If there are no more results, returns an empty result handle.
     /// If there are more results, returns a new result handle which user is expected to call next time.
-    pub async fn query_next_batch(&self, handle: QueryResultHandle<K, V>) 
-        -> Result<super::detail::btree_req::QueryResultHandle<K, V>, BtreeError> {
-        self.query_request(handle.request()).await
+    #[tracing::instrument(
+        skip(self, handle), 
+        fields(op_id=GLOBAL_OP_COUNTER.fetch_add(1, Ordering::Relaxed), 
+               btree=%self.config.btree_name))]
+
+    pub async fn query_next_batch<'a>(&self, handle: QueryResultHandle<'a, K, V>) 
+        -> Result<QueryResultHandle<'a, K, V>, BtreeError> {
+        self.query_internal(handle.request()).await
     }
 }
 

@@ -45,3 +45,36 @@ pub use blob::*;
 #[cfg(feature = "streams")]
 pub use streams::*;
 pub use index::*;
+
+//================================================================================
+// Tracing Initialization
+//================================================================================
+
+/// Initialize tracing/logging for Homestore
+///
+/// This sets up the tracing subscriber with sensible defaults:
+/// - Timestamps on all log entries
+/// - Module paths for filtering
+/// - Environment-based filtering via RUST_LOG
+///
+/// # Example
+/// ```rust,ignore
+/// // In your main() or test setup
+/// homestore::init_tracing();
+///
+/// // Then control via environment:
+/// // RUST_LOG=homestore::index::btree=debug cargo run
+/// // RUST_LOG=homestore::index::btree::detail::remove=trace cargo test
+/// ```
+pub fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::from_default_env()
+                .add_directive("homestore=info".parse().unwrap())
+        )
+        .with_target(true)
+        .with_thread_ids(false)
+        .try_init();
+}

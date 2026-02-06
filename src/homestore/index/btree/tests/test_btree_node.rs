@@ -29,9 +29,12 @@ use std::marker::PhantomData;
 
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
-use homestore::index::btree::btree_node::{Node, NodeCore, LockType, InternalLockGuard, NodeOps};
-use homestore::index::btree::btree_kvs::{BtreeKey, BtreeValue};
-use homestore::index::btree::detail::btree_req::BtreePutType;
+// When compiled as part of lib tests, use crate:: (homestore crate)
+// When compiled from integration test, crate:: refers to test crate, so we need direct path
+#[cfg(not(test))]
+use homestore::{btree_node::{Node, NodeCore, LockType, InternalLockGuard, NodeOps}, btree_kvs::{BtreeKey, BtreeValue}, detail::btree_req::BtreePutType};
+#[cfg(test)]
+use crate::{btree_node::{Node, NodeCore, LockType, InternalLockGuard, NodeOps}, btree_kvs::{BtreeKey, BtreeValue}, detail::btree_req::BtreePutType};
 
 const NODE_SIZE: usize = 4096;
 
@@ -74,7 +77,7 @@ struct SimpleNodeVariant;
 impl NodeVariant for SimpleNodeVariant {
     fn node_variant_id() -> u8 { 0 }
     fn get_node_ops<K: BtreeKey + 'static, V: BtreeValue + 'static>() -> &'static dyn NodeOps<K, V> {
-        &homestore::index::btree::btree_node::SIMPLE_NODE_OPS
+        &crate::btree_node::SIMPLE_NODE_OPS
     }
 }
 
@@ -82,7 +85,7 @@ struct VarKeyNodeVariant;
 impl NodeVariant for VarKeyNodeVariant {
     fn node_variant_id() -> u8 { 1 }
     fn get_node_ops<K: BtreeKey + 'static, V: BtreeValue + 'static>() -> &'static dyn NodeOps<K, V> {
-        &homestore::index::btree::btree_node::VAR_KEY_NODE_OPS
+        &crate::btree_node::VAR_KEY_NODE_OPS
     }
 }
 
@@ -179,7 +182,7 @@ where
             BtreePutType::Upsert => true,
         };
         
-        let result = self.node.put(&k, &value, put_type);
+        let result = self.node.put(&k, &value, put_type, None);
         
         match put_type {
             BtreePutType::Insert => {
@@ -287,14 +290,14 @@ where
         let end_key = K::generate(&mut end_seed);
         let value = V::generate(&mut self.value_counter);
         
-        let range = homestore::index::btree::detail::btree_req::BtreeKeyRange {
+        let range = crate::detail::btree_req::BtreeKeyRange {
             start_key: start_key.clone(),
             end_key: end_key.clone(),
             start_incl: true,
             end_incl: true,
         };
         
-        let result = self.node.multi_put::<K, V>(&range, &value, BtreePutType::Update, None);
+        let result = self.node.multi_put::<K, V>(&range, &value, BtreePutType::Update, None, None);
         assert!(result.is_ok(), "multi_put failed for range [{},{}]", start, start + count as u64 - 1);
         
         // Update shadow map

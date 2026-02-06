@@ -28,6 +28,7 @@ use std::sync::Arc;
 use iomgr::AsyncRwLock;
 use super::btree_kvs::{BtreeKey, BtreeValue};
 use super::variant;
+use super::detail::btree_req::{GetFilterFn, PutFilterFn, RemoveFilterFn};
 
 //================================================================================
 // Pagination Status for multi_get
@@ -136,6 +137,9 @@ pub trait NodeOps<K: BtreeKey, V: BtreeValue>: Send + Sync {
 
     fn update(&self, core: &NodeCore, idx: u32, val: &V) -> Result<(), super::btree::BtreeError>;
 
+    /// Update both key and value at index atomically (C++ update(idx, key, val))
+    fn update_with_key(&self, core: &NodeCore, idx: u32, key: &K, val: &V) -> Result<(), super::btree::BtreeError>;
+
     // Range operations
     fn remove_range(&self, core: &NodeCore, start_idx: u32, end_idx: u32) -> Result<(), super::btree::BtreeError>;
     
@@ -234,8 +238,9 @@ pub trait NodeOps<K: BtreeKey, V: BtreeValue>: Send + Sync {
     /// 
     /// Matches C++ variant_node.hpp::put() (lines 202-237)
     /// Override only if variant needs special logic (e.g., PrefixNode)
-    fn put(&self, core: &NodeCore, key: &K, value: &V, put_type: super::detail::btree_req::BtreePutType) -> Result<(), super::btree::BtreeError> {
-        use super::detail::btree_req::BtreePutType;
+    fn put(&self, core: &NodeCore, key: &K, value: &V, put_type: super::detail::btree_req::BtreePutType,
+           filter_fn: Option<&PutFilterFn<K, V>>) -> Result<(), super::btree::BtreeError> {
+        use super::detail::btree_req::{BtreePutType, PutFilterDecision};
         use super::btree::BtreeError;
         
         debug_assert!(core.is_leaf(), "Put operation on node is supported only for leaf nodes");
@@ -243,9 +248,21 @@ pub trait NodeOps<K: BtreeKey, V: BtreeValue>: Send + Sync {
         // Find the key
         let (found, idx) = self.find(core, key);
         
-        // If found and caller wants existing value, retrieve it
+        // If found and filter provided, apply filter
         if found {
-            // TODO: Replace None with filter_cb result when filter_cb is implemented
+            if let Some(filter) = filter_fn {
+                let existing_val = self.get_nth_value(core, idx, /*copy=*/true);
+                match filter(key, &existing_val, value) {
+                    PutFilterDecision::Keep => return Ok(()),  // Skip this entry
+                    PutFilterDecision::Remove => {
+                        self.remove(core, idx)?;
+                        return Ok(());
+                    }
+                    PutFilterDecision::Replace => {
+                        // Fall through to normal update logic below
+                    }
+                }
+            }
         }
         
         // Dispatch based on put_type
@@ -272,7 +289,81 @@ pub trait NodeOps<K: BtreeKey, V: BtreeValue>: Send + Sync {
         }
         Ok(())
     }
-    
+
+    /// Multi-put for range operations (default implementation)
+    /// 
+    /// Matches C++ variant_node.hpp::multi_put() (lines 258-291)
+    /// Override for variants with special needs (e.g., PrefixNode for interval keys)
+    /// 
+    /// Returns:
+    /// - Ok(()) if all entries updated successfully
+    /// - Err(HasMore) if ran out of space (caller should retry)
+    /// - Err(KeyNotFound) if no keys in range were found
+    /// - Err(Io) for I/O errors
+    fn multi_put(&self, core: &NodeCore, range: &super::detail::btree_req::BtreeKeyRange<K>,
+                 value: &V, put_type: super::detail::btree_req::BtreePutType,
+                 filter_fn: Option<&PutFilterFn<K, V>>,
+                 last_failed_key: Option<&mut K>) -> Result<(), super::btree::BtreeError> {
+        use super::detail::btree_req::{BtreePutType, PutFilterDecision};
+        use super::btree::BtreeError;
+        
+        // Only UPDATE supported for base implementation
+        if put_type != BtreePutType::Update {
+            debug_assert!(false, "multi_put base implementation only supports UPDATE");
+            return Err(BtreeError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "multi_put base implementation only supports UPDATE"
+            )));
+        }
+        debug_assert!(core.is_leaf(), "Multi put only for leaf nodes");
+        
+        let (matched, start_idx, end_idx) = self.match_range(core, range);
+        if !matched {
+            return Err(BtreeError::KeyNotFound);
+        }
+        
+        let key_size = K::FIXED_SERIALIZED_SIZE.unwrap_or(0);
+        let val_size = V::FIXED_SERIALIZED_SIZE.unwrap_or(0);
+        
+        // Update all in range (C++ lines 273-289)
+        let mut idx = start_idx;
+        while idx <= end_idx {
+            // Check room
+            if !self.has_room_for_put(core, put_type, key_size, val_size) {
+                if let Some(failed_key) = last_failed_key {
+                    *failed_key = self.get_nth_key(core, idx, /*copy=*/true);
+                }
+                return Err(BtreeError::HasMore);
+            }
+            
+            // Apply filter if provided
+            if let Some(filter) = filter_fn {
+                let key = self.get_nth_key(core, idx, /*copy=*/false);
+                let existing_val = self.get_nth_value(core, idx, /*copy=*/false);
+                match filter(&key, &existing_val, value) {
+                    PutFilterDecision::Keep => {
+                        idx += 1;
+                        continue;
+                    }
+                    PutFilterDecision::Remove => {
+                        self.remove(core, idx)?;
+                        // Don't increment idx - next entry shifts down
+                        continue;
+                    }
+                    PutFilterDecision::Replace => {
+                        // Fall through to update
+                    }
+                }
+            }
+            
+            // Update entry
+            self.update(core, idx, value)?;
+            idx += 1;
+        }
+        
+        Ok(())
+    }
+  
     /// Multi-get: Extract multiple key-value pairs from leaf node in range (default implementation)
     /// 
     /// Efficiently collects up to `max_count` key-value pairs from this leaf node
@@ -297,7 +388,7 @@ pub trait NodeOps<K: BtreeKey, V: BtreeValue>: Send + Sync {
     ///     - `Unknown`: Reached end of node, check siblings for more
     fn multi_get(&self, core: &NodeCore, range: &super::detail::btree_req::BtreeKeyRange<K>,
                  max_count: u32, out_values: &mut Vec<(K, V)>, 
-                 filter: Option<&dyn Fn(&K, &V) -> bool>) -> (u32, PaginationStatus) {
+                 filter: Option<&GetFilterFn<K, V>>) -> (u32, PaginationStatus) {
         debug_assert!(core.is_leaf(), "multi_get only for leaf nodes");
         let (matched, start_idx, end_idx) = self.match_range(core, range);
         if !matched {
@@ -356,54 +447,52 @@ pub trait NodeOps<K: BtreeKey, V: BtreeValue>: Send + Sync {
         (count, status)
     }
 
-    /// Multi-put for range operations (default implementation)
+    /// Multi-remove: Remove multiple entries from leaf node in range (default implementation)
     /// 
-    /// Matches C++ variant_node.hpp::multi_put() (lines 258-291)
-    /// Override for variants with special needs (e.g., PrefixNode for interval keys)
+    /// Efficiently removes entries from this leaf node that match the given range.
+    /// Matches C++ variant_node::multi_remove()
     /// 
-    /// Returns:
-    /// - Ok(()) if all entries updated successfully
-    /// - Err(HasMore) if ran out of space (caller should retry)
-    /// - Err(KeyNotFound) if no keys in range were found
-    /// - Err(Io) for I/O errors
-    fn multi_put(&self, core: &NodeCore, range: &super::detail::btree_req::BtreeKeyRange<K>,
-                 value: &V, put_type: super::detail::btree_req::BtreePutType,
-                 last_failed_key: Option<&mut K>) -> Result<(), super::btree::BtreeError> {
-        use super::detail::btree_req::BtreePutType;
-        use super::btree::BtreeError;
-        
-        // Only UPDATE supported for base implementation
-        if put_type != BtreePutType::Update {
-            debug_assert!(false, "multi_put base implementation only supports UPDATE");
-            return Err(BtreeError::Io(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "multi_put base implementation only supports UPDATE"
-            )));
-        }
-        debug_assert!(core.is_leaf(), "Multi put only for leaf nodes");
-        
+    /// # Arguments
+    /// * `core` - Node core
+    /// * `range` - Key range to match and remove
+    /// * `max_count` - Maximum number of entries to remove (for batch limit)
+    /// * `filter_fn` - Optional filter function to select which entries to remove
+    /// 
+    /// # Returns
+    /// * `Ok(count)` - Number of entries removed
+    /// * `Err(BtreeError)` - If error occurred
+    fn multi_remove(&self, core: &NodeCore, range: &super::detail::btree_req::BtreeKeyRange<K>, max_count: u32,
+                    filter_fn: Option<&RemoveFilterFn<K, V>>) 
+                -> Result<u32, super::btree::BtreeError> {
+        debug_assert!(core.is_leaf(), "Multi remove only for leaf nodes");
+
         let (matched, start_idx, end_idx) = self.match_range(core, range);
         if !matched {
-            return Err(BtreeError::KeyNotFound);
+            return Ok(0);  // No matches, return 0
         }
+
+        let mut removed = 0u32;
+        let mut idx = start_idx;
         
-        let key_size = K::FIXED_SERIALIZED_SIZE.unwrap_or(0);
-        let val_size = V::FIXED_SERIALIZED_SIZE.unwrap_or(0);
-        
-        // Update all in range (C++ lines 273-289)
-        for idx in start_idx..=end_idx {
-            // Check room
-            if !self.has_room_for_put(core, put_type, key_size, val_size) {
-                if let Some(failed_key) = last_failed_key {
-                    *failed_key = self.get_nth_key(core, idx, /*copy=*/true);
+        // Iterate through range entries
+        while idx <= end_idx && removed < max_count {
+            // Apply filter if provided
+            if let Some(filter) = filter_fn {
+                let key = self.get_nth_key(core, idx, /*copy=*/false);
+                let value = self.get_nth_value(core, idx, /*copy=*/false);
+                if !filter(&key, &value) {
+                    idx += 1;  // Skip this entry
+                    continue;
                 }
-                return Err(BtreeError::HasMore);
             }
-            // Update entry
-            self.update(core, idx, value)?;
+            
+            // Remove entry
+            self.remove(core, idx)?;
+            removed += 1;
+            // Don't increment idx - entries shift down after removal
         }
-        
-        Ok(())
+
+        Ok(removed)
     }
 }
 
@@ -561,6 +650,29 @@ impl NodeCore {
     #[inline]
     pub(super) fn get_persistent_header_mut(&self) -> &mut PersistentHeader {
         unsafe { &mut *(self.phys_buf.as_ptr() as *mut PersistentHeader) }
+    }
+
+    #[inline]
+    pub(super) fn has_valid_edge(&self) -> bool {
+        self.get_persistent_header().edge_id != EMPTY_BNODEID
+    }
+
+    #[inline]
+    pub(super) fn set_edge(&self, id: BNodeId) {
+        self.get_persistent_header_mut().edge_id = id;
+    }
+
+    /// Update edge with value (for interior nodes, V = BNodeId)
+    pub(super) fn update_edge<V: BtreeValue>(&self, val: &V) {
+        debug_assert!(!self.is_leaf(), "Edge update on leaf node");
+        let edge_id = unsafe { *(val as *const V as *const u64) };
+        self.set_edge(edge_id);
+        self.inc_gen();
+    }
+
+    #[inline]
+    pub(super) fn invalidate_edge(&self) {
+        self.get_persistent_header_mut().edge_id = EMPTY_BNODEID;
     }
 
     #[inline]
@@ -801,6 +913,12 @@ impl Node {
         self.node_size() - std::mem::size_of::<PersistentHeader>() as u32
     }
 
+    /// Check if node is deleted
+    #[inline]
+    pub fn is_node_deleted(&self) -> bool {
+        self.core.get_persistent_header().is_node_deleted()
+    }
+    
     ///////// Simple Mutators (require write lock) - common to all variants ////////////////
     pub fn set_nentries(&self, n: u32) {
         debug_assert!(self.lock_type == LockType::Write, "Cannot mutate with {:?} lock", self.lock_type);
@@ -832,6 +950,55 @@ impl Node {
     pub fn set_next_node(&self, id: BNodeId) {
         debug_assert!(self.lock_type == LockType::Write, "Cannot mutate with {:?} lock", self.lock_type);
         self.core.get_persistent_header_mut().next_node = id;
+    }
+
+    ///////// Node cloning and buffer operations ////////////////
+    
+    /// Clone this node into a temporary copy (not in storage cache)
+    /// 
+    /// Creates an exact copy of this node's buffer in temporary memory.
+    /// The cloned node is independent and not tracked by storage.
+    /// 
+    /// 
+    /// # Arguments
+    /// * `lock_type` - Lock type to acquire on the cloned node
+    /// 
+    /// # Returns
+    /// * Locked temporary Node guard
+    pub async fn clone_temp(&self, lock_type: LockType) -> Node {
+        // Clone the physical buffer
+        let buffer = self.core.get_phys_buf().to_vec();
+        let temp_core = Arc::new(NodeCore::from_buffer(buffer));
+        temp_core.lock(lock_type).await
+    }
+    
+    /// Overwrite this node's buffer with another node's buffer
+    /// 
+    /// Performs a complete buffer copy from `other` to `self`.
+    /// Used in merge operations to commit temporary changes to actual nodes.
+    /// 
+    /// Matches C++ `BtreeNode::overwrite()` in btree_node.hpp line 322
+    /// 
+    /// # Arguments
+    /// * `other` - Source node to copy from
+    /// 
+    /// # Panics
+    /// * If node sizes don't match
+    pub fn overwrite(&self, other: &Node) {
+        debug_assert!(self.lock_type == LockType::Write, "Cannot overwrite with {:?} lock", self.lock_type);
+        
+        let self_size = self.node_size();
+        let other_size = other.node_size();
+        
+        assert_eq!(self_size, other_size, "Cannot overwrite: node sizes don't match (self={}, other={})",
+            self_size, other_size);
+        
+        // Copy entire physical buffer (C++ line 324: memcpy)
+        unsafe {
+            let src_ptr = other.core.get_phys_buf().as_ptr();
+            let dst_ptr = self.core.get_phys_buf().as_ptr() as *mut u8;
+            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, self_size as usize);
+        }
     }
 
     ///////// Node methods using dispatch (impls high level abstraction on varient-specific NodeOps) ////////////////
@@ -945,9 +1112,12 @@ impl Node {
         start_idx: u32, 
         end_idx: u32
     ) -> Result<(), super::btree::BtreeError> {
-        debug_assert!(self.is_leaf(), "remove_range is only for leaf nodes");
-        debug_assert!(self.lock_type == LockType::Write, "remove_range requires write lock");     
-        self.get_node_ops::<K, V>(/*wlock_reqd=*/true).remove_range(&self.core, start_idx, end_idx)
+        debug_assert!(self.lock_type == LockType::Write, "remove_range requires write lock");
+        if self.is_leaf() {  
+            self.get_node_ops::<K, V>(/*wlock_reqd=*/true).remove_range(&self.core, start_idx, end_idx)
+        } else {
+            self.get_node_ops::<K, BNodeId>(/*wlock_reqd=*/true).remove_range(&self.core, start_idx, end_idx)
+        }
     }
 
     /// Move entries from this node to right sibling by entry count
@@ -981,13 +1151,8 @@ impl Node {
     /// 
     /// # Returns
     /// * `true` if copy succeeded, `false` if no room or doesn't fit
-    pub fn append_copy_in_upto_size<K: BtreeKey + 'static, V: BtreeValue + 'static>(
-        &self, 
-        src_node: &Node,
-        other_cursor: &mut u32,
-        upto_size: u32,
-        copy_only_if_fits: bool
-    ) -> bool {
+    pub fn append_copy_in_upto_size<K: BtreeKey + 'static, V: BtreeValue + 'static>(&self, src_node: &Node, 
+                                 other_cursor: &mut u32, upto_size: u32, copy_only_if_fits: bool) -> bool {
         debug_assert!(self.lock_type == LockType::Write, "Destination node must have write lock");
         
         if self.is_leaf() {
@@ -1013,6 +1178,24 @@ impl Node {
             return None;
         }
         Some(self.get_nth_key::<K, V>(nentries - 1, /*copy=*/true))
+    }
+
+    /// Get the nth value (works for both leaf nodes with V and interior nodes with BNodeId as V)
+    pub fn get_nth_value<K: BtreeKey + 'static, V: BtreeValue + 'static>(&self, idx: u32, copy: bool) -> V {
+        let ops = self.get_node_ops::<K, V>(/*wlock_reqd=*/false);
+        ops.get_nth_value(&self.core, idx, copy)
+    }
+
+    /// Get the first value in the node
+    pub fn get_first_value<K: BtreeKey + 'static, V: BtreeValue + 'static>(&self) -> V {
+        self.get_nth_value::<K, V>(0, /*copy=*/true)
+    }
+
+    /// Get the last value in the node
+    pub fn get_last_value<K: BtreeKey + 'static, V: BtreeValue + 'static>(&self) -> V {
+        let nentries = self.total_entries();
+        debug_assert!(nentries > 0, "Cannot get last value from empty node");
+        self.get_nth_value::<K, V>(nentries - 1, /*copy=*/true)
     }
 
     //================================================================================
@@ -1054,11 +1237,12 @@ impl Node {
         &self,
         key: &K,
         value: &V,
-        put_type: super::detail::btree_req::BtreePutType
+        put_type: super::detail::btree_req::BtreePutType,
+        filter_fn: Option<&PutFilterFn<K, V>>
     ) -> Result<(), super::btree::BtreeError> {
         debug_assert!(self.is_leaf(), "put() is only supported for leaf nodes");
         let ops = self.get_node_ops::<K, V>(/*wlock_reqd=*/true);
-        ops.put(&self.core, key, value, put_type)
+        ops.put(&self.core, key, value, put_type, filter_fn)
     }
 
     /// Multi-put for range operations (leaf nodes only)
@@ -1073,11 +1257,30 @@ impl Node {
         range: &super::detail::btree_req::BtreeKeyRange<K>,
         value: &V,
         put_type: super::detail::btree_req::BtreePutType,
+        filter_fn: Option<&PutFilterFn<K, V>>,
         last_failed_key: Option<&mut K>,
     ) -> Result<(), super::btree::BtreeError> {
         debug_assert!(self.is_leaf(), "multi_put is only supported for leaf nodes");
         let ops = self.get_node_ops::<K, V>(/*wlock_reqd=*/true);
-        ops.multi_put(&self.core, range, value, put_type, last_failed_key)
+        ops.multi_put(&self.core, range, value, put_type, filter_fn, last_failed_key)
+    }
+
+    /// Multi-remove for range operations (leaf nodes only)
+    /// 
+    /// Removes up to max_count entries matching the given range.
+    /// 
+    /// # Returns
+    /// * `Ok(count)` - Number of entries removed
+    /// * `Err(BtreeError)` - If error occurred
+    pub fn multi_remove<K: BtreeKey + 'static, V: BtreeValue + 'static>(
+        &self,
+        range: &super::detail::btree_req::BtreeKeyRange<K>,
+        max_count: u32,
+        filter_fn: Option<&RemoveFilterFn<K, V>>,
+    ) -> Result<u32, super::btree::BtreeError> {
+        debug_assert!(self.is_leaf(), "multi_remove is only supported for leaf nodes");
+        let ops = self.get_node_ops::<K, V>(/*wlock_reqd=*/true);
+        ops.multi_remove(&self.core, range, max_count, filter_fn)
     }
 
     /// Multi-get: Extract multiple key-value pairs from leaf node in range
@@ -1097,7 +1300,7 @@ impl Node {
     ///   - `pagination_status`: Completed/Continue/Unknown (see PaginationStatus)
     pub fn multi_get<K: BtreeKey + 'static, V: BtreeValue + 'static>(
         &self, range: &super::detail::btree_req::BtreeKeyRange<K>, max_count: u32,
-        out_values: &mut Vec<(K, V)>, filter: Option<&dyn Fn(&K, &V) -> bool>) -> (u32, PaginationStatus) {
+        out_values: &mut Vec<(K, V)>, filter: Option<&GetFilterFn<K, V>>) -> (u32, PaginationStatus) {
         debug_assert!(self.is_leaf(), "multi_get is only supported for leaf nodes");
         let ops = self.get_node_ops::<K, V>(/*wlock_reqd=*/false);
         ops.multi_get(&self.core, range, max_count, out_values, filter)
@@ -1110,23 +1313,23 @@ impl Node {
         ops.get_all_kvs(&self.core)
     }
 
-    /// Get the nth value
-    pub fn get_nth_value<K: BtreeKey + 'static, V: BtreeValue + 'static>(&self, idx: u32, copy: bool) -> V {
-        debug_assert!(self.is_leaf(), "get_nth_value is only supported for leaf nodes");
-        let ops = self.get_node_ops::<K, V>(/*wlock_reqd=*/false);
-        ops.get_nth_value(&self.core, idx, copy)
-    }
-
-    /// Get the first value in the node
-    pub fn get_first_value<K: BtreeKey + 'static, V: BtreeValue + 'static>(&self) -> V {
-        self.get_nth_value::<K, V>(0, /*copy=*/true)
-    }
-
-    /// Get the last value in the node
-    pub fn get_last_value<K: BtreeKey + 'static, V: BtreeValue + 'static>(&self) -> V {
-        let nentries = self.total_entries();
-        debug_assert!(nentries > 0, "Cannot get last value from empty node");
-        self.get_nth_value::<K, V>(nentries - 1, /*copy=*/true)
+    /// Dump node contents as string for debugging
+    pub fn dump<K: BtreeKey + 'static, V: BtreeValue + 'static>(&self) -> String {
+        let mut s = format!("Node[id={} leaf={} lvl={} entries={}",
+                            self.node_id(), self.is_leaf(), self.level(), self.total_entries());
+        if !self.is_leaf() {
+            let edge = self.get_edge_value();
+            s.push_str(&format!(" edge={}", if edge == EMPTY_BNODEID { "EMPTY".to_string() } 
+                                            else { edge.to_string() }));
+        }
+        s.push_str("] Keys: ");
+        for i in 0..self.total_entries() {
+            if i > 0 { s.push_str(", "); }
+            let key: K = self.get_nth_key::<K, V>(i, /*copy=*/true);
+            let val: V = self.get_nth_value::<K, V>(i, /*copy=*/true);
+            s.push_str(&format!("{:?}→{:?}", key, val));
+        }
+        s
     }
 
     //================================================================================
@@ -1137,14 +1340,24 @@ impl Node {
     pub fn insert_child<K: BtreeKey + 'static>(&self, idx: u32, key: &K, child_id: &BNodeId) 
         -> Result<(), super::btree::BtreeError> {
         debug_assert!(!self.is_leaf(), "insert_child called on leaf node");
-        self.insert::<K, BNodeId>(idx, key, child_id)
+        let ops = self.get_node_ops::<K, BNodeId>(/*wlock_reqd=*/true);
+        ops.insert(&self.core, idx, key, child_id)
     }
 
     /// Update child ID at index in interior node
     pub fn update_child<K: BtreeKey + 'static>(&self, idx: u32, child_id: &BNodeId) 
         -> Result<(), super::btree::BtreeError> {
         debug_assert!(!self.is_leaf(), "update_child called on leaf node");
-        self.update::<K, BNodeId>(idx, child_id)
+        let ops = self.get_node_ops::<K, BNodeId>(/*wlock_reqd=*/true);
+        ops.update(&self.core, idx, child_id)
+    }
+
+    /// Update both key and child ID at index in interior node atomically (C++ update())
+    pub fn update_child_with_key<K: BtreeKey + 'static>(&self, idx: u32, key: &K, child_id: &BNodeId) 
+        -> Result<(), super::btree::BtreeError> {
+        debug_assert!(!self.is_leaf(), "update_child_with_key called on leaf node");
+        let ops = self.get_node_ops::<K, BNodeId>(/*wlock_reqd=*/true);
+        ops.update_with_key(&self.core, idx, key, child_id)
     }
 
     /// Get child ID at index from interior node

@@ -16,4 +16,7 @@
 
 //! Btree Tests
 
+mod btree_test_kvs;  // Reusable test types and generators
+mod shadow_map;      // Shadow map for test validation
 mod test_btree_node;
+mod test_btree;

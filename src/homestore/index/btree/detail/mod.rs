@@ -22,7 +22,9 @@
 pub mod btree_req;
 pub mod mutate;
 pub mod query;
+pub mod remove;
 
 pub use btree_req::*;
 pub use mutate::*;
 pub use query::*;
+pub use remove::*;

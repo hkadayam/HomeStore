@@ -68,6 +68,14 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for VarKeyNodeOps {
         )))
     }
 
+    fn update_with_key(&self, _core: &NodeCore, _idx: u32, _key: &K, _child_id: &V) -> Result<(), super::super::btree::BtreeError> {
+        // TODO: Port C++ VarKeyNode::update logic with key
+        Err(super::super::btree::BtreeError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "VarKeyNode operations not yet implemented",
+        )))
+    }
+
     fn remove_range(&self, _core: &NodeCore, _start_idx: u32, _end_idx: u32) -> Result<(), super::super::btree::BtreeError> {
         Err(super::super::btree::BtreeError::Io(std::io::Error::new(
             std::io::ErrorKind::Unsupported, 

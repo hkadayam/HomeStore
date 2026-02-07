@@ -14,7 +14,7 @@ pub use crate::glommio::{
     IOBuffer, IoDevice, LockId, Reactor, ReactorId, WakeMsg,
 };
 pub use crate::iomanager::{
-    init_iomgr, iomgr, run_test, shutdown_iomgr, 
+    init_iomgr, iomgr, run_test, run_test_multi, shutdown_iomgr, 
     BackgroundTasks, IOManager, ReactorTarget, JoinHandle,
     spawn, spawn_and_block, spawn_detached, spawn_waitable, spawn_waitable_all,
 };

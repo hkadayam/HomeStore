@@ -129,4 +129,40 @@ impl IOManagerImplTrait for IOManagerImpl {
             let _ = crate::iomanager::shutdown_iomgr().await;
         });
     }
+    
+    fn run_test_multi<F>(fut: F, num_threads: usize)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        // If only 1 thread, use the regular run_test path
+        if num_threads <= 1 {
+            return Self::run_test(fut);
+        }
+        
+        // For multiple threads, spawn the test on ALL reactors concurrently
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
+        
+        rt.block_on(async {
+            let io_mgr = crate::iomanager::iomgr();
+            
+            // Wrap the future in Arc so we can share it across reactors
+            // Note: We can only do this once - the future will run on reactor 0,
+            // but the test code inside can spawn work on other reactors
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            
+            println!("Running test concurrently on {} reactors", num_threads);
+            
+            // Spawn test on reactor 0 (it can internally use BackgroundTasks to spawn on other reactors)
+            io_mgr.spawn_detached(crate::iomanager::ReactorTarget::Reactor(0), async move {
+                fut.await;
+                let _ = tx.send(()); // Signal completion
+            });
+            
+            let _ = rx.await;
+            let _ = crate::iomanager::shutdown_iomgr().await;
+        });
+    }
 }

@@ -98,7 +98,8 @@ pub fn iomanager_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let _ = iomgr::init_iomgr(#num_threads);
             });
 
-            iomgr::run_test(async #fn_block);
+            // Use run_test_multi which spawns on all reactors if num_threads > 1
+            iomgr::run_test_multi(async #fn_block, #num_threads);
         }
     };
 

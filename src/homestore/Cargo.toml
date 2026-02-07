@@ -58,3 +58,9 @@ cow_btree = ["device", "streams"]  # COW btree needs device layer
 name = "btree_node_tests"
 path = "tests/btree_node_tests.rs"
 required-features = ["btree-only"]
+
+[[test]]
+name = "btree_bench"
+path = "tests/btree_bench.rs"
+required-features = ["btree-only"]
+harness = false  # Disable default test harness for benchmark-style output

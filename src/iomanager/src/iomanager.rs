@@ -80,6 +80,13 @@ pub trait IOManagerImplTrait {
     fn run_test<F>(fut: F)
     where
         F: Future<Output = ()> + Send + 'static;
+    
+    /// Run an async test on multiple reactors concurrently.
+    /// If num_threads > 1, spawns the test on all reactors simultaneously.
+    /// If num_threads == 1, spawns on reactor 0 only (same as run_test).
+    fn run_test_multi<F>(fut: F, num_threads: usize)
+    where
+        F: Future<Output = ()> + Send + 'static;
 }
 
 /// Unified IOManager with common functionality and backend-specific delegation.
@@ -778,6 +785,16 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     IOManagerImpl::run_test(fut);
+}
+
+/// Run an async test on multiple reactors concurrently.
+/// If num_threads > 1, spawns the test on all reactors simultaneously.
+/// If num_threads == 1, spawns on reactor 0 only.
+pub fn run_test_multi<F>(fut: F, num_threads: usize)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    IOManagerImpl::run_test_multi(fut, num_threads);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

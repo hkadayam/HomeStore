@@ -378,6 +378,7 @@ pub trait NodeOps<K: BtreeKey, V: BtreeValue>: Send + Sync {
     /// * `max_count` - Maximum number of entries to extract
     /// * `out_values` - Vector to append results to
     /// * `filter` - Optional filter callback
+    /// * `reverse` - If true, iterate in reverse order
     /// 
     /// # Returns
     /// * `(count, pagination_status)` where:
@@ -388,8 +389,20 @@ pub trait NodeOps<K: BtreeKey, V: BtreeValue>: Send + Sync {
     ///     - `Unknown`: Reached end of node, check siblings for more
     fn multi_get(&self, core: &NodeCore, range: &super::detail::btree_req::BtreeKeyRange<K>,
                  max_count: u32, out_values: &mut Vec<(K, V)>, 
-                 filter: Option<&GetFilterFn<K, V>>) -> (u32, PaginationStatus) {
+                 filter: Option<&GetFilterFn<K, V>>, reverse: bool) -> (u32, PaginationStatus) {
         debug_assert!(core.is_leaf(), "multi_get only for leaf nodes");
+        
+        if reverse {
+            self.multi_get_reverse(core, range, max_count, out_values, filter)
+        } else {
+            self.multi_get_forward(core, range, max_count, out_values, filter)
+        }
+    }
+
+    /// Forward multi-get helper
+    fn multi_get_forward(&self, core: &NodeCore, range: &super::detail::btree_req::BtreeKeyRange<K>,
+                         max_count: u32, out_values: &mut Vec<(K, V)>, 
+                         filter: Option<&GetFilterFn<K, V>>) -> (u32, PaginationStatus) {
         let (matched, start_idx, end_idx) = self.match_range(core, range);
         if !matched {
             return (0, PaginationStatus::Completed);
@@ -436,6 +449,65 @@ pub trait NodeOps<K: BtreeKey, V: BtreeValue>: Send + Sync {
                 let last_key = &out_values.last().unwrap().0;
                 if last_key >= &range.end_key {
                     PaginationStatus::Completed  // Last key matches/exceeds range end
+                } else {
+                    PaginationStatus::Unknown    // May have more in siblings
+                }
+            } else {
+                PaginationStatus::Unknown
+            }
+        };
+        
+        (count, status)
+    }
+
+    /// Reverse multi-get helper
+    fn multi_get_reverse(&self, core: &NodeCore, range: &super::detail::btree_req::BtreeKeyRange<K>,
+                         max_count: u32, out_values: &mut Vec<(K, V)>, 
+                         filter: Option<&GetFilterFn<K, V>>) -> (u32, PaginationStatus) {
+        let (matched, start_idx, end_idx) = self.match_range(core, range);
+        if !matched {
+            return (0, PaginationStatus::Completed);
+        }
+        
+        let mut count = 0u32;
+        let mut iter_idx = end_idx;
+        
+        // Iterate in reverse: from end_idx down to start_idx
+        for idx in (start_idx..=end_idx).rev() {
+            if count >= max_count {
+                break;
+            }
+            
+            let key = self.get_nth_key(core, idx, /*copy=*/true);
+            let value = self.get_nth_value(core, idx, /*copy=*/true);
+            
+            // Apply filter if provided
+            if let Some(filter_fn) = filter {
+                if !filter_fn(&key, &value) {
+                    iter_idx = idx.saturating_sub(1);
+                    continue;
+                }
+            }
+            
+            out_values.push((key, value));
+            count += 1;
+            iter_idx = idx.saturating_sub(1);
+        }
+        
+        // Determine pagination status for reverse iteration
+        let status = if start_idx != 0 {
+            // We didn't reach the beginning of the node
+            if iter_idx < start_idx || (iter_idx == 0 && start_idx > 0) {
+                PaginationStatus::Completed  // Finished iterating the range
+            } else {
+                PaginationStatus::Continue   // Stopped early due to max_count
+            }
+        } else {
+            // We reached the beginning of the node
+            if count > 0 {
+                let last_key = &out_values.last().unwrap().0;
+                if last_key <= &range.start_key {
+                    PaginationStatus::Completed  // Last key matches/before range start
                 } else {
                     PaginationStatus::Unknown    // May have more in siblings
                 }
@@ -605,6 +677,14 @@ impl Default for PersistentHeader {
 
 // Compile-time assertion that PersistentHeader is exactly 56 bytes
 const _: () = assert!(std::mem::size_of::<PersistentHeader>() == 56);
+
+//================================================================================
+// Re-export varlen node structures from variant module
+//================================================================================
+
+// Variable-length node structures are defined in variant/varlen_node_common.rs
+// and re-exported here for backward compatibility with existing code
+pub use variant::{VarNodeHeader, BtreeObjRecord, VarKeyRecord, VarValueRecord, VarObjRecord};
 
 //================================================================================
 // NodeCore - Physical node with lock and buffer (private)
@@ -1293,6 +1373,7 @@ impl Node {
     /// * `max_count` - Maximum number of entries to extract
     /// * `out_values` - Vector to append results to
     /// * `filter` - Optional filter callback
+    /// * `reverse` - If true, iterate in reverse order
     /// 
     /// # Returns
     /// * `(count, pagination_status)` where:
@@ -1300,10 +1381,11 @@ impl Node {
     ///   - `pagination_status`: Completed/Continue/Unknown (see PaginationStatus)
     pub fn multi_get<K: BtreeKey + 'static, V: BtreeValue + 'static>(
         &self, range: &super::detail::btree_req::BtreeKeyRange<K>, max_count: u32,
-        out_values: &mut Vec<(K, V)>, filter: Option<&GetFilterFn<K, V>>) -> (u32, PaginationStatus) {
+        out_values: &mut Vec<(K, V)>, filter: Option<&GetFilterFn<K, V>>, 
+        reverse: bool) -> (u32, PaginationStatus) {
         debug_assert!(self.is_leaf(), "multi_get is only supported for leaf nodes");
         let ops = self.get_node_ops::<K, V>(/*wlock_reqd=*/false);
-        ops.multi_get(&self.core, range, max_count, out_values, filter)
+        ops.multi_get(&self.core, range, max_count, out_values, filter, reverse)
     }
 
     /// Get all key-value pairs from the node (leaf nodes only)
@@ -1403,6 +1485,9 @@ impl Node {
         match node_variant {
             0 => &SIMPLE_NODE_OPS,
             1 => &VAR_KEY_NODE_OPS,
+            2 => &VAR_VALUE_NODE_OPS,
+            3 => &VAR_OBJ_NODE_OPS,
+            4 => &PREFIX_COMPRESS_NODE_OPS,
             _ => panic!("Unknown node variant: {}", node_variant),
         }
     }
@@ -1431,4 +1516,15 @@ impl std::fmt::Debug for Node {
 /// Static instances of node operations (zero-sized types)
 /// These are used to avoid Arc allocation on every operation
 pub static SIMPLE_NODE_OPS: variant::SimpleNodeOps = variant::SimpleNodeOps;
-pub static VAR_KEY_NODE_OPS: variant::VarKeyNodeOps = variant::VarKeyNodeOps;
+
+pub static VAR_KEY_NODE_OPS: variant::VarKeyNodeOps = 
+    variant::VarNodeOps::new(variant::VarKeyRecordOps);
+
+pub static VAR_VALUE_NODE_OPS: variant::VarValueNodeOps = 
+    variant::VarNodeOps::new(variant::VarValueRecordOps);
+
+pub static VAR_OBJ_NODE_OPS: variant::VarObjNodeOps = 
+    variant::VarNodeOps::new(variant::VarObjRecordOps);
+
+pub static PREFIX_COMPRESS_NODE_OPS: variant::PrefixCompressNodeOps = 
+    variant::PrefixCompressNodeOps::new(0); // 0 = dynamic prefix size

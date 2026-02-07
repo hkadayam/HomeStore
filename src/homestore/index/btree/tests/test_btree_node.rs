@@ -89,6 +89,30 @@ impl NodeVariant for VarKeyNodeVariant {
     }
 }
 
+struct VarValueNodeVariant;
+impl NodeVariant for VarValueNodeVariant {
+    fn node_variant_id() -> u8 { 2 }
+    fn get_node_ops<K: BtreeKey + 'static, V: BtreeValue + 'static>() -> &'static dyn NodeOps<K, V> {
+        &crate::btree_node::VAR_VALUE_NODE_OPS
+    }
+}
+
+struct VarObjNodeVariant;
+impl NodeVariant for VarObjNodeVariant {
+    fn node_variant_id() -> u8 { 3 }
+    fn get_node_ops<K: BtreeKey + 'static, V: BtreeValue + 'static>() -> &'static dyn NodeOps<K, V> {
+        &crate::btree_node::VAR_OBJ_NODE_OPS
+    }
+}
+
+struct PrefixCompressNodeVariant;
+impl NodeVariant for PrefixCompressNodeVariant {
+    fn node_variant_id() -> u8 { 4 }
+    fn get_node_ops<K: BtreeKey + 'static, V: BtreeValue + 'static>() -> &'static dyn NodeOps<K, V> {
+        &crate::btree_node::PREFIX_COMPRESS_NODE_OPS
+    }
+}
+
 //================================================================================
 // Node Test Configuration (matches C++ TestType pattern)
 //================================================================================
@@ -117,10 +141,29 @@ impl NodeTestConfig for VarKeySizeNodeTest {
     type Variant = VarKeyNodeVariant;
 }
 
-// TODO: Add more test configurations as you implement them:
-// - VarValueSizeNodeTest
-// - VarObjSizeNodeTest
-// - PrefixIntervalBtreeTest
+/// Variable value size node test (VarValueNode with u32 key, u64 value)
+struct VarValueSizeNodeTest;
+impl NodeTestConfig for VarValueSizeNodeTest {
+    type K = u32;
+    type V = u64;
+    type Variant = VarValueNodeVariant;
+}
+
+/// Variable obj size node test (VarObjNode with u32 key, u64 value)
+struct VarObjSizeNodeTest;
+impl NodeTestConfig for VarObjSizeNodeTest {
+    type K = u32;
+    type V = u64;
+    type Variant = VarObjNodeVariant;
+}
+
+/// Prefix compression node test (PrefixCompressNode with u32 key, u64 value)
+struct PrefixCompressNodeTest;
+impl NodeTestConfig for PrefixCompressNodeTest {
+    type K = u32;
+    type V = u64;
+    type Variant = PrefixCompressNodeVariant;
+}
 
 //================================================================================
 // Generic Node Test Fixture
@@ -146,6 +189,12 @@ where
 {
     async fn new() -> Self {
         let node_core = NodeCore::new(/*node_id=*/1, /*is_leaf=*/true, NODE_SIZE as u32);
+        
+        // Set the node variant in persistent header
+        {
+            let header = node_core.get_persistent_header_mut();
+            header.node_variant = N::node_variant_id();
+        }
         
         // Initialize node with the appropriate NodeOps based on variant N
         N::get_node_ops::<K, V>().init_new_node(&node_core);
@@ -604,7 +653,6 @@ instantiate_typed_test!(test_range_put_get, FixedLenNodeTest);
 instantiate_typed_test!(test_random_insert_remove_update, FixedLenNodeTest);
 
 // VarKeySizeNodeTest
-/*
 instantiate_typed_test!(test_sequential_insert, VarKeySizeNodeTest);
 instantiate_typed_test!(test_simple_insert, VarKeySizeNodeTest);
 instantiate_typed_test!(test_reverse_insert, VarKeySizeNodeTest);
@@ -615,4 +663,39 @@ instantiate_typed_test!(test_remove_range_index, VarKeySizeNodeTest);
 instantiate_typed_test!(test_move, VarKeySizeNodeTest);
 instantiate_typed_test!(test_range_put_get, VarKeySizeNodeTest);
 instantiate_typed_test!(test_random_insert_remove_update, VarKeySizeNodeTest);
-*/
+
+// VarValueSizeNodeTest
+instantiate_typed_test!(test_sequential_insert, VarValueSizeNodeTest);
+instantiate_typed_test!(test_simple_insert, VarValueSizeNodeTest);
+instantiate_typed_test!(test_reverse_insert, VarValueSizeNodeTest);
+instantiate_typed_test!(test_remove, VarValueSizeNodeTest);
+instantiate_typed_test!(test_update, VarValueSizeNodeTest);
+instantiate_typed_test!(test_mixed_operations, VarValueSizeNodeTest);
+instantiate_typed_test!(test_remove_range_index, VarValueSizeNodeTest);
+instantiate_typed_test!(test_move, VarValueSizeNodeTest);
+instantiate_typed_test!(test_range_put_get, VarValueSizeNodeTest);
+instantiate_typed_test!(test_random_insert_remove_update, VarValueSizeNodeTest);
+
+// VarObjSizeNodeTest
+instantiate_typed_test!(test_sequential_insert, VarObjSizeNodeTest);
+instantiate_typed_test!(test_simple_insert, VarObjSizeNodeTest);
+instantiate_typed_test!(test_reverse_insert, VarObjSizeNodeTest);
+instantiate_typed_test!(test_remove, VarObjSizeNodeTest);
+instantiate_typed_test!(test_update, VarObjSizeNodeTest);
+instantiate_typed_test!(test_mixed_operations, VarObjSizeNodeTest);
+instantiate_typed_test!(test_remove_range_index, VarObjSizeNodeTest);
+instantiate_typed_test!(test_move, VarObjSizeNodeTest);
+instantiate_typed_test!(test_range_put_get, VarObjSizeNodeTest);
+instantiate_typed_test!(test_random_insert_remove_update, VarObjSizeNodeTest);
+
+// PrefixCompressNodeTest
+instantiate_typed_test!(test_sequential_insert, PrefixCompressNodeTest);
+instantiate_typed_test!(test_simple_insert, PrefixCompressNodeTest);
+instantiate_typed_test!(test_reverse_insert, PrefixCompressNodeTest);
+instantiate_typed_test!(test_remove, PrefixCompressNodeTest);
+instantiate_typed_test!(test_update, PrefixCompressNodeTest);
+instantiate_typed_test!(test_mixed_operations, PrefixCompressNodeTest);
+instantiate_typed_test!(test_remove_range_index, PrefixCompressNodeTest);
+instantiate_typed_test!(test_move, PrefixCompressNodeTest);
+instantiate_typed_test!(test_range_put_get, PrefixCompressNodeTest);
+instantiate_typed_test!(test_random_insert_remove_update, PrefixCompressNodeTest);

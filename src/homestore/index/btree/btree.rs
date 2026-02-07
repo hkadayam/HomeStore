@@ -468,15 +468,45 @@ where
                        filter_fn: Option<&'a GetFilterFn<K, V>>) 
         -> Result<QueryResultHandle<'a, K, V>, BtreeError> {
         tracing::debug!("Starting query");
-        let req = BtreeQueryRequest::new(range, batch_size, filter_fn);
+        let req = BtreeQueryRequest::new(range, batch_size, filter_fn, /*reverse_order=*/false);
         let result = self.query_internal(req).await;
         if let Ok(ref handle) = result { tracing::debug!(result_count = handle.results.len(), has_more = handle.has_more(), "Query completed"); }
+        result
+    }
+
+    /// Query with tree traversal (supports reverse iteration, no sibling links)
+    /// 
+    /// Executes a range query using tree traversal without following sibling links.
+    /// This method is required for reverse iteration and avoids potential deadlocks
+    /// in scenarios like TiKV integration.
+    /// 
+    /// # Arguments
+    /// * `range` - Key range to query
+    /// * `batch_size` - Maximum results per batch
+    /// * `filter_fn` - Optional filter function
+    /// * `reverse_order` - If true, iterate in reverse order (high to low)
+    /// 
+    /// # Returns
+    /// * `QueryResultHandle` - Contains results and has_more() indicator for pagination
+    #[tracing::instrument(
+        skip(self, range, filter_fn), 
+        fields(op_id=GLOBAL_OP_COUNTER.fetch_add(1, Ordering::Relaxed), 
+               btree=%self.config.btree_name, range=?range, reverse=reverse_order))]
+    pub async fn query_traversal<'a>(&self, range: BtreeKeyRange<K>, batch_size: u32,
+                                     filter_fn: Option<&'a GetFilterFn<K, V>>, reverse_order: bool) 
+        -> Result<QueryResultHandle<'a, K, V>, BtreeError> {
+        tracing::debug!("Starting traversal query");
+        let req = BtreeQueryRequest::new(range, batch_size, filter_fn, reverse_order);
+        let result = self.traversal_query_internal(req).await;
+        if let Ok(ref handle) = result { tracing::debug!(result_count = handle.results.len(), has_more = handle.has_more(), "Traversal query completed"); }
         result
     }
 
     /// Paginate for next batch of results on previous query result handle.
     /// If there are no more results, returns an empty result handle.
     /// If there are more results, returns a new result handle which user is expected to call next time.
+    /// 
+    /// Routes to the appropriate query method (sweep or traversal) based on the request.
     #[tracing::instrument(
         skip(self, handle), 
         fields(op_id=GLOBAL_OP_COUNTER.fetch_add(1, Ordering::Relaxed), 
@@ -484,7 +514,14 @@ where
 
     pub async fn query_next_batch<'a>(&self, handle: QueryResultHandle<'a, K, V>) 
         -> Result<QueryResultHandle<'a, K, V>, BtreeError> {
-        self.query_internal(handle.request()).await
+        let req = handle.request();
+        if req.reverse_order() {
+            // Use traversal query for reverse iteration
+            self.traversal_query_internal(req).await
+        } else {
+            // Use sweep query for forward iteration
+            self.query_internal(req).await
+        }
     }
 }
 

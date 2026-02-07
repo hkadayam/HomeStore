@@ -143,16 +143,15 @@ impl UnderlyingBtree for MemBtree {
     ///
     /// # Arguments
     /// * `is_leaf` - Whether this is a leaf node
-    /// * `node_type` - Node type (0=SimpleNode, 1=VarKeyNode)
+    /// * `node_variant` - Node type (0=SimpleNode, 1=VarKeyNode)
     ///
     /// # Returns
     /// * `Ok(Arc<NodeCore>)` - Unlocked new node
-    async fn create_node(
-        &self,
-        is_leaf: bool,
-        node_type: u8,
-    ) -> Result<Arc<NodeCore>, BtreeError> {
-        // Allocate new node ID (storage layer responsibility)
+    async fn create_node(&self, is_leaf: bool, node_variant: u8) -> Result<Arc<NodeCore>, BtreeError> {
+        // Storage layer: allocate ID, create buffer, store in HashMap
+        // btree_node_mgr::init_new_variant_node() sets node_variant and initializes
+        
+        // Allocate new node ID
         let node_id = self.allocate_node_id();
 
         // Create new node buffer
@@ -162,8 +161,8 @@ impl UnderlyingBtree for MemBtree {
         let mut nodes = self.nodes.write().unwrap();
         nodes.insert(node_id, Arc::clone(&core));
 
-        tracing::info!("MemBtree: Created node {} (is_leaf={}, node_type={})",
-                 node_id, is_leaf, node_type);
+        tracing::info!("MemBtree: Created node {} (is_leaf={}, node_variant={})",
+                 node_id, is_leaf, node_variant);
 
         Ok(core)
     }
@@ -217,9 +216,7 @@ impl MemBtree {
     ///
     /// # Returns
     /// * Result with Btree and MemBtree storage, or BtreeError
-    pub async fn create_btree<K, V>(
-        node_size: u32
-    ) -> Result<crate::index::btree::btree::Btree<K, V>, crate::index::btree::btree::BtreeError>
+    pub async fn create_btree<K, V>(node_size: u32) -> Result<crate::index::btree::btree::Btree<K, V>, crate::index::btree::btree::BtreeError>
     where
         K: crate::index::btree::btree_kvs::BtreeKey + 'static,
         V: crate::index::btree::btree_kvs::BtreeValue + 'static,

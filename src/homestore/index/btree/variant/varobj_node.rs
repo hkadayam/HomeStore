@@ -14,66 +14,68 @@
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
  ***************************************************************************/
 
-//! VarKey Node - Variable-length keys, fixed-size values
+//! VarObj Node - Variable-length keys and values
 //!
-//! This module provides the policy for VarKey nodes.
-//! Corresponds to C++ VarKeySizeNode in varlen_node.hpp
+//! This module provides the policy for VarObj nodes.
+//! Corresponds to C++ VarObjSizeNode in varlen_node.hpp
 
 use super::varlen_node_common::{
-    VarNodeOps, VarRecordOps, VarKeyRecord,
+    VarNodeOps, VarRecordOps, VarObjRecord,
     get_record_ptr, get_record_ptr_mut,
 };
 use super::super::btree_node::NodeCore;
 
-/// Zero-sized policy for VarKey nodes
+/// Zero-sized policy for VarObj nodes
 /// 
-/// VarKey = variable-length keys + fixed-size values
-/// Record format: [obj_offset:16, key_len:16] = 4 bytes
-pub struct VarKeyRecordOps;
+/// VarObj = variable-length keys + variable-length values
+/// Record format: [obj_offset:16, key_len:16, value_len:16] = 6 bytes
+pub struct VarObjRecordOps;
 
-impl VarRecordOps for VarKeyRecordOps {
+impl VarRecordOps for VarObjRecordOps {
     #[inline]
     fn record_size(&self) -> usize { 
-        VarKeyRecord::size() 
+        VarObjRecord::size() 
     }
     
     #[inline]
     fn node_variant_type(&self) -> u8 { 
-        1  // VAR_KEY
+        3  // VAR_OBJECT
     }
     
     #[inline]
     fn get_key_size(&self, core: &NodeCore, idx: u32) -> usize {
         let ptr = get_record_ptr(core, idx, self.record_size());
         unsafe { 
-            (*(ptr as *const VarKeyRecord)).key_len as usize 
+            (*(ptr as *const VarObjRecord)).key_len as usize 
         }
     }
     
     #[inline]
-    fn get_value_size(&self, _core: &NodeCore, _idx: u32) -> usize {
-        // VarKey = variable key, FIXED value
-        // Value size is determined by V type at compile time
-        // This will panic if V doesn't have FIXED_SERIALIZED_SIZE - that's correct!
-        panic!("VarKey get_value_size should use type's FIXED_SERIALIZED_SIZE - call site bug")
+    fn get_value_size(&self, core: &NodeCore, idx: u32) -> usize {
+        let ptr = get_record_ptr(core, idx, self.record_size());
+        unsafe { 
+            (*(ptr as *const VarObjRecord)).value_len as usize 
+        }
     }
     
     #[inline]
     fn set_key_len(&self, core: &NodeCore, idx: u32, len: usize) {
         let ptr = get_record_ptr_mut(core, idx, self.record_size());
         unsafe { 
-            (*(ptr as *mut VarKeyRecord)).key_len = len as u16;
+            (*(ptr as *mut VarObjRecord)).key_len = len as u16;
         }
     }
     
     #[inline]
-    fn set_value_len(&self, _core: &NodeCore, _idx: u32, _len: usize) {
-        // No-op for VarKey (value size is fixed, part of V type)
-        // Value length is not stored in record metadata
+    fn set_value_len(&self, core: &NodeCore, idx: u32, len: usize) {
+        let ptr = get_record_ptr_mut(core, idx, self.record_size());
+        unsafe { 
+            (*(ptr as *mut VarObjRecord)).value_len = len as u16;
+        }
     }
 }
 
-/// Public type alias for VarKey node operations
+/// Public type alias for VarObj node operations
 /// 
 /// This is the type used in static singletons and node dispatch
-pub type VarKeyNodeOps = VarNodeOps<VarKeyRecordOps>;
+pub type VarObjNodeOps = VarNodeOps<VarObjRecordOps>;

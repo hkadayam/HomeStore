@@ -390,6 +390,7 @@ impl<K: BtreeKey> BtreeGetAnyRequest<K> {
 pub struct BtreeQueryRequest<'a, K: BtreeKey, V: BtreeValue> {
     base: BtreeRangeRequest<K>,
     filter_fn: Option<&'a GetFilterFn<K, V>>,
+    reverse_order: bool,
 }
 
 impl<'a, K: BtreeKey, V: BtreeValue> BtreeQueryRequest<'a, K, V> {
@@ -399,10 +400,13 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeQueryRequest<'a, K, V> {
     /// * `range` - Key range to query
     /// * `batch_size` - Maximum number of results per batch
     /// * `filter_fn` - Optional filter function to include/exclude entries
-    pub fn new(range: BtreeKeyRange<K>, batch_size: u32, filter_fn: Option<&'a GetFilterFn<K, V>>) -> Self {
+    /// * `reverse_order` - If true, iterate in reverse order (for TiKV integration)
+    pub fn new(range: BtreeKeyRange<K>, batch_size: u32, filter_fn: Option<&'a GetFilterFn<K, V>>,
+            reverse_order: bool) -> Self {
         Self {
             base: BtreeRangeRequest::new(range, batch_size),
             filter_fn,
+            reverse_order,
         }
     }
 
@@ -426,24 +430,37 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeQueryRequest<'a, K, V> {
         self.filter_fn
     }
 
+    /// Get reverse order flag
+    pub fn reverse_order(&self) -> bool {
+        self.reverse_order
+    }
+
     /// Get the first key in working range (for finding starting child in interior nodes)
     pub fn first_key(&self) -> K {
         self.base.first_key()
     }
 
-    /// Shift working range forward for next batch
+    /// Shift working range forward (or backward if reverse) for next batch
     /// 
     /// Corresponds to C++ BtreeQueryRequest::shift_working_range()
     /// 
     /// # Arguments
-    /// * `new_start_key` - Start key for next batch
-    /// * `start_incl` - Whether new start is inclusive (false = exclusive, skip the key)
-    pub fn shift_working_range(&mut self, new_start_key: K, start_incl: bool) {
-        self.base.working_range.start_key = new_start_key;
-        self.base.working_range.start_incl = start_incl;
-        // Reset end to input_range.end
-        self.base.working_range.end_key = self.base.input_range.end_key.clone();
-        self.base.working_range.end_incl = self.base.input_range.end_incl;
+    /// * `last_key` - Last key returned in the previous batch
+    /// * `incl` - Whether the key is inclusive (false = exclusive, skip the key)
+    pub fn shift_working_range(&mut self, last_key: K, incl: bool) {
+        if self.reverse_order {
+            // For reverse: shift END key backward (last key becomes new end)
+            self.base.working_range.end_key = last_key;
+            self.base.working_range.end_incl = incl;
+            // Keep start unchanged
+        } else {
+            // For forward: shift START key forward (last key becomes new start)
+            self.base.working_range.start_key = last_key;
+            self.base.working_range.start_incl = incl;
+            // Reset end to input_range.end
+            self.base.working_range.end_key = self.base.input_range.end_key.clone();
+            self.base.working_range.end_incl = self.base.input_range.end_incl;
+        }
     }
 }
 

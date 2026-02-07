@@ -21,9 +21,11 @@
 //! - Lock upgrade functions (standalone)
 //! - Node management methods (additional impl block for Btree)
 
-use super::btree_node::{Node, LockType, InternalLockGuard, BNodeId};
+use super::btree_node::{Node, LockType, InternalLockGuard, BNodeId, NodeOps, NodeCore};
+use super::btree_node::{SIMPLE_NODE_OPS, VAR_KEY_NODE_OPS, VAR_VALUE_NODE_OPS, VAR_OBJ_NODE_OPS, PREFIX_COMPRESS_NODE_OPS};
 use super::btree_kvs::{BtreeKey, BtreeValue};
 use super::btree::{BtreeError, Btree};
+use std::sync::Arc;
 
 //================================================================================
 // Btree Node Management Methods
@@ -97,24 +99,24 @@ where
         Ok(node_core.lock(lock_type).await)
     }
 
-    pub(crate) async fn create_new_node(&self, is_leaf: bool, node_type: u8) -> Result<Node, BtreeError> {
+    pub(crate) async fn create_new_node(&self, is_leaf: bool, node_variant: u8) -> Result<Node, BtreeError> {
         if is_leaf {
-            self.create_leaf_node(node_type).await
+            self.create_leaf_node(node_variant).await
         } else {
-            self.create_interior_node(node_type).await
+            self.create_interior_node(node_variant).await
         }
     }
 
     /// Create a new leaf node
-    pub(crate) async fn create_leaf_node(&self, node_type: u8) -> Result<Node, BtreeError> {
-        let node_core = self.storage.create_node(true, node_type).await?;
-        init_new_variant_node(node_core, node_type).await
+    pub(crate) async fn create_leaf_node(&self, node_variant: u8) -> Result<Node, BtreeError> {
+        let node_core = self.storage.create_node(true, node_variant).await?;
+        init_new_variant_node(node_core, node_variant).await
     }
 
     /// Create a new interior node
-    pub(crate) async fn create_interior_node(&self, node_type: u8) -> Result<Node, BtreeError> {
-        let node_core = self.storage.create_node(false, node_type).await?;
-        init_new_variant_node(node_core, node_type).await
+    pub(crate) async fn create_interior_node(&self, node_variant: u8) -> Result<Node, BtreeError> {
+        let node_core = self.storage.create_node(false, node_variant).await?;
+        init_new_variant_node(node_core, node_variant).await
     }
 
     /// Get child node and lock it (common pattern in tree traversal)
@@ -227,9 +229,8 @@ where
 //================================================================================
 
 /// Initialize a newly created node based on its variant type
-/// Sets node_variant, calls NodeOps::init_new_node(), acquires write lock, returns Node
-async fn init_new_variant_node(node_core: std::sync::Arc<super::btree_node::NodeCore>, node_variant: u8) 
-    -> Result<Node, BtreeError> {
+/// Sets node_variant in header, calls NodeOps::init_new_node(), acquires write lock, returns Node
+async fn init_new_variant_node(node_core: Arc<NodeCore>, node_variant: u8) -> Result<Node, BtreeError> {
     // Set the node variant in persistent header
     {
         let header = node_core.get_persistent_header_mut();
@@ -237,15 +238,14 @@ async fn init_new_variant_node(node_core: std::sync::Arc<super::btree_node::Node
     }
     
     // Dispatch to appropriate NodeOps based on variant for initialization
-    use super::btree_node::NodeOps;
     match node_variant {
-        0 => { (&super::btree_node::SIMPLE_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
-        1 => { (&super::btree_node::VAR_KEY_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
-        _ => {
-            return Err(BtreeError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Unknown node variant: {}", node_variant)
-            )));
+        0 => { (&SIMPLE_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
+        1 => { (&VAR_KEY_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
+        2 => { (&VAR_VALUE_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
+        3 => { (&VAR_OBJ_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
+        4 => { (&PREFIX_COMPRESS_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
+        _ => { return Err(BtreeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                format!("Unknown node variant: {}", node_variant))));
         }
     }
     

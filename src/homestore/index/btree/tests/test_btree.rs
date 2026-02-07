@@ -38,11 +38,9 @@ use crate::index::btree::underlying::mem::MemBtree;
 
 // Import test types and generators
 use super::btree_test_kvs::{
-    FixedSizeTestKey, FixedSizeTestValue,
-    // TestVarLenKey, TestVarLenValue,  // Commented out for now
-    Generator, GenMode,
-    FixedSizeKeyGenerator, FixedSizeValueGenerator,
-    // VarLenKeyGenerator, VarLenValueGenerator,  // Commented out for now
+    FixedSizeTestKey, FixedSizeTestValue, TestVarLenKey, TestVarLenValue,
+    Generator, GenMode, FixedSizeKeyGenerator, FixedSizeValueGenerator,
+    VarLenKeyGenerator, VarLenValueGenerator,
 };
 use super::shadow_map::ShadowMap;
 
@@ -108,7 +106,6 @@ impl<S: StorageType> TestBtreeVariant for FixedSizeTestBtree<S> {
     }
 }
 
-/*
 // Variable key size (TestVarLenKey, FixedSizeTestValue)
 struct VarKeySizeBtreeTest<S: StorageType> {
     _phantom: PhantomData<S>,
@@ -118,7 +115,18 @@ impl<S: StorageType> TestBtreeVariant for VarKeySizeBtreeTest<S> {
     type K = TestVarLenKey;
     type V = FixedSizeTestValue;
     type Storage = S;
-    fn node_variant() -> u8 { 1 }  // VarKeyNode
+    type KeyGen = VarLenKeyGenerator;
+    type ValueGen = FixedSizeValueGenerator;
+    
+    fn node_variant() -> u8 { 1 }  // VAR_KEY
+    
+    fn create_key_generator() -> Self::KeyGen {
+        VarLenKeyGenerator::new(GenMode::Sequential, 42, 1_000_000)
+    }
+    
+    fn create_value_generator() -> Self::ValueGen {
+        FixedSizeValueGenerator::new(GenMode::Sequential, 43)
+    }
 }
 
 // Variable value size (FixedSizeTestKey, TestVarLenValue)
@@ -130,7 +138,18 @@ impl<S: StorageType> TestBtreeVariant for VarValueSizeBtreeTest<S> {
     type K = FixedSizeTestKey;
     type V = TestVarLenValue;
     type Storage = S;
-    fn node_variant() -> u8 { 0 }  // SimpleNode (WRONG! Need VAR_VALUE node - not yet implemented)
+    type KeyGen = FixedSizeKeyGenerator;
+    type ValueGen = VarLenValueGenerator;
+    
+    fn node_variant() -> u8 { 2 }  // VAR_VALUE
+    
+    fn create_key_generator() -> Self::KeyGen {
+        FixedSizeKeyGenerator::new(GenMode::Sequential, 42, 1_000_000)
+    }
+    
+    fn create_value_generator() -> Self::ValueGen {
+        VarLenValueGenerator::new(GenMode::Sequential, 43)
+    }
 }
 
 // Variable key and value (TestVarLenKey, TestVarLenValue)
@@ -142,9 +161,42 @@ impl<S: StorageType> TestBtreeVariant for VarObjSizeBtreeTest<S> {
     type K = TestVarLenKey;
     type V = TestVarLenValue;
     type Storage = S;
-    fn node_variant() -> u8 { 1 }  // VarKeyNode (WRONG! Need VAR_OBJECT node - not yet implemented)
+    type KeyGen = VarLenKeyGenerator;
+    type ValueGen = VarLenValueGenerator;
+    
+    fn node_variant() -> u8 { 3 }  // VAR_OBJECT
+    
+    fn create_key_generator() -> Self::KeyGen {
+        VarLenKeyGenerator::new(GenMode::Sequential, 42, 1_000_000)
+    }
+    
+    fn create_value_generator() -> Self::ValueGen {
+        VarLenValueGenerator::new(GenMode::Sequential, 43)
+    }
 }
-*/
+
+// Prefix compression (FixedSizeTestKey, FixedSizeTestValue)
+struct PrefixCompressBtreeTest<S: StorageType> {
+    _phantom: PhantomData<S>,
+}
+
+impl<S: StorageType> TestBtreeVariant for PrefixCompressBtreeTest<S> {
+    type K = FixedSizeTestKey;
+    type V = FixedSizeTestValue;
+    type Storage = S;
+    type KeyGen = FixedSizeKeyGenerator;
+    type ValueGen = FixedSizeValueGenerator;
+    
+    fn node_variant() -> u8 { 4 }  // PREFIX_COMPRESS
+    
+    fn create_key_generator() -> Self::KeyGen {
+        FixedSizeKeyGenerator::new(GenMode::Sequential, 42, 1_000_000)
+    }
+    
+    fn create_value_generator() -> Self::ValueGen {
+        FixedSizeValueGenerator::new(GenMode::Sequential, 43)
+    }
+}
 
 //================================================================================
 // Test Options
@@ -162,9 +214,9 @@ struct BtreeTestOptions {
 impl Default for BtreeTestOptions {
     fn default() -> Self {
         Self {
-            num_entries: 5000,
-            preload_size: 2500,
-            num_ios: 500,
+            num_entries: 10000,
+            preload_size: 5000,
+            num_ios: 1000,
             run_time_secs: 36000,
             disable_merge: false,
         }
@@ -354,27 +406,78 @@ impl<Variant: TestBtreeVariant> TestBtree<Variant> {
         println!("Query validation passed: {} entries", handle.results.len());
     }
     
-    async fn query_all_paginate(&mut self, batch_size: u32) {
-        // Query with pagination
-        println!("Validating with query_all_paginate (batch_size={})", batch_size);
+    async fn query_all_reverse(&mut self) {
+        // Query in reverse order using traversal query (no pagination)
+        println!("Validating with query_all_reverse (no pagination)");
         let (start_key, _) = self.key_gen.generate(Some(0));
         let (end_key, _) = self.key_gen.generate(Some(u64::MAX));
         let range = BtreeKeyRange::new(start_key, true, end_key, true);
-        let mut handle = self.btree.query(range, batch_size, None).await.expect("Query failed");
+        let handle = self.btree.query_traversal(range, u32::MAX, None, true).await
+            .expect("Reverse query failed");
+        
+        // Validate results against shadow map
+        for (key, value) in handle.results.iter() {
+            let shadow_value = self.shadow_map.get(key).expect("Key in btree but not in shadow map");
+            assert_eq!(value, shadow_value, "Value mismatch for key {:?}", key);
+        }
+        
+        // Verify results are in reverse order
+        if handle.results.len() > 1 {
+            for i in 0..handle.results.len()-1 {
+                assert!(handle.results[i].0 > handle.results[i+1].0, 
+                    "Reverse query results not in descending order at index {}", i);
+            }
+        }
+        println!("Reverse query validation passed: {} entries in descending order", handle.results.len());
+    }
+    
+    async fn query_all_paginate(&mut self, batch_size: u32, reverse: bool) {
+        // Query with pagination (forward or reverse)
+        let direction = if reverse { "reverse" } else { "forward" };
+        println!("Validating with query_all_paginate (batch_size={}, {})", batch_size, direction);
+        
+        let (start_key, _) = self.key_gen.generate(Some(0));
+        let (end_key, _) = self.key_gen.generate(Some(u64::MAX));
+        let range = BtreeKeyRange::new(start_key, true, end_key, true);
+        
+        let mut handle = if reverse {
+            self.btree.query_traversal(range, batch_size, None, true).await
+                .expect("Reverse paginated query failed")
+        } else {
+            self.btree.query(range, batch_size, None).await
+                .expect("Forward paginated query failed")
+        };
+        
         let mut total_entries = 0;
+        let mut all_keys = Vec::new();
         
         loop {
             // Validate this batch
             for (key, value) in handle.results.iter() {
                 let shadow_value = self.shadow_map.get(key).expect("Key in btree but not in shadow map");
                 assert_eq!(value, shadow_value, "Value mismatch for key {:?}", key);
+                all_keys.push(key.clone());
             }
             total_entries += handle.results.len();
             
             if !handle.has_more() { break; }
             handle = self.btree.query_next_batch(handle).await.expect("Query next batch failed");
         }
-        println!("Paginated query validation passed: {} entries", total_entries);
+        
+        // Verify order across all batches
+        if reverse && all_keys.len() > 1 {
+            for i in 0..all_keys.len()-1 {
+                assert!(all_keys[i] > all_keys[i+1], 
+                    "Reverse paginated query not in descending order at index {}", i);
+            }
+        } else if !reverse && all_keys.len() > 1 {
+            for i in 0..all_keys.len()-1 {
+                assert!(all_keys[i] < all_keys[i+1], 
+                    "Forward paginated query not in ascending order at index {}", i);
+            }
+        }
+        
+        println!("Paginated {} query validation passed: {} entries", direction, total_entries);
     }
     
     async fn do_query(&mut self, start_key_id: u64, end_key_id: u64, batch_size: u32) {
@@ -524,7 +627,16 @@ async fn test_sequential_insert_impl<Variant: TestBtreeVariant>(test_btree: &mut
     println!("Step 4: Query all entries");
     test_btree.query_all().await;
     
-    println!("Step 5: Get all entries 1-by-1");
+    println!("Step 5: Query all entries in reverse");
+    test_btree.query_all_reverse().await;
+    
+    println!("Step 6: Query all with forward pagination");
+    test_btree.query_all_paginate(100, false).await;
+    
+    println!("Step 7: Query all with reverse pagination");
+    test_btree.query_all_paginate(100, true).await;
+    
+    println!("Step 8: Get all entries 1-by-1");
     test_btree.get_all().await;
     
     println!("Sequential Insert test complete");
@@ -543,7 +655,19 @@ async fn test_random_insert_impl<Variant: TestBtreeVariant>(test_btree: &mut Tes
         test_btree.put(i as u64, BtreePutType::Insert).await;
     }
     
-    println!("Step 2: Get all entries");
+    println!("Step 2: Query all entries");
+    test_btree.query_all().await;
+    
+    println!("Step 3: Query all entries in reverse");
+    test_btree.query_all_reverse().await;
+    
+    println!("Step 4: Query all with forward pagination");
+    test_btree.query_all_paginate(100, false).await;
+    
+    println!("Step 5: Query all with reverse pagination");
+    test_btree.query_all_paginate(100, true).await;
+    
+    println!("Step 6: Get all entries 1-by-1");
     test_btree.get_all().await;
     
     println!("Random Insert test complete");
@@ -566,7 +690,13 @@ async fn test_sequential_remove_impl<Variant: TestBtreeVariant>(test_btree: &mut
         test_btree.remove(i as u64).await;
     }
     
-    println!("Step 4: Validate remaining entries");
+    println!("Step 4: Query remaining entries (forward)");
+    test_btree.query_all().await;
+    
+    println!("Step 5: Query remaining entries (reverse)");
+    test_btree.query_all_reverse().await;
+    
+    println!("Step 6: Validate remaining entries 1-by-1");
     test_btree.get_all().await;
     
     println!("Sequential Remove test complete");
@@ -666,31 +796,29 @@ macro_rules! btree_tests {
 // FixedLenBtree - Memory storage (FixedSizeTestKey + FixedSizeTestValue + SimpleNode)
 btree_tests!(FixedSizeTestBtree<MemStorage>, fixed_size_mem);
 
+// VarKeySizeBtree - Memory storage (TestVarLenKey + FixedSizeTestValue + VarKeyNode)
+btree_tests!(VarKeySizeBtreeTest<MemStorage>, var_key_mem);
+
+// VarValueSizeBtree - Memory storage (FixedSizeTestKey + TestVarLenValue + VarValueNode)
+btree_tests!(VarValueSizeBtreeTest<MemStorage>, var_value_mem);
+
+// VarObjSizeBtree - Memory storage (TestVarLenKey + TestVarLenValue + VarObjNode)
+btree_tests!(VarObjSizeBtreeTest<MemStorage>, var_obj_mem);
+
+// PrefixCompressBtree - Memory storage (FixedSizeTestKey + FixedSizeTestValue + PrefixCompressNode)
+btree_tests!(PrefixCompressBtreeTest<MemStorage>, prefix_compress_mem);
+
 /*
+// COW storage tests commented out - COW not yet implemented
 // FixedLenBtree - COW storage (FixedSizeTestKey + FixedSizeTestValue + SimpleNode)
 btree_tests!(FixedSizeTestBtree<CowStorage>, fixed_size_cow);
 
-// VarKeySizeBtree - Memory storage (TestVarLenKey + FixedSizeTestValue + VarKeyNode)
-// Commented out: VarKeyNode not fully implemented/tested yet
-btree_tests!(VarKeySizeBtreeTest<MemStorage>, var_key_mem);
-
 // VarKeySizeBtree - COW storage (TestVarLenKey + FixedSizeTestValue + VarKeyNode)
-// Commented out: VarKeyNode not fully implemented/tested yet
 btree_tests!(VarKeySizeBtreeTest<CowStorage>, var_key_cow);
 
-// VarValueSizeBtree - Memory storage (FixedSizeTestKey + TestVarLenValue)
-// Commented out: Requires VAR_VALUE node variant (not yet implemented)
-btree_tests!(VarValueSizeBtreeTest<MemStorage>, var_value_mem);
-
 // VarValueSizeBtree - COW storage (FixedSizeTestKey + TestVarLenValue)
-// Commented out: Requires VAR_VALUE node variant (not yet implemented)
 btree_tests!(VarValueSizeBtreeTest<CowStorage>, var_value_cow);
 
-// VarObjSizeBtree - Memory storage (TestVarLenKey + TestVarLenValue)
-// Commented out: Requires VAR_OBJECT node variant (not yet implemented)
-btree_tests!(VarObjSizeBtreeTest<MemStorage>, var_obj_mem);
-
 // VarObjSizeBtree - COW storage (TestVarLenKey + TestVarLenValue)
-// Commented out: Requires VAR_OBJECT node variant (not yet implemented)
 btree_tests!(VarObjSizeBtreeTest<CowStorage>, var_obj_cow);
 */

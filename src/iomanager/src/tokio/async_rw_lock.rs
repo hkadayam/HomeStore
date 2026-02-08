@@ -39,3 +39,7 @@ impl<'a, T> Deref for AsyncRwReadGuard<'a, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target { &*self.guard }
 }
+
+// Safety: Tokio's underlying guards are already Send, we just need to mark ours as well
+unsafe impl<'a, T: Send> Send for AsyncRwReadGuard<'a, T> {}
+unsafe impl<'a, T: Send> Send for AsyncRwWriteGuard<'a, T> {}

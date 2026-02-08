@@ -210,3 +210,13 @@ impl<'a, T> Deref for AsyncRwReadGuard<'a, T> {
 impl<'a, T> Drop for AsyncRwReadGuard<'a, T> {
     fn drop(&mut self) { self.rw.read_unlock(); }
 }
+
+// Safety: AsyncRwReadGuard can be Send because:
+// 1. It only holds a reference to AsyncRwLock<T>
+// 2. AsyncRwLock<T> is already Send + Sync (see line 22-23)
+// 3. The guard only provides access to T through Deref, which is safe across threads when T: Send
+// 4. The Drop implementation (read_unlock) is thread-safe
+unsafe impl<'a, T: Send> Send for AsyncRwReadGuard<'a, T> {}
+
+// Safety: AsyncRwWriteGuard can be Send for the same reasons as AsyncRwReadGuard
+unsafe impl<'a, T: Send> Send for AsyncRwWriteGuard<'a, T> {}

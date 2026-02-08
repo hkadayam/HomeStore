@@ -1,0 +1,23 @@
+[package]
+name = "mem_db"
+version = "0.1.0"
+edition = "2021"
+authors = ["Harihara Kadayam"]
+license = "Apache-2.0"
+description = "In-memory database built on Homestore Btree"
+
+[dependencies]
+homestore = { path = "../../homestore", default-features = false, features = ["btree-only"] }
+tokio = { version = "1.35", features = ["full"] }
+iomgr = { path = "../../iomanager" }
+async-trait = "0.1"
+parking_lot = "0.12"
+dashmap = "6.0"
+mem_db_macros = { path = "../mem_db_macros" }
+
+[dev-dependencies]
+rand = "0.8"
+
+[lib]
+name = "mem_db"
+path = "src/lib.rs"

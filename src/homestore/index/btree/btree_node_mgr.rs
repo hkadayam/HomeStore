@@ -110,13 +110,13 @@ where
     /// Create a new leaf node
     pub(crate) async fn create_leaf_node(&self, node_variant: u8) -> Result<Node, BtreeError> {
         let node_core = self.storage.create_node(true, node_variant).await?;
-        init_new_variant_node(node_core, node_variant).await
+        self.init_new_variant_node(node_core, node_variant).await
     }
 
     /// Create a new interior node
     pub(crate) async fn create_interior_node(&self, node_variant: u8) -> Result<Node, BtreeError> {
         let node_core = self.storage.create_node(false, node_variant).await?;
-        init_new_variant_node(node_core, node_variant).await
+        self.init_new_variant_node(node_core, node_variant).await
     }
 
     /// Get child node and lock it (common pattern in tree traversal)
@@ -222,42 +222,47 @@ where
             },
         ))
     }
+
+    /// Initialize a newly created node based on its variant type
+    /// Sets node_variant in header, calls NodeOps::init_new_node(), acquires write lock, returns Node
+    pub(crate) async fn init_new_variant_node(&self, node_core: Arc<NodeCore>, node_variant: u8) -> Result<Node, BtreeError> {
+        // Set the node variant in persistent header
+        {
+            let header = node_core.get_persistent_header_mut();
+            header.node_variant = node_variant;
+        }
+        
+        // Dispatch to appropriate NodeOps based on variant for initialization
+        match node_variant {
+            0 => { (&SIMPLE_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
+            1 => { (&VAR_KEY_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
+            2 => { (&VAR_VALUE_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
+            3 => { (&VAR_OBJ_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
+            4 => { 
+                // Create PrefixCompressNodeOps with configured expected_prefix_size
+                let prefix_ops = super::variant::PrefixCompressNodeOps::new(self.config.expected_prefix_size);
+                (&prefix_ops as &dyn NodeOps<u64, u64>).init_new_node(&node_core);
+            }
+            _ => { return Err(BtreeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                    format!("Unknown node variant: {}", node_variant))));
+            }
+        }
+        
+        // Acquire write lock on initialized node
+        let write_guard = node_core.lock.write_lock().await;
+        
+        // SAFETY: Arc<NodeCore> in Node keeps the lock alive, so 'static transmute is safe
+        let write_guard = unsafe { std::mem::transmute(write_guard) };
+        
+        Ok(Node {
+            core: node_core,
+            lock_type: LockType::Write,
+            _guard: InternalLockGuard::Write(write_guard),
+        })
+    }
 }
 
 //================================================================================
 // Helper Functions
 //================================================================================
-
-/// Initialize a newly created node based on its variant type
-/// Sets node_variant in header, calls NodeOps::init_new_node(), acquires write lock, returns Node
-async fn init_new_variant_node(node_core: Arc<NodeCore>, node_variant: u8) -> Result<Node, BtreeError> {
-    // Set the node variant in persistent header
-    {
-        let header = node_core.get_persistent_header_mut();
-        header.node_variant = node_variant;
-    }
-    
-    // Dispatch to appropriate NodeOps based on variant for initialization
-    match node_variant {
-        0 => { (&SIMPLE_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
-        1 => { (&VAR_KEY_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
-        2 => { (&VAR_VALUE_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
-        3 => { (&VAR_OBJ_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
-        4 => { (&PREFIX_COMPRESS_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
-        _ => { return Err(BtreeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput,
-                format!("Unknown node variant: {}", node_variant))));
-        }
-    }
-    
-    // Acquire write lock on initialized node
-    let write_guard = node_core.lock.write_lock().await;
-    
-    // SAFETY: Arc<NodeCore> in Node keeps the lock alive, so 'static transmute is safe
-    let write_guard = unsafe { std::mem::transmute(write_guard) };
-    
-    Ok(Node {
-        core: node_core,
-        lock_type: LockType::Write,
-        _guard: InternalLockGuard::Write(write_guard),
-    })
-}
+// (None currently)

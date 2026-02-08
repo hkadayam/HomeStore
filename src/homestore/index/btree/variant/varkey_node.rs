@@ -12,44 +12,37 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ***************************************************************************/
+ ************************************************************************* */
 
 //! VarKey Node - Variable-length keys, fixed-size values
 //!
 //! This module provides the policy for VarKey nodes.
 //! Corresponds to C++ VarKeySizeNode in varlen_node.hpp
 
-use super::varlen_node_common::{
-    VarNodeOps, VarRecordOps, VarKeyRecord,
-    get_record_ptr, get_record_ptr_mut,
-};
+use super::varlen_node_common::{VarNodeOps, VarRecordOps, VarKeyRecord, get_record_ptr, get_record_ptr_mut};
 use super::super::btree_node::NodeCore;
 
 /// Zero-sized policy for VarKey nodes
-/// 
+///
 /// VarKey = variable-length keys + fixed-size values
 /// Record format: [obj_offset:16, key_len:16] = 4 bytes
 pub struct VarKeyRecordOps;
 
 impl VarRecordOps for VarKeyRecordOps {
     #[inline]
-    fn record_size(&self) -> usize { 
-        VarKeyRecord::size() 
-    }
-    
+    fn record_size(&self) -> usize { VarKeyRecord::size() }
+
     #[inline]
-    fn node_variant_type(&self) -> u8 { 
-        1  // VAR_KEY
+    fn node_variant_type(&self) -> u8 {
+        1 // VAR_KEY
     }
-    
+
     #[inline]
     fn get_key_size(&self, core: &NodeCore, idx: u32) -> usize {
         let ptr = get_record_ptr(core, idx, self.record_size());
-        unsafe { 
-            (*(ptr as *const VarKeyRecord)).key_len as usize 
-        }
+        unsafe { (*(ptr as *const VarKeyRecord)).key_len as usize }
     }
-    
+
     #[inline]
     fn get_value_size(&self, _core: &NodeCore, _idx: u32) -> usize {
         // VarKey = variable key, FIXED value
@@ -57,15 +50,15 @@ impl VarRecordOps for VarKeyRecordOps {
         // This will panic if V doesn't have FIXED_SERIALIZED_SIZE - that's correct!
         panic!("VarKey get_value_size should use type's FIXED_SERIALIZED_SIZE - call site bug")
     }
-    
+
     #[inline]
     fn set_key_len(&self, core: &NodeCore, idx: u32, len: usize) {
         let ptr = get_record_ptr_mut(core, idx, self.record_size());
-        unsafe { 
+        unsafe {
             (*(ptr as *mut VarKeyRecord)).key_len = len as u16;
         }
     }
-    
+
     #[inline]
     fn set_value_len(&self, _core: &NodeCore, _idx: u32, _len: usize) {
         // No-op for VarKey (value size is fixed, part of V type)
@@ -74,6 +67,6 @@ impl VarRecordOps for VarKeyRecordOps {
 }
 
 /// Public type alias for VarKey node operations
-/// 
+///
 /// This is the type used in static singletons and node dispatch
 pub type VarKeyNodeOps = VarNodeOps<VarKeyRecordOps>;

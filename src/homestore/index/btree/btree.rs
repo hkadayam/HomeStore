@@ -84,6 +84,9 @@ pub struct BtreeConfig {
     pub int_node_type: u8,
     pub btree_name: String,
     
+    // Prefix compression config (for PrefixCompressNode variant)
+    pub expected_prefix_size: u16, // 0 = dynamic, >0 = fixed split point
+    
     // Precomputed values
     pub suggested_min_size: u32,
     pub ideal_fill_size: u32,
@@ -93,6 +96,7 @@ impl BtreeConfig {
     pub fn new(node_size: u32, btree_name: String) -> Self {
         let mut config = Self {
             node_size,
+            expected_prefix_size: 0, // Default to dynamic
             ideal_fill_pct: 90,
             suggested_min_pct: 30,
             split_pct: 50,
@@ -228,27 +232,35 @@ where
     /// If root_node_id is None, creates a new root node
     pub async fn new(config: BtreeConfig, storage: Box<dyn UnderlyingBtree>, root_node_id: Option<BNodeId>) 
                    -> Result<Self, BtreeError> {
-        let root_id = match root_node_id {
-            Some(id) => id,
-            None => {
-                // Create new root node
-                let root_core = storage.create_node(true, config.leaf_node_type).await?;
-                root_core.node_id()
-            }
-        };
-        
-        Ok(Self {
+        // Create the btree first (root will be initialized after if needed)
+        let btree = Self {
             btree_lock: AsyncRwLock::new(()),
             config,
             storage,
-            root_node_id: AtomicU64::new(root_id),
+            root_node_id: AtomicU64::new(0), // Temporary, will be set if needed
             _phantom: std::marker::PhantomData,
-        })
+        };
+        
+        // Handle root node creation/initialization
+        let root_id = match root_node_id {
+            Some(id) => id,
+            None => {
+                // Create and initialize new root node
+                btree.create_root_node().await?
+            }
+        };
+        
+        btree.root_node_id.store(root_id, Ordering::Relaxed);
+        Ok(btree)
     }
 
     /// Create a new root node (called during initialization or after root split)
     async fn create_root_node(&self) -> Result<BNodeId, BtreeError> {
         let root_core = self.storage.create_node(true, self.config.leaf_node_type).await?;
+        
+        // Initialize the node with proper variant
+        let _root_node = self.init_new_variant_node(root_core.clone(), self.config.leaf_node_type).await?;
+        
         let root_id = root_core.node_id();
         self.root_node_id.store(root_id, Ordering::Relaxed);
         self.storage.on_root_changed(root_id).await?;

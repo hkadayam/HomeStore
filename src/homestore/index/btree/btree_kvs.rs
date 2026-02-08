@@ -43,6 +43,13 @@ pub trait BtreeKey: Sized + Send + Sync + Clone + Ord + PartialOrd + Eq + Partia
     /// Get the serialized size of this key in bytes
     fn serialized_size(&self) -> u32;
 
+    /// Runtime fixed size check - returns Some(size) if this instance has fixed size
+    /// Default implementation uses compile-time constant
+    /// Types with runtime-determined fixed sizes (like DbKey) override this
+    fn fixed_serialized_size(&self) -> Option<u32> {
+        Self::FIXED_SERIALIZED_SIZE
+    }
+
     /// Serialize key to buffer (buffer already sliced to target position)
     ///
     /// # Arguments
@@ -88,6 +95,13 @@ pub trait BtreeValue: Sized + Send + Sync + Clone + std::fmt::Debug {
 
     /// Get the serialized size of this value in bytes
     fn serialized_size(&self) -> u32;
+
+    /// Runtime fixed size check - returns Some(size) if this instance has fixed size
+    /// Default implementation uses compile-time constant
+    /// Types with runtime-determined fixed sizes (like DbValue) override this
+    fn fixed_serialized_size(&self) -> Option<u32> {
+        Self::FIXED_SERIALIZED_SIZE
+    }
 
     /// Serialize value to buffer (buffer already sliced to target position)
     ///

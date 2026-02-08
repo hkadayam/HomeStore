@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ***************************************************************************/
+ ************************************************************************* */
 
 //! Common structures and implementation for variable-length nodes
 //!
@@ -42,16 +42,14 @@ use std::io;
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct VarNodeHeader {
-    pub tail_arena_offset: u16,  // Offset where next obj will be written (grows down from end)
-    pub available_space: u16,    // Total free bytes in node
+    pub tail_arena_offset: u16, // Offset where next obj will be written (grows down from end)
+    pub available_space: u16,   // Total free bytes in node
 }
 
 impl VarNodeHeader {
     #[inline]
-    pub const fn size() -> usize { 
-        std::mem::size_of::<Self>() 
-    }
-    
+    pub const fn size() -> usize { std::mem::size_of::<Self>() }
+
     pub fn init(&mut self, node_data_size: u16) {
         self.tail_arena_offset = node_data_size;
         self.available_space = node_data_size - Self::size() as u16;
@@ -67,7 +65,7 @@ impl VarNodeHeader {
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct BtreeObjRecord {
-    pub obj_offset: u16,  // Offset to key/value data in node buffer
+    pub obj_offset: u16, // Offset to key/value data in node buffer
 }
 
 /// VarKey record (4 bytes: base 2 + key_len 2)
@@ -81,9 +79,7 @@ pub struct VarKeyRecord {
 
 impl VarKeyRecord {
     #[inline]
-    pub const fn size() -> usize { 
-        std::mem::size_of::<Self>() 
-    }
+    pub const fn size() -> usize { std::mem::size_of::<Self>() }
 }
 
 /// VarValue record (4 bytes: base 2 + value_len 2)
@@ -97,9 +93,7 @@ pub struct VarValueRecord {
 
 impl VarValueRecord {
     #[inline]
-    pub const fn size() -> usize { 
-        std::mem::size_of::<Self>() 
-    }
+    pub const fn size() -> usize { std::mem::size_of::<Self>() }
 }
 
 /// VarObj record (6 bytes: base 2 + key_len 2 + value_len 2)
@@ -114,9 +108,7 @@ pub struct VarObjRecord {
 
 impl VarObjRecord {
     #[inline]
-    pub const fn size() -> usize { 
-        std::mem::size_of::<Self>() 
-    }
+    pub const fn size() -> usize { std::mem::size_of::<Self>() }
 }
 
 //================================================================================
@@ -124,25 +116,25 @@ impl VarObjRecord {
 //================================================================================
 
 /// Trait for variant-specific record operations (the "policy")
-/// 
+///
 /// Each variable-length variant (VarKey, VarValue, VarObj) implements this trait
 /// to provide variant-specific behavior for record sizes and metadata access.
 pub trait VarRecordOps: Send + Sync + 'static {
     /// Size of one record entry in bytes
     fn record_size(&self) -> usize;
-    
+
     /// Get key size for entry at index
     fn get_key_size(&self, core: &NodeCore, idx: u32) -> usize;
-    
+
     /// Get value size for entry at index
     fn get_value_size(&self, core: &NodeCore, idx: u32) -> usize;
-    
+
     /// Set key length in record metadata
     fn set_key_len(&self, core: &NodeCore, idx: u32, len: usize);
-    
+
     /// Set value length in record metadata
     fn set_value_len(&self, core: &NodeCore, idx: u32, len: usize);
-    
+
     /// Node variant type (1=VAR_KEY, 2=VAR_VALUE, 3=VAR_OBJECT)
     fn node_variant_type(&self) -> u8;
 }
@@ -174,16 +166,14 @@ pub fn get_var_header_mut(core: &NodeCore) -> &mut VarNodeHeader {
 /// Get pointer to record at index
 #[inline]
 pub fn get_record_ptr(core: &NodeCore, idx: u32, record_size: usize) -> *const u8 {
-    let offset = PersistentHeader::size() + VarNodeHeader::size() 
-                 + (idx as usize * record_size);
+    let offset = PersistentHeader::size() + VarNodeHeader::size() + (idx as usize * record_size);
     unsafe { core.phys_buf.as_ptr().add(offset) }
 }
 
 /// Get mutable pointer to record at index
 #[inline]
 pub fn get_record_ptr_mut(core: &NodeCore, idx: u32, record_size: usize) -> *mut u8 {
-    let offset = PersistentHeader::size() + VarNodeHeader::size() 
-                 + (idx as usize * record_size);
+    let offset = PersistentHeader::size() + VarNodeHeader::size() + (idx as usize * record_size);
     unsafe { core.phys_buf.as_ptr().add(offset) as *mut u8 }
 }
 
@@ -208,7 +198,7 @@ pub fn get_arena_free_space(core: &NodeCore, rec_size: usize) -> usize {
     let var_hdr = get_var_header(core);
     let nentries = core.get_persistent_header().nentries();
     let records_end = VarNodeHeader::size() + (nentries as usize * rec_size);
-    
+
     if var_hdr.tail_arena_offset as usize <= records_end {
         0
     } else {
@@ -221,7 +211,7 @@ pub fn get_arena_free_space(core: &NodeCore, rec_size: usize) -> usize {
 //================================================================================
 
 /// Generic variable-length node operations
-/// 
+///
 /// Implements NodeOps ONCE for all variable-length variants using policy-based design.
 /// The R type parameter provides variant-specific behavior via VarRecordOps trait.
 pub struct VarNodeOps<R> {
@@ -229,8 +219,31 @@ pub struct VarNodeOps<R> {
 }
 
 impl<R> VarNodeOps<R> {
-    pub const fn new(record_ops: R) -> Self {
-        Self { record_ops }
+    pub const fn new(record_ops: R) -> Self { Self { record_ops } }
+}
+
+impl<R> VarNodeOps<R>
+where
+    R: VarRecordOps,
+{
+    /// Get key size - uses compile-time constant if available, otherwise reads from record
+    #[inline]
+    fn get_key_size<K: BtreeKey>(&self, core: &NodeCore, idx: u32) -> usize {
+        if let Some(size) = K::FIXED_SERIALIZED_SIZE {
+            size as usize
+        } else {
+            self.record_ops.get_key_size(core, idx)
+        }
+    }
+
+    /// Get value size - uses compile-time constant if available, otherwise reads from record
+    #[inline]
+    fn get_value_size<V: BtreeValue>(&self, core: &NodeCore, idx: u32) -> usize {
+        if let Some(size) = V::FIXED_SERIALIZED_SIZE {
+            size as usize
+        } else {
+            self.record_ops.get_value_size(core, idx)
+        }
     }
 }
 
@@ -245,7 +258,7 @@ where
         header.set_nentries(0);
         header.edge_id = EMPTY_BNODEID;
         header.node_variant = self.record_ops.node_variant_type();
-        
+
         let var_hdr = get_var_header_mut(core);
         var_hdr.init(core.node_size() as u16);
     }
@@ -253,7 +266,7 @@ where
     fn get_all_kvs(&self, core: &NodeCore) -> Vec<(K, V)> {
         let nentries = core.get_persistent_header().nentries();
         let mut result = Vec::with_capacity(nentries as usize);
-        
+
         for i in 0..nentries {
             let key = <Self as NodeOps<K, V>>::get_nth_key(self, core, i, true);
             let val = <Self as NodeOps<K, V>>::get_nth_value(self, core, i, true);
@@ -265,46 +278,54 @@ where
     fn insert(&self, core: &NodeCore, idx: u32, key: &K, val: &V) -> Result<(), BtreeError> {
         let nentries = core.get_persistent_header().nentries();
         if idx > nentries {
-            return Err(BtreeError::Io(io::Error::new(io::ErrorKind::InvalidInput,
-                format!("Insert index {} out of range (nentries={})", idx, nentries))));
+            return Err(BtreeError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Insert index {} out of range (nentries={})", idx, nentries),
+            )));
         }
-        
-        // Get sizes for space calculation
+
+        // Get sizes for NEW entry being inserted
         let key_size = key.serialized_size() as usize;
         let val_size = val.serialized_size() as usize;
         let obj_size = key_size + val_size;
         let rec_size = self.record_ops.record_size();
         let to_insert_size = obj_size + rec_size;
-        
+
         // Check if we have enough space
         let avail_space = get_var_header(core).available_space;
         if to_insert_size > avail_space as usize {
-            return Err(BtreeError::Io(io::Error::new(io::ErrorKind::OutOfMemory,
-                format!("insert failed size={} avail={}", to_insert_size, avail_space))));
+            return Err(BtreeError::Io(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("insert failed size={} avail={}", to_insert_size, avail_space),
+            )));
         }
-        
+
         // Compact if needed to get contiguous space in tail arena
         let arena_free = Self::get_arena_free_space(core, rec_size);
         if to_insert_size > arena_free {
-            self.compact(core)?;
-            debug_assert!(to_insert_size <= Self::get_arena_free_space(core, rec_size),
-                         "Should have space after compaction");
+            self.compact::<K, V>(core)?;
+            debug_assert!(
+                to_insert_size <= Self::get_arena_free_space(core, rec_size),
+                "Should have space after compaction"
+            );
         }
-        
+
         // Shift records right to make room for new record (C++ line 469-471)
         if idx < nentries {
             let src = get_record_ptr_mut(core, idx, rec_size);
             let dst = unsafe { src.add(rec_size) };
             let bytes_to_move = (nentries - idx) as usize * rec_size;
-            unsafe { std::ptr::copy(src, dst, bytes_to_move); }
+            unsafe {
+                std::ptr::copy(src, dst, bytes_to_move);
+            }
         }
-        
+
         // Update tail offset and available space (C++ lines 473-476)
         let var_hdr = get_var_header_mut(core);
         debug_assert!(var_hdr.tail_arena_offset as usize >= obj_size);
         var_hdr.tail_arena_offset -= obj_size as u16;
         var_hdr.available_space -= to_insert_size as u16;
-        
+
         // Create new record metadata (C++ lines 478-481)
         let rec_ptr = get_record_ptr_mut(core, idx, rec_size);
         unsafe {
@@ -313,15 +334,15 @@ where
         }
         self.record_ops.set_key_len(core, idx, key_size);
         self.record_ops.set_value_len(core, idx, val_size);
-        
+
         // Serialize key and value directly into tail arena (C++ lines 483-487)
-        let data_ptr = unsafe { 
-            core.phys_buf.as_ptr().add(PersistentHeader::size() + var_hdr.tail_arena_offset as usize) 
-        } as *mut u8;
+        let data_ptr =
+            unsafe { core.phys_buf.as_ptr().add(PersistentHeader::size() + var_hdr.tail_arena_offset as usize) }
+                as *mut u8;
         let data_slice = unsafe { std::slice::from_raw_parts_mut(data_ptr, obj_size) };
         key.serialize_to(&mut data_slice[..key_size], true).map_err(BtreeError::Io)?;
         val.serialize_to(&mut data_slice[key_size..], true).map_err(BtreeError::Io)?;
-        
+
         // Increment entries and generation (C++ lines 489-491)
         core.get_persistent_header_mut().set_nentries(nentries + 1);
         core.inc_gen();
@@ -334,10 +355,10 @@ where
 
     fn get_nth_key(&self, core: &NodeCore, idx: u32, copy: bool) -> K {
         debug_assert!(idx < core.get_persistent_header().nentries(), "Index {} out of bounds", idx);
-        
+
         let rec_ptr = get_record_ptr(core, idx, self.record_ops.record_size());
         let obj_ptr = get_obj_ptr(core, rec_ptr);
-        let key_size = self.record_ops.get_key_size(core, idx);
+        let key_size = self.get_key_size::<K>(core, idx);
         
         let key_slice = unsafe { std::slice::from_raw_parts(obj_ptr, key_size) };
         K::deserialize_from(key_slice, copy).expect("Failed to deserialize key")
@@ -359,9 +380,9 @@ where
         
         let rec_ptr = get_record_ptr(core, idx, self.record_ops.record_size());
         let obj_ptr = get_obj_ptr(core, rec_ptr);
-        let key_size = self.record_ops.get_key_size(core, idx);
-        let val_size = self.record_ops.get_value_size(core, idx);
-        
+        let key_size = self.get_key_size::<K>(core, idx);
+        let val_size = self.get_value_size::<V>(core, idx);
+
         let val_ptr = unsafe { obj_ptr.add(key_size) };
         let val_slice = unsafe { std::slice::from_raw_parts(val_ptr, val_size) };
         V::deserialize_from(val_slice, copy).expect("Failed to deserialize value")
@@ -369,7 +390,7 @@ where
 
     fn update(&self, core: &NodeCore, idx: u32, val: &V) -> Result<(), BtreeError> {
         let nentries = core.get_persistent_header().nentries();
-        
+
         // Handle edge value update for interior nodes (C++ lines 96-100)
         if idx == nentries {
             debug_assert!(!core.is_leaf(), "Edge update only for interior nodes");
@@ -377,7 +398,7 @@ where
             core.inc_gen();
             return Ok(());
         }
-        
+
         // For regular entries, get key and call update_with_key (C++ lines 102-103)
         let key = NodeOps::<K, V>::get_nth_key(self, core, idx, true);
         NodeOps::<K, V>::update_with_key(self, core, idx, &key, val)
@@ -386,7 +407,7 @@ where
     fn update_with_key(&self, core: &NodeCore, idx: u32, key: &K, val: &V) -> Result<(), BtreeError> {
         let nentries = core.get_persistent_header().nentries();
         debug_assert!(idx <= nentries, "Update index out of bounds");
-        
+
         // Handle edge value update for interior nodes (C++ lines 113-118)
         if idx == nentries {
             debug_assert!(!core.is_leaf(), "Edge update only for interior nodes");
@@ -394,35 +415,35 @@ where
             core.inc_gen();
             return Ok(());
         }
-        
-        // Get new key and value sizes (C++ lines 120-122)
+
+        // Get new key and value sizes from NEW instances being updated
         let new_key_size = key.serialized_size() as usize;
         let new_val_size = val.serialized_size() as usize;
         let new_obj_size = new_key_size + new_val_size;
-        
-        // Get current object size (C++ line 122)
-        let cur_key_size = self.record_ops.get_key_size(core, idx);
-        let cur_val_size = self.record_ops.get_value_size(core, idx);
+
+        // Get CURRENT object size from EXISTING entry (no instance yet)
+        let cur_key_size = self.get_key_size::<K>(core, idx);
+        let cur_val_size = self.get_value_size::<V>(core, idx);
         let cur_obj_size = cur_key_size + cur_val_size;
-        
+
         // If new size fits in current space, do in-place update (C++ lines 124-141)
         if cur_obj_size >= new_obj_size {
             let rec_ptr = get_record_ptr_mut(core, idx, self.record_ops.record_size());
             let obj_ptr = get_obj_ptr_mut(core, rec_ptr);
-            
+
             // Serialize key and value directly into node buffer (C++ lines 135-137)
             let obj_slice = unsafe { std::slice::from_raw_parts_mut(obj_ptr, cur_obj_size) };
             key.serialize_to(&mut obj_slice[..new_key_size], true).map_err(BtreeError::Io)?;
             val.serialize_to(&mut obj_slice[new_key_size..new_obj_size], true).map_err(BtreeError::Io)?;
-            
+
             // Update record metadata (C++ lines 138-140)
             self.record_ops.set_key_len(core, idx, new_key_size);
             self.record_ops.set_value_len(core, idx, new_val_size);
-            
+
             // Reclaim freed space (C++ line 140)
             let var_hdr = get_var_header_mut(core);
             var_hdr.available_space += (cur_obj_size - new_obj_size) as u16;
-            
+
             core.inc_gen();
             Ok(())
         } else {
@@ -436,14 +457,14 @@ where
         let nentries = core.get_persistent_header().nentries();
         debug_assert!(start_idx <= nentries && end_idx <= nentries, "Remove range out of bounds");
         debug_assert!(start_idx <= end_idx, "Invalid range");
-        
+
         let rec_size = self.record_ops.record_size();
         let num_to_remove = end_idx - start_idx + 1;
-        
+
         // Special case: removing up to and including the edge (C++ lines 156-166)
         if end_idx == nentries {
             debug_assert!(!core.is_leaf() && core.has_valid_edge(), "Edge removal requires valid edge");
-            
+
             // Move the previous value to edge (C++ lines 159-161)
             if start_idx > 0 {
                 // Extract the BNodeId from value (assuming V is u64 for interior nodes)
@@ -453,47 +474,49 @@ where
                 let edge_id = u64::from_le_bytes(edge_buf);
                 core.set_edge(edge_id);
             }
-            
+
             // Reclaim space from removed entries (C++ lines 163-165)
             for i in (start_idx - 1)..nentries {
-                let key_size = self.record_ops.get_key_size(core, i);
-                let val_size = self.record_ops.get_value_size(core, i);
+                let key_size = self.get_key_size::<K>(core, i);
+                let val_size = self.get_value_size::<V>(core, i);
                 let var_hdr = get_var_header_mut(core);
                 var_hdr.available_space += (key_size + val_size + rec_size) as u16;
             }
-            
+
             // Update entry count (C++ line 166)
             core.get_persistent_header_mut().set_nentries(start_idx - 1);
         } else {
             // Normal case: remove entries in the middle (C++ lines 167-176)
-            
+
             // Reclaim space from removed entries (C++ lines 169-171)
             for i in start_idx..=end_idx {
-                let key_size = self.record_ops.get_key_size(core, i);
-                let val_size = self.record_ops.get_value_size(core, i);
+                let key_size = self.get_key_size::<K>(core, i);
+                let val_size = self.get_value_size::<V>(core, i);
                 let var_hdr = get_var_header_mut(core);
                 var_hdr.available_space += (key_size + val_size + rec_size) as u16;
             }
-            
+
             // Shift remaining records left to fill gap (C++ lines 172-173)
             let src = get_record_ptr_mut(core, end_idx + 1, rec_size);
             let dst = get_record_ptr_mut(core, start_idx, rec_size);
             let bytes_to_move = (nentries - end_idx - 1) as usize * rec_size;
-            unsafe { std::ptr::copy(src, dst, bytes_to_move); }
-            
+            unsafe {
+                std::ptr::copy(src, dst, bytes_to_move);
+            }
+
             // Update entry count (C++ line 175)
             core.get_persistent_header_mut().set_nentries(nentries - num_to_remove);
         }
-        
+
         core.inc_gen();
         Ok(())
     }
-    
+
     fn remove_all(&self, core: &NodeCore) {
         core.get_persistent_header_mut().set_nentries(0);
         core.get_persistent_header_mut().edge_id = EMPTY_BNODEID;
         core.inc_gen();
-        
+
         let var_hdr = get_var_header_mut(core);
         let node_size = core.node_size() as u16;
         var_hdr.tail_arena_offset = node_size;
@@ -503,43 +526,49 @@ where
     fn move_out_to_right_by_entries(&self, src_core: &NodeCore, dst_core: &NodeCore, mut nentries: u32) -> u32 {
         let this_gen = src_core.node_gen();
         let other_gen = dst_core.node_gen();
-        
+
         let src_nentries = src_core.get_persistent_header().nentries();
         nentries = nentries.min(src_nentries);
-        if nentries == 0 { return 0; }
-        
+        if nentries == 0 {
+            return 0;
+        }
+
         // Move entries from end of src to beginning of dst (C++ lines 211-227)
         let start_idx = src_nentries - 1;
         let end_idx = src_nentries - nentries;
         let mut idx = start_idx;
         let mut full_move = false;
         let mut moved_count = 0;
-        
+
         loop {
             // Get key and value blobs for this entry (C++ lines 217-218)
-            let key_size = self.record_ops.get_key_size(src_core, idx);
-            let val_size = self.record_ops.get_value_size(src_core, idx);
+            let key_size = self.get_key_size::<K>(src_core, idx);
+            let val_size = self.get_value_size::<V>(src_core, idx);
             let rec_ptr = get_record_ptr(src_core, idx, self.record_ops.record_size());
             let obj_ptr = get_obj_ptr(src_core, rec_ptr);
-            
+
             // Try to insert at beginning of dst (index 0) (C++ line 220)
             let key_slice = unsafe { std::slice::from_raw_parts(obj_ptr, key_size) };
             let val_slice = unsafe { std::slice::from_raw_parts(obj_ptr.add(key_size), val_size) };
-            
+
             let key = K::deserialize_from(key_slice, false).expect("Failed to deserialize key");
             let val = V::deserialize_from(val_slice, false).expect("Failed to deserialize value");
-            
-            if self.insert(dst_core, 0, &key, &val).is_err() { break; }
+
+            if self.insert(dst_core, 0, &key, &val).is_err() {
+                break;
+            }
             moved_count += 1;
-            
+
             if idx == 0 {
                 full_move = true;
                 break;
             }
-            if idx < end_idx { break; }
+            if idx < end_idx {
+                break;
+            }
             idx -= 1;
         }
-        
+
         // Handle edge transfer for interior nodes (C++ lines 229-233)
         if !src_core.is_leaf() && dst_core.get_persistent_header().nentries() != 0 {
             let edge_id = src_core.get_persistent_header().edge_id;
@@ -548,62 +577,71 @@ where
                 src_core.invalidate_edge();
             }
         }
-        
+
         // Remove moved entries from source (C++ line 234)
         let remove_start = if full_move { 0 } else { idx + 1 };
         NodeOps::<K, V>::remove_range(self, src_core, remove_start, start_idx).ok();
-        
+
         // Reset generation counters (C++ lines 239-240)
         src_core.set_node_gen(this_gen + 1);
         dst_core.set_node_gen(other_gen + 1);
-        
+
         moved_count
     }
-    
+
     fn move_out_to_right_by_size(&self, src_core: &NodeCore, dst_core: &NodeCore, mut size_to_move: u32) -> u32 {
         let this_gen = src_core.node_gen();
         let other_gen = dst_core.node_gen();
         let mut nmoved = 0;
-        
+
         let src_nentries = src_core.get_persistent_header().nentries();
-        if src_nentries == 0 { return 0; }
-        
+        if src_nentries == 0 {
+            return 0;
+        }
+
         let mut idx = src_nentries - 1;
         let rec_size = self.record_ops.record_size();
-        
+
         // Move entries from end of src to beginning of dst until size threshold (C++ lines 251-266)
         loop {
-            let key_size = self.record_ops.get_key_size(src_core, idx);
-            let val_size = self.record_ops.get_value_size(src_core, idx);
+            let key_size = self.get_key_size::<K>(src_core, idx);
+            let val_size = self.get_value_size::<V>(src_core, idx);
             let entry_size = (key_size + val_size + rec_size) as u32;
-            
+
             // Check if we've reached threshold (C++ lines 256-259)
-            if entry_size > size_to_move { break; }
-            
+            if entry_size > size_to_move {
+                break;
+            }
+
             // Get key and value (C++ lines 253-254)
             let rec_ptr = get_record_ptr(src_core, idx, rec_size);
             let obj_ptr = get_obj_ptr(src_core, rec_ptr);
             let key_slice = unsafe { std::slice::from_raw_parts(obj_ptr, key_size) };
             let val_slice = unsafe { std::slice::from_raw_parts(obj_ptr.add(key_size), val_size) };
-            
+
             let key = K::deserialize_from(key_slice, false).expect("Failed to deserialize key");
             let val = V::deserialize_from(val_slice, false).expect("Failed to deserialize value");
-            
+
             // Insert at beginning of dst (C++ line 261)
-            if self.insert(dst_core, 0, &key, &val).is_err() { break; }
-            
-            if idx == 0 { nmoved += 1; break; }
+            if self.insert(dst_core, 0, &key, &val).is_err() {
+                break;
+            }
+
+            if idx == 0 {
+                nmoved += 1;
+                break;
+            }
             idx -= 1;
             nmoved += 1;
             size_to_move -= entry_size;
         }
-        
+
         // Remove moved entries from source (C++ line 267)
         if nmoved > 0 {
             let remove_start = if idx == 0 && nmoved > 0 { 0 } else { idx + 1 };
             NodeOps::<K, V>::remove_range(self, src_core, remove_start, src_nentries - 1).ok();
         }
-        
+
         // Handle edge transfer for interior nodes (C++ lines 269-273)
         if !src_core.is_leaf() && dst_core.get_persistent_header().nentries() != 0 {
             let edge_id = src_core.get_persistent_header().edge_id;
@@ -612,49 +650,60 @@ where
                 src_core.invalidate_edge();
             }
         }
-        
+
         // Reset generation counters (C++ lines 278-279)
         src_core.set_node_gen(this_gen + 1);
         dst_core.set_node_gen(other_gen + 1);
-        
+
         nmoved
     }
-    
-    fn append_copy_in_upto_size(&self, dst_core: &NodeCore, src_core: &NodeCore, other_cursor: &mut u32, 
-                                 upto_size: u32, copy_only_if_fits: bool) -> bool {
+
+    fn append_copy_in_upto_size(
+        &self,
+        dst_core: &NodeCore,
+        src_core: &NodeCore,
+        other_cursor: &mut u32,
+        upto_size: u32,
+        copy_only_if_fits: bool,
+    ) -> bool {
         // Check if dst already at size limit (C++ line 298)
         let dst_occupied = self.occupied_size(dst_core);
-        if dst_occupied >= upto_size as usize { return false; }
-        
+        if dst_occupied >= upto_size as usize {
+            return false;
+        }
+
         // Check if src is empty (C++ line 299)
         let src_nentries = src_core.get_persistent_header().nentries();
-        if src_nentries == 0 { return true; }
-        
+        if src_nentries == 0 {
+            return true;
+        }
+
         let room = upto_size - dst_occupied as u32;
-        
+
         // If copy_only_if_fits, verify all remaining entries fit (C++ lines 302-304)
         if copy_only_if_fits {
-            let entries_size = self.get_entries_size(src_core, *other_cursor, src_nentries);
-            if entries_size > room { return false; }
+            let entries_size = self.get_entries_size::<K, V>(src_core, *other_cursor, src_nentries);
+            if entries_size > room {
+                return false;
+            }
         }
-        
+
         // Copy entries by size (C++ lines 305-306)
         let ncopied = self.copy_by_size::<K, V>(dst_core, src_core, *other_cursor, room);
         *other_cursor += ncopied;
-        
+
         // Verify full copy if required (C++ lines 308-311)
         if copy_only_if_fits {
-            debug_assert_eq!(*other_cursor, src_nentries,
-                           "Expected to copy all entries but didn't");
+            debug_assert_eq!(*other_cursor, src_nentries, "Expected to copy all entries but didn't");
         }
         true
     }
-    
+
     fn available_size(&self, core: &NodeCore) -> u32 {
         let var_hdr = get_var_header(core);
         var_hdr.available_space as u32
     }
-    
+
     fn has_room_for_put(&self, core: &NodeCore, put_type: BtreePutType, key_size: u32, value_size: u32) -> bool {
         let mut needed_size = key_size + value_size;
         if put_type == BtreePutType::Insert || put_type == BtreePutType::Upsert {
@@ -669,10 +718,10 @@ where
 //================================================================================
 impl<R: VarRecordOps> VarNodeOps<R> {
     /// Compact the node to reclaim fragmented space (C++ lines 504-568)
-    fn compact(&self, core: &NodeCore) -> Result<(), BtreeError> {
+    fn compact<K: BtreeKey, V: BtreeValue>(&self, core: &NodeCore) -> Result<(), BtreeError> {
         let nentries = core.get_persistent_header().nentries();
         let rec_size = self.record_ops.record_size();
-        
+
         if nentries == 0 {
             // No entries, reset to full space (C++ lines 515-520)
             let node_size = core.phys_buf.len();
@@ -680,41 +729,45 @@ impl<R: VarRecordOps> VarNodeOps<R> {
             var_hdr.tail_arena_offset = node_size as u16;
             return Ok(());
         }
-        
+
         // Build sorted list of records by offset (descending order) (C++ lines 521-534)
         #[derive(Clone, Copy)]
         struct RecordInfo {
             obj_offset: u16,
             orig_index: u32,
         }
-        
-        let mut records: Vec<RecordInfo> = (0..nentries).map(|idx| {
-            let rec_ptr = get_record_ptr(core, idx, rec_size);
-            let obj_offset = unsafe { (*(rec_ptr as *const BtreeObjRecord)).obj_offset };
-            RecordInfo { obj_offset, orig_index: idx }
-        }).collect();
-        
+
+        let mut records: Vec<RecordInfo> = (0..nentries)
+            .map(|idx| {
+                let rec_ptr = get_record_ptr(core, idx, rec_size);
+                let obj_offset = unsafe { (*(rec_ptr as *const BtreeObjRecord)).obj_offset };
+                RecordInfo { obj_offset, orig_index: idx }
+            })
+            .collect();
+
         // Sort by obj_offset descending (C++ lines 532-534)
         records.sort_by(|a, b| b.obj_offset.cmp(&a.obj_offset));
-        
+
         // Compact by moving objects to eliminate gaps (C++ lines 536-562)
         let node_size = core.phys_buf.len();
         let mut last_offset = node_size as u16;
-        
+
         for rec_info in records.iter() {
             let idx = rec_info.orig_index;
-            let key_size = self.record_ops.get_key_size(core, idx);
-            let val_size = self.record_ops.get_value_size(core, idx);
+            let key_size = self.get_key_size::<K>(core, idx);
+            let val_size = self.get_value_size::<V>(core, idx);
             let total_kv_len = key_size + val_size;
-            
+
             let sparse_space = last_offset - (rec_info.obj_offset + total_kv_len as u16);
             if sparse_space > 0 {
                 // Move data up to eliminate gap (C++ lines 546-555)
                 let rec_ptr_mut = get_record_ptr_mut(core, idx, rec_size);
                 let old_ptr = get_obj_ptr_mut(core, rec_ptr_mut);
                 let new_ptr = unsafe { old_ptr.add(sparse_space as usize) };
-                unsafe { std::ptr::copy(old_ptr, new_ptr, total_kv_len); }
-                
+                unsafe {
+                    std::ptr::copy(old_ptr, new_ptr, total_kv_len);
+                }
+
                 // Update record's offset (C++ lines 551-553)
                 let rec_ptr = get_record_ptr_mut(core, idx, rec_size);
                 unsafe {
@@ -727,13 +780,13 @@ impl<R: VarRecordOps> VarNodeOps<R> {
                 last_offset = rec_info.obj_offset;
             }
         }
-        
+
         // Update tail arena offset (C++ line 563)
         let var_hdr = get_var_header_mut(core);
         var_hdr.tail_arena_offset = last_offset;
         Ok(())
     }
-    
+
     /// Helper to compute arena free space (contiguous free space at the end of records area)
     fn get_arena_free_space(core: &NodeCore, rec_size: usize) -> usize {
         let var_hdr = get_var_header(core);
@@ -742,46 +795,56 @@ impl<R: VarRecordOps> VarNodeOps<R> {
         let records_end = size_of::<VarNodeHeader>() + (nentries as usize * rec_size);
         tail.saturating_sub(records_end)
     }
-    
+
     /// Copy entries by size from src to dst (C++ lines 315-341)
-    fn copy_by_size<K: BtreeKey + 'static, V: BtreeValue + 'static>(&self, dst_core: &NodeCore, src_core: &NodeCore, start_idx: u32, mut copy_size: u32) -> u32 {
+    fn copy_by_size<K: BtreeKey + 'static, V: BtreeValue + 'static>(
+        &self,
+        dst_core: &NodeCore,
+        src_core: &NodeCore,
+        start_idx: u32,
+        mut copy_size: u32,
+    ) -> u32 {
         let this_gen = dst_core.node_gen();
         let src_nentries = src_core.get_persistent_header().nentries();
         let rec_size = self.record_ops.record_size();
-        
+
         let mut idx = start_idx;
         let mut n = 0;
-        
+
         // Copy entries while we have room (C++ lines 321-333)
         while idx < src_nentries {
-            let key_size = self.record_ops.get_key_size(src_core, idx);
-            let val_size = self.record_ops.get_value_size(src_core, idx);
+            let key_size = self.get_key_size::<K>(src_core, idx);
+            let val_size = self.get_value_size::<V>(src_core, idx);
             let entry_size = (key_size + val_size + rec_size) as u32;
-            
+
             // Check if we've reached size threshold (C++ line 326)
-            if entry_size > copy_size { break; }
-            
+            if entry_size > copy_size {
+                break;
+            }
+
             // Get key and value (C++ lines 322-323)
             let rec_ptr = get_record_ptr(src_core, idx, rec_size);
             let obj_ptr = get_obj_ptr(src_core, rec_ptr);
             let key_slice = unsafe { std::slice::from_raw_parts(obj_ptr, key_size) };
             let val_slice = unsafe { std::slice::from_raw_parts(obj_ptr.add(key_size), val_size) };
-            
+
             let key = K::deserialize_from(key_slice, false).expect("Failed to deserialize key");
             let val = V::deserialize_from(val_slice, false).expect("Failed to deserialize value");
-            
+
             // Insert at end of dst (C++ line 328)
             let dst_nentries = dst_core.get_persistent_header().nentries();
-            if self.insert(dst_core, dst_nentries, &key, &val).is_err() { break; }
-            
+            if self.insert(dst_core, dst_nentries, &key, &val).is_err() {
+                break;
+            }
+
             n += 1;
             idx += 1;
             copy_size -= entry_size;
         }
-        
+
         // Reset generation (C++ line 334)
         dst_core.set_node_gen(this_gen + 1);
-        
+
         // Copy edge if we copied everything (C++ lines 337-339)
         if !src_core.is_leaf() && src_core.has_valid_edge() && (start_idx + n) == src_nentries {
             let edge_id = src_core.get_persistent_header().edge_id;
@@ -789,41 +852,41 @@ impl<R: VarRecordOps> VarNodeOps<R> {
                 dst_core.set_edge(edge_id);
             }
         }
-        
+
         n
     }
-    
+
     /// Get size of entries in range (C++ lines 284-294)
-    fn get_entries_size(&self, core: &NodeCore, start_idx: u32, end_idx: u32) -> u32 {
+    fn get_entries_size<K: BtreeKey, V: BtreeValue>(&self, core: &NodeCore, start_idx: u32, end_idx: u32) -> u32 {
         let nentries = core.get_persistent_header().nentries();
-        
+
         // Fast path for full node (C++ lines 285-287)
         if start_idx == 0 && end_idx == nentries {
             return (self.occupied_size(core) - size_of::<VarNodeHeader>()) as u32;
         }
-        
+
         // Sum up individual entry sizes (C++ lines 289-293)
         let rec_size = self.record_ops.record_size();
         let mut cum_size = 0;
         for i in start_idx..end_idx {
-            let key_size = self.record_ops.get_key_size(core, i);
-            let val_size = self.record_ops.get_value_size(core, i);
+            let key_size = self.get_key_size::<K>(core, i);
+            let val_size = self.get_value_size::<V>(core, i);
             cum_size += key_size + val_size + rec_size;
         }
         cum_size as u32
     }
-    
+
     /// Compute occupied size (header + records + data)
     fn occupied_size(&self, core: &NodeCore) -> usize {
         let var_hdr = get_var_header(core);
         let nentries = core.get_persistent_header().nentries();
         let rec_size = self.record_ops.record_size();
-        
+
         // Occupied = var_header + all_records + data_area_used
         let records_size = nentries as usize * rec_size;
         let node_size = core.node_size() as usize;
         let data_used = node_size - var_hdr.tail_arena_offset as usize;
-        
+
         size_of::<VarNodeHeader>() + records_size + data_used
     }
 }

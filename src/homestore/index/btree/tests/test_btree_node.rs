@@ -316,6 +316,12 @@ where
                  self.node.total_entries(), self.shadow_map.len());
     }
     
+    fn dump_node(&self) {
+        println!("\n=== NODE DUMP ===");
+        println!("{}", self.node.to_string::<K, V>());
+        println!("=================\n");
+    }
+    
     /// Helper to put a list of keys
     fn put_list(&mut self, keys: &[u64]) {
         for &k_seed in keys {
@@ -370,6 +376,7 @@ async fn test_sequential_insert<C: NodeTestConfig>() {
     }
     
     test.print();
+    test.dump_node();
     test.validate_get_all();
 }
 
@@ -403,6 +410,7 @@ async fn test_simple_insert<C: NodeTestConfig>() {
         test.put(C::K::generate(&mut (i as u64)), BtreePutType::Insert);
     }
     
+    test.dump_node();
     test.validate_get_all();
 }
 
@@ -416,6 +424,7 @@ async fn test_reverse_insert<C: NodeTestConfig>() {
     
     test.print();
     test.validate_get_all();
+    test.dump_node();
 }
 
 async fn test_remove<C: NodeTestConfig>() {
@@ -436,6 +445,7 @@ async fn test_remove<C: NodeTestConfig>() {
     
     test.print();
     test.validate_get_all();
+    test.dump_node();
 }
 
 async fn test_update<C: NodeTestConfig>() {
@@ -454,6 +464,7 @@ async fn test_update<C: NodeTestConfig>() {
     test.validate_specific(C::K::generate(&mut 1u64));
     test.validate_specific(C::K::generate(&mut 2u64));
     test.validate_specific(C::K::generate(&mut 3u64));
+    test.dump_node();
 }
 
 async fn test_mixed_operations<C: NodeTestConfig>() {
@@ -478,6 +489,7 @@ async fn test_mixed_operations<C: NodeTestConfig>() {
     
     test.print();
     test.validate_get_all();
+    test.dump_node();
 }
 
 async fn test_remove_range_index<C: NodeTestConfig>() {
@@ -509,6 +521,7 @@ async fn test_remove_range_index<C: NodeTestConfig>() {
     }
     test.print();
     test.validate_get_all();
+    test.dump_node();
 }
 
 async fn test_move<C: NodeTestConfig>() {
@@ -564,6 +577,7 @@ async fn test_move<C: NodeTestConfig>() {
     assert_eq!(test2.node.total_entries(), 0, "Node should be empty after remove_all");
     test2.shadow_map.clear();
     test2.validate_get_all();
+    test.dump_node();
 }
 
 async fn test_range_put_get<C: NodeTestConfig>() {
@@ -575,6 +589,7 @@ async fn test_range_put_get<C: NodeTestConfig>() {
     }
     
     test.validate_get_all();
+    test.dump_node();
 }
 
 async fn test_random_insert_remove_update<C: NodeTestConfig>() {
@@ -621,6 +636,7 @@ async fn test_random_insert_remove_update<C: NodeTestConfig>() {
     println!("After update of {} entries", to_update);
     test.print();
     test.validate_get_all();
+    test.dump_node();
 }
 
 //================================================================================

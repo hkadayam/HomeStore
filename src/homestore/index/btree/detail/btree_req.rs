@@ -107,6 +107,9 @@ pub struct BtreeRangeRequest<K: BtreeKey> {
     batch_size: u32,
 }
 
+// Safety: BtreeRangeRequest can be Send when K is Send
+unsafe impl<K: BtreeKey + Send> Send for BtreeRangeRequest<K> {}
+
 impl<K: BtreeKey> BtreeRangeRequest<K> {
     pub fn new(input_range: BtreeKeyRange<K>, batch_size: u32) -> Self {
         let working_range = input_range.clone();
@@ -189,6 +192,9 @@ pub struct BtreeSinglePutRequest<'a, K: BtreeKey, V: BtreeValue> {
     put_type: BtreePutType,
     filter_fn: Option<&'a PutFilterFn<K, V>>,
 }
+
+// Safety: BtreeSinglePutRequest can be Send when K and V are Send
+unsafe impl<'a, K: BtreeKey + Send, V: BtreeValue + Send> Send for BtreeSinglePutRequest<'a, K, V> {}
 
 impl<'a, K: BtreeKey, V: BtreeValue> BtreeSinglePutRequest<'a, K, V> {
     /// Create a new single PUT request (matches C++ constructor)
@@ -355,6 +361,8 @@ pub struct BtreeGetRequest<'a, K: BtreeKey> {
     key: &'a K,
 }
 
+unsafe impl<'a, K: BtreeKey + Send> Send for BtreeGetRequest<'a, K> {}
+
 impl<'a, K: BtreeKey> BtreeGetRequest<'a, K> {
     pub fn new(key: &'a K) -> Self {
         Self { key }
@@ -370,6 +378,8 @@ impl<'a, K: BtreeKey> BtreeGetRequest<'a, K> {
 pub struct BtreeGetAnyRequest<K: BtreeKey> {
     range: BtreeKeyRange<K>,
 }
+
+unsafe impl<K: BtreeKey + Send> Send for BtreeGetAnyRequest<K> {}
 
 impl<K: BtreeKey> BtreeGetAnyRequest<K> {
     pub fn new(range: BtreeKeyRange<K>) -> Self {
@@ -392,6 +402,10 @@ pub struct BtreeQueryRequest<'a, K: BtreeKey, V: BtreeValue> {
     filter_fn: Option<&'a GetFilterFn<K, V>>,
     reverse_order: bool,
 }
+
+// Safety: BtreeQueryRequest can be Send when K and V are Send
+// filter_fn is already Send + Sync (see line 54)
+unsafe impl<'a, K: BtreeKey + Send, V: BtreeValue + Send> Send for BtreeQueryRequest<'a, K, V> {}
 
 impl<'a, K: BtreeKey, V: BtreeValue> BtreeQueryRequest<'a, K, V> {
     /// Create new query request
@@ -474,6 +488,10 @@ pub struct QueryResultHandle<'a, K: BtreeKey, V: BtreeValue> {
     /// Whether there are more results beyond this batch
     has_more: bool,
 }
+
+// Safety: QueryResultHandle can be Send when K and V are Send
+// All fields are Send when K: Send and V: Send
+unsafe impl<'a, K: BtreeKey + Send, V: BtreeValue + Send> Send for QueryResultHandle<'a, K, V> {}
 
 impl<'a, K: BtreeKey, V: BtreeValue> QueryResultHandle<'a, K, V> {
     /// Create new result handle
@@ -564,6 +582,8 @@ pub struct BtreeRemoveRequest<'a, K: BtreeKey> {
     key: &'a K,
 }
 
+unsafe impl<'a, K: BtreeKey + Send> Send for BtreeRemoveRequest<'a, K> {}
+
 impl<'a, K: BtreeKey> BtreeRemoveRequest<'a, K> {
     pub fn new(key: &'a K) -> Self {
         Self { key }
@@ -578,6 +598,8 @@ impl<'a, K: BtreeKey> BtreeRemoveRequest<'a, K> {
 pub struct BtreeRemoveAnyRequest<K: BtreeKey> {
     range: BtreeKeyRange<K>,
 }
+
+unsafe impl<K: BtreeKey + Send> Send for BtreeRemoveAnyRequest<K> {}
 
 impl<K: BtreeKey> BtreeRemoveAnyRequest<K> {
     pub fn new(range: BtreeKeyRange<K>) -> Self {

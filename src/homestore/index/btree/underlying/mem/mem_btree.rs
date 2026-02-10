@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ***************************************************************************/
+ **************************************************************** */
 
 //! MemBtree - Simple In-Memory Storage for Btree Validation
 //!
@@ -38,13 +38,14 @@
 //! Once MemBtree validates all locking scenarios, COWBtree can be implemented
 //! with the same UnderlyingBtree interface but with actual persistence.
 
-use std::collections::HashMap;
-use std::sync::{RwLock, Arc};
+use dashmap::DashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 
 use crate::index::btree::btree_node::{BNodeId, NodeCore};
 use crate::index::btree::btree::{UnderlyingBtree, BtreeError};
+use iomgr::IOBuffer;
 
 //================================================================================
 // Phase 8: MemBtree - In-Memory Storage Implementation
@@ -53,13 +54,16 @@ use crate::index::btree::btree::{UnderlyingBtree, BtreeError};
 /// MemBtree - Simple in-memory storage for btree nodes
 ///
 /// **NO LOCKING** - All locking is handled by the Btree layer above.
-/// This layer handles ONLY storage/persistence (in-memory HashMap).
+/// This layer handles ONLY storage/persistence (in-memory DashMap).
 ///
-/// Uses `std::sync::RwLock` (not AsyncRwLock) since HashMap operations are fast.
+/// Uses DashMap for lock-free concurrent access without global lock contention.
 pub struct MemBtree {
-    /// In-memory node storage (HashMap wrapped in RwLock for interior mutability)
-    /// Using std::sync::RwLock (NOT AsyncRwLock) since HashMap ops are fast
-    nodes: RwLock<HashMap<BNodeId, Arc<NodeCore>>>,
+    /// In-memory node storage - concurrent HashMap without global lock
+    nodes: DashMap<BNodeId, Arc<NodeCore>>,
+
+    /// Overflow storage - separate from regular nodes
+    /// Stores pure user data (no btree headers)
+    overflow: DashMap<BNodeId, Arc<IOBuffer>>,
 
     /// Node size for this btree (fixed size for all nodes)
     node_size: u32,
@@ -77,25 +81,26 @@ impl MemBtree {
         tracing::info!("MemBtree: Creating in-memory btree with node_size={}", node_size);
 
         Self {
-            nodes: RwLock::new(HashMap::new()),
+            nodes: DashMap::new(),
+            overflow: DashMap::new(),
             node_size,
             next_node_id: AtomicU64::new(1), // Start from 1
         }
     }
 
     /// Allocate a new node ID
-    fn allocate_node_id(&self) -> BNodeId {
-        self.next_node_id.fetch_add(1, Ordering::SeqCst)
-    }
+    fn allocate_node_id(&self) -> BNodeId { self.next_node_id.fetch_add(1, Ordering::SeqCst) }
 
     /// Get node count (for debugging/testing)
-    pub fn node_count(&self) -> usize {
-        self.nodes.read().unwrap().len()
-    }
+    pub fn node_count(&self) -> usize { self.nodes.len() }
 
-    /// Clear all nodes (for testing)
+    /// Get overflow node count (for debugging/testing)
+    pub fn overflow_node_count(&self) -> usize { self.overflow.len() }
+
+    /// Clear all nodes and overflow (for testing)
     pub fn clear(&self) {
-        self.nodes.write().unwrap().clear();
+        self.nodes.clear();
+        self.overflow.clear();
     }
 }
 
@@ -112,10 +117,7 @@ impl UnderlyingBtree for MemBtree {
     /// * `Ok(Arc<NodeCore>)` - Unlocked node (Btree layer will lock it)
     /// * `Err(BtreeError::NodeNotFound)` - Node doesn't exist
     async fn read_node(&self, id: BNodeId) -> Result<Arc<NodeCore>, BtreeError> {
-        let nodes = self.nodes.read().unwrap();
-        nodes.get(&id)
-            .cloned()
-            .ok_or(BtreeError::NodeNotFound)
+        self.nodes.get(&id).map(|entry| Arc::clone(entry.value())).ok_or(BtreeError::NodeNotFound)
     }
 
     /// Write node to storage
@@ -148,21 +150,12 @@ impl UnderlyingBtree for MemBtree {
     /// # Returns
     /// * `Ok(Arc<NodeCore>)` - Unlocked new node
     async fn create_node(&self, is_leaf: bool, node_variant: u8) -> Result<Arc<NodeCore>, BtreeError> {
-        // Storage layer: allocate ID, create buffer, store in HashMap
-        // btree_node_mgr::init_new_variant_node() sets node_variant and initializes
-        
         // Allocate new node ID
         let node_id = self.allocate_node_id();
-
-        // Create new node buffer
         let core = Arc::new(NodeCore::new(node_id, is_leaf, self.node_size));
+        self.nodes.insert(node_id, Arc::clone(&core));
 
-        // Add to in-memory storage
-        let mut nodes = self.nodes.write().unwrap();
-        nodes.insert(node_id, Arc::clone(&core));
-
-        tracing::info!("MemBtree: Created node {} (is_leaf={}, node_variant={})",
-                 node_id, is_leaf, node_variant);
+        tracing::info!("MemBtree: Created node {} (is_leaf={}, node_variant={})", node_id, is_leaf, node_variant);
 
         Ok(core)
     }
@@ -177,11 +170,8 @@ impl UnderlyingBtree for MemBtree {
     /// # Returns
     /// * `Ok(())` - Node deleted (or didn't exist)
     async fn delete_node(&self, id: BNodeId) -> Result<(), BtreeError> {
-        let mut nodes = self.nodes.write().unwrap();
-        nodes.remove(&id);
-
+        self.nodes.remove(&id);
         tracing::info!("MemBtree: Deleted node {}", id);
-
         Ok(())
     }
 
@@ -200,6 +190,47 @@ impl UnderlyingBtree for MemBtree {
         tracing::info!("MemBtree: Root changed to node {}", root_node_id);
         Ok(())
     }
+
+    /// Write overflow data to memory and return allocated node_id
+    ///
+    /// # Arguments
+    /// * `data` - IOBuffer containing overflow data
+    ///
+    /// # Returns
+    /// * `Ok(BNodeId)` - Allocated node ID for this overflow data
+    async fn write_overflow(&self, data: IOBuffer) -> Result<BNodeId, BtreeError> {
+        let node_id = self.allocate_node_id();
+        let len = data.len();
+        self.overflow.insert(node_id, Arc::new(data));
+
+        tracing::debug!("MemBtree: Wrote overflow node {} ({} bytes)", node_id, len);
+        Ok(node_id)
+    }
+
+    /// Read overflow data by node_id
+    ///
+    /// # Arguments
+    /// * `node_id` - Overflow node ID to read
+    ///
+    /// # Returns
+    /// * `Ok(Arc<IOBuffer>)` - Shared overflow data (zero-copy)
+    /// * `Err(BtreeError::NodeNotFound)` - Overflow node doesn't exist
+    async fn read_overflow(&self, node_id: BNodeId) -> Result<Arc<IOBuffer>, BtreeError> {
+        self.overflow.get(&node_id).map(|entry| Arc::clone(entry.value())).ok_or(BtreeError::NodeNotFound)
+    }
+
+    /// Delete overflow node from memory
+    ///
+    /// # Arguments
+    /// * `node_id` - Overflow node ID to delete
+    ///
+    /// # Returns
+    /// * `Ok(())` - Overflow node deleted (or didn't exist)
+    async fn delete_overflow(&self, node_id: BNodeId) -> Result<(), BtreeError> {
+        self.overflow.remove(&node_id);
+        tracing::debug!("MemBtree: Deleted overflow node {}", node_id);
+        Ok(())
+    }
 }
 
 //================================================================================
@@ -216,7 +247,9 @@ impl MemBtree {
     ///
     /// # Returns
     /// * Result with Btree and MemBtree storage, or BtreeError
-    pub async fn create_btree<K, V>(node_size: u32) -> Result<crate::index::btree::btree::Btree<K, V>, crate::index::btree::btree::BtreeError>
+    pub async fn create_btree<K, V>(
+        node_size: u32,
+    ) -> Result<crate::index::btree::btree::Btree<K, V>, crate::index::btree::btree::BtreeError>
     where
         K: crate::index::btree::btree_kvs::BtreeKey + 'static,
         V: crate::index::btree::btree_kvs::BtreeValue + 'static,
@@ -243,32 +276,5 @@ impl MemBtree {
 /// // Or use convenience method
 /// let btree = MemBtree::create_btree::<u64, u64>(4096, root_node_id);
 ///
-/// // Use btree normally
-/// let _tree_lock = btree.lock_tree_shared().await;
-/// let node = btree.read_and_lock_node(node_id, LockType::Read).await?;
 /// // ... operations ...
-/// ```
-///
-/// Example: Testing locking scenarios with MemBtree
-///
-/// ```ignore
-/// // Multi-threaded GET operations (all READ locks)
-/// let btree = Arc::new(MemBtree::create_btree::<u64, u64>(4096, root_id));
-///
-/// let handles: Vec<_> = (0..10).map(|i| {
-///     let btree = Arc::clone(&btree);
-///     tokio::spawn(async move {
-///         let _tree_guard = btree.lock_tree_shared().await;
-///         let node = btree.read_and_lock_node(node_id, LockType::Read).await?;
-///         // Concurrent readers - should all succeed
-///         let value = node.get_nth_value::<u64>(i);
-///         Ok::<_, BtreeError>(value)
-///     })
-/// }).collect();
-///
-/// // Wait for all to complete
-/// for handle in handles {
-///     handle.await??;
-/// }
-/// ```
 pub(crate) mod examples {}

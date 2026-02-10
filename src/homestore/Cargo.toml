@@ -29,6 +29,8 @@ dashmap = "6.0"
 futures = "0.3"
 crc = "3.0"
 triomphe = "0.1"
+bitfield = "0.14"
+bytemuck = { version = "1.14", features = ["derive"] }
 
 # io_uring is only available on Linux
 [target.'cfg(target_os = "linux")'.dependencies]

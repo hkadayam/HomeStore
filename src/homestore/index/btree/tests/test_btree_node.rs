@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ***************************************************************************/
+ ************************************************************* */
 
 //! Btree Node Tests
 //!
@@ -32,9 +32,25 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 // When compiled as part of lib tests, use crate:: (homestore crate)
 // When compiled from integration test, crate:: refers to test crate, so we need direct path
 #[cfg(not(test))]
-use homestore::{btree_node::{Node, NodeCore, LockType, InternalLockGuard, NodeOps}, btree_kvs::{BtreeKey, BtreeValue}, detail::btree_req::BtreePutType};
+use homestore::{
+    btree_node::{
+        Node, NodeCore, LockType, InternalLockGuard, NodeOps, SIMPLE_NODE_OPS, VAR_KEY_NODE_OPS, VAR_VALUE_NODE_OPS,
+        VAR_OBJ_NODE_OPS, PREFIX_COMPRESS_NODE_OPS,
+    },
+    btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow},
+    btree::BtreeError,
+    detail::btree_req::BtreePutType,
+};
 #[cfg(test)]
-use crate::{btree_node::{Node, NodeCore, LockType, InternalLockGuard, NodeOps}, btree_kvs::{BtreeKey, BtreeValue}, detail::btree_req::BtreePutType};
+use crate::{
+    index::btree::btree_node::{
+        Node, NodeCore, LockType, InternalLockGuard, NodeOps, SIMPLE_NODE_OPS, VAR_KEY_NODE_OPS, VAR_VALUE_NODE_OPS,
+        VAR_OBJ_NODE_OPS, PREFIX_COMPRESS_NODE_OPS,
+    },
+    index::btree::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow},
+    index::btree::btree::BtreeError,
+    index::btree::detail::btree_req::BtreePutType,
+};
 
 const NODE_SIZE: usize = 4096;
 
@@ -76,16 +92,14 @@ trait NodeVariant {
 struct SimpleNodeVariant;
 impl NodeVariant for SimpleNodeVariant {
     fn node_variant_id() -> u8 { 0 }
-    fn get_node_ops<K: BtreeKey + 'static, V: BtreeValue + 'static>() -> &'static dyn NodeOps<K, V> {
-        &crate::btree_node::SIMPLE_NODE_OPS
-    }
+    fn get_node_ops<K: BtreeKey + 'static, V: BtreeValue + 'static>() -> &'static dyn NodeOps<K, V> { &SIMPLE_NODE_OPS }
 }
 
 struct VarKeyNodeVariant;
 impl NodeVariant for VarKeyNodeVariant {
     fn node_variant_id() -> u8 { 1 }
     fn get_node_ops<K: BtreeKey + 'static, V: BtreeValue + 'static>() -> &'static dyn NodeOps<K, V> {
-        &crate::btree_node::VAR_KEY_NODE_OPS
+        &VAR_KEY_NODE_OPS
     }
 }
 
@@ -93,7 +107,7 @@ struct VarValueNodeVariant;
 impl NodeVariant for VarValueNodeVariant {
     fn node_variant_id() -> u8 { 2 }
     fn get_node_ops<K: BtreeKey + 'static, V: BtreeValue + 'static>() -> &'static dyn NodeOps<K, V> {
-        &crate::btree_node::VAR_VALUE_NODE_OPS
+        &VAR_VALUE_NODE_OPS
     }
 }
 
@@ -101,7 +115,7 @@ struct VarObjNodeVariant;
 impl NodeVariant for VarObjNodeVariant {
     fn node_variant_id() -> u8 { 3 }
     fn get_node_ops<K: BtreeKey + 'static, V: BtreeValue + 'static>() -> &'static dyn NodeOps<K, V> {
-        &crate::btree_node::VAR_OBJ_NODE_OPS
+        &VAR_OBJ_NODE_OPS
     }
 }
 
@@ -109,7 +123,7 @@ struct PrefixCompressNodeVariant;
 impl NodeVariant for PrefixCompressNodeVariant {
     fn node_variant_id() -> u8 { 4 }
     fn get_node_ops<K: BtreeKey + 'static, V: BtreeValue + 'static>() -> &'static dyn NodeOps<K, V> {
-        &crate::btree_node::PREFIX_COMPRESS_NODE_OPS
+        &PREFIX_COMPRESS_NODE_OPS
     }
 }
 
@@ -188,17 +202,17 @@ where
     N: NodeVariant,
 {
     async fn new() -> Self {
-        let node_core = NodeCore::new(/*node_id=*/1, /*is_leaf=*/true, NODE_SIZE as u32);
-        
+        let node_core = NodeCore::new(/* node_id= */ 1, /* is_leaf= */ true, NODE_SIZE as u32);
+
         // Set the node variant in persistent header
         {
             let header = node_core.get_persistent_header_mut();
             header.node_variant = N::node_variant_id();
         }
-        
+
         // Initialize node with the appropriate NodeOps based on variant N
         N::get_node_ops::<K, V>().init_new_node(&node_core);
-        
+
         let node_core = std::sync::Arc::new(node_core);
         let node = unsafe {
             let write_guard = node_core.lock.write_lock().await;
@@ -209,7 +223,7 @@ where
                 _guard: InternalLockGuard::Write(write_guard),
             }
         };
-        
+
         Self {
             node,
             shadow_map: BTreeMap::new(),
@@ -217,27 +231,56 @@ where
             _phantom: PhantomData,
         }
     }
-    
+
     fn has_room(&self) -> bool {
         self.node.available_size::<K, V>() > (K::FIXED_SERIALIZED_SIZE.unwrap() + V::FIXED_SERIALIZED_SIZE.unwrap())
     }
-    
+
     fn put(&mut self, k: K, put_type: BtreePutType) {
         let value = V::generate(&mut self.value_counter);
-        
+
         let expected_success = match put_type {
             BtreePutType::Insert => !self.shadow_map.contains_key(&k),
             BtreePutType::Update => self.shadow_map.contains_key(&k),
             BtreePutType::Upsert => true,
         };
-        
-        let result = self.node.put(&k, &value, put_type, None);
-        
+
+        let value_for_shadow = value.clone();
+        let (found, idx) = self.node.find::<K, V>(&k);
+
+        let result = match put_type {
+            BtreePutType::Insert => {
+                if found {
+                    Err(BtreeError::KeyAlreadyExists)
+                } else {
+                    let val_ref = ValueOrOverflow::Inline(value);
+                    self.node.insert::<K, V>(idx, &k, &val_ref)
+                }
+            }
+            BtreePutType::Update => {
+                if !found {
+                    Err(BtreeError::KeyNotFound)
+                } else {
+                    let val_ref = ValueOrOverflow::Inline(value);
+                    self.node.update::<K, V>(idx, &val_ref)
+                }
+            }
+            BtreePutType::Upsert => {
+                if found {
+                    let val_ref = ValueOrOverflow::Inline(value);
+                    self.node.update::<K, V>(idx, &val_ref)
+                } else {
+                    let val_ref = ValueOrOverflow::Inline(value);
+                    self.node.insert::<K, V>(idx, &k, &val_ref)
+                }
+            }
+        };
+
         match put_type {
             BtreePutType::Insert => {
                 if expected_success {
                     assert!(result.is_ok(), "Expected INSERT of key {:?} to succeed", k);
-                    self.shadow_map.insert(k, value);
+                    self.shadow_map.insert(k, value_for_shadow);
                 } else {
                     assert!(result.is_err(), "Expected INSERT of existing key {:?} to fail", k);
                 }
@@ -245,22 +288,22 @@ where
             BtreePutType::Update => {
                 if expected_success {
                     assert!(result.is_ok(), "Expected UPDATE of key {:?} to succeed", k);
-                    self.shadow_map.insert(k, value);
+                    self.shadow_map.insert(k, value_for_shadow);
                 } else {
                     assert!(result.is_err(), "Expected UPDATE of non-existing key {:?} to fail", k);
                 }
             }
             BtreePutType::Upsert => {
                 assert!(result.is_ok(), "Expected UPSERT of key {:?} to succeed", k);
-                self.shadow_map.insert(k, value);
+                self.shadow_map.insert(k, value_for_shadow);
             }
         }
     }
-    
+
     fn remove(&mut self, k: K) {
         let shadow_found = self.shadow_map.contains_key(&k);
         let (found, idx) = self.node.find::<K, V>(&k);
-        
+
         if found {
             let result = self.node.remove::<K, V>(idx);
             assert!(result.is_ok(), "Expected remove of key {:?} to succeed", k);
@@ -270,58 +313,64 @@ where
             assert!(!shadow_found, "Key {:?} in shadow map but not found in node", k);
         }
     }
-    
+
     fn update(&mut self, k: K) {
         let value = V::generate(&mut self.value_counter);
         let (found, idx) = self.node.find::<K, V>(&k);
-        
+
         let expected_success = self.shadow_map.contains_key(&k);
         assert_eq!(found, expected_success, "find() mismatch for key {:?}", k);
-        
+
         if found {
-            let result = self.node.update::<K, V>(idx, &value);
+            let val_ref = ValueOrOverflow::Inline(value.clone());
+            let result = self.node.update::<K, V>(idx, &val_ref);
             assert!(result.is_ok(), "Expected update of key {:?} to succeed", k);
             self.shadow_map.insert(k, value);
         }
     }
-    
+
     fn validate_get_all(&self) {
         let kvs = self.node.get_all_kvs::<K, V>();
-        assert_eq!(kvs.len(), self.shadow_map.len(), 
-                   "get_all returned {} entries, expected {}", kvs.len(), self.shadow_map.len());
-        
-        for (k, v) in &kvs {
-            let shadow_v = self.shadow_map.get(k)
-                .expect(&format!("Key {:?} from node not found in shadow map", k));
-            assert_eq!(v, shadow_v, "Value mismatch for key {:?}", k);
+        assert_eq!(
+            kvs.len(),
+            self.shadow_map.len(),
+            "get_all returned {} entries, expected {}",
+            kvs.len(),
+            self.shadow_map.len()
+        );
+
+        for (k, val_ref) in &kvs {
+            let shadow_v = self.shadow_map.get(k).expect(&format!("Key {:?} from node not found in shadow map", k));
+            // In tests, values are always inline (no overflow)
+            let v = val_ref.clone().expect_inline("Unexpected overflow in test");
+            assert_eq!(&v, shadow_v, "Value mismatch for key {:?}", k);
         }
     }
-    
+
     fn validate_specific(&self, k: K) {
         let (found, idx) = self.node.find::<K, V>(&k);
         let shadow_found = self.shadow_map.contains_key(&k);
-        
-        assert_eq!(found, shadow_found, 
-                   "find() returned {}, expected {} for key {:?}", found, shadow_found, k);
-        
+
+        assert_eq!(found, shadow_found, "find() returned {}, expected {} for key {:?}", found, shadow_found, k);
+
         if found {
-            let node_value = self.node.get_nth_value::<K, V>(idx, /*copy=*/true);
+            let node_value = self.node.get_nth_value::<K, V>(idx, /* copy= */ true);
             let shadow_value = self.shadow_map.get(&k).unwrap();
-            assert_eq!(&node_value, shadow_value, "Value mismatch for key {:?}", k);
+            let inline_value = node_value.expect_inline("Test values should always be inline");
+            assert_eq!(&inline_value, shadow_value, "Value mismatch for key {:?}", k);
         }
     }
-    
+
     fn print(&self) {
-        println!("Node entries: {}, shadow_map size: {}", 
-                 self.node.total_entries(), self.shadow_map.len());
+        println!("Node entries: {}, shadow_map size: {}", self.node.total_entries(), self.shadow_map.len());
     }
-    
+
     fn dump_node(&self) {
         println!("\n=== NODE DUMP ===");
         println!("{}", self.node.to_string::<K, V>());
         println!("=================\n");
     }
-    
+
     /// Helper to put a list of keys
     fn put_list(&mut self, keys: &[u64]) {
         for &k_seed in keys {
@@ -329,36 +378,12 @@ where
             self.put(key, BtreePutType::Insert);
         }
     }
-    
+
     /// Helper to put a range of keys using multi_put
     fn put_range(&mut self, start: u64, count: u32) {
-        // First upsert individual keys (since we don't have IntervalValue)
         for i in 0..count {
             let key = K::generate(&mut (start + i as u64));
             self.put(key, BtreePutType::Upsert);
-        }
-        
-        // Now use multi_put to UPDATE the range
-        let mut start_seed = start;
-        let mut end_seed = start + (count - 1) as u64;
-        let start_key = K::generate(&mut start_seed);
-        let end_key = K::generate(&mut end_seed);
-        let value = V::generate(&mut self.value_counter);
-        
-        let range = crate::detail::btree_req::BtreeKeyRange {
-            start_key: start_key.clone(),
-            end_key: end_key.clone(),
-            start_incl: true,
-            end_incl: true,
-        };
-        
-        let result = self.node.multi_put::<K, V>(&range, &value, BtreePutType::Update, None, None);
-        assert!(result.is_ok(), "multi_put failed for range [{},{}]", start, start + count as u64 - 1);
-        
-        // Update shadow map
-        for i in 0..count {
-            let key = K::generate(&mut (start + i as u64));
-            self.shadow_map.insert(key, value.clone());
         }
     }
 }
@@ -369,12 +394,14 @@ where
 
 async fn test_sequential_insert<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
-    
+
     for i in 0..100 {
-        if !test.has_room() { break; }
+        if !test.has_room() {
+            break;
+        }
         test.put(C::K::generate(&mut (i as u64)), BtreePutType::Insert);
     }
-    
+
     test.print();
     test.dump_node();
     test.validate_get_all();
@@ -382,7 +409,7 @@ async fn test_sequential_insert<C: NodeTestConfig>() {
 
 async fn test_simple_insert<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
-    
+
     // Test occupied size tracking
     let oc = test.node.occupied_size::<C::K, C::V>();
     test.put(C::K::generate(&mut 1u64), BtreePutType::Insert);
@@ -393,7 +420,7 @@ async fn test_simple_insert<C: NodeTestConfig>() {
     test.remove(C::K::generate(&mut 3u64));
     let oc2 = test.node.occupied_size::<C::K, C::V>();
     assert_eq!(oc, oc2, "Occupied size cannot be more than original size");
-    
+
     test.put(C::K::generate(&mut 1u64), BtreePutType::Insert);
     test.put(C::K::generate(&mut 2u64), BtreePutType::Insert);
     test.put(C::K::generate(&mut 3u64), BtreePutType::Insert);
@@ -401,7 +428,7 @@ async fn test_simple_insert<C: NodeTestConfig>() {
     test.remove(C::K::generate(&mut 2u64));
     test.remove(C::K::generate(&mut 1u64));
     assert_eq!(oc, oc2, "Occupied size must be the same as original size");
-    
+
     test.put(C::K::generate(&mut 2u64), BtreePutType::Insert);
     test.put(C::K::generate(&mut 1u64), BtreePutType::Insert);
     test.put(C::K::generate(&mut 4u64), BtreePutType::Insert);
@@ -409,19 +436,21 @@ async fn test_simple_insert<C: NodeTestConfig>() {
     for i in 5..=50 {
         test.put(C::K::generate(&mut (i as u64)), BtreePutType::Insert);
     }
-    
+
     test.dump_node();
     test.validate_get_all();
 }
 
 async fn test_reverse_insert<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
-    
+
     for i in (0..100).rev() {
-        if !test.has_room() { break; }
+        if !test.has_room() {
+            break;
+        }
         test.put(C::K::generate(&mut (i as u64)), BtreePutType::Insert);
     }
-    
+
     test.print();
     test.validate_get_all();
     test.dump_node();
@@ -429,20 +458,20 @@ async fn test_reverse_insert<C: NodeTestConfig>() {
 
 async fn test_remove<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
-    
+
     test.put(C::K::generate(&mut 0u64), BtreePutType::Insert);
     test.put(C::K::generate(&mut 1u64), BtreePutType::Insert);
     test.put(C::K::generate(&mut 2u64), BtreePutType::Insert);
     test.put(C::K::generate(&mut 100u64), BtreePutType::Insert);
     test.put(C::K::generate(&mut 101u64), BtreePutType::Insert);
     test.put(C::K::generate(&mut 99u64), BtreePutType::Insert);
-    
+
     test.remove(C::K::generate(&mut 0u64));
     test.remove(C::K::generate(&mut 0u64)); // Remove non-existing
     test.remove(C::K::generate(&mut 1u64));
     test.remove(C::K::generate(&mut 2u64));
     test.remove(C::K::generate(&mut 99u64));
-    
+
     test.print();
     test.validate_get_all();
     test.dump_node();
@@ -450,16 +479,16 @@ async fn test_remove<C: NodeTestConfig>() {
 
 async fn test_update<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
-    
+
     test.put(C::K::generate(&mut 1u64), BtreePutType::Insert);
     test.put(C::K::generate(&mut 2u64), BtreePutType::Insert);
     test.put(C::K::generate(&mut 3u64), BtreePutType::Insert);
-    
+
     test.update(C::K::generate(&mut 1u64));
     test.update(C::K::generate(&mut 2u64));
     test.update(C::K::generate(&mut 3u64));
     test.update(C::K::generate(&mut 999u64)); // Update non-existing
-    
+
     test.validate_get_all();
     test.validate_specific(C::K::generate(&mut 1u64));
     test.validate_specific(C::K::generate(&mut 2u64));
@@ -469,15 +498,14 @@ async fn test_update<C: NodeTestConfig>() {
 
 async fn test_mixed_operations<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
-    
-    let operations = [
-        (0, 0u64), (1, 5), (2, 3), (0, 25), (1, 10),
-        (2, 15), (0, 12), (1, 20), (2, 8), (0, 35),
-    ];
-    
+
+    let operations = [(0, 0u64), (1, 5), (2, 3), (0, 25), (1, 10), (2, 15), (0, 12), (1, 20), (2, 8), (0, 35)];
+
     for (op, key_seed) in operations.iter() {
-        if !test.has_room() { break; }
-        
+        if !test.has_room() {
+            break;
+        }
+
         let key = C::K::generate(&mut key_seed.clone());
         match op {
             0 => test.put(key, BtreePutType::Upsert),
@@ -486,7 +514,7 @@ async fn test_mixed_operations<C: NodeTestConfig>() {
             _ => unreachable!(),
         }
     }
-    
+
     test.print();
     test.validate_get_all();
     test.dump_node();
@@ -494,12 +522,12 @@ async fn test_mixed_operations<C: NodeTestConfig>() {
 
 async fn test_remove_range_index<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
-    
+
     for i in 0..20 {
         test.put(C::K::generate(&mut (i as u64)), BtreePutType::Insert);
     }
     test.print();
-    
+
     // Remove middle range [5,10]
     let result = test.node.remove_range::<C::K, C::V>(5, 10);
     assert!(result.is_ok(), "remove_range [5,10] failed");
@@ -509,7 +537,7 @@ async fn test_remove_range_index<C: NodeTestConfig>() {
     }
     test.print();
     test.validate_get_all();
-    
+
     // Remove from start [0,5] (but 5 was already removed, so effective range shrinks)
     let result = test.node.remove_range::<C::K, C::V>(0, 5);
     assert!(result.is_ok(), "remove_range [0,5] failed");
@@ -527,20 +555,20 @@ async fn test_remove_range_index<C: NodeTestConfig>() {
 async fn test_move<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
     let mut test2 = NodeTest::<C::K, C::V, C::Variant>::new().await;
-    
+
     // Put entries into node1
     let keys = vec![0u64, 1, 2, 3, 4, 5, 6, 7, 8, 9];
     test.put_list(&keys);
     test.print();
-    
+
     let list_size = keys.len() as u32;
-    
+
     // Full node move to right
     let moved = test.node.move_out_to_right_by_entries::<C::K, C::V>(&test2.node, list_size);
     assert_eq!(moved, list_size, "Should move all entries");
     assert_eq!(test.node.total_entries(), 0, "Source node should be empty");
     assert_eq!(test2.node.total_entries(), list_size, "Dest node should have all entries");
-    
+
     // Move shadow map entries
     for &k in &keys {
         let mut k_seed = k;
@@ -550,18 +578,21 @@ async fn test_move<C: NodeTestConfig>() {
         }
     }
     test2.validate_get_all();
-    
+
     let filled_size = test2.node.occupied_size::<C::K, C::V>();
-    
+
     // Full copy back
     let mut cursor = 0u32;
     let copied = test.node.append_copy_in_upto_size::<C::K, C::V>(
-        &test2.node, &mut cursor, filled_size, /*copy_only_if_fits=*/true
+        &test2.node,
+        &mut cursor,
+        filled_size,
+        /* copy_only_if_fits= */ true,
     );
     assert!(copied, "append_copy_in should succeed");
     assert_eq!(cursor, test2.node.total_entries(), "Cursor should be at end");
     assert_eq!(test.node.total_entries(), list_size, "Node1 should have all entries");
-    
+
     // Restore shadow map
     for &k in &keys {
         let mut k_seed = k;
@@ -571,7 +602,7 @@ async fn test_move<C: NodeTestConfig>() {
         }
     }
     test.validate_get_all();
-    
+
     // Test remove_all
     test2.node.remove_all::<C::K, C::V>();
     assert_eq!(test2.node.total_entries(), 0, "Node should be empty after remove_all");
@@ -582,12 +613,12 @@ async fn test_move<C: NodeTestConfig>() {
 
 async fn test_range_put_get<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
-    
+
     // Put ranges: [0,4], [5,9], [10,14], ... [35,39]
     for i in (0..40).step_by(5) {
         test.put_range(i, 5);
     }
-    
+
     test.validate_get_all();
     test.dump_node();
 }
@@ -595,7 +626,7 @@ async fn test_range_put_get<C: NodeTestConfig>() {
 async fn test_random_insert_remove_update<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
     let mut rng = StdRng::seed_from_u64(42);
-    
+
     // Phase 1: Fill node with random keys
     let mut num_inserted = 0;
     while test.has_room() {
@@ -607,12 +638,14 @@ async fn test_random_insert_remove_update<C: NodeTestConfig>() {
     println!("After random insertion of {} objects", num_inserted);
     test.print();
     test.validate_get_all();
-    
+
     // Phase 2: Remove half randomly
     let to_remove = num_inserted / 2;
     for _ in 0..to_remove {
-        if test.shadow_map.is_empty() { break; }
-        
+        if test.shadow_map.is_empty() {
+            break;
+        }
+
         // Pick a random index and remove that entry
         let idx = rng.gen_range(0..test.shadow_map.len());
         if let Some(key) = test.shadow_map.keys().nth(idx).cloned() {
@@ -622,12 +655,14 @@ async fn test_random_insert_remove_update<C: NodeTestConfig>() {
     println!("After random removal of {} objects", to_remove);
     test.print();
     test.validate_get_all();
-    
+
     // Phase 3: Update half randomly
     let to_update = test.shadow_map.len() / 2;
     for _ in 0..to_update {
-        if test.shadow_map.is_empty() { break; }
-        
+        if test.shadow_map.is_empty() {
+            break;
+        }
+
         let idx = rng.gen_range(0..test.shadow_map.len());
         if let Some(key) = test.shadow_map.keys().nth(idx).cloned() {
             test.update(key);

@@ -1,4 +1,5 @@
 use crate::btree_node::{Node, NodeCore, LockType, InternalLockGuard, NodeOps, PREFIX_COMPRESS_NODE_OPS};
+use crate::btree_kvs::ValueOrOverflow;
 
 const NODE_SIZE: usize = 4096;
 
@@ -32,7 +33,8 @@ async fn test_prefix_compress_debug() {
     
     println!("Before insert: nentries = {}", node.total_entries());
     
-    let result = node.insert::<u32, u64>(0, &key, &value);
+    let val_ref = ValueOrOverflow::Inline(value);
+    let result = node.insert::<u32, u64>(0, &key, &val_ref);
     println!("Insert result: {:?}", result);
     
     if let Err(e) = result {
@@ -52,14 +54,16 @@ async fn test_prefix_compress_debug() {
         // Get all kvs to see what's actually in the node
         let kvs = node.get_all_kvs::<u32, u64>();
         println!("All KVs in node:");
-        for (k, v) in &kvs {
+        for (k, val_ref) in &kvs {
+            let v = val_ref.clone().expect_inline("Unexpected overflow in test");
             println!("  key={}, value={}", k, v);
         }
         
         panic!("Key not found after insert");
     }
     
-    let read_value = node.get_nth_value::<u32, u64>(idx, true);
+    let read_value_ref = node.get_nth_value::<u32, u64>(idx, true);
+    let read_value = read_value_ref.expect_inline("Unexpected overflow in test");
     println!("Retrieved value: {}", read_value);
     
     assert_eq!(read_value, value, "Value mismatch");

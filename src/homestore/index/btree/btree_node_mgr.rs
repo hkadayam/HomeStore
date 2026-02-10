@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ***************************************************************************/
+ ****************************************************************** */
 
 //! Btree Node Manager - Lock upgrade and node management operations
 //!
@@ -67,9 +67,7 @@ where
     //================================================================================
 
     /// Get root node ID (must be called under tree lock)
-    pub(crate) fn root_node_id(&self) -> BNodeId {
-        self.root_node_id.load(std::sync::atomic::Ordering::Relaxed)
-    }
+    pub(crate) fn root_node_id(&self) -> BNodeId { self.root_node_id.load(std::sync::atomic::Ordering::Relaxed) }
 
     /// Read node from storage and lock it (matches C++ read_and_lock_node)
     ///
@@ -87,11 +85,7 @@ where
     ///
     /// # Returns
     /// * Locked Node guard
-    pub async fn read_and_lock_node(
-        &self,
-        id: BNodeId,
-        lock_type: LockType,
-    ) -> Result<Node, BtreeError> {
+    pub async fn read_and_lock_node(&self, id: BNodeId, lock_type: LockType) -> Result<Node, BtreeError> {
         // Get UNLOCKED node from storage (storage layer handles persistence only)
         let node_core = self.storage.read_node(id).await?;
 
@@ -136,9 +130,11 @@ where
             parent.get_edge_value()
         } else {
             debug_assert!(idx < parent.total_entries(), "Index {} >= total_entries {}", idx, parent.total_entries());
-            parent.get_nth_value::<K, BNodeId>(idx, /*copy=*/false)
+            parent
+                .get_nth_value::<K, BNodeId>(idx, /* copy= */ false)
+                .expect_inline("Interior nodeid cannot be overflow references")
         };
-        
+
         self.read_and_lock_node(child_id, lock_type).await
     }
 
@@ -183,8 +179,11 @@ where
     /// 2. Reacquire WRITE locks for both (parent first, then child)
     /// 3. Validate both nodes weren't modified
     /// 4. Return Retry error if either validation fails
-    pub(crate) async fn upgrade_node_locks(&self, parent_guard: Node, child_guard: Node) 
-        -> Result<(Node, Node), BtreeError> {
+    pub(crate) async fn upgrade_node_locks(
+        &self,
+        parent_guard: Node,
+        child_guard: Node,
+    ) -> Result<(Node, Node), BtreeError> {
         let parent_core = parent_guard.core().clone();
         let child_core = child_guard.core().clone();
         let parent_prev_gen = parent_core.node_gen();
@@ -199,8 +198,11 @@ where
         let child_write = child_core.lock.write_lock().await;
 
         // Validate both nodes
-        if parent_core.is_node_deleted() || parent_core.node_gen() != parent_prev_gen
-            || child_core.is_node_deleted() || child_core.node_gen() != child_prev_gen {
+        if parent_core.is_node_deleted()
+            || parent_core.node_gen() != parent_prev_gen
+            || child_core.is_node_deleted()
+            || child_core.node_gen() != child_prev_gen
+        {
             return Err(BtreeError::Retry);
         }
 
@@ -225,35 +227,50 @@ where
 
     /// Initialize a newly created node based on its variant type
     /// Sets node_variant in header, calls NodeOps::init_new_node(), acquires write lock, returns Node
-    pub(crate) async fn init_new_variant_node(&self, node_core: Arc<NodeCore>, node_variant: u8) -> Result<Node, BtreeError> {
+    pub(crate) async fn init_new_variant_node(
+        &self,
+        node_core: Arc<NodeCore>,
+        node_variant: u8,
+    ) -> Result<Node, BtreeError> {
         // Set the node variant in persistent header
         {
             let header = node_core.get_persistent_header_mut();
             header.node_variant = node_variant;
         }
-        
+
         // Dispatch to appropriate NodeOps based on variant for initialization
         match node_variant {
-            0 => { (&SIMPLE_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
-            1 => { (&VAR_KEY_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
-            2 => { (&VAR_VALUE_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
-            3 => { (&VAR_OBJ_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core); }
-            4 => { 
+            0 => {
+                (&SIMPLE_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core);
+            }
+            1 => {
+                (&VAR_KEY_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core);
+            }
+            2 => {
+                (&VAR_VALUE_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core);
+            }
+            3 => {
+                (&VAR_OBJ_NODE_OPS as &dyn NodeOps<u64, u64>).init_new_node(&node_core);
+            }
+            4 => {
                 // Create PrefixCompressNodeOps with configured expected_prefix_size
                 let prefix_ops = super::variant::PrefixCompressNodeOps::new(self.config.expected_prefix_size);
                 (&prefix_ops as &dyn NodeOps<u64, u64>).init_new_node(&node_core);
             }
-            _ => { return Err(BtreeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput,
-                    format!("Unknown node variant: {}", node_variant))));
+            _ => {
+                return Err(BtreeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Unknown node variant: {}", node_variant),
+                )));
             }
         }
-        
+
         // Acquire write lock on initialized node
         let write_guard = node_core.lock.write_lock().await;
-        
+
         // SAFETY: Arc<NodeCore> in Node keeps the lock alive, so 'static transmute is safe
         let write_guard = unsafe { std::mem::transmute(write_guard) };
-        
+
         Ok(Node {
             core: node_core,
             lock_type: LockType::Write,

@@ -38,7 +38,7 @@ pub use prefix_compress_node::PrefixCompressNodeOps;
 
 // Re-export varlen common structures and implementation for convenience
 pub use varlen_node_common::{
-    VarNodeHeader, BtreeObjRecord, 
+    VarNodeHeader, RecordHeader, 
     VarKeyRecord, VarValueRecord, VarObjRecord,
     VarRecordOps, VarNodeOps,
     get_var_header, get_var_header_mut,

@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ******************* */
+ ****************** */
 
 //! Prefix Compression Node Implementation
 //!
@@ -30,7 +30,7 @@
 //! - Logical copy for move operations (natural compression)
 
 use super::super::btree::BtreeError;
-use super::super::btree_kvs::{BtreeKey, BtreeValue};
+use super::super::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow};
 use super::super::btree_node::{NodeCore, NodeOps, PersistentHeader};
 use super::super::detail::btree_req::BtreePutType;
 use smallvec::{SmallVec, smallvec};
@@ -280,7 +280,13 @@ impl SuffixAndValue {
     fn new(offset: u16, suffix_size: u16, value_size: u16) -> Self { Self { offset, suffix_size, value_size } }
 
     /// Write suffix+value to pre-allocated buffer location
-    fn write<V: BtreeValue>(&self, ops: &PrefixCompressNodeOps, core: &NodeCore, suffix: &[u8], val: &V) {
+    fn write<V: BtreeValue>(
+        &self,
+        ops: &PrefixCompressNodeOps,
+        core: &NodeCore,
+        suffix: &[u8],
+        val: &ValueOrOverflow<V>,
+    ) {
         ops.write_bytes_at(core, self.offset as usize, suffix);
         ops.write_value_at(core, self.offset as usize + suffix.len(), val, self.value_size as usize);
     }
@@ -344,22 +350,22 @@ where
         header.init(node_data_size);
     }
 
-    fn get_all_kvs(&self, core: &NodeCore) -> Vec<(K, V)> {
+    fn get_all_kvs(&self, core: &NodeCore) -> Vec<(K, ValueOrOverflow<V>)> {
         let nentries = core.nentries();
-        let mut result: Vec<(K, V)> = Vec::with_capacity(nentries as usize);
+        let mut result = Vec::with_capacity(nentries as usize);
 
         for idx in 0..nentries {
             let key: K = <Self as NodeOps<K, V>>::get_nth_key(self, core, idx, true);
-            let val: V = <Self as NodeOps<K, V>>::get_nth_value(self, core, idx, true);
+            let val = <Self as NodeOps<K, V>>::get_nth_value(self, core, idx, true);
             result.push((key, val));
         }
 
         result
     }
 
-    fn insert(&self, core: &NodeCore, idx: u32, key: &K, val: &V) -> Result<(), BtreeError> {
+    fn insert(&self, core: &NodeCore, idx: u32, key: &K, val: &ValueOrOverflow<V>) -> Result<(), BtreeError> {
         let key_size = key.serialized_size() as usize;
-        let val_size = val.serialized_size() as usize;
+        let val_size = val.serialized_size();
 
         // Serialize key to temp buffer for matching (stack allocation for small keys)
         let mut key_buf: SmallVec<[u8; 128]> = smallvec![0u8; key_size];
@@ -393,15 +399,16 @@ where
         Ok(())
     }
 
-    fn update(&self, core: &NodeCore, idx: u32, val: &V) -> Result<(), BtreeError> {
-        // For simplicity, do remove+insert for updates
+    fn update(&self, core: &NodeCore, idx: u32, val: &ValueOrOverflow<V>) -> Result<(), BtreeError> {
+        // PrefixCompressNode: For simplicity, do remove+insert for updates
+        // (Only fetch key when actually needed for re-insertion)
         let key: K = <Self as NodeOps<K, V>>::get_nth_key(self, core, idx, true);
         <Self as NodeOps<K, V>>::remove(self, core, idx)?;
         <Self as NodeOps<K, V>>::insert(self, core, idx, &key, val)?;
         Ok(())
     }
 
-    fn update_with_key(&self, core: &NodeCore, idx: u32, key: &K, val: &V) -> Result<(), BtreeError> {
+    fn update_with_key(&self, core: &NodeCore, idx: u32, key: &K, val: &ValueOrOverflow<V>) -> Result<(), BtreeError> {
         <Self as NodeOps<K, V>>::remove(self, core, idx)?;
         <Self as NodeOps<K, V>>::insert(self, core, idx, key, val)?;
         Ok(())
@@ -489,7 +496,7 @@ where
         }
     }
 
-    fn get_nth_value(&self, core: &NodeCore, idx: u32, _copy: bool) -> V {
+    fn get_nth_value(&self, core: &NodeCore, idx: u32, _copy: bool) -> ValueOrOverflow<V> {
         let record = Record::from_slot(core, idx);
 
         let value_offset = if record.data.suffix_size == 0 {
@@ -501,7 +508,15 @@ where
         };
 
         let value_data = self.get_data_slice(core, value_offset, record.data.value_size);
-        V::deserialize_from(value_data, true).expect("Value deserialization failed")
+        let value = V::deserialize_from(value_data, true).expect("Value deserialization failed");
+
+        // PrefixCompressNode: always inline (no overflow support yet)
+        ValueOrOverflow::Inline(value)
+    }
+
+    fn is_nth_value_overflow(&self, _core: &NodeCore, _idx: u32) -> bool {
+        // PrefixCompressNode: always inline, no overflow support yet
+        false
     }
 
     fn move_out_to_right_by_entries(&self, core: &NodeCore, other: &NodeCore, num_entries: u32) -> u32 {
@@ -516,10 +531,10 @@ where
         let mut moved = 0;
         for idx in (start_idx..nentries).rev() {
             let key: K = <Self as NodeOps<K, V>>::get_nth_key(self, core, idx, true);
-            let val: V = <Self as NodeOps<K, V>>::get_nth_value(self, core, idx, true);
+            let val_ref = <Self as NodeOps<K, V>>::get_nth_value(self, core, idx, true);
 
             // Insert into other node (will compress naturally)
-            if <Self as NodeOps<K, V>>::insert(self, other, 0, &key, &val).is_ok() {
+            if <Self as NodeOps<K, V>>::insert(self, other, 0, &key, &val_ref).is_ok() {
                 <Self as NodeOps<K, V>>::remove(self, core, idx).ok();
                 moved += 1;
             } else {
@@ -542,16 +557,17 @@ where
 
         loop {
             let key: K = <Self as NodeOps<K, V>>::get_nth_key(self, core, idx, true);
-            let val: V = <Self as NodeOps<K, V>>::get_nth_value(self, core, idx, true);
+            let val_ref = <Self as NodeOps<K, V>>::get_nth_value(self, core, idx, true);
 
-            let record_size = key.serialized_size() + val.serialized_size() + Record::serialized_size() as u32;
+            let val_size = val_ref.serialized_size();
+            let record_size = key.serialized_size() + val_size as u32 + Record::serialized_size() as u32;
 
             if moved_size + record_size > size_to_move && moved > 0 {
                 break;
             }
 
             // Insert into other node
-            if <Self as NodeOps<K, V>>::insert(self, other, 0, &key, &val).is_ok() {
+            if <Self as NodeOps<K, V>>::insert(self, other, 0, &key, &val_ref).is_ok() {
                 <Self as NodeOps<K, V>>::remove(self, core, idx).ok();
                 moved += 1;
                 moved_size += record_size;
@@ -586,9 +602,10 @@ where
 
         while *other_cursor < other_nentries {
             let key: K = <Self as NodeOps<K, V>>::get_nth_key(self, other, *other_cursor, true);
-            let val: V = <Self as NodeOps<K, V>>::get_nth_value(self, other, *other_cursor, true);
+            let val_ref = <Self as NodeOps<K, V>>::get_nth_value(self, other, *other_cursor, true);
 
-            let record_size = key.serialized_size() + val.serialized_size() + Record::serialized_size() as u32;
+            let val_size = val_ref.serialized_size();
+            let record_size = key.serialized_size() + val_size as u32 + Record::serialized_size() as u32;
 
             if copied_size + record_size > upto_size {
                 if copy_only_if_fits && *other_cursor > start_cursor {
@@ -599,7 +616,7 @@ where
                 break;
             }
 
-            if <Self as NodeOps<K, V>>::insert(self, core, core.nentries(), &key, &val).is_err() {
+            if <Self as NodeOps<K, V>>::insert(self, core, core.nentries(), &key, &val_ref).is_err() {
                 break;
             }
 
@@ -757,13 +774,20 @@ impl PrefixCompressNodeOps {
     }
 
     // Insert with shared prefix
-    fn insert_with_prefix<V: BtreeValue>(&self, core: &NodeCore, idx: u32, prefix: Prefix, key_buf: &[u8], val: &V) {
+    fn insert_with_prefix<V: BtreeValue>(
+        &self,
+        core: &NodeCore,
+        idx: u32,
+        prefix: Prefix,
+        key_buf: &[u8],
+        val: &ValueOrOverflow<V>,
+    ) {
         // Increment refcount on shared prefix and write to buffer
         prefix.inc_refcount(core);
 
         // Allocate space only for suffix+value and write suffix+value
         let suffix_key = &key_buf[prefix.size() as usize..];
-        let val_size = val.serialized_size() as usize;
+        let val_size = val.serialized_size();
         let sv_offset = self.alloc_space(core, SuffixAndValue::space_needed(suffix_key.len(), val_size));
 
         let suffix_kv = SuffixAndValue::new(sv_offset, suffix_key.len() as u16, val_size as u16);
@@ -774,9 +798,16 @@ impl PrefixCompressNodeOps {
     }
 
     // Insert with configured split point
-    fn insert_with_split<V: BtreeValue>(&self, core: &NodeCore, idx: u32, key_buf: &[u8], val: &V, split_point: u16) {
+    fn insert_with_split<V: BtreeValue>(
+        &self,
+        core: &NodeCore,
+        idx: u32,
+        key_buf: &[u8],
+        val: &ValueOrOverflow<V>,
+        split_point: u16,
+    ) {
         let split = split_point as usize;
-        let val_size = val.serialized_size() as usize;
+        let val_size = val.serialized_size();
 
         // Allocate and write prefix
         let prefix_offset = self.alloc_space(core, Prefix::space_needed(split));
@@ -795,8 +826,8 @@ impl PrefixCompressNodeOps {
 
     // Insert standalone (no compression)
     // Allocates [refcount][key][value] all contiguous
-    fn insert_standalone<V: BtreeValue>(&self, core: &NodeCore, idx: u32, key_buf: &[u8], val: &V) {
-        let val_size = val.serialized_size() as usize;
+    fn insert_standalone<V: BtreeValue>(&self, core: &NodeCore, idx: u32, key_buf: &[u8], val: &ValueOrOverflow<V>) {
+        let val_size = val.serialized_size();
 
         // Allocate space
         let total_size = Prefix::space_needed(key_buf.len()) + val_size;
@@ -824,14 +855,14 @@ impl PrefixCompressNodeOps {
         }
     }
 
-    // Write value by serializing directly at offset
+    // Write value or overflow reference by serializing directly at offset
     #[inline]
-    fn write_value_at<V: BtreeValue>(&self, core: &NodeCore, offset: usize, val: &V, size: usize) {
+    fn write_value_at<V: BtreeValue>(&self, core: &NodeCore, offset: usize, val: &ValueOrOverflow<V>, size: usize) {
         let base = std::mem::size_of::<PersistentHeader>();
         unsafe {
             let dst = core.phys_buf.as_ptr().add(base + offset) as *mut u8;
             let dst_slice = std::slice::from_raw_parts_mut(dst, size);
-            let _ = val.serialize_to(dst_slice, false);
+            let _ = val.serialize_to(dst_slice);
         }
     }
 
@@ -893,7 +924,7 @@ impl PrefixCompressNodeOps {
     // Compact to reclaim fragmented space
     fn compact(&self, core: &NodeCore) -> Result<(), BtreeError> {
         use std::collections::HashMap;
-        
+
         let nentries = core.nentries();
         if nentries == 0 {
             return Ok(());
@@ -901,13 +932,13 @@ impl PrefixCompressNodeOps {
 
         // Track prefix relocations (old_offset -> new_offset)
         let mut prefix_map: HashMap<u16, u16> = HashMap::new();
-        
+
         // Collect all records and their data
         let mut records_data: Vec<(Record, Option<Vec<u8>>, Vec<u8>)> = Vec::new();
-        
+
         for idx in 0..nentries {
             let record = Record::from_slot(core, idx);
-            
+
             if record.is_standalone() {
                 // Standalone: copy [refcount][key][value]
                 let prefix = Prefix::from_record(record);
@@ -917,7 +948,7 @@ impl PrefixCompressNodeOps {
             } else {
                 // Compressed: handle prefix and suffix+value separately
                 let prefix = Prefix::from_record(record);
-                
+
                 // Copy prefix data if not already tracked
                 let prefix_data = if !prefix_map.contains_key(&prefix.offset()) {
                     let prefix_total = prefix.total_size();
@@ -925,30 +956,30 @@ impl PrefixCompressNodeOps {
                 } else {
                     None
                 };
-                
+
                 // Copy suffix+value
                 let sv_size = record.data.suffix_size + record.data.value_size;
                 let sv_data = self.get_data_slice(core, record.data.kv_offset, sv_size).to_vec();
-                
+
                 records_data.push((record, prefix_data, sv_data));
             }
         }
-        
+
         // Reset tail to start compaction from the end
         let node_data_size = (core.node_size() - std::mem::size_of::<PersistentHeader>() as u32) as u16;
         let header = self.get_header_mut(core);
         header.tail_offset = node_data_size;
         header.hole_size = 0;
-        
+
         // Rewrite all data compactly
         let mut updated_records: Vec<Record> = Vec::new();
-        
+
         for (mut record, prefix_data_opt, sv_data) in records_data {
             if record.is_standalone() {
                 // Allocate and write standalone data
                 let new_offset = self.alloc_space(core, sv_data.len());
                 self.write_bytes_at(core, new_offset as usize, &sv_data);
-                
+
                 record.data.prefix_offset = new_offset;
                 updated_records.push(record);
             } else {
@@ -964,22 +995,22 @@ impl PrefixCompressNodeOps {
                     // Prefix already relocated
                     *prefix_map.get(&old_prefix_offset).unwrap()
                 };
-                
+
                 // Allocate and write suffix+value
                 let new_sv_offset = self.alloc_space(core, sv_data.len());
                 self.write_bytes_at(core, new_sv_offset as usize, &sv_data);
-                
+
                 record.data.prefix_offset = new_prefix_offset;
                 record.data.kv_offset = new_sv_offset;
                 updated_records.push(record);
             }
         }
-        
+
         // Write all updated records back
         for record in updated_records {
             record.write(core);
         }
-        
+
         core.inc_gen();
         Ok(())
     }

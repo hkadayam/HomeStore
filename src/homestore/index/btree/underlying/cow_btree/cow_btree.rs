@@ -993,7 +993,7 @@ impl COWBtree {
     
     /// Get cache statistics
     pub fn cache_stats(&self) -> (usize, usize) {
-        let cached = self.cache.len();
+        let cached = self.node_cache.len();
         let mapped = self.bnodeid_map.read().len();
         (cached, mapped)
     }

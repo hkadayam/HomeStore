@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ************************************************************************ */
+ */
 
 //! Btree Query Operations
 //!
@@ -20,9 +20,16 @@
 //! Corresponds to btree_get_impl.ipp and btree_query_impl.ipp in C++ btree implementation.
 
 use super::super::btree_node::{Node, LockType, EMPTY_BNODEID, PaginationStatus};
-use super::super::btree_kvs::{BtreeKey, BtreeValue};
+use super::super::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow};
 use super::super::btree::{BtreeError, Btree};
-use super::btree_req::{BtreeGetRequest, BtreeGetAnyRequest, BtreeKeyRange, BtreeQueryRequest, QueryResultHandle};
+use super::btree_req::{
+    BtreeGetRequest, BtreeGetAnyRequest, BtreeKeyRange, BtreeQueryRequest, QueryResultHandle, GetFilter,
+    GetFilterDecision,
+};
+
+//================================================================================
+// Helper for multi-get operations
+//================================================================================
 
 impl<K, V> Btree<K, V>
 where
@@ -48,7 +55,7 @@ where
     /// Recursive GET traversal
     async fn get_one_walk<'a>(&self, node: Node, req: &'a BtreeGetRequest<'a, K>) -> Result<Option<V>, BtreeError> {
         if node.is_leaf() {
-            return self.get_one_in_leaf(&node, req.key());
+            return self.get_one_in_leaf(&node, req.key()).await;
         }
 
         // Interior node: find child and traverse
@@ -60,17 +67,139 @@ where
         Box::pin(self.get_one_walk(child, req)).await
     }
 
-    /// Read value from leaf node
-    fn get_one_in_leaf(&self, node: &Node, key: &K) -> Result<Option<V>, BtreeError> {
+    /// Read value from leaf node (with overflow resolution)
+    async fn get_one_in_leaf(&self, node: &Node, key: &K) -> Result<Option<V>, BtreeError> {
         debug_assert!(node.is_leaf());
 
         let (found, idx) = node.find::<K, V>(key);
         if found {
-            let value = node.get_nth_value::<K, V>(idx, /* copy= */ true);
+            let copy = true;
+            let value = node.get_nth_value::<K, V>(idx, copy).resolve(self.storage.as_ref(), copy).await?;
             Ok(Some(value))
         } else {
             Ok(None)
         }
+    }
+
+    //================================================================================
+    // Multi-GET: Extract multiple KVs from leaf with overflow and filtering
+    //================================================================================
+
+    /// Extract multiple key-value pairs from leaf node in range
+    ///
+    /// Forward iteration with:
+    /// - Async overflow value resolution
+    /// - Two-phase filtering (check_key, then check_kv)
+    /// - Pagination status tracking
+    ///
+    /// Returns (count, pagination_status)
+    async fn multi_get_from_leaf(
+        &self,
+        node: &Node,
+        range: &BtreeKeyRange<K>,
+        max_count: u32,
+        out_values: &mut Vec<(K, V)>,
+        filter: Option<&dyn GetFilter<K, V>>,
+        reverse: bool,
+    ) -> (u32, PaginationStatus) {
+        debug_assert!(node.is_leaf(), "multi_get only for leaf nodes");
+
+        let (matched, start_idx, end_idx) = node.match_range::<K, V>(range);
+        if !matched {
+            return (0, PaginationStatus::Completed);
+        }
+
+        let nentries = node.total_entries();
+        let last_idx_in_node = if nentries > 0 { nentries - 1 } else { 0 };
+
+        let mut count = 0u32;
+        let indices: Vec<u32> =
+            if reverse { (start_idx..=end_idx).rev().collect() } else { (start_idx..=end_idx).collect() };
+
+        let mut last_processed_idx = if reverse { end_idx } else { start_idx };
+
+        for idx in indices {
+            if count >= max_count {
+                break;
+            }
+            last_processed_idx = idx;
+            let key = node.get_nth_key::<K, V>(idx, /* copy= */ true);
+
+            let (decision, mut value) = match self.apply_get_filter(node, idx, filter).await {
+                Ok(result) => result,
+                Err(_) => return (count, PaginationStatus::Completed),
+            };
+
+            if decision == GetFilterDecision::Skip {
+                continue;
+            }
+
+            if value.is_none() {
+                let copy = true;
+                match node.get_nth_value::<K, V>(idx, copy).resolve(self.storage.as_ref(), copy).await {
+                    Ok(v) => value = Some(v),
+                    Err(_) => return (count, PaginationStatus::Completed),
+                }
+            }
+            out_values.push((key, value.unwrap()));
+            count += 1;
+        }
+
+        // Determine pagination status
+        let status = if reverse {
+            if start_idx != 0 {
+                if last_processed_idx <= start_idx {
+                    PaginationStatus::Completed
+                } else {
+                    PaginationStatus::Continue
+                }
+            } else {
+                if count > 0 {
+                    let last_key = &out_values.last().unwrap().0;
+                    if last_key <= &range.start_key { PaginationStatus::Completed } else { PaginationStatus::Unknown }
+                } else {
+                    PaginationStatus::Unknown
+                }
+            }
+        } else {
+            if end_idx != last_idx_in_node {
+                if last_processed_idx >= end_idx { PaginationStatus::Completed } else { PaginationStatus::Continue }
+            } else {
+                if count > 0 {
+                    let last_key = &out_values.last().unwrap().0;
+                    if last_key >= &range.end_key { PaginationStatus::Completed } else { PaginationStatus::Unknown }
+                } else {
+                    PaginationStatus::Unknown
+                }
+            }
+        };
+
+        (count, status)
+    }
+
+    async fn apply_get_filter(
+        &self,
+        node: &Node,
+        idx: u32,
+        filter: Option<&dyn GetFilter<K, V>>,
+    ) -> Result<(GetFilterDecision, Option<V>), BtreeError> {
+        if filter.is_none() {
+            return Ok((GetFilterDecision::Include, None));
+        }
+
+        let filter = filter.unwrap();
+        let key = node.get_nth_key::<K, V>(idx, /* copy= */ false);
+
+        if !filter.always_needs_value() {
+            let decision = filter.check_key(&key);
+            if decision != GetFilterDecision::NeedValue {
+                return Ok((decision, None));
+            }
+        }
+
+        let copy = true; // we might use this value for query result, so copy it
+        let old_val = node.get_nth_value::<K, V>(idx, copy).resolve(self.storage.as_ref(), copy).await?;
+        Ok((filter.check_kv(&key, &old_val), Some(old_val)))
     }
 
     //================================================================================
@@ -92,7 +221,12 @@ where
     /// Recursive GET_ANY traversal
     async fn get_any_walk(&self, node: Node, req: &BtreeGetAnyRequest<K>) -> Result<Option<(K, V)>, BtreeError> {
         if node.is_leaf() {
-            return self.get_any_in_leaf(&node, req.range());
+            let result = self.get_any_in_leaf(&node, req.range())?;
+            if let Some((key, value_ref)) = result {
+                let value = value_ref.resolve(self.storage.as_ref(), true).await?;
+                return Ok(Some((key, value)));
+            }
+            return Ok(None);
         }
 
         // Interior node: match range and pick first child
@@ -109,14 +243,18 @@ where
     }
 
     /// Get any key-value from leaf in range
-    fn get_any_in_leaf(&self, node: &Node, range: &BtreeKeyRange<K>) -> Result<Option<(K, V)>, BtreeError> {
+    fn get_any_in_leaf(
+        &self,
+        node: &Node,
+        range: &BtreeKeyRange<K>,
+    ) -> Result<Option<(K, ValueOrOverflow<V>)>, BtreeError> {
         debug_assert!(node.is_leaf());
 
         let (matched, start_idx, _) = node.match_range::<K, V>(range);
         if matched {
             let key = node.get_nth_key::<K, V>(start_idx, /* copy= */ true);
-            let value = node.get_nth_value::<K, V>(start_idx, /* copy= */ true);
-            Ok(Some((key, value)))
+            let value_ref = node.get_nth_value::<K, V>(start_idx, /* copy= */ true);
+            Ok(Some((key, value_ref)))
         } else {
             Ok(None)
         }
@@ -189,13 +327,16 @@ where
             loop {
                 // Call multi_get on current leaf
                 let remaining = req.batch_size().saturating_sub(count);
-                let (cur_count, pagination_status) = my_node.multi_get::<K, V>(
-                    &req.working_range().clone(),
-                    remaining,
-                    out_values,
-                    req.filter_fn(),
-                    req.reverse_order(),
-                );
+                let (cur_count, pagination_status) = self
+                    .multi_get_from_leaf(
+                        &my_node,
+                        req.working_range(),
+                        remaining,
+                        out_values,
+                        req.filter(),
+                        req.reverse_order(),
+                    )
+                    .await;
                 count += cur_count;
 
                 // Handle pagination status
@@ -205,13 +346,7 @@ where
                     }
                     PaginationStatus::Continue => {
                         // Stopped due to max_count - assert and return HasMore
-                        debug_assert_eq!(
-                            count,
-                            req.batch_size(),
-                            "Continue status but count {} != batch_size {}",
-                            count,
-                            req.batch_size()
-                        );
+                        debug_assert_eq!(count, req.batch_size(), "Continue status but count != batch_size");
                         return Ok(/* has_more= */ true);
                     }
                     PaginationStatus::Unknown => {
@@ -310,13 +445,16 @@ where
         if my_node.is_leaf() {
             // Leaf node: use multi_get
             let remaining = req.batch_size().saturating_sub(out_values.len() as u32);
-            let (_cur_count, _pagination_status) = my_node.multi_get::<K, V>(
-                &req.working_range().clone(),
-                remaining,
-                out_values,
-                req.filter_fn(),
-                req.reverse_order(),
-            );
+            let (_cur_count, _pagination_status) = self
+                .multi_get_from_leaf(
+                    &my_node,
+                    req.working_range(),
+                    remaining,
+                    out_values,
+                    req.filter(),
+                    req.reverse_order(),
+                )
+                .await;
 
             drop(my_node);
 

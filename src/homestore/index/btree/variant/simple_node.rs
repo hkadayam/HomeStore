@@ -12,16 +12,16 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ***************************************************************************/
+ ******************************************** */
 
 //! SimpleNode - Fixed-size key/value node variant
-//! 
+//!
 //! Layout: [PersistentHeader][K0][V0][K1][V1]...
 //! All entries are fixed size, stored contiguously.
-//!
 
 use super::super::btree_node::{NodeCore, NodeOps, PersistentHeader};
-use super::super::btree_kvs::{BtreeKey, BtreeValue};
+use super::super::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow};
+use super::super::btree::BtreeError;
 use std::io;
 
 /// Zero-sized type for SimpleNode operations
@@ -38,17 +38,19 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
         header.edge_id = super::super::btree_node::EMPTY_BNODEID;
     }
 
-    fn insert(&self, core: &NodeCore, idx: u32, key: &K, val: &V) -> Result<(), super::super::btree::BtreeError> {
-        use super::super::btree::BtreeError;
+    fn insert(&self, core: &NodeCore, idx: u32, key: &K, val: &ValueOrOverflow<V>) -> Result<(), BtreeError> {
         let nentries = core.get_persistent_header().nentries();
         if (!core.is_leaf() && (idx > nentries)) {
-            core.update_edge(val);
+            let edge_val = val.clone().expect_inline("SimpleNode requires inline values");
+            core.update_edge(&edge_val);
             return Ok(());
         }
 
         if idx > nentries {
-            return Err(BtreeError::Io(io::Error::new(io::ErrorKind::InvalidInput,
-                format!("Insert index {} out of range (nentries={})", idx, nentries))));
+            return Err(BtreeError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Insert index {} out of range (nentries={})", idx, nentries),
+            )));
         }
 
         // Use fixed serialized sizes (SimpleNode requires fixed-size keys/values)
@@ -84,9 +86,9 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
         unsafe {
             let base_ptr = core.phys_buf.as_ptr() as *mut u8;
             let buf = std::slice::from_raw_parts_mut(base_ptr, node_size);
-            
+
             key.serialize_to(&mut buf[k_offset..k_offset + key_size], true).map_err(BtreeError::Io)?;
-            val.serialize_to(&mut buf[v_offset..v_offset + val_size], true).map_err(BtreeError::Io)?;
+            val.serialize_to(&mut buf[v_offset..v_offset + val_size]).map_err(BtreeError::Io)?;
         }
 
         // Update nentries
@@ -95,19 +97,19 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
         Ok(())
     }
 
-    fn update(&self, core: &NodeCore, idx: u32, val: &V) -> Result<(), super::super::btree::BtreeError> {
-        use super::super::btree::BtreeError;
-        use std::io;
-        
+    fn update(&self, core: &NodeCore, idx: u32, val: &ValueOrOverflow<V>) -> Result<(), BtreeError> {
         let nentries = core.get_persistent_header().nentries();
         if idx == nentries {
-            core.update_edge(val);
+            let edge_val = val.clone().expect_inline("SimpleNode requires inline values");
+            core.update_edge(&edge_val);
             return Ok(());
         }
 
         if idx > nentries {
-            return Err(BtreeError::Io(io::Error::new(io::ErrorKind::InvalidInput,
-                format!("Update index {} out of range (nentries={})", idx, nentries))));
+            return Err(BtreeError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Update index {} out of range (nentries={})", idx, nentries),
+            )));
         }
 
         let key_size = K::FIXED_SERIALIZED_SIZE.unwrap() as usize;
@@ -119,28 +121,27 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
         unsafe {
             let base_ptr = core.phys_buf.as_ptr() as *mut u8;
             let buf = std::slice::from_raw_parts_mut(base_ptr, core.node_size() as usize);
-            
-            val.serialize_to(&mut buf[v_offset..v_offset + val_size], true).map_err(BtreeError::Io)?;
+            val.serialize_to(&mut buf[v_offset..v_offset + val_size]).map_err(BtreeError::Io)?;
         }
         core.inc_gen();
         Ok(())
     }
 
-    fn update_with_key(&self, core: &NodeCore, idx: u32, key: &K, val: &V) -> Result<(), super::super::btree::BtreeError> {
-        use super::super::btree::BtreeError;
-        use std::io;
-        
+    fn update_with_key(&self, core: &NodeCore, idx: u32, key: &K, val: &ValueOrOverflow<V>) -> Result<(), BtreeError> {
         let nentries = core.get_persistent_header().nentries();
-        
+
         // Handle edge case (C++ lines 83-85): set_edge for idx == nentries
         if idx == nentries {
-            core.update_edge(val);
+            let edge_val = val.clone().expect_inline("SimpleNode requires inline values");
+            core.update_edge(&edge_val);
             return Ok(());
         }
-        
+
         if idx > nentries {
-            return Err(BtreeError::Io(io::Error::new(io::ErrorKind::InvalidInput,
-                format!("Update index {} out of range (nentries={})", idx, nentries))));
+            return Err(BtreeError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Update index {} out of range (nentries={})", idx, nentries),
+            )));
         }
 
         let key_size = K::FIXED_SERIALIZED_SIZE.unwrap() as usize;
@@ -152,10 +153,11 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
         unsafe {
             let base_ptr = core.phys_buf.as_ptr() as *mut u8;
             let buf = std::slice::from_raw_parts_mut(base_ptr, core.node_size() as usize);
-            
+
             // Update both key and value in place (C++ set_nth_obj)
             key.serialize_to(&mut buf[kv_offset..kv_offset + key_size], true).map_err(BtreeError::Io)?;
-            val.serialize_to(&mut buf[kv_offset + key_size..kv_offset + key_size + val_size], true).map_err(BtreeError::Io)?;
+            val.serialize_to(&mut buf[kv_offset + key_size..kv_offset + key_size + val_size])
+                .map_err(BtreeError::Io)?;
         }
         core.inc_gen();
         Ok(())
@@ -165,24 +167,24 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
         <Self as NodeOps<K, V>>::remove_range(self, core, idx, idx)
     }
 
-    fn remove_range(&self, core: &NodeCore, start_idx: u32, end_idx: u32) -> Result<(), super::super::btree::BtreeError> {
-        use super::super::btree::BtreeError;
-        use std::io;
-        
+    fn remove_range(&self, core: &NodeCore, start_idx: u32, end_idx: u32) -> Result<(), BtreeError> {
         let nentries = core.get_persistent_header().nentries();
         if start_idx > nentries || end_idx > nentries {
-            return Err(BtreeError::Io(io::Error::new(io::ErrorKind::InvalidInput,
-                format!("Remove range [{}, {}] out of range (nentries={})", start_idx, end_idx, nentries))));
+            return Err(BtreeError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Remove range [{}, {}] out of range (nentries={})", start_idx, end_idx, nentries),
+            )));
         }
 
         // Handle edge entry case
         if end_idx == nentries {
             debug_assert!(!core.is_leaf() && core.has_valid_edge(), "Removing edge entry requires valid edge");
-            
+
             // Set the last key/value as edge entry (C++ line 103-104)
             // get_nth_value at (start_idx-1) and set_nth_value at nentries (edge)
             if start_idx > 0 {
-                let new_edge: V = <Self as NodeOps<K, V>>::get_nth_value(self, core, start_idx - 1, false);
+                let edge_val = <Self as NodeOps<K, V>>::get_nth_value(self, core, start_idx - 1, false);
+                let new_edge = edge_val.expect_inline("SimpleNode edge values cannot be overflow");
                 core.update_edge(&new_edge);
             } else {
                 core.invalidate_edge();
@@ -199,7 +201,7 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
             if sz > 0 {
                 let src_offset = data_start + ((end_idx + 1) as usize) * entry_size;
                 let dst_offset = data_start + (start_idx as usize) * entry_size;
-                
+
                 unsafe {
                     let base_ptr = core.phys_buf.as_ptr() as *mut u8;
                     std::ptr::copy(base_ptr.add(src_offset), base_ptr.add(dst_offset), sz);
@@ -218,7 +220,7 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
         core.inc_gen();
     }
 
-    fn get_all_kvs(&self, core: &NodeCore) -> Vec<(K, V)> {
+    fn get_all_kvs(&self, core: &NodeCore) -> Vec<(K, ValueOrOverflow<V>)> {
         let nentries = core.get_persistent_header().nentries();
         let mut result = Vec::with_capacity(nentries as usize);
 
@@ -230,17 +232,17 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
 
         unsafe {
             let buf = std::slice::from_raw_parts(core.phys_buf.as_ptr(), core.node_size() as usize);
-            
+
             for i in 0..nentries {
                 let k_offset = data_start + (i as usize) * entry_size;
                 let v_offset = k_offset + key_size;
 
-                let key = K::deserialize_from(&buf[k_offset..k_offset + key_size], true)
-                    .expect("Key deserialization failed");
+                let key =
+                    K::deserialize_from(&buf[k_offset..k_offset + key_size], true).expect("Key deserialization failed");
                 let val = V::deserialize_from(&buf[v_offset..v_offset + val_size], true)
                     .expect("Value deserialization failed");
 
-                result.push((key, val));
+                result.push((key, ValueOrOverflow::Inline(val))); // SimpleNode: always inline (no overflow support)
             }
         }
 
@@ -256,12 +258,11 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
 
         unsafe {
             let buf = std::slice::from_raw_parts(core.phys_buf.as_ptr(), core.node_size() as usize);
-            K::deserialize_from(&buf[k_offset..k_offset + key_size], copy)
-                .expect("Key deserialization failed")
+            K::deserialize_from(&buf[k_offset..k_offset + key_size], copy).expect("Key deserialization failed")
         }
     }
 
-    fn get_nth_value(&self, core: &NodeCore, idx: u32, copy: bool) -> V {
+    fn get_nth_value(&self, core: &NodeCore, idx: u32, copy: bool) -> ValueOrOverflow<V> {
         let key_size = K::FIXED_SERIALIZED_SIZE.unwrap() as usize;
         let val_size = V::FIXED_SERIALIZED_SIZE.unwrap() as usize;
         let data_start = PersistentHeader::size();
@@ -270,23 +271,28 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
 
         unsafe {
             let buf = std::slice::from_raw_parts(core.phys_buf.as_ptr(), core.node_size() as usize);
-            V::deserialize_from(&buf[v_offset..v_offset + val_size], copy)
-                .expect("Value deserialization failed")
+            let value =
+                V::deserialize_from(&buf[v_offset..v_offset + val_size], copy).expect("Value deserialization failed");
+            ValueOrOverflow::Inline(value) // SimpleNode: always inline (no overflow support)
         }
+    }
+
+    fn is_nth_value_overflow(&self, _core: &NodeCore, _idx: u32) -> bool {
+        false // SimpleNode: always inline, no overflow support
     }
 
     fn move_out_to_right_by_entries(&self, src_core: &NodeCore, dst_core: &NodeCore, mut nentries: u32) -> u32 {
         let src_nentries = src_core.get_persistent_header().nentries();
         let dst_nentries = dst_core.get_persistent_header().nentries();
-        
+
         let entry_size = (K::FIXED_SERIALIZED_SIZE.unwrap() + V::FIXED_SERIALIZED_SIZE.unwrap()) as usize;
         let data_start = PersistentHeader::size();
-        
+
         // Calculate available entries in dst (C++ line 131)
         let dst_available = self.get_available_entries::<K, V>(dst_core);
         nentries = nentries.min(src_nentries).min(dst_available);
         let sz = (nentries as usize) * entry_size;
-        
+
         if sz != 0 {
             // Shift existing entries in dst to make room (C++ line 136)
             let dst_sz = (dst_nentries as usize) * entry_size;
@@ -298,7 +304,7 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
                     std::ptr::copy(dst_ptr.add(src_offset), dst_ptr.add(dst_offset), dst_sz);
                 }
             }
-            
+
             // Copy entries from src to dst (C++ line 137)
             let src_start_idx = src_nentries - nentries;
             unsafe {
@@ -308,20 +314,20 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
                 std::ptr::copy_nonoverlapping(src_ptr.add(src_offset), dst_ptr.add(data_start), sz);
             }
         }
-        
+
         // Update entry counts (C++ lines 140-141)
         dst_core.get_persistent_header_mut().set_nentries(dst_nentries + nentries);
         src_core.get_persistent_header_mut().set_nentries(src_nentries - nentries);
-        
+
         // Handle edge entry for interior nodes (C++ lines 144-147)
         if !src_core.is_leaf() && src_core.get_persistent_header().edge_id != super::super::btree_node::EMPTY_BNODEID {
             dst_core.get_persistent_header_mut().edge_id = src_core.get_persistent_header().edge_id;
             src_core.get_persistent_header_mut().edge_id = super::super::btree_node::EMPTY_BNODEID;
         }
-        
+
         dst_core.inc_gen();
         src_core.inc_gen();
-        
+
         nentries
     }
 
@@ -330,27 +336,33 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
         <Self as NodeOps<K, V>>::move_out_to_right_by_entries(self, src_core, dst_core, size / entry_size)
     }
 
-    fn append_copy_in_upto_size(&self, dst_core: &NodeCore, src_core: &NodeCore, 
-                                other_cursor: &mut u32, upto_size: u32, copy_only_if_fits: bool) -> bool {
+    fn append_copy_in_upto_size(
+        &self,
+        dst_core: &NodeCore,
+        src_core: &NodeCore,
+        other_cursor: &mut u32,
+        upto_size: u32,
+        copy_only_if_fits: bool,
+    ) -> bool {
         let entry_size = (K::FIXED_SERIALIZED_SIZE.unwrap() + V::FIXED_SERIALIZED_SIZE.unwrap()) as usize;
         let data_start = PersistentHeader::size();
-        
+
         let dst_nentries = dst_core.get_persistent_header().nentries();
         let src_nentries = src_core.get_persistent_header().nentries();
-        
+
         // Check if already at capacity (C++ line 169)
         let occupied = dst_nentries as usize * entry_size;
         if occupied >= upto_size as usize {
             return false;
         }
-        
+
         // No entries to copy (C++ line 170)
         if src_nentries == 0 {
             return true;
         }
-        
+
         let room = upto_size as usize - occupied;
-        
+
         if copy_only_if_fits {
             // Check if all remaining entries fit (C++ lines 173-177)
             let remaining_size = ((src_nentries - *other_cursor) as usize) * entry_size;
@@ -358,11 +370,11 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
                 return false;
             }
         }
-        
+
         // Calculate how many entries we can copy (C++ line 182)
         let nentries = (room / entry_size).min((src_nentries - *other_cursor) as usize) as u32;
         let copy_size = (nentries as usize) * entry_size;
-        
+
         // Copy entries (C++ lines 183-184)
         unsafe {
             let src_ptr = src_core.phys_buf.as_ptr();
@@ -371,16 +383,16 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
             let dst_offset = data_start + (dst_nentries as usize) * entry_size;
             std::ptr::copy_nonoverlapping(src_ptr.add(src_offset), dst_ptr.add(dst_offset), copy_size);
         }
-        
+
         *other_cursor += nentries;
         dst_core.get_persistent_header_mut().set_nentries(dst_nentries + nentries);
         dst_core.inc_gen();
-        
+
         // Copy edge if we copied everything (C++ lines 190-192)
         if src_core.has_valid_edge() && *other_cursor == src_nentries {
             dst_core.set_edge(src_core.get_persistent_header().edge_id);
         }
-        
+
         true
     }
 
@@ -391,8 +403,13 @@ impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
         data_size - (nentries * entry_size)
     }
 
-    fn has_room_for_put(&self, core: &NodeCore, put_type: super::super::detail::btree_req::BtreePutType,
-                        _key_size: u32, _value_size: u32) -> bool {
+    fn has_room_for_put(
+        &self,
+        core: &NodeCore,
+        put_type: super::super::detail::btree_req::BtreePutType,
+        _key_size: u32,
+        _value_size: u32,
+    ) -> bool {
         // UPSERT/INSERT need available space, UPDATE doesn't (modifies in-place)
         use super::super::detail::btree_req::BtreePutType;
         match put_type {
@@ -406,8 +423,8 @@ impl SimpleNodeOps {
     /// Helper: Get number of available entries
     fn get_available_entries<K: BtreeKey, V: BtreeValue>(&self, core: &NodeCore) -> u32 {
         let entry_size = (K::FIXED_SERIALIZED_SIZE.unwrap() + V::FIXED_SERIALIZED_SIZE.unwrap()) as u32;
-        let avail_size = (core.node_size() - PersistentHeader::size() as u32) - 
-                         (core.get_persistent_header().nentries() * entry_size);
+        let avail_size = (core.node_size() - PersistentHeader::size() as u32)
+            - (core.get_persistent_header().nentries() * entry_size);
         avail_size / entry_size
     }
 }

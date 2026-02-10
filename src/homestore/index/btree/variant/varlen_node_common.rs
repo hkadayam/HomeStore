@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ************************************************************************* */
+ */
 
 //! Common structures and implementation for variable-length nodes
 //!
@@ -28,10 +28,11 @@
 //! Record structures use full u16 fields (no bit masking) for performance.
 
 use super::super::btree_node::{NodeCore, NodeOps, PersistentHeader, EMPTY_BNODEID};
-use super::super::btree_kvs::{BtreeKey, BtreeValue};
+use super::super::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow};
 use super::super::btree::BtreeError;
 use super::super::detail::btree_req::BtreePutType;
 use std::io;
+use bitfield::bitfield;
 
 //================================================================================
 // Variable-Length Node Header
@@ -57,58 +58,201 @@ impl VarNodeHeader {
 }
 
 //================================================================================
-// Record Structures
+// Record Structures with modular-bitfield for elegant bit manipulation
 //================================================================================
 
-/// Base record for all varlen nodes (2 bytes)
-/// Contains offset to actual key/value data
+/// Common base for all varlen records - just the obj_offset field
+/// Used for generic access to offset without caring about record type
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
-pub struct BtreeObjRecord {
-    pub obj_offset: u16, // Offset to key/value data in node buffer
+pub struct RecordHeader {
+    obj_offset: u16,
 }
 
-/// VarKey record (4 bytes: base 2 + key_len 2)
+impl RecordHeader {
+    #[inline]
+    pub fn obj_offset(&self) -> u16 { unsafe { std::ptr::addr_of!(self.obj_offset).read_unaligned() } }
+
+    #[inline]
+    pub fn set_obj_offset(&mut self, offset: u16) {
+        unsafe {
+            std::ptr::addr_of_mut!(self.obj_offset).write_unaligned(offset);
+        }
+    }
+}
+
+/// VarKey record (4 bytes: obj_offset 2 + key_len 2)
 /// Variable-length key, fixed-size value
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct VarKeyRecord {
-    pub base: BtreeObjRecord,
-    pub key_len: u16,
+    pub header: RecordHeader,
+    key_len: u16,
 }
 
 impl VarKeyRecord {
     #[inline]
     pub const fn size() -> usize { std::mem::size_of::<Self>() }
+
+    #[inline]
+    pub fn from_bytes_mut(bytes: &mut [u8]) -> &mut Self {
+        assert_eq!(bytes.len(), Self::size());
+        unsafe { &mut *(bytes.as_mut_ptr() as *mut Self) }
+    }
+
+    #[inline]
+    pub fn key_len(&self) -> u16 { unsafe { std::ptr::addr_of!(self.key_len).read_unaligned() } }
+
+    #[inline]
+    pub fn set_key_len(&mut self, len: u16) {
+        unsafe {
+            std::ptr::addr_of_mut!(self.key_len).write_unaligned(len);
+        }
+    }
 }
 
-/// VarValue record (4 bytes: base 2 + value_len 2)
-/// Fixed-size key, variable-length value
+/// VarValue record (4 bytes: obj_offset 16 bits + value_len 15 bits + overflow 1 bit)
+/// Fixed-size key, variable-length value with overflow support
+/// overflow flag is packed in MSB of value_len field
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct VarValueRecord {
-    pub base: BtreeObjRecord,
-    pub value_len: u16,
+    pub header: RecordHeader,
+    value_len_packed: u16, // 15 bits len + 1 bit overflow (MSB)
 }
 
 impl VarValueRecord {
+    const OVERFLOW_BIT: u16 = 0x8000;
+    const VALUE_LEN_MASK: u16 = 0x7FFF;
+
     #[inline]
-    pub const fn size() -> usize { std::mem::size_of::<Self>() }
+    pub const fn size() -> usize { 4 }
+
+    #[inline]
+    pub fn from_bytes_mut(bytes: &mut [u8]) -> &mut Self {
+        assert_eq!(bytes.len(), Self::size());
+        unsafe { &mut *(bytes.as_mut_ptr() as *mut Self) }
+    }
+
+    #[inline]
+    pub fn value_len(&self) -> u16 {
+        let packed = unsafe { std::ptr::addr_of!(self.value_len_packed).read_unaligned() };
+        packed & Self::VALUE_LEN_MASK
+    }
+
+    #[inline]
+    pub fn is_overflow(&self) -> bool {
+        let packed = unsafe { std::ptr::addr_of!(self.value_len_packed).read_unaligned() };
+        (packed & Self::OVERFLOW_BIT) != 0
+    }
+
+    #[inline]
+    pub fn obj_offset(&self) -> u16 { self.header.obj_offset() }
+
+    #[inline]
+    pub fn set_obj_offset(&mut self, offset: u16) { self.header.set_obj_offset(offset); }
+
+    #[inline]
+    pub fn set_value_len(&mut self, len: u16) {
+        debug_assert!(len <= Self::VALUE_LEN_MASK, "value_len too large");
+        let packed = unsafe { std::ptr::addr_of!(self.value_len_packed).read_unaligned() };
+        unsafe { std::ptr::addr_of_mut!(self.value_len_packed).write_unaligned((packed & Self::OVERFLOW_BIT) | (len & Self::VALUE_LEN_MASK)); }
+    }
+
+    #[inline]
+    pub fn set_is_overflow(&mut self, is_overflow: bool) {
+        let packed = unsafe { std::ptr::addr_of!(self.value_len_packed).read_unaligned() };
+        let new_packed = if is_overflow {
+            packed | Self::OVERFLOW_BIT
+        } else {
+            packed & !Self::OVERFLOW_BIT
+        };
+        unsafe { std::ptr::addr_of_mut!(self.value_len_packed).write_unaligned(new_packed); }
+    }
+
+    #[inline]
+    pub fn get_value_len_tuple(&self) -> (usize, bool) { (self.value_len() as usize, self.is_overflow()) }
+
+    #[inline]
+    pub fn set_value_len_tuple(&mut self, len: u16, is_overflow: bool) {
+        self.set_value_len(len);
+        self.set_is_overflow(is_overflow);
+    }
 }
 
-/// VarObj record (6 bytes: base 2 + key_len 2 + value_len 2)
-/// Both key and value are variable-length
+/// VarObj record (6 bytes: obj_offset 16 + key_len 16 + value_len 15 + overflow 1 bit)
+/// Variable-length key and value with overflow support
+/// overflow flag is packed in MSB of value_len field
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct VarObjRecord {
-    pub base: BtreeObjRecord,
-    pub key_len: u16,
-    pub value_len: u16,
+    pub header: RecordHeader,
+    key_len: u16,
+    value_len_packed: u16, // 15 bits len + 1 bit overflow (MSB)
 }
 
 impl VarObjRecord {
+    const OVERFLOW_BIT: u16 = 0x8000;
+    const VALUE_LEN_MASK: u16 = 0x7FFF;
+
     #[inline]
-    pub const fn size() -> usize { std::mem::size_of::<Self>() }
+    pub const fn size() -> usize { 6 }
+
+    #[inline]
+    pub fn from_bytes_mut(bytes: &mut [u8]) -> &mut Self {
+        assert_eq!(bytes.len(), Self::size());
+        unsafe { &mut *(bytes.as_mut_ptr() as *mut Self) }
+    }
+
+    #[inline]
+    pub fn key_len(&self) -> u16 { unsafe { std::ptr::addr_of!(self.key_len).read_unaligned() } }
+
+    #[inline]
+    pub fn set_key_len(&mut self, len: u16) {
+        unsafe {
+            std::ptr::addr_of_mut!(self.key_len).write_unaligned(len);
+        }
+    }
+
+    #[inline]
+    pub fn value_len(&self) -> u16 {
+        let packed = unsafe { std::ptr::addr_of!(self.value_len_packed).read_unaligned() };
+        packed & Self::VALUE_LEN_MASK
+    }
+
+    #[inline]
+    pub fn is_overflow(&self) -> bool {
+        let packed = unsafe { std::ptr::addr_of!(self.value_len_packed).read_unaligned() };
+        (packed & Self::OVERFLOW_BIT) != 0
+    }
+
+    #[inline]
+    pub fn set_value_len(&mut self, len: u16) {
+        debug_assert!(len <= Self::VALUE_LEN_MASK, "value_len too large");
+        let packed = unsafe { std::ptr::addr_of!(self.value_len_packed).read_unaligned() };
+        unsafe {
+            std::ptr::addr_of_mut!(self.value_len_packed)
+                .write_unaligned((packed & Self::OVERFLOW_BIT) | (len & Self::VALUE_LEN_MASK));
+        }
+    }
+
+    #[inline]
+    pub fn set_is_overflow(&mut self, is_overflow: bool) {
+        let packed = unsafe { std::ptr::addr_of!(self.value_len_packed).read_unaligned() };
+        let new_packed = if is_overflow { packed | Self::OVERFLOW_BIT } else { packed & !Self::OVERFLOW_BIT };
+        unsafe {
+            std::ptr::addr_of_mut!(self.value_len_packed).write_unaligned(new_packed);
+        }
+    }
+
+    #[inline]
+    pub fn get_value_len_tuple(&self) -> (usize, bool) { (self.value_len() as usize, self.is_overflow()) }
+
+    #[inline]
+    pub fn set_value_len_tuple(&mut self, len: u16, is_overflow: bool) {
+        self.set_value_len(len);
+        self.set_is_overflow(is_overflow);
+    }
 }
 
 //================================================================================
@@ -127,13 +271,17 @@ pub trait VarRecordOps: Send + Sync + 'static {
     fn get_key_size(&self, core: &NodeCore, idx: u32) -> usize;
 
     /// Get value size for entry at index
+    /// This returns the stored size (could be OVERFLOW_REFERENCE_SIZE if overflow)
     fn get_value_size(&self, core: &NodeCore, idx: u32) -> usize;
+
+    /// Check if value at index is overflow
+    fn is_value_overflow(&self, core: &NodeCore, idx: u32) -> bool;
 
     /// Set key length in record metadata
     fn set_key_len(&self, core: &NodeCore, idx: u32, len: usize);
 
-    /// Set value length in record metadata
-    fn set_value_len(&self, core: &NodeCore, idx: u32, len: usize);
+    /// Set value length in record metadata (with overflow bit if needed)
+    fn set_value_len(&self, core: &NodeCore, idx: u32, len: usize, is_overflow: bool);
 
     /// Node variant type (1=VAR_KEY, 2=VAR_VALUE, 3=VAR_OBJECT)
     fn node_variant_type(&self) -> u8;
@@ -180,16 +328,16 @@ pub fn get_record_ptr_mut(core: &NodeCore, idx: u32, record_size: usize) -> *mut
 /// Get pointer to actual key/value data from record pointer
 #[inline]
 pub fn get_obj_ptr(core: &NodeCore, rec_ptr: *const u8) -> *const u8 {
-    let rec = unsafe { &*(rec_ptr as *const BtreeObjRecord) };
-    let offset = rec.obj_offset as usize;
+    let rec = unsafe { &*(rec_ptr as *const RecordHeader) };
+    let offset = rec.obj_offset() as usize;
     unsafe { core.phys_buf.as_ptr().add(PersistentHeader::size() + offset) }
 }
 
 /// Get mutable pointer to actual key/value data from record pointer
 #[inline]
 pub fn get_obj_ptr_mut(core: &NodeCore, rec_ptr: *mut u8) -> *mut u8 {
-    let rec = unsafe { &*(rec_ptr as *const BtreeObjRecord) };
-    let offset = rec.obj_offset as usize;
+    let rec = unsafe { &*(rec_ptr as *const RecordHeader) };
+    let offset = rec.obj_offset() as usize;
     unsafe { core.phys_buf.as_ptr().add(PersistentHeader::size() + offset) as *mut u8 }
 }
 
@@ -263,7 +411,7 @@ where
         var_hdr.init(core.node_size() as u16);
     }
 
-    fn get_all_kvs(&self, core: &NodeCore) -> Vec<(K, V)> {
+    fn get_all_kvs(&self, core: &NodeCore) -> Vec<(K, ValueOrOverflow<V>)> {
         let nentries = core.get_persistent_header().nentries();
         let mut result = Vec::with_capacity(nentries as usize);
 
@@ -275,7 +423,7 @@ where
         result
     }
 
-    fn insert(&self, core: &NodeCore, idx: u32, key: &K, val: &V) -> Result<(), BtreeError> {
+    fn insert(&self, core: &NodeCore, idx: u32, key: &K, val: &ValueOrOverflow<V>) -> Result<(), BtreeError> {
         let nentries = core.get_persistent_header().nentries();
         if idx > nentries {
             return Err(BtreeError::Io(io::Error::new(
@@ -286,7 +434,7 @@ where
 
         // Get sizes for NEW entry being inserted
         let key_size = key.serialized_size() as usize;
-        let val_size = val.serialized_size() as usize;
+        let val_size = val.serialized_size();
         let obj_size = key_size + val_size;
         let rec_size = self.record_ops.record_size();
         let to_insert_size = obj_size + rec_size;
@@ -329,19 +477,19 @@ where
         // Create new record metadata (C++ lines 478-481)
         let rec_ptr = get_record_ptr_mut(core, idx, rec_size);
         unsafe {
-            let base_rec = &mut *(rec_ptr as *mut BtreeObjRecord);
-            base_rec.obj_offset = var_hdr.tail_arena_offset;
+            let base_rec = &mut *(rec_ptr as *mut RecordHeader);
+            base_rec.set_obj_offset(var_hdr.tail_arena_offset);
         }
         self.record_ops.set_key_len(core, idx, key_size);
-        self.record_ops.set_value_len(core, idx, val_size);
+        self.record_ops.set_value_len(core, idx, val_size, val.is_overflow());
 
-        // Serialize key and value directly into tail arena (C++ lines 483-487)
+        // Serialize key and value/reference directly into tail arena (C++ lines 483-487)
         let data_ptr =
             unsafe { core.phys_buf.as_ptr().add(PersistentHeader::size() + var_hdr.tail_arena_offset as usize) }
                 as *mut u8;
         let data_slice = unsafe { std::slice::from_raw_parts_mut(data_ptr, obj_size) };
         key.serialize_to(&mut data_slice[..key_size], true).map_err(BtreeError::Io)?;
-        val.serialize_to(&mut data_slice[key_size..], true).map_err(BtreeError::Io)?;
+        val.serialize_to(&mut data_slice[key_size..]).map_err(BtreeError::Io)?;
 
         // Increment entries and generation (C++ lines 489-491)
         core.get_persistent_header_mut().set_nentries(nentries + 1);
@@ -359,25 +507,26 @@ where
         let rec_ptr = get_record_ptr(core, idx, self.record_ops.record_size());
         let obj_ptr = get_obj_ptr(core, rec_ptr);
         let key_size = self.get_key_size::<K>(core, idx);
-        
+
         let key_slice = unsafe { std::slice::from_raw_parts(obj_ptr, key_size) };
         K::deserialize_from(key_slice, copy).expect("Failed to deserialize key")
     }
 
-    fn get_nth_value(&self, core: &NodeCore, idx: u32, copy: bool) -> V {
+    fn get_nth_value(&self, core: &NodeCore, idx: u32, copy: bool) -> ValueOrOverflow<V> {
         let nentries = core.get_persistent_header().nentries();
-        
+
         // Handle edge case for interior nodes
         if idx == nentries {
             debug_assert!(!core.is_leaf(), "get_nth_value out-of-bound for leaf");
             debug_assert!(core.has_valid_edge(), "get_nth_value out-of-bound, no edge");
-            // For interior nodes, edge value is stored in header
-            return V::deserialize_from(&core.get_persistent_header().edge_id.to_le_bytes(), copy)
+            // For interior nodes, edge value is stored in header (always inline BNodeId)
+            let edge_value = V::deserialize_from(&core.get_persistent_header().edge_id.to_le_bytes(), true)
                 .expect("Failed to deserialize edge value");
+            return ValueOrOverflow::Inline(edge_value);
         }
-        
+
         debug_assert!(idx < nentries, "Index {} out of bounds", idx);
-        
+
         let rec_ptr = get_record_ptr(core, idx, self.record_ops.record_size());
         let obj_ptr = get_obj_ptr(core, rec_ptr);
         let key_size = self.get_key_size::<K>(core, idx);
@@ -385,41 +534,93 @@ where
 
         let val_ptr = unsafe { obj_ptr.add(key_size) };
         let val_slice = unsafe { std::slice::from_raw_parts(val_ptr, val_size) };
-        V::deserialize_from(val_slice, copy).expect("Failed to deserialize value")
+
+        // Deserialize value or overflow reference
+        ValueOrOverflow::deserialize_from(val_slice, self.record_ops.is_value_overflow(core, idx), copy)
+            .expect("Failed to deserialize value")
     }
 
-    fn update(&self, core: &NodeCore, idx: u32, val: &V) -> Result<(), BtreeError> {
+    fn is_nth_value_overflow(&self, core: &NodeCore, idx: u32) -> bool {
+        let nentries = core.get_persistent_header().nentries();
+
+        // Handle edge case for interior nodes - edge is always inline BNodeId
+        if idx == nentries {
+            debug_assert!(!core.is_leaf(), "is_nth_value_overflow out-of-bound for leaf");
+            debug_assert!(core.has_valid_edge(), "is_nth_value_overflow out-of-bound, no edge");
+            return false;
+        }
+
+        debug_assert!(idx < nentries, "Index {} out of bounds", idx);
+        self.record_ops.is_value_overflow(core, idx)
+    }
+
+    fn update(&self, core: &NodeCore, idx: u32, val: &ValueOrOverflow<V>) -> Result<(), BtreeError> {
         let nentries = core.get_persistent_header().nentries();
 
         // Handle edge value update for interior nodes (C++ lines 96-100)
         if idx == nentries {
             debug_assert!(!core.is_leaf(), "Edge update only for interior nodes");
-            core.update_edge(val);
-            core.inc_gen();
+            let edge_val = val.clone().expect_inline("Interior node values (BNodeId) cannot be overflow references");
+            core.update_edge(&edge_val);
             return Ok(());
         }
 
-        // For regular entries, get key and call update_with_key (C++ lines 102-103)
-        let key = NodeOps::<K, V>::get_nth_key(self, core, idx, true);
-        NodeOps::<K, V>::update_with_key(self, core, idx, &key, val)
+        let new_val_size = val.serialized_size();
+        let current_gen = core.node_gen();
+
+        // Get CURRENT sizes
+        let cur_key_size = self.get_key_size::<K>(core, idx);
+        let cur_val_size = self.get_value_size::<V>(core, idx);
+        let cur_obj_size = cur_key_size + cur_val_size;
+        let new_obj_size = cur_key_size + new_val_size;
+
+        // If new value fits in current space, do in-place update
+        if cur_obj_size >= new_obj_size {
+            let rec_ptr = get_record_ptr_mut(core, idx, self.record_ops.record_size());
+            let obj_ptr = get_obj_ptr_mut(core, rec_ptr);
+
+            // Serialize ONLY the value, starting after the key
+            let obj_slice = unsafe { std::slice::from_raw_parts_mut(obj_ptr, cur_obj_size) };
+            val.serialize_to(&mut obj_slice[cur_key_size..cur_key_size + new_val_size])
+                .map_err(BtreeError::Io)?;
+
+            // Update record metadata
+            self.record_ops.set_value_len(core, idx, new_val_size, val.is_overflow());
+
+            // Reclaim freed space if value shrunk
+            if cur_obj_size > new_obj_size {
+                let var_hdr = get_var_header_mut(core);
+                var_hdr.available_space += (cur_obj_size - new_obj_size) as u16;
+            }
+        } else {
+            // Value grew, need to remove and re-insert
+            let key = NodeOps::<K, V>::get_nth_key(self, core, idx, true);
+            NodeOps::<K, V>::remove_range(self, core, idx, idx)?;
+            self.insert(core, idx, &key, val)?;
+        }
+
+        core.set_node_gen(current_gen + 1);
+        Ok(())
     }
 
-    fn update_with_key(&self, core: &NodeCore, idx: u32, key: &K, val: &V) -> Result<(), BtreeError> {
+    fn update_with_key(&self, core: &NodeCore, idx: u32, key: &K, val: &ValueOrOverflow<V>) -> Result<(), BtreeError> {
         let nentries = core.get_persistent_header().nentries();
         debug_assert!(idx <= nentries, "Update index out of bounds");
 
         // Handle edge value update for interior nodes (C++ lines 113-118)
         if idx == nentries {
             debug_assert!(!core.is_leaf(), "Edge update only for interior nodes");
-            core.update_edge(val);
-            core.inc_gen();
+            // For interior nodes, value is always inline BNodeId
+            let edge_val = val.clone().expect_inline("Interior node values (BNodeId) cannot be overflow references");
+            core.update_edge(&edge_val);
             return Ok(());
         }
 
         // Get new key and value sizes from NEW instances being updated
         let new_key_size = key.serialized_size() as usize;
-        let new_val_size = val.serialized_size() as usize;
+        let new_val_size = val.serialized_size();
         let new_obj_size = new_key_size + new_val_size;
+        let current_gen = core.node_gen();
 
         // Get CURRENT object size from EXISTING entry (no instance yet)
         let cur_key_size = self.get_key_size::<K>(core, idx);
@@ -431,26 +632,27 @@ where
             let rec_ptr = get_record_ptr_mut(core, idx, self.record_ops.record_size());
             let obj_ptr = get_obj_ptr_mut(core, rec_ptr);
 
-            // Serialize key and value directly into node buffer (C++ lines 135-137)
+            // Serialize key and value/reference directly into node buffer (C++ lines 135-137)
             let obj_slice = unsafe { std::slice::from_raw_parts_mut(obj_ptr, cur_obj_size) };
             key.serialize_to(&mut obj_slice[..new_key_size], true).map_err(BtreeError::Io)?;
-            val.serialize_to(&mut obj_slice[new_key_size..new_obj_size], true).map_err(BtreeError::Io)?;
+            val.serialize_to(&mut obj_slice[new_key_size..new_key_size + new_val_size])
+                .map_err(BtreeError::Io)?;
 
             // Update record metadata (C++ lines 138-140)
             self.record_ops.set_key_len(core, idx, new_key_size);
-            self.record_ops.set_value_len(core, idx, new_val_size);
+            self.record_ops.set_value_len(core, idx, new_val_size, val.is_overflow());
 
             // Reclaim freed space (C++ line 140)
             let var_hdr = get_var_header_mut(core);
             var_hdr.available_space += (cur_obj_size - new_obj_size) as u16;
-
-            core.inc_gen();
-            Ok(())
         } else {
-            // Size increased, need to remove and re-insert (C++ lines 142-146)
+            // Size increased, need to remove and re-insert
             NodeOps::<K, V>::remove_range(self, core, idx, idx)?;
-            self.insert(core, idx, key, val)
+            self.insert(core, idx, key, val)?;
         }
+
+        core.set_node_gen(current_gen + 1);
+        Ok(())
     }
 
     fn remove_range(&self, core: &NodeCore, start_idx: u32, end_idx: u32) -> Result<(), BtreeError> {
@@ -460,6 +662,7 @@ where
 
         let rec_size = self.record_ops.record_size();
         let num_to_remove = end_idx - start_idx + 1;
+        let current_gen = core.node_gen();
 
         // Special case: removing up to and including the edge (C++ lines 156-166)
         if end_idx == nentries {
@@ -467,12 +670,10 @@ where
 
             // Move the previous value to edge (C++ lines 159-161)
             if start_idx > 0 {
-                // Extract the BNodeId from value (assuming V is u64 for interior nodes)
-                let last_val = NodeOps::<K, V>::get_nth_value(self, core, start_idx - 1, false);
-                let mut edge_buf = [0u8; 8];
-                last_val.serialize_to(&mut edge_buf, true).map_err(BtreeError::Io)?;
-                let edge_id = u64::from_le_bytes(edge_buf);
-                core.set_edge(edge_id);
+                // Extract the BNodeId from value. For interior nodes, value is always inline BNodeId
+                let last_val = NodeOps::<K, V>::get_nth_value(self, core, start_idx - 1, false)
+                    .expect_inline("Interior node values (BNodeId) cannot be overflow references");
+                core.update_edge(&last_val);
             }
 
             // Reclaim space from removed entries (C++ lines 163-165)
@@ -496,7 +697,7 @@ where
                 var_hdr.available_space += (key_size + val_size + rec_size) as u16;
             }
 
-            // Shift remaining records left to fill gap (C++ lines 172-173)
+            // Shift remaining records left to fill gap
             let src = get_record_ptr_mut(core, end_idx + 1, rec_size);
             let dst = get_record_ptr_mut(core, start_idx, rec_size);
             let bytes_to_move = (nentries - end_idx - 1) as usize * rec_size;
@@ -508,7 +709,7 @@ where
             core.get_persistent_header_mut().set_nentries(nentries - num_to_remove);
         }
 
-        core.inc_gen();
+        core.set_node_gen(current_gen + 1);
         Ok(())
     }
 
@@ -552,7 +753,12 @@ where
             let val_slice = unsafe { std::slice::from_raw_parts(obj_ptr.add(key_size), val_size) };
 
             let key = K::deserialize_from(key_slice, false).expect("Failed to deserialize key");
-            let val = V::deserialize_from(val_slice, false).expect("Failed to deserialize value");
+            let val = ValueOrOverflow::<V>::deserialize_from(
+                val_slice,
+                self.record_ops.is_value_overflow(src_core, idx),
+                false,
+            )
+            .expect("Failed to deserialize value");
 
             if self.insert(dst_core, 0, &key, &val).is_err() {
                 break;
@@ -608,21 +814,26 @@ where
             let val_size = self.get_value_size::<V>(src_core, idx);
             let entry_size = (key_size + val_size + rec_size) as u32;
 
-            // Check if we've reached threshold (C++ lines 256-259)
+            // Check if we've reached threshold
             if entry_size > size_to_move {
                 break;
             }
 
-            // Get key and value (C++ lines 253-254)
+            // Get key and value
             let rec_ptr = get_record_ptr(src_core, idx, rec_size);
             let obj_ptr = get_obj_ptr(src_core, rec_ptr);
             let key_slice = unsafe { std::slice::from_raw_parts(obj_ptr, key_size) };
             let val_slice = unsafe { std::slice::from_raw_parts(obj_ptr.add(key_size), val_size) };
 
             let key = K::deserialize_from(key_slice, false).expect("Failed to deserialize key");
-            let val = V::deserialize_from(val_slice, false).expect("Failed to deserialize value");
+            let val = ValueOrOverflow::<V>::deserialize_from(
+                val_slice,
+                self.record_ops.is_value_overflow(src_core, idx),
+                false,
+            )
+            .expect("Failed to deserialize value");
 
-            // Insert at beginning of dst (C++ line 261)
+            // Insert at beginning of dst
             if self.insert(dst_core, 0, &key, &val).is_err() {
                 break;
             }
@@ -740,7 +951,7 @@ impl<R: VarRecordOps> VarNodeOps<R> {
         let mut records: Vec<RecordInfo> = (0..nentries)
             .map(|idx| {
                 let rec_ptr = get_record_ptr(core, idx, rec_size);
-                let obj_offset = unsafe { (*(rec_ptr as *const BtreeObjRecord)).obj_offset };
+                let obj_offset = unsafe { (*(rec_ptr as *const RecordHeader)).obj_offset() };
                 RecordInfo { obj_offset, orig_index: idx }
             })
             .collect();
@@ -771,10 +982,11 @@ impl<R: VarRecordOps> VarNodeOps<R> {
                 // Update record's offset (C++ lines 551-553)
                 let rec_ptr = get_record_ptr_mut(core, idx, rec_size);
                 unsafe {
-                    let base_rec = &mut *(rec_ptr as *mut BtreeObjRecord);
-                    base_rec.obj_offset += sparse_space;
+                    let base_rec = &mut *(rec_ptr as *mut RecordHeader);
+                    let new_offset = base_rec.obj_offset() + sparse_space;
+                    base_rec.set_obj_offset(new_offset);
                 }
-                last_offset = unsafe { (*(rec_ptr as *const BtreeObjRecord)).obj_offset };
+                last_offset = unsafe { (*(rec_ptr as *const RecordHeader)).obj_offset() };
             } else {
                 debug_assert_eq!(sparse_space, 0);
                 last_offset = rec_info.obj_offset;
@@ -829,7 +1041,12 @@ impl<R: VarRecordOps> VarNodeOps<R> {
             let val_slice = unsafe { std::slice::from_raw_parts(obj_ptr.add(key_size), val_size) };
 
             let key = K::deserialize_from(key_slice, false).expect("Failed to deserialize key");
-            let val = V::deserialize_from(val_slice, false).expect("Failed to deserialize value");
+            let val = ValueOrOverflow::<V>::deserialize_from(
+                val_slice,
+                self.record_ops.is_value_overflow(src_core, idx),
+                false,
+            )
+            .expect("Failed to deserialize value");
 
             // Insert at end of dst (C++ line 328)
             let dst_nentries = dst_core.get_persistent_header().nentries();

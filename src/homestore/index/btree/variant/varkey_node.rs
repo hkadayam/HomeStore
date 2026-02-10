@@ -40,7 +40,9 @@ impl VarRecordOps for VarKeyRecordOps {
     #[inline]
     fn get_key_size(&self, core: &NodeCore, idx: u32) -> usize {
         let ptr = get_record_ptr(core, idx, self.record_size());
-        unsafe { (*(ptr as *const VarKeyRecord)).key_len as usize }
+        let slice = unsafe { std::slice::from_raw_parts(ptr, self.record_size()) };
+        let record = unsafe { &*(slice.as_ptr() as *const VarKeyRecord) };
+        record.key_len() as usize
     }
 
     #[inline]
@@ -52,15 +54,21 @@ impl VarRecordOps for VarKeyRecordOps {
     }
 
     #[inline]
-    fn set_key_len(&self, core: &NodeCore, idx: u32, len: usize) {
-        let ptr = get_record_ptr_mut(core, idx, self.record_size());
-        unsafe {
-            (*(ptr as *mut VarKeyRecord)).key_len = len as u16;
-        }
+    fn is_value_overflow(&self, _core: &NodeCore, _idx: u32) -> bool {
+        // VarKey has FIXED values, overflow not supported
+        false
     }
 
     #[inline]
-    fn set_value_len(&self, _core: &NodeCore, _idx: u32, _len: usize) {
+    fn set_key_len(&self, core: &NodeCore, idx: u32, len: usize) {
+        let ptr = get_record_ptr_mut(core, idx, self.record_size());
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.record_size()) };
+        let record = VarKeyRecord::from_bytes_mut(slice);
+        record.set_key_len(len as u16);
+    }
+
+    #[inline]
+    fn set_value_len(&self, _core: &NodeCore, _idx: u32, _len: usize, _is_overflow: bool) {
         // No-op for VarKey (value size is fixed, part of V type)
         // Value length is not stored in record metadata
     }

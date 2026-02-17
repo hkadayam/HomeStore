@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ********** */
+ */
 
 //! B-tree Node Implementation
 //!
@@ -953,7 +953,7 @@ impl Node {
     /// * `copy_only_if_fits` - If true, only copy if all entries fit; if false, copy what fits
     ///
     /// # Returns
-    /// * `true` if copy succeeded, `false` if no room or doesn't fit
+    /// * `true` if source node has more entries to copy, `false` if everything has been copied
     pub fn append_copy_in_upto_size<K: BtreeKey + 'static, V: BtreeValue + 'static>(
         &self,
         src_node: &Node,
@@ -1070,19 +1070,21 @@ impl Node {
 
     /// Dump node contents as string for debugging
     pub fn to_string<K: BtreeKey + 'static, V: BtreeValue + 'static>(&self) -> String {
-        let mut s = format!(
-            "Node[id={} leaf={} lvl={} entries={}",
-            self.node_id(),
-            self.is_leaf(),
-            self.level(),
-            self.total_entries()
-        );
+        if self.is_leaf() {
+            self.to_string_internal::<K, V>()
+        } else {
+            self.to_string_internal::<K, BNodeId>()
+        }
+    }
+
+    fn to_string_internal<K: BtreeKey + 'static, V: BtreeValue + 'static>(&self) -> String {
+        let mut s = format!("Node[id={} leaf={} lvl={} entries={}", 
+        self.node_id(), self.is_leaf(), self.level(), self.total_entries());
         if !self.is_leaf() {
             let edge = self.get_edge_value();
-            s.push_str(&format!(
-                " edge={}",
-                if edge == EMPTY_BNODEID { "EMPTY".to_string() } else { edge.to_string() }
-            ));
+            s.push_str(
+                &format!(" edge={}", if edge == EMPTY_BNODEID { "EMPTY".to_string() } else { edge.to_string() }),
+            );
         }
         s.push_str("] Keys: ");
         for i in 0..self.total_entries() {

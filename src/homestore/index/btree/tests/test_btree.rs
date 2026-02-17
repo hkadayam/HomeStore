@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ****************************************************** */
+ *********************************************** */
 
 //! Btree Integration Tests
 //!
@@ -257,10 +257,7 @@ impl<Variant: TestBtreeVariant> TestBtree<Variant> {
         // When multiple reactors write trace logs concurrently, stdout blocks causing hangs
         // Uncomment for single-threaded debugging:
         let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive("homestore::index::btree=trace".parse().unwrap()),
-            )
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_target(true)
             .try_init();
 

@@ -1,3 +1,4 @@
+use triomphe::Arc as TArc;
 use crate::btree_node::{Node, NodeCore, LockType, InternalLockGuard, NodeOps, PREFIX_COMPRESS_NODE_OPS};
 use crate::btree_kvs::ValueOrOverflow;
 
@@ -16,7 +17,7 @@ async fn test_prefix_compress_debug() {
     // Initialize node with explicit type parameters
     <dyn NodeOps<u32, u64>>::init_new_node(&PREFIX_COMPRESS_NODE_OPS, &node_core);
     
-    let node_core = std::sync::Arc::new(node_core);
+    let node_core = TArc::new(node_core);
     let node = unsafe {
         let write_guard = node_core.lock.write_lock().await;
         let write_guard = std::mem::transmute(write_guard);

@@ -201,6 +201,7 @@ struct ChainBlkId {
 }
 
 impl ChainBlkId {
+    #[allow(dead_code)]
     fn is_valid(&self) -> bool { self.nblks != 0 }
 }
 

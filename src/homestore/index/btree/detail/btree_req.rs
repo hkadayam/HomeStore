@@ -73,7 +73,7 @@ pub trait PutFilter<K: BtreeKey, V: BtreeValue>: Send + Sync {
 
     /// Phase 1: Check with key + new_value only (no old value)
     /// Return Keep/Replace/Remove to decide immediately, or NeedOldValue to proceed to phase 2
-    fn check_key(&self, key: &K) -> PutFilterDecision { PutFilterDecision::NeedOldValue }
+    fn check_key(&self, _key: &K) -> PutFilterDecision { PutFilterDecision::NeedOldValue }
 
     /// Phase 2: Check with old value resolved
     /// MUST NOT return NeedOldValue (will panic)
@@ -88,7 +88,7 @@ pub trait GetFilter<K: BtreeKey, V: BtreeValue>: Send + Sync {
 
     /// Phase 1: Check key only
     /// Return Skip/Include to decide immediately, or NeedValue to proceed to phase 2
-    fn check_key(&self, key: &K) -> GetFilterDecision { GetFilterDecision::NeedValue }
+    fn check_key(&self, _key: &K) -> GetFilterDecision { GetFilterDecision::NeedValue }
 
     /// Phase 2: Check with value resolved
     /// MUST NOT return NeedValue (will panic)
@@ -101,7 +101,7 @@ pub trait RemoveFilter<K: BtreeKey, V: BtreeValue>: Send + Sync {
     fn always_needs_value(&self) -> bool { false }
 
     /// Phase 1: Check key only
-    fn check_key(&self, key: &K) -> RemoveFilterDecision { RemoveFilterDecision::NeedValue }
+    fn check_key(&self, _key: &K) -> RemoveFilterDecision { RemoveFilterDecision::NeedValue }
 
     /// Phase 2: Check with value resolved
     /// MUST NOT return NeedValue (will panic)
@@ -516,7 +516,7 @@ unsafe impl<'a, K: BtreeKey + Send, V: BtreeValue + Send> Send for QueryResultHa
 
 impl<'a, K: BtreeKey, V: BtreeValue> QueryResultHandle<'a, K, V> {
     /// Create new result handle
-    pub(crate) fn new(results: Vec<(K, V)>, request: BtreeQueryRequest<'a, K, V>, has_more: bool) -> Self {
+    pub fn new(results: Vec<(K, V)>, request: BtreeQueryRequest<'a, K, V>, has_more: bool) -> Self {
         Self { results, request, has_more }
     }
 
@@ -526,7 +526,7 @@ impl<'a, K: BtreeKey, V: BtreeValue> QueryResultHandle<'a, K, V> {
     pub fn has_more(&self) -> bool { self.has_more }
 
     /// Get the internal request (for query_next() continuation)
-    pub(crate) fn request(self) -> BtreeQueryRequest<'a, K, V> { self.request }
+    pub fn request(self) -> BtreeQueryRequest<'a, K, V> { self.request }
 }
 
 #[cfg(test)]

@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 /// Shadow map for tracking expected state during testing
 pub struct ShadowMap<K: Ord, V> {
     map: BTreeMap<K, V>,
+    #[allow(dead_code)]
     max_entries: u32,
 }
 
@@ -57,6 +58,7 @@ impl<K: Ord + Clone, V: Clone> ShadowMap<K, V> {
         self.map.is_empty()
     }
     
+    #[allow(dead_code)]
     pub fn keys(&self) -> impl Iterator<Item = &K> {
         self.map.keys()
     }

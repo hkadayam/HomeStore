@@ -29,10 +29,9 @@
 
 use super::super::btree_node::{NodeCore, NodeOps, PersistentHeader, EMPTY_BNODEID};
 use super::super::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow};
-use super::super::btree::BtreeError;
+use super::super::btree_types::BtreeError;
 use super::super::detail::btree_req::BtreePutType;
 use std::io;
-use bitfield::bitfield;
 
 //================================================================================
 // Variable-Length Node Header
@@ -49,11 +48,11 @@ pub struct VarNodeHeader {
 
 impl VarNodeHeader {
     #[inline]
-    pub const fn size() -> usize { std::mem::size_of::<Self>() }
+    pub const fn size() -> u16 { std::mem::size_of::<Self>() as u16 }
 
-    pub fn init(&mut self, node_data_size: u16) {
-        self.tail_arena_offset = node_data_size;
-        self.available_space = node_data_size - Self::size() as u16;
+    pub fn init(&mut self, node_size: u16) {
+        self.tail_arena_offset = node_size;
+        self.available_space = node_size - PersistentHeader::size() - Self::size();
     }
 }
 
@@ -156,18 +155,19 @@ impl VarValueRecord {
     pub fn set_value_len(&mut self, len: u16) {
         debug_assert!(len <= Self::VALUE_LEN_MASK, "value_len too large");
         let packed = unsafe { std::ptr::addr_of!(self.value_len_packed).read_unaligned() };
-        unsafe { std::ptr::addr_of_mut!(self.value_len_packed).write_unaligned((packed & Self::OVERFLOW_BIT) | (len & Self::VALUE_LEN_MASK)); }
+        unsafe {
+            std::ptr::addr_of_mut!(self.value_len_packed)
+                .write_unaligned((packed & Self::OVERFLOW_BIT) | (len & Self::VALUE_LEN_MASK));
+        }
     }
 
     #[inline]
     pub fn set_is_overflow(&mut self, is_overflow: bool) {
         let packed = unsafe { std::ptr::addr_of!(self.value_len_packed).read_unaligned() };
-        let new_packed = if is_overflow {
-            packed | Self::OVERFLOW_BIT
-        } else {
-            packed & !Self::OVERFLOW_BIT
-        };
-        unsafe { std::ptr::addr_of_mut!(self.value_len_packed).write_unaligned(new_packed); }
+        let new_packed = if is_overflow { packed | Self::OVERFLOW_BIT } else { packed & !Self::OVERFLOW_BIT };
+        unsafe {
+            std::ptr::addr_of_mut!(self.value_len_packed).write_unaligned(new_packed);
+        }
     }
 
     #[inline]
@@ -296,7 +296,7 @@ pub trait VarRecordOps: Send + Sync + 'static {
 pub fn get_var_header(core: &NodeCore) -> &VarNodeHeader {
     let offset = PersistentHeader::size();
     unsafe {
-        let ptr = core.phys_buf.as_ptr().add(offset) as *const VarNodeHeader;
+        let ptr = core.phys_buf.as_ref().as_ptr().add(offset as usize) as *const VarNodeHeader;
         &*ptr
     }
 }
@@ -306,7 +306,7 @@ pub fn get_var_header(core: &NodeCore) -> &VarNodeHeader {
 pub fn get_var_header_mut(core: &NodeCore) -> &mut VarNodeHeader {
     let offset = PersistentHeader::size();
     unsafe {
-        let ptr = core.phys_buf.as_ptr().add(offset) as *mut VarNodeHeader;
+        let ptr = core.phys_buf.as_ref().as_ptr().add(offset as usize) as *mut VarNodeHeader;
         &mut *ptr
     }
 }
@@ -314,15 +314,15 @@ pub fn get_var_header_mut(core: &NodeCore) -> &mut VarNodeHeader {
 /// Get pointer to record at index
 #[inline]
 pub fn get_record_ptr(core: &NodeCore, idx: u32, record_size: usize) -> *const u8 {
-    let offset = PersistentHeader::size() + VarNodeHeader::size() + (idx as usize * record_size);
-    unsafe { core.phys_buf.as_ptr().add(offset) }
+    let offset = PersistentHeader::size() + VarNodeHeader::size() + (idx as u16 * record_size as u16);
+    unsafe { core.phys_buf.as_ref().as_ptr().add(offset as usize) }
 }
 
 /// Get mutable pointer to record at index
 #[inline]
 pub fn get_record_ptr_mut(core: &NodeCore, idx: u32, record_size: usize) -> *mut u8 {
-    let offset = PersistentHeader::size() + VarNodeHeader::size() + (idx as usize * record_size);
-    unsafe { core.phys_buf.as_ptr().add(offset) as *mut u8 }
+    let offset = PersistentHeader::size() + VarNodeHeader::size() + (idx as u16 * record_size as u16);
+    unsafe { core.phys_buf.as_ref().as_ptr().add(offset as usize) as *mut u8 }
 }
 
 /// Get pointer to actual key/value data from record pointer
@@ -330,7 +330,7 @@ pub fn get_record_ptr_mut(core: &NodeCore, idx: u32, record_size: usize) -> *mut
 pub fn get_obj_ptr(core: &NodeCore, rec_ptr: *const u8) -> *const u8 {
     let rec = unsafe { &*(rec_ptr as *const RecordHeader) };
     let offset = rec.obj_offset() as usize;
-    unsafe { core.phys_buf.as_ptr().add(PersistentHeader::size() + offset) }
+    unsafe { core.phys_buf.as_ref().as_ptr().add(offset) }
 }
 
 /// Get mutable pointer to actual key/value data from record pointer
@@ -338,19 +338,19 @@ pub fn get_obj_ptr(core: &NodeCore, rec_ptr: *const u8) -> *const u8 {
 pub fn get_obj_ptr_mut(core: &NodeCore, rec_ptr: *mut u8) -> *mut u8 {
     let rec = unsafe { &*(rec_ptr as *const RecordHeader) };
     let offset = rec.obj_offset() as usize;
-    unsafe { core.phys_buf.as_ptr().add(PersistentHeader::size() + offset) as *mut u8 }
+    unsafe { core.phys_buf.as_ref().as_ptr().add(offset) as *mut u8 }
 }
 
 /// Get free space in tail arena (contiguous space for new data)
 pub fn get_arena_free_space(core: &NodeCore, rec_size: usize) -> usize {
     let var_hdr = get_var_header(core);
     let nentries = core.get_persistent_header().nentries();
-    let records_end = VarNodeHeader::size() + (nentries as usize * rec_size);
+    let records_end: u16 = PersistentHeader::size() + VarNodeHeader::size() + (nentries as u16 * rec_size as u16);
 
-    if var_hdr.tail_arena_offset as usize <= records_end {
+    if var_hdr.tail_arena_offset <= records_end {
         0
     } else {
-        var_hdr.tail_arena_offset as usize - records_end
+        (var_hdr.tail_arena_offset - records_end) as usize
     }
 }
 
@@ -484,9 +484,7 @@ where
         self.record_ops.set_value_len(core, idx, val_size, val.is_overflow());
 
         // Serialize key and value/reference directly into tail arena (C++ lines 483-487)
-        let data_ptr =
-            unsafe { core.phys_buf.as_ptr().add(PersistentHeader::size() + var_hdr.tail_arena_offset as usize) }
-                as *mut u8;
+        let data_ptr = unsafe { core.phys_buf.as_ref().as_ptr().add(var_hdr.tail_arena_offset as usize) } as *mut u8;
         let data_slice = unsafe { std::slice::from_raw_parts_mut(data_ptr, obj_size) };
         key.serialize_to(&mut data_slice[..key_size], true).map_err(BtreeError::Io)?;
         val.serialize_to(&mut data_slice[key_size..]).map_err(BtreeError::Io)?;
@@ -721,7 +719,7 @@ where
         let var_hdr = get_var_header_mut(core);
         let node_size = core.node_size() as u16;
         var_hdr.tail_arena_offset = node_size;
-        var_hdr.available_space = node_size - VarNodeHeader::size() as u16;
+        var_hdr.available_space = node_size - PersistentHeader::size() - VarNodeHeader::size();
     }
 
     fn move_out_to_right_by_entries(&self, src_core: &NodeCore, dst_core: &NodeCore, mut nentries: u32) -> u32 {
@@ -938,6 +936,7 @@ impl<R: VarRecordOps> VarNodeOps<R> {
             let node_size = core.phys_buf.len();
             let var_hdr = get_var_header_mut(core);
             var_hdr.tail_arena_offset = node_size as u16;
+            var_hdr.available_space = node_size as u16 - PersistentHeader::size() as u16 - VarNodeHeader::size() as u16;
             return Ok(());
         }
 
@@ -1003,9 +1002,9 @@ impl<R: VarRecordOps> VarNodeOps<R> {
     fn get_arena_free_space(core: &NodeCore, rec_size: usize) -> usize {
         let var_hdr = get_var_header(core);
         let nentries = core.get_persistent_header().nentries();
-        let tail = var_hdr.tail_arena_offset as usize;
-        let records_end = size_of::<VarNodeHeader>() + (nentries as usize * rec_size);
-        tail.saturating_sub(records_end)
+        let tail = var_hdr.tail_arena_offset;
+        let records_end = PersistentHeader::size() + VarNodeHeader::size() + (nentries as u16 * rec_size as u16);
+        tail.saturating_sub(records_end) as usize
     }
 
     /// Copy entries by size from src to dst (C++ lines 315-341)

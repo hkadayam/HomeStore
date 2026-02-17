@@ -21,7 +21,8 @@
 
 use super::super::btree_node::{Node, LockType, EMPTY_BNODEID, PaginationStatus};
 use super::super::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow};
-use super::super::btree::{BtreeError, Btree};
+use super::super::btree::Btree;
+use super::super::btree_types::BtreeError;
 use super::btree_req::{
     BtreeGetRequest, BtreeGetAnyRequest, BtreeKeyRange, BtreeQueryRequest, QueryResultHandle, GetFilter,
     GetFilterDecision,
@@ -467,7 +468,7 @@ where
         }
 
         // Interior node: find child range (C++ lines 157-168)
-        let (_start_found, mut start_idx) = my_node.find::<K, V>(&req.first_key());
+        let (_start_found, start_idx) = my_node.find::<K, V>(&req.first_key());
         let (_end_found, mut end_idx) = my_node.find::<K, V>(&req.working_range().end_key);
 
         let nentries = my_node.total_entries();

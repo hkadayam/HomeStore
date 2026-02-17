@@ -5,17 +5,17 @@
 
 use std::sync::Arc;
 use homestore::index::btree::{
-    btree::{Btree, BtreeConfig},
+    btree::Btree,
+    BtreeConfig,  // Re-exported from btree_types at btree module level
     btree_kvs::{BtreeKey, BtreeValue},
     underlying::mem::MemBtree,
 };
 use crate::{
-    key_value_spec::{TableSpec, KeyType, ValueSpec, PrefixType},
+    key_value_spec::TableSpec,
     error::{MemDbError, Result},
 };
 
 /// Data storage for DbKey - either owned or borrowed
-#[derive(Clone)]
 enum DbKeyData {
     Owned(Vec<u8>),                 // User input or copy=true deserialization
     Borrowed(*const u8, usize),     // Temp borrowed during search (copy=false)
@@ -34,7 +34,6 @@ unsafe impl Sync for DbKeyData {}
 /// Zero-copy design:
 /// - User passes Vec<u8> → Owned variant (moved, not copied)
 /// - Btree search → Borrowed variant (zero-copy temp references)
-#[derive(Clone)]
 pub struct DbKey {
     data: DbKeyData,
     pub(crate) fixed_size: Option<usize>, // None = variable, Some(n) = fixed n bytes
@@ -80,6 +79,16 @@ impl DbKey {
                     std::slice::from_raw_parts(ptr, len).to_vec()
                 }
             }
+        }
+    }
+}
+
+impl Clone for DbKey {
+    fn clone(&self) -> Self {
+        // Always clone as Owned to avoid dangling pointers from Borrowed variant
+        Self {
+            data: DbKeyData::Owned(self.as_bytes().to_vec()),
+            fixed_size: self.fixed_size,
         }
     }
 }
@@ -154,7 +163,6 @@ impl BtreeKey for DbKey {
 }
 
 /// Data storage for DbValue - either owned or borrowed
-#[derive(Clone)]
 enum DbValueData {
     Owned(Vec<u8>),                 // User input or copy=true deserialization
     Borrowed(*const u8, usize),     // Temp borrowed during search (copy=false)
@@ -173,7 +181,6 @@ unsafe impl Sync for DbValueData {}
 /// Zero-copy design:
 /// - User passes Vec<u8> → Owned variant (moved, not copied)
 /// - Btree search → Borrowed variant (zero-copy temp references)
-#[derive(Clone)]
 pub struct DbValue {
     data: DbValueData,
     pub(crate) fixed_size: Option<usize>, // None = variable, Some(n) = fixed n bytes
@@ -219,6 +226,16 @@ impl DbValue {
                     std::slice::from_raw_parts(ptr, len).to_vec()
                 }
             }
+        }
+    }
+}
+
+impl Clone for DbValue {
+    fn clone(&self) -> Self {
+        // Always clone as Owned to avoid dangling pointers from Borrowed variant
+        Self {
+            data: DbValueData::Owned(self.as_bytes().to_vec()),
+            fixed_size: self.fixed_size,
         }
     }
 }
@@ -310,8 +327,8 @@ impl TableIndex {
         
         // Create btree config
         let mut config = BtreeConfig::new(4096, name.clone());
-        config.leaf_node_type = node_variant;
-        config.int_node_type = node_variant;
+        config.leaf_node_variant = node_variant;
+        config.int_node_variant = node_variant;
         
         // Set expected_prefix_size if using prefix compression with fixed size
         if let crate::key_value_spec::PrefixType::Prefixable(Some(prefix_size)) = spec.key_spec.prefix_type {
@@ -463,19 +480,23 @@ impl TableIndex {
         // Validate keys
         self.spec.key_spec.validate_key(&start_key)?;
         self.spec.key_spec.validate_key(&end_key)?;
-        
+
+        // Store keys before moving them
+        let start_key_copy = start_key.clone();
+        let end_key_copy = end_key.clone();
+
         // Create range query with spec info (moved)
         let start = DbKey::new(start_key, &self.spec.key_spec);
         let end = DbKey::new(end_key, &self.spec.key_spec);
         let range = BtreeKeyRange::new(start, true, end, false);
-        
+
         let btree = Arc::clone(&self.btree);
         let handle = btree
             .query(range, batch_size, None)
             .await
             .map_err(|e| MemDbError::BtreeError(format!("{:?}", e)))?;
-        
-        Ok(crate::iterator::RangeIterator::new(btree, handle))
+
+        Ok(crate::iterator::RangeIterator::new(btree, handle, start_key_copy, end_key_copy, batch_size, false, self.spec.key_spec.clone()))
     }
     
     /// Query a range in reverse order
@@ -496,19 +517,23 @@ impl TableIndex {
         // Validate keys
         self.spec.key_spec.validate_key(&start_key)?;
         self.spec.key_spec.validate_key(&end_key)?;
-        
+
+        // Store keys before moving them
+        let start_key_copy = start_key.clone();
+        let end_key_copy = end_key.clone();
+
         // Create reverse range query with spec info (moved)
         let start = DbKey::new(start_key, &self.spec.key_spec);
         let end = DbKey::new(end_key, &self.spec.key_spec);
         let range = BtreeKeyRange::new(start, true, end, false);
-        
+
         let btree = Arc::clone(&self.btree);
         let handle = btree
             .query_traversal(range, batch_size, None, true) // reverse=true
             .await
             .map_err(|e| MemDbError::BtreeError(format!("{:?}", e)))?;
-        
-        Ok(crate::iterator::RangeIterator::new(btree, handle))
+
+        Ok(crate::iterator::RangeIterator::new(btree, handle, start_key_copy, end_key_copy, batch_size, true, self.spec.key_spec.clone()))
     }
     
     /// Get any key-value pair in the given range

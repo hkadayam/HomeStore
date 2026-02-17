@@ -12,12 +12,12 @@
 //! ## Usage
 //! ```ignore
 //! let (result_tx, result_rx) = source_reactor.create_result_handle();
-//! 
+//!
 //! target_reactor.spawn_future(Box::pin(async move {
 //!     let result = do_work().await;
 //!     result_tx.send_result(result).await.unwrap();
 //! }));
-//! 
+//!
 //! let result: MyType = result_rx.wait().await;
 //! ```
 
@@ -46,7 +46,7 @@ struct Message {
 ///
 /// Flow:
 /// 1. Calling reactor: allocates message from ITS OWN channel
-/// 2. Calling reactor: sends ResultSender to target reactor  
+/// 2. Calling reactor: sends ResultSender to target reactor
 /// 3. Target reactor: executes work, sends result back via sender (uses atomic channel)
 /// 4. Calling reactor's demux loop: receives result via run_receiver_loop(), stores in ITS OWN channel
 /// 5. Calling reactor: waits on ITS OWN channel
@@ -56,7 +56,7 @@ struct Message {
 /// Safety: Only the owning reactor's thread accesses these fields.
 pub struct ResultChannel<S, R> {
     sender: S,
-    receiver: UnsafeCell<Option<R>>,  // UnsafeCell so receiver loop can access via &self
+    receiver: UnsafeCell<Option<R>>, // UnsafeCell so receiver loop can access via &self
     messages: UnsafeCell<Vec<Option<Message>>>,
     free_ids: UnsafeCell<VecDeque<MessageId>>,
 }
@@ -77,9 +77,7 @@ impl<S, R> ResultChannel<S, R> {
     }
 
     /// Get a reference to the sender (for spawning work on remote reactor).
-    pub fn sender(&self) -> &S {
-        &self.sender
-    }
+    pub fn sender(&self) -> &S { &self.sender }
 
     /// Take the receiver out of the channel (can only be called once).
     /// This is used to start the receiver loop.
@@ -94,14 +92,14 @@ impl<S, R> ResultChannel<S, R> {
         // Safety: Only accessed by owning reactor thread
         let free_ids = unsafe { &mut *self.free_ids.get() };
         let messages = unsafe { &mut *self.messages.get() };
-        
+
         // Try to reuse a freed ID first
         if let Some(id) = free_ids.pop_front() {
             // Reuse this slot
             messages[id] = Some(Message::default());
             return id;
         }
-        
+
         // No free IDs, allocate new slot
         let id = messages.len();
         messages.push(Some(Message::default()));
@@ -113,8 +111,8 @@ impl<S, R> ResultChannel<S, R> {
     fn free_message(&self, id: MessageId) {
         // Safety: Only accessed by owning reactor thread
         let messages = unsafe { &mut *self.messages.get() };
-        messages[id] = None;  // Clear the message
-        
+        messages[id] = None; // Clear the message
+
         let free_ids = unsafe { &mut *self.free_ids.get() };
         free_ids.push_back(id);
     }
@@ -146,17 +144,11 @@ pub struct ResultSender<S> {
 
 // Backend-specific implementations are in each runtime's module
 impl<S> ResultSender<S> {
-    pub fn msg_id(&self) -> MessageId {
-        self.msg_id
-    }
-    
-    pub fn sender(&self) -> &S {
-        &self.sender
-    }
-    
-    pub fn into_parts(self) -> (MessageId, S) {
-        (self.msg_id, self.sender)
-    }
+    pub fn msg_id(&self) -> MessageId { self.msg_id }
+
+    pub fn sender(&self) -> &S { &self.sender }
+
+    pub fn into_parts(self) -> (MessageId, S) { (self.msg_id, self.sender) }
 }
 
 /// Receiver half of a cross-reactor result handle.
@@ -169,11 +161,11 @@ pub struct ResultReceiver<'a, S, R> {
 // ResultReceiver IS the Future - no wrapper needed!
 impl<'a, S, R> Future for ResultReceiver<'a, S, R> {
     type Output = Box<dyn std::any::Any + Send>;
-    
+
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Safety: Only accessed by owning reactor thread (waiting future)
         let messages = unsafe { &mut *self.channel.messages.get() };
-        
+
         if let Some(msg) = &mut messages[self.msg_id] {
             if let Some(result) = msg.result.take() {
                 return Poll::Ready(result);
@@ -183,7 +175,7 @@ impl<'a, S, R> Future for ResultReceiver<'a, S, R> {
                 return Poll::Pending;
             }
         }
-        
+
         // Message slot was freed - this shouldn't happen
         panic!("ResultReceiver polled after message was freed");
     }
@@ -202,7 +194,7 @@ impl<'a, S, R> ResultReceiver<'a, S, R> {
     /// Wait for the result from the target reactor.
     /// This will block (async) until `ResultSender::put_result()` is called.
     pub async fn wait<T: 'static>(self) -> T {
-        let result_box = self.await;  // Use Future impl
+        let result_box = self.await; // Use Future impl
         *result_box.downcast::<T>().expect("Type mismatch in cross-reactor result")
     }
 }
@@ -213,13 +205,10 @@ impl<S: Clone, R> ResultChannel<S, R> {
     pub fn create_result_handle(&self) -> (ResultSender<S>, ResultReceiver<'_, S, R>) {
         let msg_id = self.allocate_message();
         let sender = self.sender().clone();
-        
+
         let result_tx = ResultSender { msg_id, sender };
-        let result_rx = ResultReceiver { 
-            msg_id, 
-            channel: self 
-        };
-        
+        let result_rx = ResultReceiver { msg_id, channel: self };
+
         (result_tx, result_rx)
     }
 }

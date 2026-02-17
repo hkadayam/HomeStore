@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ****************** */
+ */
 
 //! Prefix Compression Node Implementation
 //!
@@ -29,23 +29,13 @@
 //! - On-failure compaction to reclaim fragmented space
 //! - Logical copy for move operations (natural compression)
 
-use super::super::btree::BtreeError;
+use super::super::btree_types::BtreeError;
 use super::super::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow};
 use super::super::btree_node::{NodeCore, NodeOps, PersistentHeader};
 use super::super::detail::btree_req::BtreePutType;
 use smallvec::{SmallVec, smallvec};
 use std::io;
-
-//================================================================================
-// Helper Macros
-//================================================================================
-
-/// Simplifies BtreeError::Io creation
-macro_rules! btree_io_err {
-    ($kind:expr, $msg:expr) => {
-        Err(BtreeError::Io(io::Error::new($kind, $msg)))
-    };
-}
+use crate::btree_io_err;
 
 //================================================================================
 // Prefix Compression Node Header
@@ -107,6 +97,7 @@ struct RecordData {
 
 /// In-memory record with slot tracking
 #[derive(Debug, Clone, Copy)]
+#[allow(private_interfaces)]
 pub struct Record {
     pub slot_num: u32,
     pub data: RecordData,
@@ -146,7 +137,7 @@ impl Record {
             + (slot_num as usize * Self::serialized_size());
 
         unsafe {
-            let ptr = core.phys_buf.as_ptr().add(offset) as *const RecordData;
+            let ptr = core.phys_buf.as_ref().as_ptr().add(offset) as *const RecordData;
             Self {
                 slot_num,
                 data: std::ptr::read_unaligned(ptr),
@@ -161,7 +152,7 @@ impl Record {
             + (self.slot_num as usize * Self::serialized_size());
 
         unsafe {
-            let ptr = core.phys_buf.as_ptr().add(offset) as *mut RecordData;
+            let ptr = core.phys_buf.as_ref().as_ptr().add(offset) as *mut RecordData;
             std::ptr::write_unaligned(ptr, self.data);
         }
     }
@@ -200,7 +191,7 @@ impl Prefix {
 
         // Write PrefixInfo header
         unsafe {
-            let ptr = core.phys_buf.as_ptr().add(base + self.offset as usize) as *mut PrefixInfo;
+            let ptr = core.phys_buf.as_ref().as_ptr().add(base + self.offset as usize) as *mut PrefixInfo;
             std::ptr::write_unaligned(ptr, PrefixInfo { refcount: 1 });
         }
 
@@ -216,7 +207,7 @@ impl Prefix {
     fn write_refcount(&self, core: &NodeCore, refcount: u16) {
         let base = std::mem::size_of::<PersistentHeader>();
         unsafe {
-            let ptr = core.phys_buf.as_ptr().add(base + self.offset as usize) as *mut PrefixInfo;
+            let ptr = core.phys_buf.as_ref().as_ptr().add(base + self.offset as usize) as *mut PrefixInfo;
             (*ptr).refcount = refcount;
         }
     }
@@ -225,7 +216,7 @@ impl Prefix {
     fn refcount(&self, core: &NodeCore) -> u16 {
         let base = std::mem::size_of::<PersistentHeader>();
         unsafe {
-            let ptr = core.phys_buf.as_ptr().add(base + self.offset as usize) as *const PrefixInfo;
+            let ptr = core.phys_buf.as_ref().as_ptr().add(base + self.offset as usize) as *const PrefixInfo;
             (*ptr).refcount
         }
     }
@@ -247,7 +238,7 @@ impl Prefix {
     fn prefix_key<'a>(&self, core: &'a NodeCore) -> &'a [u8] {
         let base = std::mem::size_of::<PersistentHeader>();
         let data_offset = base + self.offset as usize + PrefixInfo::header_size();
-        unsafe { std::slice::from_raw_parts(core.phys_buf.as_ptr().add(data_offset), self.size as usize) }
+        unsafe { std::slice::from_raw_parts(core.phys_buf.as_ref().as_ptr().add(data_offset), self.size as usize) }
     }
 
     /// Get offset
@@ -296,23 +287,25 @@ impl SuffixAndValue {
     fn space_needed(suffix_len: usize, value_size: usize) -> usize { suffix_len + value_size }
 
     /// Get suffix key bytes
+    #[allow(dead_code)]
     fn suffix_key<'a>(&self, core: &'a NodeCore) -> &'a [u8] {
         let base = std::mem::size_of::<PersistentHeader>();
         unsafe {
             std::slice::from_raw_parts(
-                core.phys_buf.as_ptr().add(base + self.offset as usize),
+                core.phys_buf.as_ref().as_ptr().add(base + self.offset as usize),
                 self.suffix_size as usize,
             )
         }
     }
 
     /// Get value
+    #[allow(dead_code)]
     fn value<V: BtreeValue>(&self, core: &NodeCore) -> V {
         let base = std::mem::size_of::<PersistentHeader>();
         let val_offset = base + self.offset as usize + self.suffix_size as usize;
         unsafe {
             let val_slice =
-                std::slice::from_raw_parts(core.phys_buf.as_ptr().add(val_offset), self.value_size as usize);
+                std::slice::from_raw_parts(core.phys_buf.as_ref().as_ptr().add(val_offset), self.value_size as usize);
             V::deserialize_from(val_slice, true).expect("Value deserialization should not fail")
         }
     }
@@ -364,6 +357,22 @@ where
     }
 
     fn insert(&self, core: &NodeCore, idx: u32, key: &K, val: &ValueOrOverflow<V>) -> Result<(), BtreeError> {
+        let nentries = core.get_persistent_header().nentries();
+
+        // Handle edge insertion for interior nodes (when idx > nentries)
+        if !core.is_leaf() && idx > nentries {
+            let edge_val = val.clone().expect_inline("PrefixCompressNode requires inline values for edge");
+            core.update_edge(&edge_val);
+            return Ok(());
+        }
+
+        if idx > nentries {
+            return Err(BtreeError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Insert index {} out of range (nentries={})", idx, nentries),
+            )));
+        }
+
         let key_size = key.serialized_size() as usize;
         let val_size = val.serialized_size();
 
@@ -378,10 +387,10 @@ where
                 self.compact(core)?;
                 // Retry after compaction
                 if !self.has_space_for::<K, V>(core, key_size, val_size) {
-                    return btree_io_err!(io::ErrorKind::OutOfMemory, "Not enough space even after compaction");
+                    return btree_io_err!(OutOfMemory, "Not enough space even after compaction");
                 }
             } else {
-                return btree_io_err!(io::ErrorKind::OutOfMemory, "Not enough space for insertion");
+                return btree_io_err!(OutOfMemory, "Not enough space for insertion");
             }
         }
 
@@ -400,6 +409,16 @@ where
     }
 
     fn update(&self, core: &NodeCore, idx: u32, val: &ValueOrOverflow<V>) -> Result<(), BtreeError> {
+        let nentries = core.get_persistent_header().nentries();
+
+        // Handle edge update for interior nodes (when idx == nentries)
+        if idx == nentries {
+            debug_assert!(!core.is_leaf(), "Edge update only for interior nodes");
+            let edge_val = val.clone().expect_inline("PrefixCompressNode requires inline values for edge");
+            core.update_edge(&edge_val);
+            return Ok(());
+        }
+
         // PrefixCompressNode: For simplicity, do remove+insert for updates
         // (Only fetch key when actually needed for re-insertion)
         let key: K = <Self as NodeOps<K, V>>::get_nth_key(self, core, idx, true);
@@ -417,10 +436,7 @@ where
     fn remove(&self, core: &NodeCore, idx: u32) -> Result<(), BtreeError> {
         let nentries = core.nentries();
         if idx >= nentries {
-            return btree_io_err!(
-                io::ErrorKind::InvalidInput,
-                format!("Index {} out of bounds (total: {})", idx, nentries)
-            );
+            return btree_io_err!(InvalidInput, format!("Index {} out of bounds (total: {})", idx, nentries));
         }
 
         let record = Record::from_slot(core, idx);
@@ -647,13 +663,13 @@ impl PrefixCompressNodeOps {
     #[inline]
     fn get_header<'a>(&self, core: &'a NodeCore) -> &'a PrefixCompressHeader {
         let offset = std::mem::size_of::<PersistentHeader>();
-        unsafe { &*(core.phys_buf.as_ptr().add(offset) as *const PrefixCompressHeader) }
+        unsafe { &*(core.phys_buf.as_ref().as_ptr().add(offset) as *const PrefixCompressHeader) }
     }
 
     #[inline]
     fn get_header_mut<'a>(&self, core: &'a NodeCore) -> &'a mut PrefixCompressHeader {
         let offset = std::mem::size_of::<PersistentHeader>();
-        unsafe { &mut *(core.phys_buf.as_ptr().add(offset) as *mut PrefixCompressHeader) }
+        unsafe { &mut *(core.phys_buf.as_ref().as_ptr().add(offset) as *mut PrefixCompressHeader) }
     }
 
     // Prefix data access
@@ -661,13 +677,15 @@ impl PrefixCompressNodeOps {
     fn get_prefix_data<'a>(&self, core: &'a NodeCore, offset: u16, len: u16) -> &'a [u8] {
         let base_offset = std::mem::size_of::<PersistentHeader>();
         let prefix_start = base_offset + offset as usize + PrefixInfo::header_size();
-        unsafe { std::slice::from_raw_parts(core.phys_buf.as_ptr().add(prefix_start), len as usize) }
+        unsafe { std::slice::from_raw_parts(core.phys_buf.as_ref().as_ptr().add(prefix_start), len as usize) }
     }
 
     #[inline]
     fn get_data_slice<'a>(&self, core: &'a NodeCore, offset: u16, len: u16) -> &'a [u8] {
         let base_offset = std::mem::size_of::<PersistentHeader>();
-        unsafe { std::slice::from_raw_parts(core.phys_buf.as_ptr().add(base_offset + offset as usize), len as usize) }
+        unsafe {
+            std::slice::from_raw_parts(core.phys_buf.as_ref().as_ptr().add(base_offset + offset as usize), len as usize)
+        }
     }
 
     fn immediate_available_space(&self, core: &NodeCore) -> u32 {
@@ -850,7 +868,7 @@ impl PrefixCompressNodeOps {
     fn write_bytes_at(&self, core: &NodeCore, offset: usize, data: &[u8]) {
         let base = std::mem::size_of::<PersistentHeader>();
         unsafe {
-            let dst = core.phys_buf.as_ptr().add(base + offset) as *mut u8;
+            let dst = core.phys_buf.as_ref().as_ptr().add(base + offset) as *mut u8;
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
     }
@@ -860,7 +878,7 @@ impl PrefixCompressNodeOps {
     fn write_value_at<V: BtreeValue>(&self, core: &NodeCore, offset: usize, val: &ValueOrOverflow<V>, size: usize) {
         let base = std::mem::size_of::<PersistentHeader>();
         unsafe {
-            let dst = core.phys_buf.as_ptr().add(base + offset) as *mut u8;
+            let dst = core.phys_buf.as_ref().as_ptr().add(base + offset) as *mut u8;
             let dst_slice = std::slice::from_raw_parts_mut(dst, size);
             let _ = val.serialize_to(dst_slice);
         }
@@ -886,8 +904,8 @@ impl PrefixCompressNodeOps {
 
             unsafe {
                 std::ptr::copy(
-                    core.phys_buf.as_ptr().add(src_offset),
-                    core.phys_buf.as_ptr().add(dst_offset) as *mut u8,
+                    core.phys_buf.as_ref().as_ptr().add(src_offset),
+                    core.phys_buf.as_ref().as_ptr().add(dst_offset) as *mut u8,
                     count,
                 );
             }
@@ -910,8 +928,8 @@ impl PrefixCompressNodeOps {
 
             unsafe {
                 std::ptr::copy(
-                    core.phys_buf.as_ptr().add(src_offset),
-                    core.phys_buf.as_ptr().add(dst_offset) as *mut u8,
+                    core.phys_buf.as_ref().as_ptr().add(src_offset),
+                    core.phys_buf.as_ref().as_ptr().add(dst_offset) as *mut u8,
                     count,
                 );
             }

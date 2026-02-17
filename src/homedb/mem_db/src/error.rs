@@ -18,9 +18,12 @@ pub enum MemDbError {
     
     /// Btree operation error
     BtreeError(String),
-    
+
     /// Invalid configuration
     InvalidConfig(String),
+
+    /// Invalid operation
+    InvalidOperation(String),
 }
 
 impl fmt::Display for MemDbError {
@@ -36,6 +39,7 @@ impl fmt::Display for MemDbError {
             }
             MemDbError::BtreeError(msg) => write!(f, "Btree error: {}", msg),
             MemDbError::InvalidConfig(msg) => write!(f, "Invalid configuration: {}", msg),
+            MemDbError::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
         }
     }
 }

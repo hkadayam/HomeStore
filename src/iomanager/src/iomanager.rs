@@ -47,8 +47,9 @@ pub trait IOManagerImplTrait {
     fn spawn_detached<F>(reactor: &Reactor, fut: F)
     where
         F: Future<Output = ()> + 'static + Send;
-    
+
     /// Spawn a local (non-Send) future on the given reactor.
+    #[allow(dead_code)]
     fn spawn_local<F>(reactor: &Reactor, fut: F)
     where
         F: Future<Output = ()> + 'static;
@@ -77,14 +78,8 @@ pub trait IOManagerImplTrait {
 
     /// Run an async test using the backend-specific runtime.
     /// This blocks the current thread until the test completes.
+    /// Includes shutdown at the end.
     fn run_test<F>(fut: F)
-    where
-        F: Future<Output = ()> + Send + 'static;
-    
-    /// Run an async test on multiple reactors concurrently.
-    /// If num_threads > 1, spawns the test on all reactors simultaneously.
-    /// If num_threads == 1, spawns on reactor 0 only (same as run_test).
-    fn run_test_multi<F>(fut: F, num_threads: usize)
     where
         F: Future<Output = ()> + Send + 'static;
 }
@@ -99,6 +94,7 @@ pub struct IOManager {
     drive_interface: Arc<crate::DriveInterface>,
 }
 
+#[allow(dead_code)]
 impl IOManager {
     fn new(num_reactors: usize) -> Result<Self, &'static str> {
         let reactors = IOManagerImpl::spawn_reactors(num_reactors)?;
@@ -129,11 +125,7 @@ impl IOManager {
 
     pub fn current_reactor(&self) -> Option<&Reactor> {
         let rid = IOManagerImpl::current_reactor_id();
-        if rid < self.num_reactors {
-            Some(&self.reactors[rid])
-        } else {
-            None
-        }
+        if rid < self.num_reactors { Some(&self.reactors[rid]) } else { None }
     }
 
     /// Return current reactor id if running on a reactor thread, else 0.
@@ -166,7 +158,7 @@ impl IOManager {
         if matches!(target, ReactorTarget::All) {
             panic!("spawn_detached doesn't support ReactorTarget::All - use BackgroundTasks::spawn_on_all");
         }
-        
+
         let reactor_id = self.resolve_target(target);
         let reactor = self.reactor(reactor_id);
         IOManagerImpl::spawn_detached(reactor, fut);
@@ -208,14 +200,14 @@ impl IOManager {
         if matches!(target, ReactorTarget::All) {
             panic!("spawn_waitable doesn't support ReactorTarget::All");
         }
-        
+
         let calling_reactor_id = IOManagerImpl::current_reactor_id();
         if calling_reactor_id >= self.num_reactors() {
             panic!("spawn_waitable can only be called from a reactor thread");
         }
-        
+
         let target_reactor_id = self.resolve_target(target);
-        
+
         // We need to return a 'static future, so we use the reactor ID and re-fetch from IOManager
         async move {
             let target_reactor = iomgr().reactor(target_reactor_id);
@@ -257,18 +249,18 @@ impl IOManager {
         R: Send + 'static,
     {
         let target_reactor_id = self.next_reactor();
-        
+
         // Use crossbeam channel - works for both .await and .join()
         let (tx, rx) = crossbeam::channel::bounded(1);
-        
+
         // Spawn the work on target reactor
         let target_reactor = self.reactor(target_reactor_id);
         IOManagerImpl::spawn_detached(target_reactor, async move {
             let result = fut.await;
             let _ = tx.send(result);
         });
-        
-        JoinHandle { 
+
+        JoinHandle {
             receiver: Some(rx),
             reactor_id: target_reactor_id,
             detached: AtomicBool::new(false),
@@ -310,16 +302,12 @@ impl IOManager {
     /// Resolve ReactorTarget to a specific reactor ID.
     fn resolve_target(&self, target: ReactorTarget) -> ReactorId {
         match target {
-            ReactorTarget::Current => {
-                IOManagerImpl::current_reactor_id()
-            }
+            ReactorTarget::Current => IOManagerImpl::current_reactor_id(),
             ReactorTarget::Reactor(id) => {
                 assert!(id < self.num_reactors(), "Invalid reactor ID: {}", id);
                 id
             }
-            ReactorTarget::Any => {
-                self.next_reactor()
-            }
+            ReactorTarget::Any => self.next_reactor(),
             ReactorTarget::All => {
                 panic!("resolve_target called with ReactorTarget::All - handle separately")
             }
@@ -340,8 +328,8 @@ impl IOManager {
     ///
     /// # Backend Behavior
     ///
-    /// - **glommio**: Uses `yield_if_needed()` - smart yielding that only yields if the task has
-    ///   been running for a while and other tasks are waiting
+    /// - **glommio**: Uses `yield_if_needed()` - smart yielding that only yields if the task has been running for a
+    ///   while and other tasks are waiting
     /// - **tokio**: Uses `yield_now()` - unconditional yielding
     ///
     /// # Example
@@ -362,36 +350,70 @@ impl IOManager {
     /// # }
     /// ```
     pub async fn yield_now(&self) { IOManagerImpl::yield_now().await }
+}
 
+impl Drop for IOManager {
+    fn drop(&mut self) {
+        if self.shutting_down.load(Ordering::Relaxed) == 0 {
+            // IOManager is being dropped without shutdown being called!
+            // This is a bug - reactors will become zombie threads
+            // Log error to stderr for immediate visibility
+            eprintln!("ERROR: IOManager dropped without calling shutdown()! Reactor threads will become zombies.");
+            eprintln!("       This indicates a panic or early return in shutdown_iomgr()");
+        }
+    }
 }
 
 // IOManager Global Instance
-// 
+//
 // PRODUCTION: Uses `static mut` for zero-overhead access after init.
 // TESTS: Uses `OnceLock` for thread-safe concurrent test execution.
-// 
+//
 // This is safe because:
 // - Production: IOManager is initialized once at startup, never mutated
 // - Tests: OnceLock provides proper synchronization
 
-#[cfg(test)]
-use std::sync::OnceLock;
 
-#[cfg(test)]
-static IO_MANAGER: OnceLock<IOManager> = OnceLock::new();
+#[cfg(any(test, feature = "test-mode"))]
+static IO_MANAGER: parking_lot::RwLock<Option<Box<IOManager>>> =
+    parking_lot::RwLock::const_new(<parking_lot::RawRwLock as parking_lot::lock_api::RawRwLock>::INIT, None);
 
-#[cfg(not(test))]
+#[cfg(any(test, feature = "test-mode"))]
+static INIT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(not(any(test, feature = "test-mode")))]
 static mut IO_MANAGER: Option<IOManager> = None;
 
 pub fn init_iomgr(num_reactors: usize) -> Result<(), &'static str> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-mode"))]
     {
-        IO_MANAGER
-            .set(IOManager::new(num_reactors)?)
-            .map_err(|_| "IOManager already initialized")
+        use std::sync::atomic::Ordering;
+
+        // Try fast path with read lock to prevent TOCTOU race with shutdown
+        {
+            let guard = IO_MANAGER.read();
+            let count_check = INIT_COUNT.load(Ordering::Acquire);
+            let has_manager = guard.is_some();
+            if count_check > 0 && has_manager {
+                let _ = INIT_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+                return Ok(());
+            }
+        } // Release read lock
+
+        // Slow path: acquire write lock and check if we're first
+        let mut guard = IO_MANAGER.write();
+        let prev = INIT_COUNT.fetch_add(1, Ordering::SeqCst);
+        if prev == 0 || guard.is_none() {
+            // We're first OR IOManager was destroyed in previous shutdown - (re)create it
+            *guard = Some(Box::new(IOManager::new(num_reactors)?));
+        }
+        // else: someone beat us, they already created it
+
+        Ok(())
     }
-    
-    #[cfg(not(test))]
+
+    #[cfg(not(any(test, feature = "test-mode")))]
+    #[allow(static_mut_refs)]
     unsafe {
         if IO_MANAGER.is_some() {
             return Err("IOManager already initialized");
@@ -402,25 +424,38 @@ pub fn init_iomgr(num_reactors: usize) -> Result<(), &'static str> {
 }
 
 pub fn iomgr() -> &'static IOManager {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-mode"))]
     {
-        IO_MANAGER.get().expect("IOManager not initialized")
+        use std::sync::atomic::Ordering;
+
+        let count = INIT_COUNT.load(Ordering::Acquire);
+        assert!(count > 0, "IOManager not initialized. Call init_iomgr() first.");
+
+        let guard = IO_MANAGER.read();
+        let mgr_ref = guard.as_ref().expect("IOManager missing despite count > 0");
+
+        // Safety: count > 0 means IOManager is alive
+        // Tests are disciplined: they finish using it before shutdown
+        unsafe { std::mem::transmute::<&IOManager, &'static IOManager>(mgr_ref.as_ref()) }
     }
-    
-    #[cfg(not(test))]
+
+    #[cfg(not(any(test, feature = "test-mode")))]
+    #[allow(static_mut_refs)]
     unsafe {
         IO_MANAGER.as_ref().expect("IOManager not initialized")
     }
 }
 
+#[allow(unused_variables)]
+#[allow(dead_code)]
 pub async fn restart(num_reactors: usize) -> Result<(), &'static str> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-mode"))]
     {
         // Can't restart with OnceLock - would need to add this capability
         Err("restart not supported in test builds")
     }
-    
-    #[cfg(not(test))]
+
+    #[cfg(not(any(test, feature = "test-mode")))]
     unsafe {
         // Shutdown existing
         if let Some(ref mgr) = IO_MANAGER {
@@ -463,6 +498,7 @@ where
 ///
 /// # Panics
 /// Panics if called from a non-reactor thread.
+#[allow(dead_code)]
 pub fn spawn_local<F>(fut: F)
 where
     F: Future<Output = ()> + 'static,
@@ -557,23 +593,20 @@ impl<R: Send + 'static> JoinHandle<R> {
         if IOManagerImpl::current_reactor_id() < iomgr().num_reactors() {
             panic!("JoinHandle::join() called from reactor thread - use .await instead");
         }
-        
+
         // Use ManuallyDrop to prevent Drop from running
         let handle = ManuallyDrop::new(self);
-        
+
         // Mark as detached since we're consuming via .join()
         handle.detached.store(true, Ordering::Release);
-        
+
         // Safety: We're consuming the handle and won't use it again
         let receiver = unsafe { std::ptr::read(&handle.receiver) };
-        
+
         // Block on crossbeam channel - works from any non-reactor thread
-        receiver
-            .expect("JoinHandle already consumed")
-            .recv()
-            .expect("Task channel disconnected")
+        receiver.expect("JoinHandle already consumed").recv().expect("Task channel disconnected")
     }
-    
+
     /// Get the reactor ID where this task is running.
     ///
     /// This is analogous to `std::thread::JoinHandle::thread()`.
@@ -583,10 +616,8 @@ impl<R: Send + 'static> JoinHandle<R> {
     /// let handle = spawn(async { work().await });
     /// println!("Task running on reactor {}", handle.reactor_id());
     /// ```
-    pub fn reactor_id(&self) -> ReactorId {
-        self.reactor_id
-    }
-    
+    pub fn reactor_id(&self) -> ReactorId { self.reactor_id }
+
     /// Check if the task has finished without blocking.
     ///
     /// This is analogous to `std::thread::JoinHandle::is_finished()`.
@@ -594,12 +625,12 @@ impl<R: Send + 'static> JoinHandle<R> {
     /// # Examples
     /// ```ignore
     /// let handle = spawn(async { expensive_work().await });
-    /// 
+    ///
     /// while !handle.is_finished() {
     ///     // Do other work while waiting
     ///     do_something_else();
     /// }
-    /// 
+    ///
     /// let result = handle.join();  // Won't block, already finished
     /// ```
     pub fn is_finished(&self) -> bool {
@@ -610,7 +641,7 @@ impl<R: Send + 'static> JoinHandle<R> {
             false
         }
     }
-    
+
     /// Detach the task, allowing it to run in the background without waiting.
     ///
     /// This consumes the handle without waiting for the result. The task continues
@@ -634,7 +665,7 @@ impl<R: Send + 'static> JoinHandle<R> {
 
 impl<R: Send + 'static> Future for JoinHandle<R> {
     type Output = R;
-    
+
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
         if let Some(ref rx) = self.receiver {
             // Try to receive result without blocking
@@ -761,24 +792,24 @@ where
             crossbeam::channel::Receiver<Box<dyn Any + Send>>
         )>> = RefCell::new(None);
     }
-    
+
     // Panic if called from reactor thread
     let current_id = IOManagerImpl::current_reactor_id();
     if current_id < iomgr().num_reactors() {
         panic!("spawn_and_block() cannot be called from reactor thread - use spawn_waitable() instead");
     }
-    
+
     CHANNEL.with(|cell| {
         let mut opt = cell.borrow_mut();
-        
+
         // Create channel on first use for this thread
         if opt.is_none() {
             *opt = Some(crossbeam::channel::bounded(1));
         }
-        
+
         let (tx, rx) = opt.as_ref().unwrap();
         let tx_clone = tx.clone();
-        
+
         // Resolve target reactor
         let reactor = match target {
             ReactorTarget::Current => {
@@ -790,48 +821,62 @@ where
                 panic!("spawn_and_block() doesn't support ReactorTarget::All - use spawn_waitable_all() instead")
             }
         };
-        
+
         // Spawn task on target reactor
         IOManagerImpl::spawn_detached(reactor, async move {
             let result = fut.await;
             // Send result via crossbeam channel (works from async context)
             let _ = tx_clone.send(Box::new(result) as Box<dyn Any + Send>);
         });
-        
+
         // Block current thread waiting for result
-        let result_box = rx.recv()
-            .expect("spawn_and_block: channel disconnected - reactor may have shut down");
-        
+        let result_box = rx.recv().expect("spawn_and_block: channel disconnected - reactor may have shut down");
+
         // Downcast to concrete type
-        *result_box.downcast::<R>()
-            .expect("spawn_and_block: type mismatch in result")
+        *result_box.downcast::<R>().expect("spawn_and_block: type mismatch in result")
     })
 }
 
-pub async fn shutdown_iomgr() -> Result<(), &'static str> { iomgr().shutdown().await }
+pub async fn shutdown_iomgr() -> Result<(), &'static str> {
+    #[cfg(any(test, feature = "test-mode"))]
+    {
+        use std::sync::atomic::Ordering;
 
-/// Sleep for a duration (async, runtime-agnostic)
-pub async fn sleep(duration: std::time::Duration) {
-    IOManagerImpl::sleep(duration).await
+        // Acquire write lock first to serialize with init
+        let mut guard = IO_MANAGER.write();
+        let prev = INIT_COUNT.fetch_sub(1, Ordering::SeqCst);
+
+        assert!(prev > 0, "Shutdown called more times than init");
+
+        if prev == 1 {
+            // Last shutdown - destroy IOManager
+            let mgr = guard.take().ok_or("IOManager already destroyed")?;
+            mgr.shutdown().await?;
+            drop(guard);
+        }
+        // else: count > 1, just decremented, keep IOManager alive
+
+        Ok(())
+    }
+
+    #[cfg(not(any(test, feature = "test-mode")))]
+    {
+        iomgr().shutdown().await
+    }
 }
+
+#[allow(dead_code)]
+/// Sleep for a duration (async, runtime-agnostic)
+pub async fn sleep(duration: std::time::Duration) { IOManagerImpl::sleep(duration).await }
 
 /// Run an async test using the iomanager runtime.
 /// This is a helper function for tests that blocks the current thread until the async test completes.
+/// Includes shutdown at the end.
 pub fn run_test<F>(fut: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
     IOManagerImpl::run_test(fut);
-}
-
-/// Run an async test on multiple reactors concurrently.
-/// If num_threads > 1, spawns the test on all reactors simultaneously.
-/// If num_threads == 1, spawns on reactor 0 only.
-pub fn run_test_multi<F>(fut: F, num_threads: usize)
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    IOManagerImpl::run_test_multi(fut, num_threads);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -905,7 +950,7 @@ impl BackgroundTasks {
         if matches!(target, ReactorTarget::All) {
             panic!("BackgroundTasks::spawn doesn't support ReactorTarget::All - use spawn_on_all");
         }
-        
+
         let io_mgr = iomgr();
         let reactor_id = match target {
             ReactorTarget::Current => IOManagerImpl::current_reactor_id(),
@@ -916,7 +961,7 @@ impl BackgroundTasks {
             ReactorTarget::Any => io_mgr.next_reactor(),
             ReactorTarget::All => unreachable!(),
         };
-        
+
         let reactor = io_mgr.reactor(reactor_id);
         self.spawn_on(reactor, fut);
     }
@@ -971,13 +1016,9 @@ impl BackgroundTasks {
     ///
     /// This will block until all tasks spawned via `spawn()`, `spawn_local()`,
     /// or `spawn_on_reactor()` have finished. Returns immediately if no tasks are running.
-    pub async fn join_all(&self) {
-        self.completion.wait_all().await;
-    }
+    pub async fn join_all(&self) { self.completion.wait_all().await; }
 }
 
 impl Default for BackgroundTasks {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }

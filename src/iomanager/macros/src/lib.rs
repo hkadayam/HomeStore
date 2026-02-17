@@ -90,16 +90,28 @@ pub fn iomanager_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         #(#fn_attrs)*
         #[test]
         #fn_vis fn #fn_name() {
-            // Use a global static Once for all tests in the module
-            use std::sync::Once;
-            static IOMANAGER_INIT: Once = Once::new();
-            IOMANAGER_INIT.call_once(|| {
-                // Ignore error if already initialized
-                let _ = iomgr::init_iomgr(#num_threads);
-            });
+            // #region agent log
+            let test_name = stringify!(#fn_name);
+            let thread_id = std::thread::current().id();
+            let log_entry = format!("{{\"location\":\"macro:93\",\"message\":\"test entry\",\"data\":{{\"test\":\"{}\",\"thread\":\"{:?}\"}},\"timestamp\":{},\"hypothesisId\":\"H5\"}}\n", test_name, thread_id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/hkadayam/src/Homestore/.cursor/debug.log").and_then(|mut f| std::io::Write::write_all(&mut f, log_entry.as_bytes()));
+            // #endregion
 
-            // Use run_test_multi which spawns on all reactors if num_threads > 1
-            iomgr::run_test_multi(async #fn_block, #num_threads);
+            // Init IOManager (refcounting handles concurrent tests)
+            let _ = iomgr::init_iomgr(#num_threads);
+
+            // #region agent log
+            let log_entry = format!("{{\"location\":\"macro:97\",\"message\":\"test pre-run_test\",\"data\":{{\"test\":\"{}\",\"thread\":\"{:?}\"}},\"timestamp\":{},\"hypothesisId\":\"H5\"}}\n", test_name, thread_id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/hkadayam/src/Homestore/.cursor/debug.log").and_then(|mut f| std::io::Write::write_all(&mut f, log_entry.as_bytes()));
+            // #endregion
+
+            // Run test (includes shutdown at end)
+            iomgr::run_test(async #fn_block);
+
+            // #region agent log
+            let log_entry = format!("{{\"location\":\"macro:102\",\"message\":\"test exit\",\"data\":{{\"test\":\"{}\",\"thread\":\"{:?}\"}},\"timestamp\":{},\"hypothesisId\":\"H5\"}}\n", test_name, thread_id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/hkadayam/src/Homestore/.cursor/debug.log").and_then(|mut f| std::io::Write::write_all(&mut f, log_entry.as_bytes()));
+            // #endregion
         }
     };
 

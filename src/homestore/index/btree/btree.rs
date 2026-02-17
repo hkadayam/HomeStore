@@ -28,9 +28,9 @@
 //! Node/NodeCore (core library) - tangent to both layers
 //! ```
 
-use std::io;
-use std::sync::Arc;
+use triomphe::Arc as TArc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use super::btree_types::{BtreeError, BtreeConfig};
 use async_trait::async_trait;
 use iomgr::{AsyncRwLock, AsyncRwReadGuard, AsyncRwWriteGuard, IOBuffer};
 use tracing;
@@ -43,102 +43,13 @@ use tracing;
 static GLOBAL_OP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 use super::btree_node::{BNodeId, Node, NodeCore};
-use super::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow};
+use super::btree_kvs::{BtreeKey, BtreeValue};
 use super::detail::btree_req::{
     BtreeKeyRange,
     BtreeRemoveRequest, BtreeRemoveAnyRequest, BtreeRangeRemoveRequest, RemoveFilter,
     BtreeGetRequest, BtreeGetAnyRequest, BtreeQueryRequest, QueryResultHandle, GetFilter,
     BtreeSinglePutRequest,BtreeRangePutRequest, BtreePutType, PutFilter,
-    PutFilterDecision, GetFilterDecision, RemoveFilterDecision,
 };
-
-//================================================================================
-// Error Types
-//================================================================================
-
-#[derive(Debug)]
-pub enum BtreeError {
-    Retry,     // Lock upgrade failed due to concurrent modification - retry operation
-    CpMismatch, // Checkpoint context mismatch - retry operation from root
-    HasMore,   // Range operation has more entries to process, keep going
-    KeyNotFound, // Key not found in the btree
-    KeyAlreadyExists, // Key already exists in the btree
-    NodeNotFound,     // Node not found in storage (completely internal error)
-    Io(io::Error),    // I/O error from storage layer
-}
-
-//================================================================================
-// Btree Configuration
-//================================================================================
-
-/// Btree configuration (matches C++ BtreeConfig)
-#[derive(Debug, Clone)]
-pub struct BtreeConfig {
-    pub node_size: u32,
-    pub ideal_fill_pct: u8,
-    pub suggested_min_pct: u8,
-    pub split_pct: u8,
-    pub max_merge_nodes: u32,
-    pub rebalance_turned_on: bool,
-    pub merge_turned_on: bool,
-    pub leaf_node_type: u8,
-    pub int_node_type: u8,
-    pub btree_name: String,
-    
-    // Prefix compression config (for PrefixCompressNode variant)
-    pub expected_prefix_size: u16, // 0 = dynamic, >0 = fixed split point
-    
-    // Overflow node configuration
-    pub overflow_threshold: u32,  // Max inline value size (e.g., node_size / 4)
-    pub overflow_min_alloc_size: u32, // Min allocation unit for persistence (e.g., 4096)
-    
-    // Precomputed values
-    pub suggested_min_size: u32,
-    pub ideal_fill_size: u32,
-}
-
-impl BtreeConfig {
-    pub fn new(node_size: u32, btree_name: String) -> Self {
-        let mut config = Self {
-            node_size,
-            expected_prefix_size: 0, // Default to dynamic
-            ideal_fill_pct: 90,
-            suggested_min_pct: 30,
-            split_pct: 50,
-            max_merge_nodes: 3,
-            rebalance_turned_on: false,
-            merge_turned_on: true,
-            leaf_node_type: 0, // Simple node
-            int_node_type: 0,  // Simple node
-            btree_name,
-            overflow_threshold: 128, // 128 bytes is a good default for most use cases
-            overflow_min_alloc_size: 512, // 512 minimum for persistence alignment
-            suggested_min_size: 0,
-            ideal_fill_size: 0,
-        };
-        config.finalize();
-        config
-    }
-    
-    fn finalize(&mut self) {
-        let node_header_size = std::mem::size_of::<super::btree_node::PersistentHeader>() as u32;
-        let usable_size = self.node_size - node_header_size;
-        self.ideal_fill_size = (usable_size * self.ideal_fill_pct as u32) / 100;
-        self.suggested_min_size = (usable_size * self.suggested_min_pct as u32) / 100;
-    }
-    
-    pub fn split_size(&self, filled_size: u32) -> u32 {
-        (filled_size * self.split_pct as u32) / 100
-    }
-    
-    pub fn ideal_fill_size(&self) -> u32 {
-        self.ideal_fill_size
-    }
-    
-    pub fn suggested_min_size(&self) -> u32 {
-        self.suggested_min_size
-    }
-}
 
 //================================================================================
 // UnderlyingBtree Trait
@@ -153,7 +64,7 @@ pub trait UnderlyingBtree: Send + Sync {
     /// Read node from storage - returns UNLOCKED node
     ///
     /// The Btree layer is responsible for locking the returned node.
-    async fn read_node(&self, id: BNodeId) -> Result<Arc<NodeCore>, BtreeError>;
+    async fn read_node(&self, id: BNodeId) -> Result<TArc<NodeCore>, BtreeError>;
 
     /// Write node to storage
     ///
@@ -163,7 +74,7 @@ pub trait UnderlyingBtree: Send + Sync {
     /// Create new node in storage (storage allocates node_id internally)
     ///
     /// Returns UNLOCKED node that Btree layer will lock as needed.
-    async fn create_node(&self, is_leaf: bool, node_type: u8) -> Result<Arc<NodeCore>, BtreeError>;
+    async fn create_node(&self, is_leaf: bool, node_type: u8) -> Result<TArc<NodeCore>, BtreeError>;
 
     /// Delete node from storage (for cleanup)
     async fn delete_node(&self, id: BNodeId) -> Result<(), BtreeError>;
@@ -180,7 +91,7 @@ pub trait UnderlyingBtree: Send + Sync {
     async fn write_overflow(&self, data: IOBuffer) -> Result<BNodeId, BtreeError>;
 
     /// Read overflow data by node_id, returns Arc<IOBuffer> for zero-copy sharing
-    async fn read_overflow(&self, node_id: BNodeId) -> Result<Arc<IOBuffer>, BtreeError>;
+    async fn read_overflow(&self, node_id: BNodeId) -> Result<TArc<IOBuffer>, BtreeError>;
 
     /// Delete overflow node
     async fn delete_overflow(&self, node_id: BNodeId) -> Result<(), BtreeError>;
@@ -277,10 +188,10 @@ where
 
     /// Create a new root node (called during initialization or after root split)
     async fn create_root_node(&self) -> Result<BNodeId, BtreeError> {
-        let root_core = self.storage.create_node(true, self.config.leaf_node_type).await?;
+        let root_core = self.storage.create_node(true, self.config.leaf_node_variant).await?;
         
         // Initialize the node with proper variant
-        let _root_node = self.init_new_variant_node(root_core.clone(), self.config.leaf_node_type).await?;
+        let _root_node = self.init_new_variant_node(root_core.clone(), self.config.leaf_node_variant).await?;
         
         let root_id = root_core.node_id();
         self.root_node_id.store(root_id, Ordering::Relaxed);
@@ -377,7 +288,10 @@ where
         tracing::debug!("Starting remove operation");
         let req = BtreeRemoveRequest::new(key);
         let result = self.remove_one_internal(req).await;
-        match &result { Ok(Some(_)) => tracing::info!("Key removed successfully"), Ok(None) => tracing::debug!("Key not found"), Err(_) => tracing::warn!("Remove failed") }
+        match &result { 
+            Ok(Some(_)) => tracing::info!("Key removed successfully"), 
+            Ok(None) => tracing::debug!("Key not found"), Err(e) => tracing::warn!("Remove failed: {:?}", e) 
+        }
         result
     }
 

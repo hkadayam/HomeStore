@@ -27,22 +27,11 @@ impl MemoryDB {
     /// This is intentionally private to enforce the singleton pattern.
     /// Use `init_mem_homedb()` to create the singleton instance.
     pub(super) fn new(num_reactors: usize) -> Result<Self> {
-        // Initialize IOManager
-        let actual_reactors = match iomgr::init_iomgr(num_reactors) {
-            Ok(()) => num_reactors,
-            Err("IOManager already initialized") => {
-                // IOManager already exists - get its actual reactor count
-                let actual = iomgr::iomgr().num_reactors;
-                if actual != num_reactors {
-                    eprintln!("WARNING: MemoryDB requested {} reactors, but IOManager already initialized with {} reactors. Using {}.",
-                             num_reactors, actual, actual);
-                }
-                actual
-            },
-            Err(e) => {
-                return Err(MemDbError::InvalidConfig(format!("Failed to initialize IOManager: {}", e)));
-            }
-        };
+        // Initialize IOManager (this increments IOManager refcount)
+        iomgr::init_iomgr(num_reactors)
+            .map_err(|e| MemDbError::InvalidConfig(format!("Failed to initialize IOManager: {}", e)))?;
+        
+        let actual_reactors = iomgr::iomgr().num_reactors;
         
         Ok(Self {
             tables: DashMap::new(),

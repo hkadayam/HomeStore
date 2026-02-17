@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ************************************************************* */
+ ********************************************************* */
 
 //! Btree Node Tests
 //!
@@ -26,29 +26,17 @@
 
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use triomphe::Arc as TArc;
 
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
-// When compiled as part of lib tests, use crate:: (homestore crate)
-// When compiled from integration test, crate:: refers to test crate, so we need direct path
-#[cfg(not(test))]
-use homestore::{
-    btree_node::{
-        Node, NodeCore, LockType, InternalLockGuard, NodeOps, SIMPLE_NODE_OPS, VAR_KEY_NODE_OPS, VAR_VALUE_NODE_OPS,
-        VAR_OBJ_NODE_OPS, PREFIX_COMPRESS_NODE_OPS,
-    },
-    btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow},
-    btree::BtreeError,
-    detail::btree_req::BtreePutType,
-};
-#[cfg(test)]
 use crate::{
     index::btree::btree_node::{
         Node, NodeCore, LockType, InternalLockGuard, NodeOps, SIMPLE_NODE_OPS, VAR_KEY_NODE_OPS, VAR_VALUE_NODE_OPS,
         VAR_OBJ_NODE_OPS, PREFIX_COMPRESS_NODE_OPS,
     },
     index::btree::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow},
-    index::btree::btree::BtreeError,
+    index::btree::BtreeError, // Re-exported from btree_types at btree module level
     index::btree::detail::btree_req::BtreePutType,
 };
 
@@ -213,7 +201,7 @@ where
         // Initialize node with the appropriate NodeOps based on variant N
         N::get_node_ops::<K, V>().init_new_node(&node_core);
 
-        let node_core = std::sync::Arc::new(node_core);
+        let node_core = TArc::new(node_core);
         let node = unsafe {
             let write_guard = node_core.lock.write_lock().await;
             let write_guard = std::mem::transmute(write_guard);

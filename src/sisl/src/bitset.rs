@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ***************************************************************************/
+ ****************************************************************** */
 
 use std::{fmt, marker::PhantomData};
 
@@ -149,7 +149,9 @@ impl<T: BitStorage<WordType = u64> + Clone + From<u64>> BitsetImpl<T> {
     }
 
     /// Get mutable header reference using zerocopy for safe access
+    #[allow(dead_code)]
     fn header_mut(&mut self) -> &mut [u8] { &mut self.data.as_mut_slice()[..std::mem::size_of::<BitsetSerialized>()] }
+    
 
     /// Basic accessors that read safely using zerocopy
     pub fn get_id(&self) -> u64 { self.header().id }
@@ -182,15 +184,13 @@ impl<T: BitStorage<WordType = u64> + Clone + From<u64>> BitsetImpl<T> {
 
     fn word_count(&self) -> usize { self.header().word_count as usize }
 
+    #[allow(dead_code)]
     fn word_index(&self, bit: u64) -> Option<usize> {
         let offset = bit + self.skip_bits();
-        if offset >= self.nbits() {
-            None
-        } else {
-            Some((offset / Self::WORD_SIZE) as usize)
-        }
+        if offset >= self.nbits() { None } else { Some((offset / Self::WORD_SIZE) as usize) }
     }
 
+    #[allow(dead_code)]
     fn word_offset(&self, bit: u64) -> u8 { ((bit + self.skip_bits()) % Self::WORD_SIZE) as u8 }
 
     /// Get word slice for safe access to word data
@@ -332,12 +332,12 @@ impl<T: BitStorage<WordType = u64> + Clone + From<u64>> BitsetImpl<T> {
     }
 
     /// Establish (update) the set_count field in the serialized header.
-    /// 
+    ///
     /// # Arguments
     /// * `count` - Optional count value:
     ///   - `Some(n)` - Use the provided count value directly
     ///   - `None` - Calculate count by calling get_set_count() on entire bitset
-    /// 
+    ///
     /// # Note
     /// This method modifies the serialized header's set_count field. The set_count
     /// is NOT automatically maintained by bitset operations and must be explicitly
@@ -379,7 +379,11 @@ impl<T: BitStorage<WordType = u64> + Clone + From<u64>> BitsetImpl<T> {
     }
 
     pub fn get_next_contiguous_n_reset_bits_range(
-        &self, start_bit: u64, end_bit: Option<u64>, min_needed: u32, max_needed: u32,
+        &self,
+        start_bit: u64,
+        end_bit: Option<u64>,
+        min_needed: u32,
+        max_needed: u32,
     ) -> BitBlock {
         if start_bit >= self.size() {
             return BitBlock::new(NPOS, 0);
@@ -472,11 +476,7 @@ impl<T: BitStorage<WordType = u64> + Clone + From<u64>> BitsetImpl<T> {
 
     /// Get the raw word value at the specified word index
     pub fn get_word_value(&self, word_idx: usize) -> u64 {
-        if let Some(word) = self.get_word(word_idx) {
-            word
-        } else {
-            0
-        }
+        if let Some(word) = self.get_word(word_idx) { word } else { 0 }
     }
 
     /// Copy logical bits from another bitset ignoring its head shift
@@ -649,10 +649,10 @@ impl<T: BitStorage<WordType = u64> + Clone + From<u64>> BitsetImpl<T> {
 
 impl<T: BitStorage<WordType = u64> + Clone + From<u64>> BitsetImpl<T> {
     /// Load a bitset from an IOBuffer containing serialized bitset data
-    /// 
+    ///
     /// # Arguments
     /// * `data` - IOBuffer containing BitsetSerialized header followed by bit words
-    /// 
+    ///
     /// # Returns
     /// * `Ok((BitsetImpl, set_count))` - Successfully loaded bitset and the set_count from header
     /// * `Err(&'static str)` - Error message if validation fails

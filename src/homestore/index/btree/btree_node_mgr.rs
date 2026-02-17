@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ****************************************************************** */
+ ***************************************************** */
 
 //! Btree Node Manager - Lock upgrade and node management operations
 //!
@@ -22,10 +22,11 @@
 //! - Node management methods (additional impl block for Btree)
 
 use super::btree_node::{Node, LockType, InternalLockGuard, BNodeId, NodeOps, NodeCore};
-use super::btree_node::{SIMPLE_NODE_OPS, VAR_KEY_NODE_OPS, VAR_VALUE_NODE_OPS, VAR_OBJ_NODE_OPS, PREFIX_COMPRESS_NODE_OPS};
+use super::btree_node::{SIMPLE_NODE_OPS, VAR_KEY_NODE_OPS, VAR_VALUE_NODE_OPS, VAR_OBJ_NODE_OPS};
 use super::btree_kvs::{BtreeKey, BtreeValue};
-use super::btree::{BtreeError, Btree};
-use std::sync::Arc;
+use super::btree_types::BtreeError;
+use super::btree::Btree;
+use triomphe::Arc as TArc;
 
 //================================================================================
 // Btree Node Management Methods
@@ -90,7 +91,7 @@ where
         let node_core = self.storage.read_node(id).await?;
 
         // Lock it (node manager handles all locking)
-        Ok(node_core.lock(lock_type).await)
+        Ok(NodeCore::lock(node_core, lock_type).await)
     }
 
     pub(crate) async fn create_new_node(&self, is_leaf: bool, node_variant: u8) -> Result<Node, BtreeError> {
@@ -229,7 +230,7 @@ where
     /// Sets node_variant in header, calls NodeOps::init_new_node(), acquires write lock, returns Node
     pub(crate) async fn init_new_variant_node(
         &self,
-        node_core: Arc<NodeCore>,
+        node_core: TArc<NodeCore>,
         node_variant: u8,
     ) -> Result<Node, BtreeError> {
         // Set the node variant in persistent header

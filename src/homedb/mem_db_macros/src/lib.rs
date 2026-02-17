@@ -37,7 +37,7 @@ pub fn reactor_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Transform self references in body to cloned
     SelfReplacer.visit_block_mut(&mut body);
     
-    let param_names: Vec<_> = sig.inputs.iter().skip(1).filter_map(|arg| {
+    let _param_names: Vec<_> = sig.inputs.iter().skip(1).filter_map(|arg| {
         if let FnArg::Typed(pat_type) = arg {
             if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
                 return Some(&pat_ident.ident);

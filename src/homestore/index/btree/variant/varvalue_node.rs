@@ -12,14 +12,14 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ************************************************************ */
+ ********************************************************* */
 
 //! VarValue Node - Fixed-size keys, variable-length values
 //!
 //! This module provides the policy for VarValue nodes.
 //! Corresponds to C++ VarValueSizeNode in varlen_node.hpp
 
-use super::varlen_node_common::{VarNodeOps, VarRecordOps, VarValueRecord, get_record_ptr, get_record_ptr_mut};
+use super::varlen_node_common::{VarNodeOps, VarRecordOps, VarValueRecord, get_record_ptr_mut};
 use super::super::btree_node::NodeCore;
 
 /// Zero-sized policy for VarValue nodes

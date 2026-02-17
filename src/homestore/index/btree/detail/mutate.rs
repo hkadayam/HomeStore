@@ -21,10 +21,10 @@
 
 use super::super::btree_node::{Node, BNodeId, LockType};
 use super::super::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow};
-use super::super::btree::{BtreeError, Btree};
+use super::super::btree::Btree;
+use super::super::btree_types::BtreeError;
 use super::btree_req::{
-    BtreeSinglePutRequest, BtreeRangePutRequest, BtreeRequest, BtreePutType, BtreeKeyRange, PutFilter,
-    PutFilterDecision,
+    BtreeSinglePutRequest, BtreeRangePutRequest, BtreeRequest, BtreePutType, PutFilter, PutFilterDecision,
 };
 
 //================================================================================

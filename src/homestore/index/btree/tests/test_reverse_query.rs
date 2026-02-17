@@ -19,7 +19,10 @@
 //! Tests for reverse iteration support using traversal queries.
 //! Critical for TiKV integration to avoid deadlocks.
 
-use crate::index::btree::btree::{Btree, BtreeConfig, UnderlyingBtree};
+use crate::index::btree::{
+    btree::{Btree, UnderlyingBtree},
+    BtreeConfig,  // Re-exported from btree_types at btree module level
+};
 use crate::index::btree::underlying::mem::MemBtree;
 use crate::index::btree::detail::btree_req::BtreeKeyRange;
 
@@ -28,8 +31,8 @@ async fn test_reverse_traversal_query_basic() {
     println!("=== Testing Reverse Traversal Query (Basic) ===");
     
     let mut config = BtreeConfig::new(4096, "test_reverse".to_string());
-    config.leaf_node_type = 4; // PREFIX_COMPRESS
-    config.int_node_type = 4;
+    config.leaf_node_variant = 4; // PREFIX_COMPRESS
+    config.int_node_variant = 4;
     
     let storage: Box<dyn UnderlyingBtree> = Box::new(MemBtree::new(config.node_size));
     let btree = Btree::<u32, u64>::new(config, storage, None).await.expect("Failed to create btree");
@@ -79,8 +82,8 @@ async fn test_reverse_traversal_pagination() {
     println!("=== Testing Reverse Traversal with Pagination ===");
     
     let mut config = BtreeConfig::new(4096, "test_reverse_page".to_string());
-    config.leaf_node_type = 4; // PREFIX_COMPRESS
-    config.int_node_type = 4;
+    config.leaf_node_variant = 4; // PREFIX_COMPRESS
+    config.int_node_variant = 4;
     
     let storage: Box<dyn UnderlyingBtree> = Box::new(MemBtree::new(config.node_size));
     let btree = Btree::<u32, u64>::new(config, storage, None).await.expect("Failed to create btree");
@@ -152,8 +155,8 @@ async fn test_reverse_traversal_multi_level_tree() {
     println!("=== Testing Reverse Traversal on Multi-Level Tree ===");
     
     let mut config = BtreeConfig::new(4096, "test_reverse_multilevel".to_string());
-    config.leaf_node_type = 4; // PREFIX_COMPRESS
-    config.int_node_type = 4;
+    config.leaf_node_variant = 4; // PREFIX_COMPRESS
+    config.int_node_variant = 4;
     
     let storage: Box<dyn UnderlyingBtree> = Box::new(MemBtree::new(config.node_size));
     let btree = Btree::<u32, u64>::new(config, storage, None).await.expect("Failed to create btree");

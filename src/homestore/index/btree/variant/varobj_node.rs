@@ -12,14 +12,14 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ****************************************************** */
+ ************************************************* */
 
 //! VarObj Node - Variable-length keys and values
 //!
 //! This module provides the policy for VarObj nodes.
 //! Corresponds to C++ VarObjSizeNode in varlen_node.hpp
 
-use super::varlen_node_common::{VarNodeOps, VarRecordOps, VarObjRecord, get_record_ptr, get_record_ptr_mut};
+use super::varlen_node_common::{VarNodeOps, VarRecordOps, VarObjRecord, get_record_ptr_mut};
 use super::super::btree_node::NodeCore;
 
 /// Zero-sized policy for VarObj nodes

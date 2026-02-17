@@ -56,6 +56,7 @@ impl FixedSizeTestKey {
     }
     
     /// Create key from u64 value (useful for lookups, id == value)
+    #[allow(dead_code)]
     pub fn from_u64(val: u64) -> Self {
         FixedSizeTestKey { value: val, id: val }
     }
@@ -120,6 +121,7 @@ impl FixedSizeTestValue {
     }
     
     /// Create value from u64 (useful for validation, id == value)
+    #[allow(dead_code)]
     pub fn from_u64(val: u64) -> Self {
         FixedSizeTestValue { value: val, id: val }
     }
@@ -181,6 +183,7 @@ impl TestVarLenKey {
     }
     
     /// Create key from u64 id (useful for lookups)
+    #[allow(dead_code)]
     pub fn from_u64(id: u64) -> Self {
         TestVarLenKey { value: format!("key_{:010}", id), id }
     }
@@ -250,6 +253,7 @@ impl TestVarLenValue {
     }
     
     /// Create value from u64 id (useful for validation)
+    #[allow(dead_code)]
     pub fn from_u64(id: u64) -> Self {
         TestVarLenValue { value: format!("value_{:010}", id), id }
     }
@@ -289,6 +293,7 @@ impl BtreeValue for TestVarLenValue {
 // Generators section - FixedSizeTestKey, FixedSizeTestValue, TestVarLenKey, TestVarLenValue
 //================================================================================
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub enum GenMode {
     Sequential,
     Random,
@@ -332,11 +337,13 @@ impl FixedSizeKeyGenerator {
     }
     
     /// Switch generation mode
+    #[allow(dead_code)]
     pub fn set_mode(&mut self, mode: GenMode) {
         self.mode = mode;
     }
     
     /// Reset counter to 0
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.counter = 0;
     }
@@ -379,10 +386,12 @@ impl FixedSizeValueGenerator {
         }
     }
     
+    #[allow(dead_code)]
     pub fn set_mode(&mut self, mode: GenMode) {
         self.mode = mode;
     }
     
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.counter = 0;
     }
@@ -430,10 +439,12 @@ impl VarLenKeyGenerator {
         }
     }
     
+    #[allow(dead_code)]
     pub fn set_mode(&mut self, mode: GenMode) {
         self.mode = mode;
     }
     
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.counter = 0;
     }
@@ -477,10 +488,12 @@ impl VarLenValueGenerator {
         }
     }
     
+    #[allow(dead_code)]
     pub fn set_mode(&mut self, mode: GenMode) {
         self.mode = mode;
     }
     
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.counter = 0;
     }

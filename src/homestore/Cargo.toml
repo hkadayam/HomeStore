@@ -40,26 +40,23 @@ tokio-uring = "0.4"
 tokio-test = "0.4"
 paste = "1.0"
 rand = "0.8"
+iomgr = { path = "../iomanager", features = ["tokio", "test-mode"] }
 
 [lib]
 name = "homestore"
 path = "lib.rs"
 
 [features]
-default = ["full"]
+default = ["btree-only", "async-locks"]  # Build only btree by default
 full = ["device", "checkpoint", "blkalloc", "blob", "streams", "cow_btree"]
 btree-only = []  # Just index/btree modules, no device layer
+async-locks = []  # Enable async locking for homedb (default ON)
 device = []
 checkpoint = []
 blkalloc = []
 blob = []
 streams = []
 cow_btree = ["device", "streams"]  # COW btree needs device layer
-
-[[test]]
-name = "btree_node_tests"
-path = "tests/btree_node_tests.rs"
-required-features = ["btree-only"]
 
 [[test]]
 name = "btree_bench"

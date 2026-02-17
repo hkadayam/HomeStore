@@ -21,7 +21,10 @@ normalize_doc_attributes = false
 license_template_path = ""
 format_strings = false
 format_macro_matchers = false
-format_macro_bodies = true
+format_macro_bodies = false
+skip_macro_invocations = ["btree_io_err", "btree_err_result", 
+                          "tracing::info", "tracing::debug", "tracing::trace", 
+                          "debug_assert", "debug_assert_eq", "debug_assert_ne"]
 empty_item_single_line = true
 struct_lit_single_line = true
 fn_single_line = true

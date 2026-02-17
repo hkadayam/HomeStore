@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ***************************************************************************/
+ ********************************************************************* */
 
 use left_right::{self, Absorb, ReadHandle, WriteHandle};
 
@@ -102,7 +102,10 @@ where
     /// Create a new RcuPtr with initial value
     pub fn new(initial: T) -> Self {
         let (writer, reader) = left_right::new::<RcuValue<T>, T>();
-        let mut rcu = Self { reader, writer: std::cell::UnsafeCell::new(writer) };
+        let rcu = Self {
+            reader,
+            writer: std::cell::UnsafeCell::new(writer),
+        };
         rcu.update(initial);
         rcu
     }

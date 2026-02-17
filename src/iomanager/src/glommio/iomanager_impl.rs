@@ -78,66 +78,26 @@ impl IOManagerImplTrait for IOManagerImpl {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        // Main thread flow (as specified):
-        // 1. Main thread: iomgr() creates N reactor threads (already done by test macro)
-        // 2. Main thread: spawn(fut) with completion signal
-        // 3. Main thread: wait for completion
-        // 4. Main thread: shutdown iomanager
-        
         // Create glommio executor on main thread to run async operations
         glommio::LocalExecutorBuilder::new()
             .spawn(|| async move {
-                // Step 1: Get iomanager (reactors already running)
+                // Get iomanager (reactors already running)
                 let io_mgr = crate::iomanager::iomgr();
                 
-                // Step 2: Create a shared_channel for completion notification
-                // (Glommio's cross-executor communication mechanism)
+                // Create a shared_channel for completion notification
                 use glommio::channels::shared_channel;
                 let (tx, rx) = shared_channel::new_bounded(1);
                 
-                // Spawn test on reactor 0 (fire-and-forget, but with completion signal)
+                // Spawn test on reactor 0
                 io_mgr.spawn_detached(crate::iomanager::ReactorTarget::Reactor(0), async move {
                     fut.await;
                     let _ = tx.try_send(()); // Signal completion
                 });
                 
-                // Step 3: Wait for completion signal
+                // Wait for completion signal
                 let _ = rx.recv().await;
                 
-                // Step 4: Shutdown iomanager
-                let _ = crate::iomanager::shutdown_iomgr().await;
-            })
-            .expect("Failed to spawn glommio executor")
-            .join()
-            .expect("Failed to join glommio executor");
-    }
-    
-    fn run_test_multi<F>(fut: F, num_threads: usize)
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        // If only 1 thread, use the regular run_test path
-        if num_threads <= 1 {
-            return Self::run_test(fut);
-        }
-        
-        // For multiple threads, spawn the test on ALL reactors concurrently
-        println!("Running test concurrently on {} reactors", num_threads);
-        
-        glommio::LocalExecutorBuilder::new()
-            .spawn(|| async move {
-                let io_mgr = crate::iomanager::iomgr();
-                
-                use glommio::channels::shared_channel;
-                let (tx, rx) = shared_channel::new_bounded(1);
-                
-                // Spawn test on reactor 0 (it can internally use BackgroundTasks to spawn on other reactors)
-                io_mgr.spawn_detached(crate::iomanager::ReactorTarget::Reactor(0), async move {
-                    fut.await;
-                    let _ = tx.try_send(()); // Signal completion
-                });
-                
-                let _ = rx.recv().await;
+                // Shutdown iomanager
                 let _ = crate::iomanager::shutdown_iomgr().await;
             })
             .expect("Failed to spawn glommio executor")

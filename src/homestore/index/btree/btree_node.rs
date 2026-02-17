@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- *************************************************************** */
+ ********** */
 
 //! B-tree Node Implementation
 //!
@@ -24,11 +24,11 @@
 //! - Atomic operations for modified_cp_id and other metadata
 //! - Simple buffer management without complex memory pooling initially
 
-use std::sync::Arc;
-use iomgr::AsyncRwLock;
+use triomphe::Arc as TArc;
+#[cfg(feature = "async-locks")]
 use super::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow};
+use super::btree_types::BtreeError;
 use super::variant;
-use super::detail::btree_req::{PutFilter, PutFilterDecision};
 
 //================================================================================
 // Pagination Status for multi_get
@@ -68,7 +68,7 @@ pub struct NodeInner {}
 pub type BNodeId = u64;
 
 /// BtreeNodePtr - Shared pointer to NodeCore
-pub type BtreeNodePtr = triomphe::Arc<NodeCore>;
+pub type BtreeNodePtr = TArc<NodeCore>;
 
 /// Compact node ID (48-bit, 6 bytes) - used for persistent storage to save space
 /// This is the node_number portion (47 bits) + overflow_bit (1 bit)
@@ -103,9 +103,18 @@ pub fn unpack_compact_id(bytes: CompactNodeId) -> u64 {
 pub const EMPTY_BNODEID: BNodeId = u64::MAX;
 
 /// Internal guard enum (public for btree_base module) - holds actual lock guards
+#[cfg(feature = "async-locks")]
 pub enum InternalLockGuard {
     Read(iomgr::AsyncRwReadGuard<'static, NodeInner>),
     Write(iomgr::AsyncRwWriteGuard<'static, NodeInner>),
+    None, // For unlocked nodes from storage layer
+}
+
+/// Internal guard enum for sync locks (cabindb)
+#[cfg(not(feature = "async-locks"))]
+pub enum InternalLockGuard {
+    Read(parking_lot::RwLockReadGuard<'static, NodeInner>),
+    Write(parking_lot::RwLockWriteGuard<'static, NodeInner>),
     None, // For unlocked nodes from storage layer
 }
 
@@ -127,15 +136,9 @@ pub trait NodeOps<K: BtreeKey, V: BtreeValue>: Send + Sync {
 
     fn get_all_kvs(&self, core: &NodeCore) -> Vec<(K, ValueOrOverflow<V>)>;
 
-    fn insert(
-        &self,
-        core: &NodeCore,
-        idx: u32,
-        key: &K,
-        val: &ValueOrOverflow<V>,
-    ) -> Result<(), super::btree::BtreeError>;
+    fn insert(&self, core: &NodeCore, idx: u32, key: &K, val: &ValueOrOverflow<V>) -> Result<(), BtreeError>;
 
-    fn remove(&self, core: &NodeCore, idx: u32) -> Result<(), super::btree::BtreeError>;
+    fn remove(&self, core: &NodeCore, idx: u32) -> Result<(), BtreeError>;
 
     fn get_nth_key(&self, core: &NodeCore, idx: u32, copy: bool) -> K;
 
@@ -144,19 +147,13 @@ pub trait NodeOps<K: BtreeKey, V: BtreeValue>: Send + Sync {
     /// Check if the nth value is an overflow reference (without fetching the value)
     fn is_nth_value_overflow(&self, core: &NodeCore, idx: u32) -> bool;
 
-    fn update(&self, core: &NodeCore, idx: u32, val: &ValueOrOverflow<V>) -> Result<(), super::btree::BtreeError>;
+    fn update(&self, core: &NodeCore, idx: u32, val: &ValueOrOverflow<V>) -> Result<(), BtreeError>;
 
     /// Update both key and value at index atomically (C++ update(idx, key, val))
-    fn update_with_key(
-        &self,
-        core: &NodeCore,
-        idx: u32,
-        key: &K,
-        val: &ValueOrOverflow<V>,
-    ) -> Result<(), super::btree::BtreeError>;
+    fn update_with_key(&self, core: &NodeCore, idx: u32, key: &K, val: &ValueOrOverflow<V>) -> Result<(), BtreeError>;
 
     // Range operations
-    fn remove_range(&self, core: &NodeCore, start_idx: u32, end_idx: u32) -> Result<(), super::btree::BtreeError>;
+    fn remove_range(&self, core: &NodeCore, start_idx: u32, end_idx: u32) -> Result<(), BtreeError>;
 
     fn remove_all(&self, core: &NodeCore);
 
@@ -345,7 +342,7 @@ impl PersistentHeader {
     pub fn validate(&self) -> bool { self.magic == BTREE_NODE_MAGIC && self.version == BTREE_NODE_VERSION }
 
     /// Get size of persistent header
-    pub const fn size() -> usize { std::mem::size_of::<Self>() }
+    pub const fn size() -> u16 { std::mem::size_of::<Self>() as u16 }
 }
 
 impl Default for PersistentHeader {
@@ -369,13 +366,22 @@ pub use variant::{VarNodeHeader, RecordHeader, VarKeyRecord, VarValueRecord, Var
 
 /// Core node data (private) - holds lock and buffer
 /// This is NOT exposed publicly - only Node guard is public
+#[cfg(feature = "async-locks")]
 pub struct NodeCore {
-    pub lock: AsyncRwLock<NodeInner>,
-    pub(super) phys_buf: Arc<iomgr::IOBuffer>, // Physical buffer with PersistentHeader at offset 0
+    pub lock: iomgr::AsyncRwLock<NodeInner>,
+    pub(super) phys_buf: TArc<iomgr::IOBuffer>, // Physical buffer with PersistentHeader at offset 0
+}
+
+/// Core node data (sync version for cabindb)
+#[cfg(not(feature = "async-locks"))]
+pub struct NodeCore {
+    pub lock: parking_lot::RwLock<NodeInner>,
+    pub(super) phys_buf: TArc<iomgr::IOBuffer>, // Physical buffer with PersistentHeader at offset 0
 }
 
 impl NodeCore {
     /// Create a new node with given parameters
+    #[cfg(feature = "async-locks")]
     pub fn new(node_id: BNodeId, is_leaf: bool, node_size: u32) -> Self {
         let mut buffer = vec![0u8; node_size as usize];
 
@@ -386,27 +392,54 @@ impl NodeCore {
         }
 
         Self {
-            lock: AsyncRwLock::new(NodeInner {}),
-            phys_buf: Arc::new(iomgr::IOBuffer::from_vec(buffer)),
+            lock: iomgr::AsyncRwLock::new(NodeInner {}),
+            phys_buf: TArc::new(iomgr::IOBuffer::from_vec(buffer)),
+        }
+    }
+
+    /// Create a new node with given parameters (sync version)
+    #[cfg(not(feature = "async-locks"))]
+    pub fn new(node_id: BNodeId, is_leaf: bool, node_size: u32) -> Self {
+        let mut buffer = vec![0u8; node_size as usize];
+
+        // Initialize PersistentHeader at the beginning of buffer
+        unsafe {
+            let header_ptr = buffer.as_mut_ptr() as *mut PersistentHeader;
+            *header_ptr = PersistentHeader::new(node_id, is_leaf, node_size as u16);
+        }
+
+        Self {
+            lock: parking_lot::RwLock::new(NodeInner {}),
+            phys_buf: TArc::new(iomgr::IOBuffer::from_vec(buffer)),
         }
     }
 
     /// Create node from existing buffer (loaded from storage)
+    #[cfg(feature = "async-locks")]
     pub fn from_buffer(buffer: Vec<u8>) -> Self {
         Self {
-            lock: AsyncRwLock::new(NodeInner {}),
-            phys_buf: Arc::new(iomgr::IOBuffer::from_vec(buffer)),
+            lock: iomgr::AsyncRwLock::new(NodeInner {}),
+            phys_buf: TArc::new(iomgr::IOBuffer::from_vec(buffer)),
+        }
+    }
+
+    /// Create node from existing buffer (sync version)
+    #[cfg(not(feature = "async-locks"))]
+    pub fn from_buffer(buffer: Vec<u8>) -> Self {
+        Self {
+            lock: parking_lot::RwLock::new(NodeInner {}),
+            phys_buf: TArc::new(iomgr::IOBuffer::from_vec(buffer)),
         }
     }
 
     #[inline]
-    pub(super) fn get_persistent_header(&self) -> &PersistentHeader {
-        unsafe { &*(self.phys_buf.as_ptr() as *const PersistentHeader) }
+    pub fn get_persistent_header(&self) -> &PersistentHeader {
+        unsafe { &*(self.phys_buf.as_ref().as_ptr() as *const PersistentHeader) }
     }
 
     #[inline]
-    pub(super) fn get_persistent_header_mut(&self) -> &mut PersistentHeader {
-        unsafe { &mut *(self.phys_buf.as_ptr() as *mut PersistentHeader) }
+    pub fn get_persistent_header_mut(&self) -> &mut PersistentHeader {
+        unsafe { &mut *(self.phys_buf.as_ref().as_ptr() as *mut PersistentHeader) }
     }
 
     #[inline]
@@ -436,7 +469,7 @@ impl NodeCore {
     pub fn node_size(&self) -> u32 { self.get_persistent_header().node_size as u32 }
 
     #[inline]
-    pub fn get_phys_buf(&self) -> &Arc<iomgr::IOBuffer> { &self.phys_buf }
+    pub fn get_phys_buf(&self) -> &TArc<iomgr::IOBuffer> { &self.phys_buf }
 
     #[inline]
     pub fn get_modified_cp_id(&self) -> i64 { self.get_persistent_header().modified_cp_id }
@@ -469,11 +502,21 @@ impl NodeCore {
     #[inline]
     pub fn is_node_deleted(&self) -> bool { self.get_persistent_header().is_node_deleted() }
 
+    /// Synchronous read lock accessor (for cabindb btree_node_mgr)
+    #[cfg(not(feature = "async-locks"))]
+    pub fn read_lock(&self) -> parking_lot::RwLockReadGuard<'_, NodeInner> { self.lock.read() }
+
+    /// Synchronous write lock accessor (for cabindb btree_node_mgr)
+    #[cfg(not(feature = "async-locks"))]
+    pub fn write_lock(&self) -> parking_lot::RwLockWriteGuard<'_, NodeInner> { self.lock.write() }
+
     /// Lock node based on lock type and whether node is leaf
     /// Matches C++ read_and_lock_node(int_lock_type, leaf_lock_type)
     /// Called by Btree layer to lock nodes retrieved from storage
-    pub async fn lock(self: &Arc<Self>, lock_type: LockType) -> Node {
-        let is_leaf = self.is_leaf();
+    // Async version for homedb
+    #[cfg(feature = "async-locks")]
+    pub async fn lock(core: TArc<Self>, lock_type: LockType) -> Node {
+        let is_leaf = core.is_leaf();
 
         // Determine actual lock to acquire based on node type
         let actual_lock = match lock_type {
@@ -491,12 +534,12 @@ impl NodeCore {
 
         let guard = match actual_lock {
             LockType::Read => {
-                let g = self.lock.read_lock().await;
+                let g = core.lock.read_lock().await;
                 // SAFETY: Safe because Arc<NodeCore> in Node guard keeps lock alive
                 InternalLockGuard::Read(unsafe { std::mem::transmute(g) })
             }
             LockType::Write => {
-                let g = self.lock.write_lock().await;
+                let g = core.lock.write_lock().await;
                 // SAFETY: Safe because Arc<NodeCore> in Node guard keeps lock alive
                 InternalLockGuard::Write(unsafe { std::mem::transmute(g) })
             }
@@ -504,7 +547,47 @@ impl NodeCore {
         };
 
         Node {
-            core: Arc::clone(self),
+            core: core,
+            lock_type: actual_lock,
+            _guard: guard,
+        }
+    }
+
+    // Sync version for cabindb
+    #[cfg(not(feature = "async-locks"))]
+    pub fn lock(core: TArc<Self>, lock_type: LockType) -> Node {
+        let is_leaf = core.is_leaf();
+
+        // Determine actual lock to acquire based on node type
+        let actual_lock = match lock_type {
+            LockType::None => panic!("Cannot lock with LockType::None"),
+            LockType::Read => LockType::Read,
+            LockType::Write => LockType::Write,
+            LockType::ReadInteriorWriteLeaf => {
+                if is_leaf {
+                    LockType::Write
+                } else {
+                    LockType::Read
+                }
+            }
+        };
+
+        let guard = match actual_lock {
+            LockType::Read => {
+                let g = core.lock.read();
+                // SAFETY: Safe because Arc<NodeCore> in Node guard keeps lock alive
+                InternalLockGuard::Read(unsafe { std::mem::transmute(g) })
+            }
+            LockType::Write => {
+                let g = core.lock.write();
+                // SAFETY: Safe because Arc<NodeCore> in Node guard keeps lock alive
+                InternalLockGuard::Write(unsafe { std::mem::transmute(g) })
+            }
+            _ => unreachable!(),
+        };
+
+        Node {
+            core: core,
             lock_type: actual_lock,
             _guard: guard,
         }
@@ -532,14 +615,14 @@ impl std::fmt::Debug for NodeCore {
 /// Node guard - used by Btree layer (matches C++ BtreeNode interface)
 /// This is the ONLY public node type - NodeCore is private
 pub struct Node {
-    pub core: Arc<NodeCore>,
+    pub core: TArc<NodeCore>,
     pub lock_type: LockType,
     pub _guard: InternalLockGuard,
     // NO variant field - dispatch via node_type in header (zero cost)
 }
 
 /// Pointer type for cache storage (unlocked nodes)
-pub type NodePtr = Arc<NodeCore>;
+pub type NodePtr = TArc<NodeCore>;
 
 impl Node {
     // Delegate to core for read operations (common to all variants)
@@ -582,7 +665,7 @@ impl Node {
     pub fn get_edge_value(&self) -> BNodeId { self.core.get_persistent_header().edge_id }
 
     #[inline]
-    pub fn get_phys_buf(&self) -> &Arc<iomgr::IOBuffer> { self.core.get_phys_buf() }
+    pub fn get_phys_buf(&self) -> &TArc<iomgr::IOBuffer> { self.core.get_phys_buf() }
 
     /// Get current lock type
     #[inline]
@@ -590,7 +673,7 @@ impl Node {
 
     /// Get underlying core for upgrade operations
     #[inline]
-    pub fn core(&self) -> &Arc<NodeCore> { &self.core }
+    pub fn core(&self) -> &TArc<NodeCore> { &self.core }
 
     /// Get persistent header for debugging/inspection
     #[inline]
@@ -654,11 +737,24 @@ impl Node {
     ///
     /// # Returns
     /// * Locked temporary Node guard
+    #[cfg(feature = "async-locks")]
     pub async fn clone_temp(&self, lock_type: LockType) -> Node {
         // Clone the physical buffer
         let buffer = self.core.get_phys_buf().to_vec();
-        let temp_core = Arc::new(NodeCore::from_buffer(buffer));
-        temp_core.lock(lock_type).await
+        let temp_core = TArc::new(NodeCore::from_buffer(buffer));
+        NodeCore::lock(temp_core, lock_type).await
+    }
+
+    /// Clone this node's buffer into a temporary node and lock it (sync version)
+    ///
+    /// # Returns
+    /// * Locked temporary Node guard
+    #[cfg(not(feature = "async-locks"))]
+    pub fn clone_temp(&self, lock_type: LockType) -> Node {
+        // Clone the physical buffer
+        let buffer = self.core.get_phys_buf().to_vec();
+        let temp_core = TArc::new(NodeCore::from_buffer(buffer));
+        NodeCore::lock(temp_core, lock_type)
     }
 
     /// Overwrite this node's buffer with another node's buffer
@@ -687,8 +783,8 @@ impl Node {
 
         // Copy entire physical buffer (C++ line 324: memcpy)
         unsafe {
-            let src_ptr = other.core.get_phys_buf().as_ptr();
-            let dst_ptr = self.core.get_phys_buf().as_ptr() as *mut u8;
+            let src_ptr = other.core.get_phys_buf().as_ref().as_ptr();
+            let dst_ptr = self.core.get_phys_buf().as_ref().as_ptr() as *mut u8;
             std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, self_size as usize);
         }
     }
@@ -812,7 +908,7 @@ impl Node {
         &self,
         start_idx: u32,
         end_idx: u32,
-    ) -> Result<(), super::btree::BtreeError> {
+    ) -> Result<(), BtreeError> {
         debug_assert!(self.lock_type == LockType::Write, "remove_range requires write lock");
         if self.is_leaf() {
             self.get_node_ops::<K, V>(/* wlock_reqd= */ true).remove_range(&self.core, start_idx, end_idx)
@@ -941,7 +1037,7 @@ impl Node {
         idx: u32,
         key: &K,
         val: &ValueOrOverflow<V>,
-    ) -> Result<(), super::btree::BtreeError> {
+    ) -> Result<(), BtreeError> {
         debug_assert!(self.is_leaf(), "insert() is only supported for leaf nodes");
         let ops = self.get_node_ops::<K, V>(/* wlock_reqd= */ true);
         ops.insert(&self.core, idx, key, val)
@@ -952,17 +1048,14 @@ impl Node {
         &self,
         idx: u32,
         val: &ValueOrOverflow<V>,
-    ) -> Result<(), super::btree::BtreeError> {
+    ) -> Result<(), BtreeError> {
         debug_assert!(self.is_leaf(), "update() is only supported for leaf nodes");
         let ops = self.get_node_ops::<K, V>(/* wlock_reqd= */ true);
         ops.update(&self.core, idx, val)
     }
 
     /// Remove the entry at the specified index
-    pub fn remove<K: BtreeKey + 'static, V: BtreeValue + 'static>(
-        &self,
-        idx: u32,
-    ) -> Result<(), super::btree::BtreeError> {
+    pub fn remove<K: BtreeKey + 'static, V: BtreeValue + 'static>(&self, idx: u32) -> Result<(), BtreeError> {
         debug_assert!(self.is_leaf(), "remove() is only supported for leaf nodes");
         let ops = self.get_node_ops::<K, V>(/* wlock_reqd= */ true);
         ops.remove(&self.core, idx)
@@ -1000,8 +1093,9 @@ impl Node {
             let val_ref = self.get_nth_value::<K, V>(i, /* copy= */ true);
             let val_str = match val_ref {
                 ValueOrOverflow::Inline(v) => format!("{:?}", v),
-                ValueOrOverflow::OverflowRef { node_id, overflow_size } => 
-                    format!("Overflow[node_id={}, size={}]", node_id, overflow_size),
+                ValueOrOverflow::OverflowRef { node_id, overflow_size } => {
+                    format!("Overflow[node_id={}, size={}]", node_id, overflow_size)
+                }
             };
             s.push_str(&format!("{:?}→{}", key, val_str));
         }
@@ -1013,12 +1107,7 @@ impl Node {
     //================================================================================
 
     /// Insert key-child pair into interior node
-    pub fn insert_child<K: BtreeKey + 'static>(
-        &self,
-        idx: u32,
-        key: &K,
-        child_id: &BNodeId,
-    ) -> Result<(), super::btree::BtreeError> {
+    pub fn insert_child<K: BtreeKey + 'static>(&self, idx: u32, key: &K, child_id: &BNodeId) -> Result<(), BtreeError> {
         debug_assert!(!self.is_leaf(), "insert_child called on leaf node");
         let ops = self.get_node_ops::<K, BNodeId>(/* wlock_reqd= */ true);
         let val_ref = ValueOrOverflow::Inline(*child_id);
@@ -1026,11 +1115,7 @@ impl Node {
     }
 
     /// Update child ID at index in interior node
-    pub fn update_child<K: BtreeKey + 'static>(
-        &self,
-        idx: u32,
-        child_id: &BNodeId,
-    ) -> Result<(), super::btree::BtreeError> {
+    pub fn update_child<K: BtreeKey + 'static>(&self, idx: u32, child_id: &BNodeId) -> Result<(), BtreeError> {
         debug_assert!(!self.is_leaf(), "update_child called on leaf node");
         let ops = self.get_node_ops::<K, BNodeId>(/* wlock_reqd= */ true);
         let val_ref = ValueOrOverflow::Inline(*child_id);
@@ -1043,7 +1128,7 @@ impl Node {
         idx: u32,
         key: &K,
         child_id: &BNodeId,
-    ) -> Result<(), super::btree::BtreeError> {
+    ) -> Result<(), BtreeError> {
         debug_assert!(!self.is_leaf(), "update_child_with_key called on leaf node");
         let ops = self.get_node_ops::<K, BNodeId>(/* wlock_reqd= */ true);
         let val_ref = ValueOrOverflow::Inline(*child_id);

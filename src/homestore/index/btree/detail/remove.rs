@@ -21,12 +21,14 @@
 
 use std::io;
 use super::super::btree_node::{Node, BNodeId, LockType};
-use super::super::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow};
-use super::super::btree::{BtreeError, Btree};
+use super::super::btree_kvs::{BtreeKey, BtreeValue};
+use super::super::btree::Btree;
+use super::super::btree_types::{BtreeError, MergePolicy};
 use super::btree_req::{
     BtreeRemoveRequest, BtreeRemoveAnyRequest, BtreeRangeRemoveRequest, BtreeKeyRange, RemoveFilter,
     RemoveFilterDecision,
 };
+use crate::{btree_io_err};
 
 //================================================================================
 // Remove Request Trait (for compile-time dispatch like C++ templates)
@@ -195,7 +197,7 @@ where
 
         // Iterate through range entries
         while idx <= end_idx && removed < max_count {
-            let key = node.get_nth_key::<K, V>(idx, /* copy= */ true);
+            let _ = node.get_nth_key::<K, V>(idx, /* copy= */ true);
 
             let (decision, _value) = self.apply_remove_filter(node, idx, filter).await?;
             match decision {
@@ -427,7 +429,7 @@ where
     /// Check if root should be collapsed (means that it has only edge child and no entries) and if so,
     /// collapse it and set the new root to the edge child
     async fn check_collapse_root(&self) -> Result<bool, BtreeError> {
-        if !self.config.merge_turned_on {
+        if self.config.merge_policy == MergePolicy::Never {
             return Ok(false);
         }
 
@@ -453,9 +455,10 @@ where
 
     /// Check if child node needs merging (matches C++ is_merge_needed)
     fn is_merge_needed(&self, child: &Node) -> bool {
-        self.config.merge_turned_on && (child.occupied_size::<K, V>() < self.config.suggested_min_size)
+        self.config.merge_policy != MergePolicy::Never && (child.occupied_size::<K, V>() < self.config.suggested_min_size)
     }
 
+    /*
     /// Merge child nodes to reduce the number of nodes
     ///
     /// This function attempts to merge multiple child nodes (from start_idx to end_idx)
@@ -484,7 +487,7 @@ where
         }
 
         // Check if merge is enabled
-        if !self.config.merge_turned_on {
+        if self.config.merge_policy == MergePolicy::Never {
             return Ok(false);
         }
 
@@ -622,5 +625,210 @@ where
         self.storage.write_node(leftmost_node).await?;
         self.storage.write_node(parent_node).await?;
         Ok(true)
+    }
+*/
+
+    pub(in super::super) async fn merge_child_nodes(
+        &self,
+        parent_node: &Node,
+        leftmost_node: &mut Node,
+        start_idx: u32,
+        end_idx: u32,
+    ) -> Result<bool, BtreeError> {
+        // Early return if invalid range or merge is disabled
+        if end_idx <= start_idx || self.config.merge_policy == MergePolicy::Never {
+            return Ok(false);
+        }
+
+        tracing::debug!("Merge child nodes: parent_node={}, leftmost_node={}, start_idx={}, end_idx={}",
+            parent_node.node_id(), leftmost_node.node_id(), start_idx, end_idx);
+
+        // Collections for old and new nodes
+        let mut old_nodes: Vec<Node> = Vec::with_capacity(3);
+        let mut new_nodes: Vec<Node> = Vec::with_capacity(3);
+        let mut cur_new_node = leftmost_node.clone_temp(LockType::Write).await;
+        let mut idx = start_idx + 1;
+
+        // Main merge loop: read old nodes and pack into new nodes
+        while idx <= end_idx {
+            // Read the old node at this index
+            let old_node = self.get_child_and_lock(parent_node, idx, LockType::Write).await?;
+            tracing::trace!("Merge loop: processing node at idx={}, node_id={}, entries={}",
+                idx, old_node.node_id(), old_node.total_entries());
+
+            let mut src_cursor: u32 = 0;
+            let mut src_has_more = true;
+
+            // For the last node, we copy only if it fits, because we don't want to leave half moved last node at the
+            // end, which might cause merge to be more expensive.
+            let copy_only_if_fits = idx == end_idx;
+
+            // Inner loop: Pack all entries from this old_node into new nodes
+            while src_has_more {
+                let prev_cursor = src_cursor;
+                src_has_more = cur_new_node.append_copy_in_upto_size::<K, V>(
+                    &old_node,
+                    &mut src_cursor,
+                    self.config.ideal_fill_size,
+                    copy_only_if_fits,
+                );
+                tracing::trace!("cursor {} -> {}, has_more={}, copy_only_if_fits={}, cur_new_entries={}",
+                    prev_cursor, src_cursor, src_has_more, copy_only_if_fits, cur_new_node.total_entries());
+
+                if src_has_more {
+                    if copy_only_if_fits {
+                        // Last old node doesn't fit completely.
+                        break;
+                    }
+
+                    // Current node is full - save it and create a fresh one
+                    debug_assert_ne!(cur_new_node.total_entries(), 0, "New node after append still empty");
+                    new_nodes.push(cur_new_node);
+                    cur_new_node = self.create_new_node(leftmost_node.is_leaf(), leftmost_node.node_variant()).await?;
+                }
+            }
+
+            if src_has_more && copy_only_if_fits {
+                // Last old node doesn't fit completely.
+                break;
+            }
+
+            // Save the old node for later cleanup
+            old_nodes.push(old_node);
+            idx += 1;
+        }
+
+        // After all old nodes processed: handle the final working node
+        if cur_new_node.total_entries() > 0 {
+            new_nodes.push(cur_new_node);
+        } else {
+            // Empty node created but never used - delete it, but only if it's NOT the temp clone of leftmost_node
+            if cur_new_node.node_id() != leftmost_node.node_id() {
+                self.storage.delete_node(cur_new_node.node_id()).await?;
+            }
+        }
+
+        if new_nodes.len() == 0 {
+            debug_assert!(false, "Turns out that commit merge result in all empty nodes");
+            return btree_io_err!(InvalidData,
+                format!("Merge resulted in all empty nodes - leftmost, {} old nodes were empty", old_nodes.len()));
+        }
+
+        // Debug: Dump nodes before merge decision
+        tracing::trace!("Before merge decision - leftmost node: {}", leftmost_node.to_string::<K, V>());
+        for (i, node) in old_nodes.iter().enumerate() {
+            tracing::trace!("Before merge - old node {}: {}", i + 1, node.to_string::<K, V>());
+        }
+        for (i, node) in new_nodes.iter().enumerate() {
+            tracing::trace!("Before merge - new node {}: {}", i, node.to_string::<K, V>());
+        }
+        tracing::trace!("Before merge - parent node: {}", parent_node.to_string::<K, BNodeId>());
+
+        // Decision point: should we commit this merge?
+        if !self.should_accept_merge(end_idx - start_idx + 1, old_nodes.len() + 1, new_nodes.len()) {
+            tracing::info!("Merge rejected by {:?} policy: attempted={}, old={}, new={}", 
+                self.config.merge_policy, end_idx - start_idx + 1, old_nodes.len() + 1, new_nodes.len());
+
+            // Cleanup: delete the new nodes we created
+            for (i, node) in new_nodes.iter().enumerate() {
+                // Skip first node if it has the same ID as leftmost_node (it's the temp clone)
+                if node.node_id() == leftmost_node.node_id() {
+                    debug_assert_eq!(i, 0, "First new node should be the temp clone of leftmost node");
+                    continue;
+                }
+                self.storage.delete_node(node.node_id()).await?;
+            }
+            return Ok(false);
+        }
+
+        // We are committing the merge at this point. We are going to overwrite the leftmost node with the temp node
+        // and delete the temp node. We are also going to update the parent node entries for the new nodes.
+        tracing::info!("Committing merge: reducing {} nodes to {}", old_nodes.len() + 1, new_nodes.len());
+
+        // Step 1: Swap the contents of the first new node with the leftmost node, because leftmost node is updated
+        // in-place. We will remove the first new node after this step.
+        leftmost_node.overwrite(&new_nodes[0]);
+        new_nodes.remove(0);
+
+        // Step 2: Remove the excess entries from the parent node
+        parent_node
+            .remove_range::<K, BNodeId>(start_idx + 1 + new_nodes.len() as u32, start_idx + old_nodes.len() as u32)?;
+
+        // Step 3: Walk through the new nodes in reverse order and update both the next node and
+        // the parent node entries for the new nodes.
+        let mut next_node_id = old_nodes.last().unwrap().get_next_node();
+        let mut parent_idx = start_idx + new_nodes.len() as u32;
+        for node in new_nodes.iter().rev() {
+            node.set_next_node(next_node_id);
+            let last_key = node.get_last_key::<K, V>().ok_or(BtreeError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Last key not found for new node {}", node.node_id()),
+            )))?;
+            parent_node.update_child_with_key::<K>(parent_idx, &last_key, &node.node_id())?;
+            next_node_id = node.node_id();
+            parent_idx -= 1;
+        }
+
+        // Step 4: Update the leftmost node's next pointer
+        leftmost_node.set_next_node(next_node_id);
+        let last_key = leftmost_node.get_last_key::<K, V>().ok_or(BtreeError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Last key not found for leftmost node {}", leftmost_node.node_id()),
+        )))?;
+        parent_node.update_child_with_key::<K>(start_idx, &last_key, &leftmost_node.node_id())?;
+
+        // Debug: Dump merged nodes state
+        tracing::trace!("Leftmost node after merge: {}", leftmost_node.to_string::<K, V>());
+        for (i, node) in new_nodes.iter().enumerate() {
+            tracing::trace!("New node {} after merge: {}", i + 1, node.to_string::<K, V>());
+        }
+        tracing::trace!("Parent after merge: {}", parent_node.to_string::<K, BNodeId>());
+
+        // Step 5: Delete the old nodes and write the leftmost node and parent node to the storage
+        for node in old_nodes.iter() {
+            self.storage.delete_node(node.node_id()).await?;
+        }
+        self.storage.write_node(leftmost_node).await?;
+        self.storage.write_node(parent_node).await?;
+
+        // Step 6: Write the new nodes to the storage
+        for node in new_nodes.iter() {
+            self.storage.write_node(node).await?;
+        }
+
+        Ok(true)
+    }
+        
+    /// Policy-based merge acceptance decision
+    ///
+    /// Determines whether to commit a merge based on configured MergePolicy:
+    /// - Aggressive: Accept any reduction in node count
+    /// - Conservative: Accept only if 2+ nodes saved, or 1+ when only 2 attempted (edge case)
+    ///
+    /// # Arguments
+    /// * `attempted` - Number of nodes we attempted to merge (end_idx - start_idx + 1)
+    /// * `old_total` - Total nodes before merge (old_nodes.len() + 1 for leftmost)
+    /// * `new_total` - Total nodes after merge (new_nodes.len())
+    fn should_accept_merge(&self, attempted: u32, old_total: usize, new_total: usize) -> bool {
+        // Always reject if no reduction
+        if new_total >= old_total {
+            return false;
+        }
+
+        let nodes_saved = old_total - new_total;
+
+        match self.config.merge_policy {
+            MergePolicy::Never => false,
+            MergePolicy::Aggressive => nodes_saved > 0,
+            MergePolicy::Conservative => {
+                // For edge merges (only 2 nodes available), accept any savings
+                if attempted == 2 {
+                    nodes_saved >= 1
+                } else {
+                    // For middle merges (3+ nodes), require 2+ savings
+                    nodes_saved >= 2
+                }
+            }
+        }
     }
 }

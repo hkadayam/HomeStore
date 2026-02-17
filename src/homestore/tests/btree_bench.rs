@@ -19,7 +19,8 @@
 //!   flamegraph target/release/examples/btree_concurrent_bench
 
 use homestore::index::btree::{
-    btree::{Btree, BtreeConfig},
+    btree::Btree,
+    BtreeConfig,  // Re-exported from btree_types at btree module level
     btree_kvs::{BtreeKey, BtreeValue},
     underlying::mem::MemBtree,
 };
@@ -106,8 +107,8 @@ async fn main() {
 
     // Create btree
     let mut config = BtreeConfig::new(4096, "benchmark".to_string());
-    config.leaf_node_type = 0; // SimpleNode for raw performance
-    config.int_node_type = 0;
+    config.leaf_node_variant = 0; // SimpleNode for raw performance
+    config.int_node_variant = 0;
 
     let storage = Box::new(MemBtree::new(config.node_size));
     let btree = Arc::new(

@@ -19,12 +19,17 @@
 //! This module contains detailed btree operations split into separate files
 //! (mutate, query) similar to the C++ implementation structure.
 
+// btree_req contains only types/requests - always available
 pub mod btree_req;
+pub use btree_req::*;
+
+// Implementation modules - only when async-locks is enabled
+#[cfg(feature = "async-locks")]
 pub mod mutate;
+#[cfg(feature = "async-locks")]
 pub mod query;
+#[cfg(feature = "async-locks")]
 pub mod remove;
 
-pub use btree_req::*;
+#[cfg(feature = "async-locks")]
 pub use mutate::*;
-pub use query::*;
-pub use remove::*;

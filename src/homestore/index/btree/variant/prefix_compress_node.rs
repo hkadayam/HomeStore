@@ -324,6 +324,15 @@ pub struct PrefixCompressNodeOps {
 }
 
 impl PrefixCompressNodeOps {
+    /// Returns (total_header_size including PersistentHeader, per_entry_overhead)
+    /// PrefixCompressNode has PersistentHeader (56) + PrefixCompressHeader (4) + RecordData per entry (10)
+    pub const fn get_overhead_size() -> (u32, u32) {
+        let header_size = PersistentHeader::size() as u32 
+            + std::mem::size_of::<PrefixCompressHeader>() as u32; // 56 + 4 = 60
+        let per_entry = std::mem::size_of::<RecordData>() as u32; // 10 bytes
+        (header_size, per_entry)
+    }
+    
     pub const fn new(expected_prefix_size: u16) -> Self {
         Self {
             expected_prefix_size,

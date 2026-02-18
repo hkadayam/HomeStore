@@ -1,0 +1,37 @@
+[package]
+name = "homedb"
+version = "0.1.0"
+edition = "2021"
+authors = ["Harihara Kadayam"]
+license = "Apache-2.0"
+description = "Unified database API supporting sync/async and in-memory/persistent modes"
+
+[dependencies]
+homestore = { path = "../homestore", default-features = false, features = ["btree-only"] }
+maybe-async-cfg = "0.2"
+parking_lot = "0.12"
+dashmap = "6.0"
+async-trait = "0.1"
+tokio = { version = "1.35", features = ["sync", "rt"], optional = true }
+iomgr = { path = "../iomanager", optional = true }
+
+[dev-dependencies]
+rand = "0.8"
+tokio = { version = "1.35", features = ["full", "test-util"] }
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+
+[features]
+default = ["persistent"]
+
+# Storage mode features
+persistent = ["homestore/persistent", "dep:iomgr", "dep:tokio"]  # Full persistent DB (requires iomanager)
+inmem = ["homestore/inmem"]  # In-memory only (btree only, no device layer)
+
+# Sync/async mode features
+sync_code = ["homestore/sync_code"]  # Sync mode (strips async/await)
+
+# Note: Lock type (async vs sync) is now controlled by sync_code/async_code features
+
+[lib]
+name = "homedb"
+path = "src/lib.rs"

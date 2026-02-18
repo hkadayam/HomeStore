@@ -7,22 +7,38 @@ license = "Apache-2.0"
 description = "In-memory database built on Homestore Btree"
 
 [dependencies]
-homestore = { path = "../../homestore", default-features = false, features = ["btree-only", "async-locks"] }
-tokio = { version = "1.35", features = ["full"] }
-iomgr = { path = "../../iomanager" }
+homestore = { path = "../../homestore", default-features = false, features = ["btree-only", "inmem"] }
+tokio = { version = "1.35", features = ["full"], optional = true }
+iomgr = { path = "../../iomanager", optional = true }
 async-trait = "0.1"
 parking_lot = "0.12"
 dashmap = "6.0"
+maybe-async-cfg = "0.2"
 mem_db_macros = { path = "../mem_db_macros" }
 
 [dev-dependencies]
 rand = "0.8"
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+clap = { version = "4.5", features = ["derive"] }
+# Note: iomgr and tokio are only needed for async_mode tests, but Cargo requires
+# all dev-dependencies for any test build. When building just the library without
+# tests, these are not included.
+iomgr = { path = "../../iomanager", features = ["tokio", "test-mode"] }
+tokio = { version = "1.35", features = ["full"] }
 
 [lib]
 name = "mem_db"
 path = "src/lib.rs"
 
+[features]
+default = []  # Explicitly choose sync_mode or async_mode
+sync_mode = ["homestore/sync_code"]
+async_mode = ["homestore/async_code", "dep:iomgr", "dep:tokio"]
+
 [[bench]]
 name = "bench_memdb_vs_rocksdb"
+harness = false
+
+[[test]]
+name = "memdb_bench"
+path = "tests/memdb_bench.rs"
 harness = false

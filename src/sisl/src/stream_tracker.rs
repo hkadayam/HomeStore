@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ***************************************************************************/
+ ************************************************************************* */
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -31,7 +31,14 @@ pub struct StreamStatus {
 }
 
 impl Default for StreamStatus {
-    fn default() -> Self { Self { is_out_of_range: false, is_hole: false, is_active: false, is_completed: false } }
+    fn default() -> Self {
+        Self {
+            is_out_of_range: false,
+            is_hole: false,
+            is_active: false,
+            is_completed: false,
+        }
+    }
 }
 
 /// Constants for stream tracker
@@ -109,7 +116,7 @@ impl<T: Clone, const AUTO_TRUNCATE: bool> StreamTracker<T, AUTO_TRUNCATE> {
 
     /// Reinitialize with a new starting index
     pub async fn reinit(&self, start_idx: i64) {
-        let mut inner = self.inner.write_lock().await;
+        let mut inner = self.inner.write().await;
         inner.slot_ref_idx = start_idx + 1;
     }
 
@@ -131,19 +138,19 @@ impl<T: Clone, const AUTO_TRUNCATE: bool> StreamTracker<T, AUTO_TRUNCATE> {
 
     /// Mark a range of entries as completed
     pub async fn complete(&self, start_idx: i64, end_idx: i64) {
-        let inner = self.inner.read_lock().await;
+        let inner = self.inner.read().await;
         let start_bit = (start_idx - inner.slot_ref_idx) as u64;
         let count = (end_idx - start_idx + 1) as u64;
         drop(inner);
 
         // Need to get write access for mutations
-        let mut inner = self.inner.write_lock().await;
+        let mut inner = self.inner.write().await;
         inner.comp_slot_bits.set_bits(start_bit, count);
     }
 
     /// Rollback active entries from new_end_idx onwards
     pub async fn rollback(&self, new_end_idx: i64) -> Result<(), String> {
-        let mut inner = self.inner.write_lock().await;
+        let mut inner = self.inner.write().await;
 
         if new_end_idx < inner.slot_ref_idx
             || new_end_idx >= (inner.slot_ref_idx + inner.active_slot_bits.size() as i64)
@@ -165,7 +172,7 @@ impl<T: Clone, const AUTO_TRUNCATE: bool> StreamTracker<T, AUTO_TRUNCATE> {
 
     /// Get a reference to the data at the specified index
     pub async fn at(&self, idx: i64) -> Result<T, String> {
-        let inner = self.inner.read_lock().await;
+        let inner = self.inner.read().await;
 
         if idx < inner.slot_ref_idx {
             return Err("Slot idx is not in range".to_string());
@@ -186,7 +193,7 @@ impl<T: Clone, const AUTO_TRUNCATE: bool> StreamTracker<T, AUTO_TRUNCATE> {
     /// Get the status of an entry at the specified index
     pub async fn status(&self, idx: i64) -> StreamStatus {
         let mut status = StreamStatus::default();
-        let inner = self.inner.read_lock().await;
+        let inner = self.inner.read().await;
 
         if idx < inner.slot_ref_idx {
             status.is_out_of_range = true;
@@ -206,7 +213,7 @@ impl<T: Clone, const AUTO_TRUNCATE: bool> StreamTracker<T, AUTO_TRUNCATE> {
 
     /// Truncate entries up to the specified index
     pub async fn truncate_to(&self, idx: i64) -> usize {
-        let mut inner = self.inner.write_lock().await;
+        let mut inner = self.inner.write().await;
         let upto_bit = idx - inner.slot_ref_idx + 1;
 
         if upto_bit <= 0 {
@@ -222,7 +229,7 @@ impl<T: Clone, const AUTO_TRUNCATE: bool> StreamTracker<T, AUTO_TRUNCATE> {
             return 0;
         }
 
-        let mut inner = self.inner.write_lock().await;
+        let mut inner = self.inner.write().await;
 
         // Find the first incomplete bit
         let first_incomplete_bit = inner.comp_slot_bits.get_next_reset_bit(0);
@@ -242,13 +249,13 @@ impl<T: Clone, const AUTO_TRUNCATE: bool> StreamTracker<T, AUTO_TRUNCATE> {
     /// Find the highest consecutive completed index starting from
     /// search_hint_idx
     pub async fn completed_upto(&self, search_hint_idx: i64) -> i64 {
-        let inner = self.inner.read_lock().await;
+        let inner = self.inner.read().await;
         self.upto(&inner, true, search_hint_idx)
     }
 
     /// Find the highest consecutive active index starting from search_hint_idx
     pub async fn active_upto(&self, search_hint_idx: i64) -> i64 {
-        let inner = self.inner.read_lock().await;
+        let inner = self.inner.read().await;
         self.upto(&inner, false, search_hint_idx)
     }
 
@@ -257,7 +264,7 @@ impl<T: Clone, const AUTO_TRUNCATE: bool> StreamTracker<T, AUTO_TRUNCATE> {
     where
         F: FnMut(i64, i64, &T) -> bool,
     {
-        let inner = self.inner.read_lock().await;
+        let inner = self.inner.read().await;
         let upto = self.upto(&inner, true, start_idx);
 
         for idx in start_idx..=upto {
@@ -274,7 +281,7 @@ impl<T: Clone, const AUTO_TRUNCATE: bool> StreamTracker<T, AUTO_TRUNCATE> {
     where
         F: FnMut(i64, i64, &T) -> bool,
     {
-        let inner = self.inner.read_lock().await;
+        let inner = self.inner.read().await;
         let upto = self.upto(&inner, false, start_idx);
 
         for idx in start_idx..=upto {
@@ -292,7 +299,7 @@ impl<T: Clone, const AUTO_TRUNCATE: bool> StreamTracker<T, AUTO_TRUNCATE> {
     where
         F: FnMut(i64, &T) -> bool,
     {
-        let inner = self.inner.read_lock().await;
+        let inner = self.inner.read().await;
         let mut search_bit = std::cmp::max(0, start_idx - inner.slot_ref_idx) as u64;
 
         loop {
@@ -317,7 +324,7 @@ impl<T: Clone, const AUTO_TRUNCATE: bool> StreamTracker<T, AUTO_TRUNCATE> {
     where
         F: FnMut(i64, &T) -> bool,
     {
-        let inner = self.inner.read_lock().await;
+        let inner = self.inner.read().await;
         let mut search_bit = std::cmp::max(0, start_idx - inner.slot_ref_idx) as u64;
 
         loop {
@@ -338,7 +345,7 @@ impl<T: Clone, const AUTO_TRUNCATE: bool> StreamTracker<T, AUTO_TRUNCATE> {
 
     /// Get detailed status information as JSON
     pub async fn get_status(&self, verbosity: u8) -> JsonValue {
-        let inner = self.inner.read_lock().await;
+        let inner = self.inner.read().await;
         let mut status = json!({
             "start": inner.slot_ref_idx,
             "completed_upto": self.completed_upto(0).await,
@@ -370,7 +377,7 @@ impl<T: Clone, const AUTO_TRUNCATE: bool> StreamTracker<T, AUTO_TRUNCATE> {
 
         // Check if we need to resize first (read lock)
         {
-            let inner = self.inner.read_lock().await;
+            let inner = self.inner.read().await;
             if idx < inner.slot_ref_idx {
                 return inner.slot_ref_idx - 1;
             }
@@ -384,7 +391,7 @@ impl<T: Clone, const AUTO_TRUNCATE: bool> StreamTracker<T, AUTO_TRUNCATE> {
         }
 
         // Actual update under write lock
-        let mut inner = self.inner.write_lock().await;
+        let mut inner = self.inner.write().await;
         let nbit = (idx - inner.slot_ref_idx) as usize;
         let data_idx = nbit + inner.data_skip_count;
 
@@ -414,16 +421,12 @@ impl<T: Clone, const AUTO_TRUNCATE: bool> StreamTracker<T, AUTO_TRUNCATE> {
         let ret = inner.slot_ref_idx - 1;
         drop(inner); // Release write lock
 
-        if need_truncate {
-            self.truncate().await as i64
-        } else {
-            ret
-        }
+        if need_truncate { self.truncate().await as i64 } else { ret }
     }
 
     /// Resize the internal storage
     async fn do_resize(&self, atleast_count: usize) {
-        let mut inner = self.inner.write_lock().await;
+        let mut inner = self.inner.write().await;
 
         if atleast_count <= inner.allocated_slots {
             return;

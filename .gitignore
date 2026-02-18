@@ -108,3 +108,9 @@ CMakeSettings.json
 CMakeUserPresets.json
 .vs/**
 .cache
+
+Cargo.lock
+target/
+.cursor
+ai_docs/
+tmp/

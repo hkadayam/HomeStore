@@ -57,6 +57,7 @@ impl RangeIterator {
     /// - Ok(Some((key, value))) if there's a next item
     /// - Ok(None) if iteration is complete
     /// - Err if btree operation fails
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         loop {
             // Try to get from current batch
@@ -90,6 +91,7 @@ impl RangeIterator {
     }
     
     /// Collect all remaining items into a vector
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn collect(mut self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut results = Vec::new();
         while let Some(item) = self.next().await? {
@@ -102,6 +104,7 @@ impl RangeIterator {
     ///
     /// Returns true if found, false if target is beyond end of range.
     /// After a successful seek, calling next() will return the key seeked to or the next available key.
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn seek(&mut self, key: &[u8]) -> Result<bool> {
         // Discard current state
         self.handle = None;
@@ -158,6 +161,7 @@ impl RangeIterator {
     ///
     /// Returns true if found, false if target is before start of range.
     /// This method is only valid for reverse iterators.
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn seek_for_prev(&mut self, key: &[u8]) -> Result<bool> {
         if !self.reverse {
             return Err(MemDbError::InvalidOperation(

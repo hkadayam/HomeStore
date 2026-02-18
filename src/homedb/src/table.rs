@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use crate::{
     table_index::{TableIndex, IndexType},
     key_value_spec::TableSpec,
-    error::{MemDbError, Result},
+    error::{HomeDbError, Result},
 };
 
 /// A table in MemDB - manages multiple indices
@@ -32,7 +32,6 @@ impl Table {
     /// # Arguments
     /// * `name` - Name of the table
     /// * `spec` - Schema specification for the primary index
-    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn new(name: String, spec: TableSpec) -> Result<Self> {
         let table = Self {
             name: name.clone(),
@@ -76,11 +75,10 @@ impl Table {
     /// 
     /// # Returns
     /// Arc to the newly created TableIndex
-    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn create_index(&self, index_name: &str, spec: TableSpec) -> Result<Arc<TableIndex>> {
         // Check if index already exists
         if self.indices.contains_key(index_name) {
-            return Err(MemDbError::InvalidConfig(
+            return Err(HomeDbError::InvalidConfig(
                 format!("Index '{}' already exists on table '{}'", index_name, self.name)
             ));
         }
@@ -106,7 +104,7 @@ impl Table {
         self.indices
             .get(index_name)
             .map(|entry| Arc::clone(entry.value()))
-            .ok_or_else(|| MemDbError::InvalidConfig(
+            .ok_or_else(|| HomeDbError::InvalidConfig(
                 format!("Index '{}' not found on table '{}'", index_name, self.name)
             ))
     }
@@ -121,14 +119,14 @@ impl Table {
     /// Note: Cannot drop the primary index
     pub fn drop_index(&self, index_name: &str) -> Result<()> {
         if index_name == "primary" {
-            return Err(MemDbError::InvalidConfig(
+            return Err(HomeDbError::InvalidConfig(
                 "Cannot drop primary index".to_string()
             ));
         }
         
         self.indices
             .remove(index_name)
-            .ok_or_else(|| MemDbError::InvalidConfig(
+            .ok_or_else(|| HomeDbError::InvalidConfig(
                 format!("Index '{}' not found on table '{}'", index_name, self.name)
             ))?;
         
@@ -140,25 +138,21 @@ impl Table {
     // ═══════════════════════════════════════════════════════════════════════
     
     /// Put a single key-value pair (uses primary index)
-    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         self.primary_index().put(key, value).await
     }
     
     /// Get a single value by key (uses primary index)
-    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
         self.primary_index().get(key).await
     }
     
     /// Remove a single key (uses primary index)
-    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn remove(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
         self.primary_index().remove(key).await
     }
     
     /// Put multiple key-value pairs (uses primary index)
-    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn put_range(&self, kvs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
         let primary = self.primary_index();
         for (key, value) in kvs {
@@ -179,7 +173,6 @@ impl Table {
     /// - `start_key`: Start of range (inclusive)
     /// - `end_key`: End of range (exclusive)
     /// - `batch_size`: Number of results to fetch per batch
-    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn get_range(
         &self,
         start_key: Vec<u8>,
@@ -190,7 +183,6 @@ impl Table {
     }
     
     /// Query a range in reverse order (convenience method, delegates to primary index)
-    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn get_range_reverse(
         &self,
         start_key: Vec<u8>,
@@ -201,7 +193,6 @@ impl Table {
     }
     
     /// Get any key-value pair in the given range (convenience method, delegates to primary index)
-    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn get_any(
         &self,
         start_key: Vec<u8>,
@@ -211,7 +202,6 @@ impl Table {
     }
     
     /// Remove any key in the given range (convenience method, delegates to primary index)
-    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn remove_any(
         &self,
         start_key: Vec<u8>,

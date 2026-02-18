@@ -218,6 +218,17 @@ where
     }
 
     //================================================================================
+    // Configuration Getters
+    //================================================================================
+    
+    /// Get the maximum key size for this btree
+    /// This is computed based on node_size, variant overhead, and inline_value_size
+    /// to guarantee at least 2 entries fit in a node
+    pub fn max_key_size(&self) -> u32 {
+        self.config.max_key_size()
+    }
+
+    //================================================================================
     // Public API Methods
     //================================================================================
 

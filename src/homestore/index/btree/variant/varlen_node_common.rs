@@ -368,6 +368,14 @@ pub struct VarNodeOps<R> {
 
 impl<R> VarNodeOps<R> {
     pub const fn new(record_ops: R) -> Self { Self { record_ops } }
+    
+    /// Returns (total_header_size including PersistentHeader, per_entry_overhead)
+    /// VarlenNode has PersistentHeader (56) + VarNodeHeader (4) + RecordHeader per entry (2)
+    pub const fn get_overhead_size() -> (u32, u32) {
+        let header_size = PersistentHeader::size() as u32 + VarNodeHeader::size() as u32; // 56 + 4 = 60
+        let per_entry = std::mem::size_of::<RecordHeader>() as u32; // 2 bytes
+        (header_size, per_entry)
+    }
 }
 
 impl<R> VarNodeOps<R>

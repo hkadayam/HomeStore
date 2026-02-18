@@ -70,150 +70,57 @@ pub use error::{MemDbError, Result};
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Singleton Pattern (like init_iomgr)
+// IOManager Convenience Wrappers
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(test)]
-static MEM_HOMEDB: parking_lot::RwLock<Option<Box<MemoryDB>>> = parking_lot::RwLock::const_new(None);
-
-#[cfg(test)]
-static HOMEDB_INIT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(not(test))]
-static mut MEM_HOMEDB: Option<MemoryDB> = None;
-
-/// Initialize the in-memory HomeDB singleton
+/// Initialize IOManager for async mode (convenience wrapper)
 /// 
-/// This should be called once at application startup. Subsequent calls will
-/// return an error. The singleton can be accessed via `mem_homedb()`.
+/// In async mode, this initializes the IOManager with the specified number of reactors.
+/// In sync mode, this is a no-op.
+/// 
+/// This is idempotent and refcounted - safe to call multiple times.
 /// 
 /// # Arguments
 /// * `num_reactors` - Number of reactor threads (typically number of CPU cores)
 /// 
 /// # Example
 /// ```ignore
-/// use mem_db::{init_mem_homedb, mem_homedb};
+/// use mem_db::{init_mem_homedb, MemoryDB};
 /// 
-/// // Initialize once
+/// // Initialize IOManager once (async mode only)
 /// init_mem_homedb(4)?;
 /// 
-/// // Access singleton
-/// let db = mem_homedb();
+/// // Create MemoryDB instances as needed
+/// let db = MemoryDB::new()?;
 /// let table = db.create_table("users", spec).await?;
 /// ```
 pub fn init_mem_homedb(num_reactors: usize) -> Result<()> {
-    #[cfg(test)]
+    #[cfg(feature = "async_mode")]
     {
-        use std::sync::atomic::Ordering;
-        
-        // Fast path: already initialized
-        if HOMEDB_INIT_COUNT.load(Ordering::Acquire) > 0 {
-            HOMEDB_INIT_COUNT.fetch_add(1, Ordering::SeqCst);
-            return Ok(());
-        }
-        
-        // Slow path: acquire write lock
-        let mut guard = MEM_HOMEDB.write();
-        
-        // Atomically increment and check if we're first (or if we need to recreate after full shutdown)
-        let prev = HOMEDB_INIT_COUNT.fetch_add(1, Ordering::SeqCst);
-        
-        if prev == 0 || guard.is_none() {
-            // We're first OR MemoryDB was destroyed in previous shutdown - (re)create it
-            *guard = Some(Box::new(MemoryDB::new(num_reactors)?));
-        }
-        // else: someone beat us, they already created it
-        
-        Ok(())
+        iomgr::init_iomgr(num_reactors)
+            .map_err(|e| MemDbError::InvalidConfig(format!("Failed to initialize IOManager: {}", e)))?;
     }
     
-    #[cfg(not(test))]
-    unsafe {
-        if MEM_HOMEDB.is_some() {
-            return Err(MemDbError::InvalidConfig(
-                "MemoryDB already initialized. Use mem_homedb() to access it.".to_string()
-            ));
-        }
-        
-        MEM_HOMEDB = Some(MemoryDB::new(num_reactors)?);
-        Ok(())
-    }
-}
-
-/// Get the singleton MemoryDB instance
-/// 
-/// # Panics
-/// Panics if `init_mem_homedb()` has not been called yet.
-/// 
-/// # Example
-/// ```ignore
-/// let db = mem_homedb();
-/// let users = db.get_table("users")?;
-/// users.put(&key, &value).await?;
-/// ```
-pub fn mem_homedb() -> &'static MemoryDB {
-    #[cfg(test)]
+    #[cfg(feature = "sync_mode")]
     {
-        use std::sync::atomic::Ordering;
-        
-        let count = HOMEDB_INIT_COUNT.load(Ordering::Acquire);
-        assert!(count > 0, "MemoryDB not initialized. Call init_mem_homedb() first.");
-        
-        let guard = MEM_HOMEDB.read();
-        let db_ref = guard.as_ref().expect("MemoryDB missing despite count > 0");
-        
-        // Safety: count > 0 means MemoryDB is alive
-        // Tests are disciplined: they finish using it before shutdown
-        unsafe {
-            std::mem::transmute::<&MemoryDB, &'static MemoryDB>(db_ref.as_ref())
-        }
+        let _ = num_reactors; // Unused in sync mode
     }
     
-    #[cfg(not(test))]
-    #[allow(static_mut_refs)]
-    unsafe {
-        MEM_HOMEDB.as_ref().expect("MemoryDB not initialized. Call init_mem_homedb() first.")
-    }
+    Ok(())
 }
 
-/// Shutdown the MemoryDB singleton and all reactors
+/// Shutdown IOManager (convenience wrapper)
 /// 
-/// This should be called before application exit for clean shutdown.
-/// Decrements the reference count and only performs actual shutdown when count reaches 0.
+/// In async mode, shuts down the IOManager and all reactors.
+/// In sync mode, this is a no-op.
+/// 
+/// This is refcounted - actual shutdown only happens when refcount reaches 0.
+#[cfg(feature = "sync_mode")]
+pub fn shutdown_mem_homedb() {
+    // No-op in sync mode
+}
+
+#[cfg(feature = "async_mode")]
 pub async fn shutdown_mem_homedb() {
-    #[cfg(test)]
-    {
-        use std::sync::atomic::Ordering;
-        
-        // Acquire write lock first to serialize with init
-        let mut guard = MEM_HOMEDB.write();
-        
-        let prev = HOMEDB_INIT_COUNT.fetch_sub(1, Ordering::SeqCst);
-        
-        if prev == 0 {
-            // Undo the decrement
-            HOMEDB_INIT_COUNT.fetch_add(1, Ordering::SeqCst);
-            eprintln!("Warning: shutdown_mem_homedb() called more times than init");
-            return;
-        }
-        
-        if prev == 1 {
-            // Last shutdown - destroy MemoryDB
-            if let Some(_db) = guard.take() {
-                drop(guard); // Release lock before async operation
-            }
-        }
-        // else: count > 1, just decremented, keep MemoryDB alive
-        
-        // Always shutdown IOManager to match init (which always calls init_iomgr)
-        let _ = iomgr::shutdown_iomgr().await;
-    }
-    
-    #[cfg(not(test))]
-    unsafe {
-        if MEM_HOMEDB.is_some() {
-            let _ = iomgr::shutdown_iomgr().await;
-            MEM_HOMEDB = None;
-        }
-    }
+    let _ = iomgr::shutdown_iomgr().await;
 }

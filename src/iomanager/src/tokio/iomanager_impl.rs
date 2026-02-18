@@ -16,9 +16,9 @@ impl IOManagerImplTrait for IOManagerImpl {
     fn current_reactor_id() -> ReactorId {
         // Check if we're on a reactor thread
         if super::reactor::is_reactor_thread() {
-            0  // Tokio doesn't have thread affinity, but mark as reactor thread
+            0 // Tokio doesn't have thread affinity, but mark as reactor thread
         } else {
-            usize::MAX  // Not on a reactor thread
+            usize::MAX // Not on a reactor thread
         }
     }
 
@@ -28,7 +28,7 @@ impl IOManagerImplTrait for IOManagerImpl {
     {
         reactor.spawn_future(Box::pin(fut));
     }
-    
+
     fn spawn_local<F>(reactor: &Reactor, fut: F)
     where
         F: Future<Output = ()> + 'static,
@@ -42,12 +42,12 @@ impl IOManagerImplTrait for IOManagerImpl {
         R: Send + 'static,
     {
         let (result_tx, result_rx) = reactor.create_result_handle();
-        
+
         reactor.spawn_future(Box::pin(async move {
             let result = fut.await;
             let _ = result_tx.send_result(result).await;
         }));
-        
+
         result_rx.wait().await
     }
 
@@ -58,22 +58,22 @@ impl IOManagerImplTrait for IOManagerImpl {
         R: Send + 'static,
     {
         let mut results = Vec::with_capacity(reactors.len());
-        
+
         for (rid, reactor) in reactors.iter().enumerate() {
             let (result_tx, result_rx) = reactor.create_result_handle();
             let fut = f(rid);
-            
+
             // Spawn on the specific reactor
             Self::spawn_detached(reactor, async move {
-                let result = fut.await;  // Runs on reactor rid
+                let result = fut.await; // Runs on reactor rid
                 let _ = result_tx.send_result(result).await;
             });
-            
+
             // Await result from this reactor before proceeding to next
             let result = result_rx.wait().await;
             results.push(result);
         }
-        
+
         results
     }
 
@@ -89,9 +89,7 @@ impl IOManagerImplTrait for IOManagerImpl {
         tokio::task::yield_now().await
     }
 
-    async fn sleep(duration: std::time::Duration) {
-        tokio::time::sleep(duration).await
-    }
+    async fn sleep(duration: std::time::Duration) { tokio::time::sleep(duration).await }
 
     fn run_test<F>(fut: F)
     where
@@ -102,26 +100,25 @@ impl IOManagerImplTrait for IOManagerImpl {
             .enable_all()
             .build()
             .expect("Failed to create tokio runtime");
-        
+
         rt.block_on(async {
             // Get iomanager (reactors already running)
             let io_mgr = crate::iomanager::iomgr();
-            
-            
-            /* 
+
+            /*
             // Create a oneshot channel for completion notification
             let (tx, rx) = tokio::sync::oneshot::channel();
-            
+
             // Spawn test on reactor 0
             io_mgr.spawn_detached(crate::iomanager::ReactorTarget::Reactor(0), async move {
                 fut.await;
                 let _ = tx.send(()); // Signal completion
             });
-            
+
             // Wait for test completion
             let _ = rx.await;
             */
-            // Spawn test on reactor 0 and get handle
+            // Spawn test on any reactor and get handle
             let handle = io_mgr.spawn(async move {
                 fut.await;
             });
@@ -129,7 +126,6 @@ impl IOManagerImplTrait for IOManagerImpl {
             // Wait for completion
             let _ = handle.await;
 
-            
             // Shutdown iomanager
             let _ = crate::iomanager::shutdown_iomgr().await;
         });

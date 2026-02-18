@@ -12,12 +12,15 @@ use crate::{
 /// In-memory database managing multiple tables
 /// 
 /// MemoryDB should be accessed via the singleton pattern:
-/// - Initialize once with `init_mem_homedb(num_reactors)`
+/// - Initialize once with `init_mem_homedb(num_reactors)` (async mode only)
+/// - Initialize once with `init_mem_homedb_sync()` (sync mode only)
 /// - Access via `mem_homedb()`
 /// 
-/// All operations are guaranteed to run within reactor context.
+/// In async mode, all operations run within reactor context.
+/// In sync mode, all operations use standard Rust synchronous primitives.
 pub struct MemoryDB {
     tables: DashMap<String, Arc<Table>>,
+    #[cfg(feature = "async_mode")]
     num_reactors: usize,
 }
 
@@ -25,21 +28,32 @@ impl MemoryDB {
     /// Create a new MemoryDB instance (private - only callable from lib.rs singleton)
     /// 
     /// This is intentionally private to enforce the singleton pattern.
-    /// Use `init_mem_homedb()` to create the singleton instance.
-    pub(super) fn new(num_reactors: usize) -> Result<Self> {
-        // Initialize IOManager (this increments IOManager refcount)
-        iomgr::init_iomgr(num_reactors)
-            .map_err(|e| MemDbError::InvalidConfig(format!("Failed to initialize IOManager: {}", e)))?;
+    /// Use `init_mem_homedb()` (async) or `init_mem_homedb_sync()` (sync) to create the singleton instance.
+    /// Create a new MemoryDB instance
+    /// 
+    /// In async mode, caller should ensure iomgr is initialized first via `init_mem_homedb()`
+    /// or by calling `iomgr::init_iomgr()` directly (both are idempotent/refcounted).
+    pub fn new() -> Result<Self> {
+        #[cfg(feature = "async_mode")]
+        {
+            let actual_reactors = iomgr::iomgr().num_reactors;
+            
+            Ok(Self {
+                tables: DashMap::new(),
+                num_reactors: actual_reactors,
+            })
+        }
         
-        let actual_reactors = iomgr::iomgr().num_reactors;
-        
-        Ok(Self {
-            tables: DashMap::new(),
-            num_reactors: actual_reactors,
-        })
+        #[cfg(feature = "sync_mode")]
+        {
+            Ok(Self {
+                tables: DashMap::new(),
+            })
+        }
     }
     
-    /// Get the number of reactor threads
+    /// Get the number of reactor threads (async mode only)
+    #[cfg(feature = "async_mode")]
     pub fn num_reactors(&self) -> usize {
         self.num_reactors
     }
@@ -47,16 +61,22 @@ impl MemoryDB {
     /// Shutdown the database and IOManager
     /// 
     /// This should be called before the application exits to cleanly shutdown
-    /// all reactor threads.
+    /// all reactor threads (async mode) or perform cleanup (sync mode).
     /// 
     /// Note: Prefer using `shutdown_mem_homedb()` for singleton pattern.
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn shutdown(self) {
-        let _ = iomgr::shutdown_iomgr().await;
+        #[cfg(feature = "async_mode")]
+        {
+            let _ = iomgr::shutdown_iomgr().await;
+        }
+        // Sync mode: no-op, DashMap cleanup happens automatically
     }
     
     /// Create a new table with the given specification
     /// 
     /// Returns an Arc to the newly created table for direct access.
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn create_table(&self, name: &str, spec: TableSpec) -> Result<Arc<Table>> {
         // Check if table already exists
         if self.tables.contains_key(name) {
@@ -115,18 +135,21 @@ impl MemoryDB {
     //==========================================================================
     
     /// Put a single key-value pair (convenience method)
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn put_one(&self, table_name: &str, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         let table = self.get_table(table_name)?;
         table.put(key, value).await
     }
     
     /// Get a single value by key (convenience method)
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn get(&self, table_name: &str, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
         let table = self.get_table(table_name)?;
         table.get(key).await
     }
     
     /// Remove a single key (convenience method)
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn remove(&self, table_name: &str, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
         let table = self.get_table(table_name)?;
         table.remove(key).await
@@ -137,6 +160,7 @@ impl MemoryDB {
     //==========================================================================
     
     /// Put multiple key-value pairs in a range (convenience method)
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn put_range(&self, table_name: &str, kvs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
         let table = self.get_table(table_name)?;
         table.put_range(kvs).await
@@ -145,6 +169,7 @@ impl MemoryDB {
     /// Query a range of keys (convenience method - returns iterator)
     /// 
     /// For better performance, get the table handle once and call `table.get_range()`.
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn get_range<'a>(
         &'a self,
         table_name: &str,
@@ -159,6 +184,7 @@ impl MemoryDB {
     /// Query a range in reverse order (convenience method)
     /// 
     /// For better performance, get the table handle once and call `table.get_range_reverse()`.
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn get_range_reverse<'a>(
         &'a self,
         table_name: &str,
@@ -173,6 +199,7 @@ impl MemoryDB {
     /// Get any key-value pair in the given range (convenience method)
     /// 
     /// For better performance, get the table handle once and call `table.get_any()`.
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn get_any(
         &self,
         table_name: &str,
@@ -186,6 +213,7 @@ impl MemoryDB {
     /// Remove any key in the given range (convenience method)
     /// 
     /// For better performance, get the table handle once and call `table.remove_any()`.
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
     pub async fn remove_any(
         &self,
         table_name: &str,
@@ -200,11 +228,14 @@ impl MemoryDB {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::key_value_spec::KeySpec;
     
-    #[iomgr::iomanager_test(4)]
-    async fn test_create_table() {
-        let db = MemoryDB::new(4).unwrap();
+    // Test implementation functions (unified with maybe-async-cfg)
+    mod test_impls {
+        use super::*;
+        
+        #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
+        pub(super) async fn test_create_table() {
+        let db = MemoryDB::new().unwrap();
         
         let spec = TableSpec::fixed_kv(8, 16);
         let table = db.create_table("users", spec).await.unwrap();
@@ -215,9 +246,9 @@ mod tests {
         assert!(tables.contains(&"users".to_string()));
     }
     
-    #[iomgr::iomanager_test(4)]
-    async fn test_put_get_via_table_handle() {
-        let db = MemoryDB::new(4).unwrap();
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
+    pub(super) async fn test_put_get_via_table_handle() {
+        let db = MemoryDB::new().unwrap();
         let spec = TableSpec::fixed_kv(8, 16);
         let table = db.create_table("test", spec).await.unwrap();
         
@@ -237,9 +268,9 @@ mod tests {
         assert_eq!(result, None);
     }
     
-    #[iomgr::iomanager_test(4)]
-    async fn test_put_get_convenience() {
-        let db = MemoryDB::new(4).unwrap();
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
+    pub(super) async fn test_put_get_convenience() {
+        let db = MemoryDB::new().unwrap();
         let spec = TableSpec::fixed_kv(8, 16);
         db.create_table("test", spec).await.unwrap();
         
@@ -254,9 +285,9 @@ mod tests {
         assert_eq!(result, Some(value.to_vec()));
     }
     
-    #[iomgr::iomanager_test(4)]
-    async fn test_remove() {
-        let db = MemoryDB::new(4).unwrap();
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
+    pub(super) async fn test_remove() {
+        let db = MemoryDB::new().unwrap();
         let spec = TableSpec::fixed_kv(8, 16);
         let table = db.create_table("test", spec).await.unwrap();
         
@@ -275,9 +306,9 @@ mod tests {
         assert_eq!(result, None);
     }
     
-    #[iomgr::iomanager_test(4)]
-    async fn test_drop_table() {
-        let db = MemoryDB::new(4).unwrap();
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
+    pub(super) async fn test_drop_table() {
+        let db = MemoryDB::new().unwrap();
         let spec = TableSpec::fixed_kv(8, 16);
         let table = db.create_table("test", spec).await.unwrap();
         
@@ -294,9 +325,9 @@ mod tests {
         assert_eq!(db.list_tables().len(), 0);
     }
     
-    #[iomgr::iomanager_test(4)]
-    async fn test_secondary_index() {
-        let db = MemoryDB::new(4).unwrap();
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
+    pub(super) async fn test_secondary_index() {
+        let db = MemoryDB::new().unwrap();
         
         // Create table with primary index
         let primary_spec = TableSpec::fixed_kv(8, 16);
@@ -330,4 +361,34 @@ mod tests {
         let user = primary.get(user_id.to_vec()).await.unwrap();
         assert_eq!(user, Some(user_data.to_vec()));
     }
+    } // end test_impls module
+    
+    // Macro to generate test wrappers for both sync and async modes
+    macro_rules! generate_tests {
+        ($($test_fn:ident),* $(,)?) => {
+            $(
+                #[cfg(feature = "async_mode")]
+                #[iomgr::iomanager_test]
+                async fn $test_fn() {
+                    test_impls::$test_fn().await;
+                }
+                
+                #[cfg(feature = "sync_mode")]
+                #[test]
+                fn $test_fn() {
+                    test_impls::$test_fn();
+                }
+            )*
+        };
+    }
+    
+    // Generate all test wrappers
+    generate_tests!(
+        test_create_table,
+        test_put_get_via_table_handle,
+        test_put_get_convenience,
+        test_remove,
+        test_drop_table,
+        test_secondary_index,
+    );
 }

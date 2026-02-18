@@ -348,9 +348,10 @@ where
     {
         if !node.is_leaf() {
             // Interior node: size is at most one additional entry with max key and nodeid
+            // Use config.max_key_size instead of K::get_max_size() for accurate sizing
             return !node.has_room_for_put::<K, V>(
                 BtreePutType::Upsert,
-                K::get_max_size(),
+                self.config.max_key_size(),
                 std::mem::size_of::<BNodeId>() as u32,
             );
         }

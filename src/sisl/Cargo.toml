@@ -33,9 +33,10 @@ path = "tests/test_bitword.rs"
 name = "bitset_tests"
 path = "tests/test_bitset.rs"
 
-[[bin]]
+[[bench]]
 name = "bitset_bench"
 path = "benches/bitset_bench.rs"
+harness = false
 
 [lib]
 name = "sisl"

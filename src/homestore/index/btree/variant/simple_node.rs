@@ -30,6 +30,16 @@ use std::io;
 /// SimpleNode layout: [PersistentHeader][K0][V0][K1][V1]...
 pub struct SimpleNodeOps;
 
+impl SimpleNodeOps {
+    /// Returns (total_header_size including PersistentHeader, per_entry_overhead)
+    /// SimpleNode has only PersistentHeader (56 bytes) and no per-entry overhead
+    pub const fn get_overhead_size() -> (u32, u32) {
+        let header_size = PersistentHeader::size() as u32; // 56 bytes
+        let per_entry = 0; // No per-entry overhead for fixed-size layout
+        (header_size, per_entry)
+    }
+}
+
 impl<K: BtreeKey, V: BtreeValue> NodeOps<K, V> for SimpleNodeOps {
     fn init_new_node(&self, core: &NodeCore) {
         // SimpleNode: initialize nentries to 0 and edge to invalid

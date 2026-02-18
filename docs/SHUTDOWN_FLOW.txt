@@ -1,0 +1,161 @@
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    REACTOR SHUTDOWN FLOW DIAGRAM                            │
+│                                                                             │
+│  This shows the expected sequence for proper reactor shutdown              │
+│  Each reactor (0-N) should follow this exact sequence                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+MAIN THREAD (Test)                    REACTOR THREADS (0..N)
+═══════════════                       ═══════════════════════
+
+Test completes
+    │
+    ├──> shutdown_iomgr()              [Reactor 0, 1, 2, 3 running work_loop]
+    │    called                        
+    │                                  
+    ├──> Acquire write lock            
+    │    INIT_COUNT.fetch_sub(1)       
+    │                                  
+    ├──> If last shutdown (count==1):  
+    │    │                             
+    │    ├──> guard.take()             
+    │    │    (removes IOManager)      
+    │    │                             
+    │    └──> mgr.shutdown().await     
+    │         │                        
+    │         └──> For each reactor:   
+    │              ┌─────────────────┐
+    │              │ reactor.shutdown() 
+    │              │      │           
+    │              │      ├──────────────────> shutdown_tx.send(()) 
+    │              │      │                    ║
+    │              │      │                    ║
+    │              │      │                    ▼
+    │              │      │              [shutdown_rx.await returns]
+    │              │      │              reactor.rs:98 ✓
+    │              │      │                    ║
+    │              │      │              CRITICAL POINT 1
+    │              │      │              Signal received!
+    │              │      │                    ║
+    │              │      │                    ▼
+    │              │      │              [work_handle.await]
+    │              │      │              Waits for work_loop to exit
+    │              │      │                    ║
+    │              │      │                    ▼
+    │              │      │              work_loop (remote/local channels closed)
+    │              │      │              Processes remaining tasks
+    │              │      │              reactor.rs:181 ✓
+    │              │      │                    ║
+    │              │      │              CRITICAL POINT 2
+    │              │      │              All tasks drained!
+    │              │      │                    ║
+    │              │      │                    ▼
+    │              │      │              [receiver_handle.await]
+    │              │      │              Waits for receiver_loop to exit
+    │              │      │              reactor.rs:83 ✓
+    │              │      │                    ║
+    │              │      │                    ▼
+    │              │      │              run_until completes
+    │              │      │              reactor.rs:117 ✓
+    │              │      │                    ║
+    │              │      │              CRITICAL POINT 3
+    │              │      │              run_until exiting!
+    │              │      │                    ║
+    │              │      │                    ▼
+    │              │      │              LocalSet run_until returns
+    │              │      │              reactor.rs:129 ✓
+    │              │      │                    ║
+    │              │      │                    ▼
+    │              │      │              Thread exits
+    │              │      │                    ║
+    │              │      │                    ▼
+    │              │      ├──────────────────> spawn_blocking(|| handle.join())
+    │              │      │              ┌─────┴─────┐
+    │              │      │  Wait here <─┤ pthread_join
+    │              │      │              └───────────┘
+    │              │      │                    ║
+    │              │      │                    ▼
+    │              │      │              reactor.rs:279 ✓
+    │              │      │
+    │              │      └──────────────────> CRITICAL POINT 4
+    │              │                           Thread joined successfully!
+    │              └─────────────────┘
+    │
+    └──> IOManager dropped             
+         (was_shutdown should be 1)    
+         iomanager.rs:354 ✓
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         COMMON FAILURE POINTS                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+FAILURE A: Shutdown signal never sent/received
+  Stuck at: CRITICAL POINT 1
+  Symptom: Reactor threads stuck in shutdown_rx.await
+  Check: Did shutdown_tx.send() succeed? Was tx already dropped?
+  
+FAILURE B: work_loop never exits  
+  Stuck at: CRITICAL POINT 2
+  Symptom: work_loop still receiving tasks, never hits "else => break"
+  Check: Are channels closed? Are tasks still being spawned?
+  
+FAILURE C: run_until doesn't complete
+  Stuck at: CRITICAL POINT 3
+  Symptom: work_handle and receiver_handle awaited but run_until not exiting
+  Check: Are there zombie LocalSet tasks? Is LocalSet properly shutting down?
+  
+FAILURE D: thread.join() hangs
+  Stuck at: CRITICAL POINT 4
+  Symptom: Thread exited (all logs present) but join never returns
+  Check: spawn_blocking stuck? tokio runtime issue?
+
+FAILURE E: Premature IOManager drop
+  Stuck at: IOManager::drop with was_shutdown=0
+  Symptom: Panic "IOManager dropped without calling shutdown()"
+  Check: Is panic unwinding causing early drop? Race in test framework?
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            LLDB BREAKPOINTS                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Essential breakpoints to diagnose where shutdown fails:
+
+  (lldb) b reactor.rs:98     # CRITICAL POINT 1 - Signal received
+  (lldb) b reactor.rs:181    # CRITICAL POINT 2 - work_loop exit
+  (lldb) b reactor.rs:125    # CRITICAL POINT 3 - run_until exiting  
+  (lldb) b reactor.rs:287    # CRITICAL POINT 4 - join completed
+
+Run test and count how many times each breakpoint is hit.
+With 4 reactors, each should be hit exactly 4 times.
+
+If any breakpoint is hit fewer times → That's your failure point!
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           LOG FILE ANALYSIS                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+For each reactor, you should see these log entries in order:
+
+1. "reactor thread started"              (reactor.rs:68)
+2. "waiting for shutdown signal"         (reactor.rs:93)
+3. "shutdown signal received"            (reactor.rs:101)  ← CRITICAL POINT 1
+4. "work_loop exit"                      (reactor.rs:181)  ← CRITICAL POINT 2
+5. "receiver_loop exit"                  (reactor.rs:83)
+6. "run_until about to exit"             (reactor.rs:117)  ← CRITICAL POINT 3
+7. "LocalSet run_until returned"         (reactor.rs:129)
+8. "thread join completed"               (reactor.rs:279)  ← CRITICAL POINT 4
+
+To check:
+  $ grep "reactor thread started" .cursor/debug.log | wc -l
+  $ grep "thread join completed" .cursor/debug.log | wc -l
+  
+If counts don't match → Some reactors didn't complete shutdown!
+
+To see which reactor is stuck:
+  $ for rid in 0 1 2 3; do
+      echo "=== Reactor $rid ==="
+      grep "\"rid\":$rid" .cursor/debug.log | jq -r .message
+    done

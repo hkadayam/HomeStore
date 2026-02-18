@@ -65,7 +65,7 @@ async fn async_rwlock_readers_can_share() {
         let cr = concurrent_readers.clone();
         let saw = saw_multi.clone();
         handles.push(tokio::spawn(async move {
-            let guard = rw_cl.read_lock().await;
+            let guard = rw_cl.read().await;
             let prev = cr.fetch_add(1, Ordering::SeqCst) + 1;
             if prev >= 2 {
                 saw.store(1, Ordering::SeqCst);
@@ -92,7 +92,7 @@ async fn async_rwlock_writer_is_exclusive() {
     // until release.
     let rw_writer = rw.clone();
     let write_handle = tokio::spawn(async move {
-        let mut wg = rw_writer.write_lock().await;
+        let mut wg = rw_writer.write().await;
         *wg = 99;
         // Simulate holding the write lock with cooperative yields instead of sleeping
         // (tokio time feature not enabled).
@@ -109,7 +109,7 @@ async fn async_rwlock_writer_is_exclusive() {
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
-        let rg = rw_reader.read_lock().await;
+        let rg = rw_reader.read().await;
         *rg // return observed value
     });
 

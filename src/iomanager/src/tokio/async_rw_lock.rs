@@ -9,13 +9,13 @@ pub struct AsyncRwLock<T> {
 impl<T> AsyncRwLock<T> {
     pub fn new(val: T) -> Self { Self { inner: TokioRwLock::new(val) } }
 
-    pub async fn write_lock(&self) -> AsyncRwWriteGuard<'_, T> { AsyncRwWriteGuard { guard: self.inner.write().await } }
+    pub async fn write(&self) -> AsyncRwWriteGuard<'_, T> { AsyncRwWriteGuard { guard: self.inner.write().await } }
 
-    pub async fn read_lock(&self) -> AsyncRwReadGuard<'_, T> { AsyncRwReadGuard { guard: self.inner.read().await } }
+    pub async fn read(&self) -> AsyncRwReadGuard<'_, T> { AsyncRwReadGuard { guard: self.inner.read().await } }
 
-    pub async fn write_lock_on(&self, _rid: usize) -> AsyncRwWriteGuard<'_, T> { self.write_lock().await }
+    pub async fn write_on(&self, _rid: usize) -> AsyncRwWriteGuard<'_, T> { self.write().await }
 
-    pub async fn read_lock_on(&self, _rid: usize) -> AsyncRwReadGuard<'_, T> { self.read_lock().await }
+    pub async fn read_on(&self, _rid: usize) -> AsyncRwReadGuard<'_, T> { self.read().await }
 }
 
 pub struct AsyncRwWriteGuard<'a, T> {

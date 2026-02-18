@@ -17,7 +17,8 @@ uuid = { version = "1.18.1", features = ["v4"] }
 log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-iomgr = { path = "../iomanager" }
+iomgr = { path = "../iomanager", optional = true }
+maybe-async-cfg = "0.2"
 parking_lot = "0.12"
 crossbeam = { workspace = true }
 async-trait = "0.1"
@@ -47,15 +48,21 @@ name = "homestore"
 path = "lib.rs"
 
 [features]
-default = ["btree-only", "async-locks"]  # Build only btree by default
+# New unified feature flags for sync/async + inmem/persistent modes
+default = ["persistent", "btree-only", "async_code"]
+persistent = ["dep:iomgr"]  # Persistent mode requires iomanager (async runtime)
+inmem = []  # In-memory mode (btree only, no device layer)
+sync_code = []  # Sync mode (strips async/await, uses sync locks)
+async_code = ["dep:iomgr"]  # Async mode (uses async locks and iomanager)
+
+# Legacy features (backward compatibility)
 full = ["device", "checkpoint", "blkalloc", "blob", "streams", "cow_btree"]
 btree-only = []  # Just index/btree modules, no device layer
-async-locks = []  # Enable async locking for homedb (default ON)
-device = []
-checkpoint = []
-blkalloc = []
-blob = []
-streams = []
+device = ["persistent"]  # Device layer requires iomanager
+checkpoint = ["persistent"]
+blkalloc = ["persistent"]
+blob = ["persistent"]
+streams = ["persistent"]
 cow_btree = ["device", "streams"]  # COW btree needs device layer
 
 [[test]]

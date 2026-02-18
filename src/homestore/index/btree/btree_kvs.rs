@@ -20,13 +20,10 @@
 //! Corresponds to C++ BtreeKey and BtreeValue concepts.
 
 use std::io;
-use iomgr::IOBuffer;
 
 use super::btree_node::BNodeId;
-use super::btree_types::{BtreeError};
+use super::btree_types::{BtreeError, BtreeBuffer};
 
-#[cfg(not(feature = "async-locks"))]
-use super::btree_types::SyncOverflowStorage;
 
 //================================================================================
 // Core Traits
@@ -128,16 +125,16 @@ pub trait BtreeValue: Sized + Send + Sync + Clone + std::fmt::Debug {
     /// * Deserialized value
     fn deserialize_from(buf: &[u8], copy: bool) -> io::Result<Self>;
 
-    /// Serialize value to IOBuffer (optional - has default implementation)
+    /// Serialize value to BtreeBuffer (optional - has default implementation)
     ///
     /// Default implementation allocates a new buffer and calls serialize_to.
     /// Users can override for optimization (zero-copy, buffer pooling, etc.)
     ///
     /// # Returns
-    /// * IOBuffer containing serialized value
-    fn serialize_to_iobuffer(&self) -> io::Result<IOBuffer> {
+    /// * BtreeBuffer containing serialized value
+    fn serialize_to_iobuffer(&self) -> io::Result<BtreeBuffer> {
         let size = self.serialized_size() as usize;
-        let mut buffer = IOBuffer::new(size);
+        let mut buffer = BtreeBuffer::new(size);
         self.serialize_to(&mut buffer.as_mut_slice(), false)?;
         Ok(buffer)
     }
@@ -376,7 +373,11 @@ impl<V: BtreeValue> ValueOrOverflow<V> {
     /// # Returns
     /// * `ValueOrOverflow::Inline(value.clone())` if size <= threshold
     /// * `ValueOrOverflow::OverflowRef { node_id, overflow_size }` if size > threshold
-    #[cfg(feature = "async-locks")]
+    #[maybe_async_cfg::maybe(
+        keep_self,
+        sync(feature = "sync_code"),
+        async(feature = "async_code")
+    )]
     pub async fn build<S>(storage: &S, value: &V, overflow_threshold: u32) -> Result<Self, BtreeError>
     where
         S: super::btree::UnderlyingBtree + ?Sized,
@@ -396,28 +397,7 @@ impl<V: BtreeValue> ValueOrOverflow<V> {
         }
     }
 
-    /// Build ValueOrOverflow (sync version for cabindb)
-    #[cfg(not(feature = "async-locks"))]
-    pub fn build_sync<S>(storage: &S, value: &V, overflow_threshold: u32) -> Result<Self, BtreeError>
-    where
-        S: SyncOverflowStorage + ?Sized,
-    {
-        let value_size = value.serialized_size();
-
-        if value_size > overflow_threshold {
-            // Serialize value to IOBuffer (no clone needed)
-            let iobuf = value.serialize_to_iobuffer().map_err(BtreeError::Io)?;
-
-            // Write to overflow storage (sync)
-            let node_id = storage.write_overflow_sync(iobuf)?;
-            Ok(ValueOrOverflow::OverflowRef { node_id, overflow_size: value_size })
-        } else {
-            // Store inline (clone only for inline case)
-            Ok(ValueOrOverflow::Inline(value.clone()))
-        }
-    }
-
-    /// Resolve a ValueOrOverflow to an actual value (async version)
+    /// Resolve a ValueOrOverflow to an actual value
     ///
     /// If the value is inline, returns it directly (with optional clone).
     /// If the value is an overflow reference, reads from overflow storage and deserializes.
@@ -425,7 +405,11 @@ impl<V: BtreeValue> ValueOrOverflow<V> {
     /// # Arguments
     /// * `storage` - The underlying storage interface
     /// * `copy` - Whether to copy the value during deserialization
-    #[cfg(feature = "async-locks")]
+    #[maybe_async_cfg::maybe(
+        keep_self,
+        sync(feature = "sync_code"),
+        async(feature = "async_code")
+    )]
     pub async fn resolve<S>(self, storage: &S, copy: bool) -> Result<V, BtreeError>
     where
         S: super::btree::UnderlyingBtree + ?Sized,
@@ -435,22 +419,6 @@ impl<V: BtreeValue> ValueOrOverflow<V> {
             ValueOrOverflow::OverflowRef { node_id, overflow_size: _ } => {
                 // Read overflow node and deserialize value
                 let iobuf = storage.read_overflow(node_id).await?;
-                V::deserialize_from(iobuf.as_slice(), copy).map_err(BtreeError::Io)
-            }
-        }
-    }
-
-    /// Resolve a ValueOrOverflow to an actual value (sync version for cabindb)
-    #[cfg(not(feature = "async-locks"))]
-    pub fn resolve_sync<S>(self, storage: &S, copy: bool) -> Result<V, BtreeError>
-    where
-        S: SyncOverflowStorage + ?Sized,
-    {
-        match self {
-            ValueOrOverflow::Inline(v) => Ok(v),
-            ValueOrOverflow::OverflowRef { node_id, overflow_size: _ } => {
-                // Read overflow node and deserialize value (sync)
-                let iobuf = storage.read_overflow_sync(node_id)?;
                 V::deserialize_from(iobuf.as_slice(), copy).map_err(BtreeError::Io)
             }
         }

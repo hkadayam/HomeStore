@@ -28,24 +28,15 @@ pub mod btree_types;     // Common types (BtreeError, BtreeConfig, SyncOverflowS
 pub mod btree_kvs;       // Key/Value traits
 pub mod variant;         // Node variant implementations (SimpleNode, VarKeyNode, etc.)
 pub mod detail;          // Contains btree_req (types) - always available
-
-// Only compile btree implementation when async-locks is enabled (homedb)
-// When disabled, only types are available (for cabindb)
-#[cfg(feature = "async-locks")]
-pub mod btree;           // Defines Btree struct
-#[cfg(feature = "async-locks")]
+pub mod btree;           // Defines Btree struct (sync or async based on features)
 pub mod btree_node_mgr;  // Additional impl for Btree (must come after btree)
-#[cfg(feature = "async-locks")]
-pub mod underlying;
+pub mod underlying;      // Storage implementations (MemBtree, COWBtree)
 
 // Re-export main types (always available)
 pub use btree_node::*;   // Exports Node, NodeCore, LockType, InternalLockGuard
 pub use btree_types::*;  // Exports BtreeError, BtreeConfig, SyncOverflowStorage
 pub use btree_kvs::*;    // Export key/value traits
-
-// Re-export implementation (only with async-locks)
-#[cfg(feature = "async-locks")]
-pub use btree::*;
+pub use btree::*;        // Export Btree (compiled as sync or async based on features)
 
 // Note: btree_node_mgr methods are already part of Btree impl, no need to re-export
 

@@ -23,13 +23,9 @@
 pub mod btree_req;
 pub use btree_req::*;
 
-// Implementation modules - only when async-locks is enabled
-#[cfg(feature = "async-locks")]
+// Implementation modules - compiled with sync or async based on features
 pub mod mutate;
-#[cfg(feature = "async-locks")]
 pub mod query;
-#[cfg(feature = "async-locks")]
 pub mod remove;
 
-#[cfg(feature = "async-locks")]
 pub use mutate::*;

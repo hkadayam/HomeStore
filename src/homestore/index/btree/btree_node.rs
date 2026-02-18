@@ -25,9 +25,8 @@
 //! - Simple buffer management without complex memory pooling initially
 
 use triomphe::Arc as TArc;
-#[cfg(feature = "async-locks")]
 use super::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow};
-use super::btree_types::BtreeError;
+use super::btree_types::{BtreeError, BtreeBuffer};
 use super::variant;
 
 //================================================================================
@@ -103,15 +102,15 @@ pub fn unpack_compact_id(bytes: CompactNodeId) -> u64 {
 pub const EMPTY_BNODEID: BNodeId = u64::MAX;
 
 /// Internal guard enum (public for btree_base module) - holds actual lock guards
-#[cfg(feature = "async-locks")]
+#[cfg(feature = "async_code")]
 pub enum InternalLockGuard {
     Read(iomgr::AsyncRwReadGuard<'static, NodeInner>),
     Write(iomgr::AsyncRwWriteGuard<'static, NodeInner>),
     None, // For unlocked nodes from storage layer
 }
 
-/// Internal guard enum for sync locks (cabindb)
-#[cfg(not(feature = "async-locks"))]
+/// Internal guard enum for sync locks
+#[cfg(feature = "sync_code")]
 pub enum InternalLockGuard {
     Read(parking_lot::RwLockReadGuard<'static, NodeInner>),
     Write(parking_lot::RwLockWriteGuard<'static, NodeInner>),
@@ -366,22 +365,22 @@ pub use variant::{VarNodeHeader, RecordHeader, VarKeyRecord, VarValueRecord, Var
 
 /// Core node data (private) - holds lock and buffer
 /// This is NOT exposed publicly - only Node guard is public
-#[cfg(feature = "async-locks")]
+#[cfg(feature = "async_code")]
 pub struct NodeCore {
     pub lock: iomgr::AsyncRwLock<NodeInner>,
-    pub(super) phys_buf: TArc<iomgr::IOBuffer>, // Physical buffer with PersistentHeader at offset 0
+    pub(super) phys_buf: TArc<BtreeBuffer>, // Physical buffer with PersistentHeader at offset 0
 }
 
-/// Core node data (sync version for cabindb)
-#[cfg(not(feature = "async-locks"))]
+/// Core node data (sync version)
+#[cfg(feature = "sync_code")]
 pub struct NodeCore {
     pub lock: parking_lot::RwLock<NodeInner>,
-    pub(super) phys_buf: TArc<iomgr::IOBuffer>, // Physical buffer with PersistentHeader at offset 0
+    pub(super) phys_buf: TArc<BtreeBuffer>, // Physical buffer with PersistentHeader at offset 0
 }
 
 impl NodeCore {
     /// Create a new node with given parameters
-    #[cfg(feature = "async-locks")]
+    #[cfg(feature = "async_code")]
     pub fn new(node_id: BNodeId, is_leaf: bool, node_size: u32) -> Self {
         let mut buffer = vec![0u8; node_size as usize];
 
@@ -393,12 +392,12 @@ impl NodeCore {
 
         Self {
             lock: iomgr::AsyncRwLock::new(NodeInner {}),
-            phys_buf: TArc::new(iomgr::IOBuffer::from_vec(buffer)),
+            phys_buf: TArc::new(BtreeBuffer::from_vec(buffer)),
         }
     }
 
     /// Create a new node with given parameters (sync version)
-    #[cfg(not(feature = "async-locks"))]
+    #[cfg(feature = "sync_code")]
     pub fn new(node_id: BNodeId, is_leaf: bool, node_size: u32) -> Self {
         let mut buffer = vec![0u8; node_size as usize];
 
@@ -410,25 +409,25 @@ impl NodeCore {
 
         Self {
             lock: parking_lot::RwLock::new(NodeInner {}),
-            phys_buf: TArc::new(iomgr::IOBuffer::from_vec(buffer)),
+            phys_buf: TArc::new(BtreeBuffer::from_vec(buffer)),
         }
     }
 
     /// Create node from existing buffer (loaded from storage)
-    #[cfg(feature = "async-locks")]
+    #[cfg(feature = "async_code")]
     pub fn from_buffer(buffer: Vec<u8>) -> Self {
         Self {
             lock: iomgr::AsyncRwLock::new(NodeInner {}),
-            phys_buf: TArc::new(iomgr::IOBuffer::from_vec(buffer)),
+            phys_buf: TArc::new(BtreeBuffer::from_vec(buffer)),
         }
     }
 
     /// Create node from existing buffer (sync version)
-    #[cfg(not(feature = "async-locks"))]
+    #[cfg(feature = "sync_code")]
     pub fn from_buffer(buffer: Vec<u8>) -> Self {
         Self {
             lock: parking_lot::RwLock::new(NodeInner {}),
-            phys_buf: TArc::new(iomgr::IOBuffer::from_vec(buffer)),
+            phys_buf: TArc::new(BtreeBuffer::from_vec(buffer)),
         }
     }
 
@@ -469,7 +468,7 @@ impl NodeCore {
     pub fn node_size(&self) -> u32 { self.get_persistent_header().node_size as u32 }
 
     #[inline]
-    pub fn get_phys_buf(&self) -> &TArc<iomgr::IOBuffer> { &self.phys_buf }
+    pub fn get_phys_buf(&self) -> &TArc<BtreeBuffer> { &self.phys_buf }
 
     #[inline]
     pub fn get_modified_cp_id(&self) -> i64 { self.get_persistent_header().modified_cp_id }
@@ -502,19 +501,10 @@ impl NodeCore {
     #[inline]
     pub fn is_node_deleted(&self) -> bool { self.get_persistent_header().is_node_deleted() }
 
-    /// Synchronous read lock accessor (for cabindb btree_node_mgr)
-    #[cfg(not(feature = "async-locks"))]
-    pub fn read_lock(&self) -> parking_lot::RwLockReadGuard<'_, NodeInner> { self.lock.read() }
-
-    /// Synchronous write lock accessor (for cabindb btree_node_mgr)
-    #[cfg(not(feature = "async-locks"))]
-    pub fn write_lock(&self) -> parking_lot::RwLockWriteGuard<'_, NodeInner> { self.lock.write() }
-
     /// Lock node based on lock type and whether node is leaf
     /// Matches C++ read_and_lock_node(int_lock_type, leaf_lock_type)
     /// Called by Btree layer to lock nodes retrieved from storage
-    // Async version for homedb
-    #[cfg(feature = "async-locks")]
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
     pub async fn lock(core: TArc<Self>, lock_type: LockType) -> Node {
         let is_leaf = core.is_leaf();
 
@@ -534,52 +524,12 @@ impl NodeCore {
 
         let guard = match actual_lock {
             LockType::Read => {
-                let g = core.lock.read_lock().await;
+                let g = core.lock.read().await;
                 // SAFETY: Safe because Arc<NodeCore> in Node guard keeps lock alive
                 InternalLockGuard::Read(unsafe { std::mem::transmute(g) })
             }
             LockType::Write => {
-                let g = core.lock.write_lock().await;
-                // SAFETY: Safe because Arc<NodeCore> in Node guard keeps lock alive
-                InternalLockGuard::Write(unsafe { std::mem::transmute(g) })
-            }
-            _ => unreachable!(),
-        };
-
-        Node {
-            core: core,
-            lock_type: actual_lock,
-            _guard: guard,
-        }
-    }
-
-    // Sync version for cabindb
-    #[cfg(not(feature = "async-locks"))]
-    pub fn lock(core: TArc<Self>, lock_type: LockType) -> Node {
-        let is_leaf = core.is_leaf();
-
-        // Determine actual lock to acquire based on node type
-        let actual_lock = match lock_type {
-            LockType::None => panic!("Cannot lock with LockType::None"),
-            LockType::Read => LockType::Read,
-            LockType::Write => LockType::Write,
-            LockType::ReadInteriorWriteLeaf => {
-                if is_leaf {
-                    LockType::Write
-                } else {
-                    LockType::Read
-                }
-            }
-        };
-
-        let guard = match actual_lock {
-            LockType::Read => {
-                let g = core.lock.read();
-                // SAFETY: Safe because Arc<NodeCore> in Node guard keeps lock alive
-                InternalLockGuard::Read(unsafe { std::mem::transmute(g) })
-            }
-            LockType::Write => {
-                let g = core.lock.write();
+                let g = core.lock.write().await;
                 // SAFETY: Safe because Arc<NodeCore> in Node guard keeps lock alive
                 InternalLockGuard::Write(unsafe { std::mem::transmute(g) })
             }
@@ -665,7 +615,7 @@ impl Node {
     pub fn get_edge_value(&self) -> BNodeId { self.core.get_persistent_header().edge_id }
 
     #[inline]
-    pub fn get_phys_buf(&self) -> &TArc<iomgr::IOBuffer> { self.core.get_phys_buf() }
+    pub fn get_phys_buf(&self) -> &TArc<BtreeBuffer> { self.core.get_phys_buf() }
 
     /// Get current lock type
     #[inline]
@@ -731,13 +681,12 @@ impl Node {
     /// Creates an exact copy of this node's buffer in temporary memory.
     /// The cloned node is independent and not tracked by storage.
     ///
-    ///
     /// # Arguments
     /// * `lock_type` - Lock type to acquire on the cloned node
     ///
     /// # Returns
     /// * Locked temporary Node guard
-    #[cfg(feature = "async-locks")]
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
     pub async fn clone_temp(&self, lock_type: LockType) -> Node {
         // Clone the physical buffer
         let buffer = self.core.get_phys_buf().to_vec();
@@ -745,24 +694,11 @@ impl Node {
         NodeCore::lock(temp_core, lock_type).await
     }
 
-    /// Clone this node's buffer into a temporary node and lock it (sync version)
-    ///
-    /// # Returns
-    /// * Locked temporary Node guard
-    #[cfg(not(feature = "async-locks"))]
-    pub fn clone_temp(&self, lock_type: LockType) -> Node {
-        // Clone the physical buffer
-        let buffer = self.core.get_phys_buf().to_vec();
-        let temp_core = TArc::new(NodeCore::from_buffer(buffer));
-        NodeCore::lock(temp_core, lock_type)
-    }
-
     /// Overwrite this node's buffer with another node's buffer
     ///
     /// Performs a complete buffer copy from `other` to `self`.
     /// Used in merge operations to commit temporary changes to actual nodes.
     ///
-    /// Matches C++ `BtreeNode::overwrite()` in btree_node.hpp line 322
     ///
     /// # Arguments
     /// * `other` - Source node to copy from

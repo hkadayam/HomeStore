@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ***************************************************** */
+ ************************************************** */
 
 //! Btree Node Manager - Lock upgrade and node management operations
 //!
@@ -32,6 +32,7 @@ use triomphe::Arc as TArc;
 // Btree Node Management Methods
 //================================================================================
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 impl<K, V> Btree<K, V>
 where
     K: BtreeKey + 'static,
@@ -47,9 +48,7 @@ where
     ///
     /// Used for normal operations (GET/PUT/REMOVE) that don't modify root.
     pub(super) async fn lock_tree_shared(&self) -> super::btree::TreeLockGuard<'_> {
-        super::btree::TreeLockGuard {
-            _guard: self.btree_lock.read_lock().await,
-        }
+        super::btree::TreeLockGuard { _guard: self.btree_lock.read().await }
     }
 
     /// Acquire exclusive tree lock (for root split/collapse)
@@ -58,9 +57,7 @@ where
     ///
     /// Used for operations that modify the root node (split/collapse).
     pub(super) async fn lock_tree_exclusive(&self) -> super::btree::TreeLockGuardExclusive<'_> {
-        super::btree::TreeLockGuardExclusive {
-            _guard: self.btree_lock.write_lock().await,
-        }
+        super::btree::TreeLockGuardExclusive { _guard: self.btree_lock.write().await }
     }
 
     //================================================================================
@@ -154,7 +151,7 @@ where
         drop(guard);
 
         // Acquire WRITE lock
-        let write_guard = core.lock.write_lock().await;
+        let write_guard = core.lock.write().await;
 
         // Validate node wasn't modified
         if core.is_node_deleted() || core.node_gen() != prev_gen {
@@ -195,8 +192,8 @@ where
         drop(parent_guard);
 
         // Acquire WRITE locks (parent first, then child - matches C++ ordering)
-        let parent_write = parent_core.lock.write_lock().await;
-        let child_write = child_core.lock.write_lock().await;
+        let parent_write = parent_core.lock.write().await;
+        let child_write = child_core.lock.write().await;
 
         // Validate both nodes
         if parent_core.is_node_deleted()
@@ -267,7 +264,7 @@ where
         }
 
         // Acquire write lock on initialized node
-        let write_guard = node_core.lock.write_lock().await;
+        let write_guard = node_core.lock.write().await;
 
         // SAFETY: Arc<NodeCore> in Node keeps the lock alive, so 'static transmute is safe
         let write_guard = unsafe { std::mem::transmute(write_guard) };

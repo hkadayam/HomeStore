@@ -22,10 +22,68 @@
 //! - SyncOverflowStorage: Trait for synchronous overflow storage (cabindb)
 
 use std::io;
-#[cfg(not(feature = "async-locks"))]
-use triomphe::Arc;
-#[cfg(not(feature = "async-locks"))]
-use iomgr::IOBuffer;
+use std::ops::Deref;
+
+//================================================================================
+// BtreeBuffer - Abstraction over IOBuffer (persistent) and Vec<u8> (inmem)
+//================================================================================
+
+/// BtreeBuffer abstracts the underlying buffer storage.
+/// - For persistent mode: Uses IOBuffer from iomanager
+/// - For inmem mode: Uses Vec<u8> directly
+#[cfg(feature = "persistent")]
+pub struct BtreeBuffer(iomgr::IOBuffer);
+
+#[cfg(not(feature = "persistent"))]
+pub struct BtreeBuffer(Vec<u8>);
+
+impl BtreeBuffer {
+    #[cfg(feature = "persistent")]
+    pub fn new(size: usize) -> Self {
+        BtreeBuffer(iomgr::IOBuffer::new(size))
+    }
+
+    #[cfg(not(feature = "persistent"))]
+    pub fn new(size: usize) -> Self {
+        BtreeBuffer(vec![0u8; size])
+    }
+
+    #[cfg(feature = "persistent")]
+    pub fn from_vec(buf: Vec<u8>) -> Self {
+        BtreeBuffer(iomgr::IOBuffer::from_vec(buf))
+    }
+
+    #[cfg(not(feature = "persistent"))]
+    pub fn from_vec(buf: Vec<u8>) -> Self {
+        BtreeBuffer(buf)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl Deref for BtreeBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for BtreeBuffer {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 //================================================================================
 // BtreeError - Common error type for btree operations
@@ -160,16 +218,4 @@ impl BtreeConfig {
     pub fn ideal_fill_size(&self) -> u32 { self.ideal_fill_size }
 
     pub fn suggested_min_size(&self) -> u32 { self.suggested_min_size }
-}
-
-//================================================================================
-// Overflow Storage Trait (for sync version)
-//================================================================================
-
-/// Trait for synchronous overflow storage operations
-/// Implemented by CabinStorage for cabindb
-#[cfg(not(feature = "async-locks"))]
-pub trait SyncOverflowStorage {
-    fn write_overflow_sync(&self, buf: IOBuffer) -> Result<BNodeId, BtreeError>;
-    fn read_overflow_sync(&self, id: BNodeId) -> Result<Arc<IOBuffer>, BtreeError>;
 }

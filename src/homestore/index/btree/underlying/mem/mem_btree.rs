@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ****************************** */
+ ***************************** */
 
 //! MemBtree - Simple In-Memory Storage for Btree Validation
 //!
@@ -41,13 +41,14 @@
 use dashmap::DashMap;
 use triomphe::Arc as TArc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(feature = "async_code")]
 use async_trait::async_trait;
 
 use crate::index::btree::btree_node::{BNodeId, NodeCore, Node};
-use crate::index::btree::btree_types::{BtreeError, BtreeConfig};
+use crate::index::btree::btree_types::{BtreeError, BtreeConfig, BtreeBuffer};
 use crate::index::btree::btree::{Btree, UnderlyingBtree};
 use crate::index::btree::btree_kvs::{BtreeKey, BtreeValue};
-use iomgr::IOBuffer;
 
 //================================================================================
 // Phase 8: MemBtree - In-Memory Storage Implementation
@@ -65,7 +66,7 @@ pub struct MemBtree {
 
     /// Overflow storage - separate from regular nodes
     /// Stores pure user data (no btree headers)
-    overflow: DashMap<BNodeId, TArc<IOBuffer>>,
+    overflow: DashMap<BNodeId, TArc<BtreeBuffer>>,
 
     /// Node size for this btree (fixed size for all nodes)
     node_size: u32,
@@ -106,7 +107,8 @@ impl MemBtree {
     }
 }
 
-#[async_trait]
+#[cfg_attr(feature = "async_code", async_trait)]
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 impl UnderlyingBtree for MemBtree {
     /// Read node from memory - returns UNLOCKED node
     ///
@@ -196,11 +198,11 @@ impl UnderlyingBtree for MemBtree {
     /// Write overflow data to memory and return allocated node_id
     ///
     /// # Arguments
-    /// * `data` - IOBuffer containing overflow data
+    /// * `data` - BtreeBuffer containing overflow data
     ///
     /// # Returns
     /// * `Ok(BNodeId)` - Allocated node ID for this overflow data
-    async fn write_overflow(&self, data: IOBuffer) -> Result<BNodeId, BtreeError> {
+    async fn write_overflow(&self, data: BtreeBuffer) -> Result<BNodeId, BtreeError> {
         let node_id = self.allocate_node_id();
         let len = data.len();
         self.overflow.insert(node_id, TArc::new(data));
@@ -215,9 +217,9 @@ impl UnderlyingBtree for MemBtree {
     /// * `node_id` - Overflow node ID to read
     ///
     /// # Returns
-    /// * `Ok(Arc<IOBuffer>)` - Shared overflow data (zero-copy)
+    /// * `Ok(Arc<BtreeBuffer>)` - Shared overflow data (zero-copy)
     /// * `Err(BtreeError::NodeNotFound)` - Overflow node doesn't exist
-    async fn read_overflow(&self, node_id: BNodeId) -> Result<TArc<IOBuffer>, BtreeError> {
+    async fn read_overflow(&self, node_id: BNodeId) -> Result<TArc<BtreeBuffer>, BtreeError> {
         self.overflow.get(&node_id).map(|entry| TArc::clone(entry.value())).ok_or(BtreeError::NodeNotFound)
     }
 
@@ -239,6 +241,7 @@ impl UnderlyingBtree for MemBtree {
 // Helper for Btree Construction
 //================================================================================
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 impl MemBtree {
     /// Create a new Btree with MemBtree storage (for testing)
     ///

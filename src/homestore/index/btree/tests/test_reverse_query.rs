@@ -26,8 +26,12 @@ use crate::index::btree::{
 use crate::index::btree::underlying::mem::MemBtree;
 use crate::index::btree::detail::btree_req::BtreeKeyRange;
 
-#[iomgr::iomanager_test]
-async fn test_reverse_traversal_query_basic() {
+//================================================================================
+// Test Implementation Functions (with maybe-async-cfg)
+//================================================================================
+
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
+async fn test_reverse_traversal_query_basic_impl() {
     println!("=== Testing Reverse Traversal Query (Basic) ===");
     
     let mut config = BtreeConfig::new(4096, "test_reverse".to_string());
@@ -77,8 +81,8 @@ async fn test_reverse_traversal_query_basic() {
     println!("\n✅ Basic reverse traversal tests passed!");
 }
 
-#[iomgr::iomanager_test]
-async fn test_reverse_traversal_pagination() {
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
+async fn test_reverse_traversal_pagination_impl() {
     println!("=== Testing Reverse Traversal with Pagination ===");
     
     let mut config = BtreeConfig::new(4096, "test_reverse_page".to_string());
@@ -150,8 +154,8 @@ async fn test_reverse_traversal_pagination() {
     println!("\n✅ All reverse pagination tests passed!");
 }
 
-#[iomgr::iomanager_test]
-async fn test_reverse_traversal_multi_level_tree() {
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
+async fn test_reverse_traversal_multi_level_tree_impl() {
     println!("=== Testing Reverse Traversal on Multi-Level Tree ===");
     
     let mut config = BtreeConfig::new(4096, "test_reverse_multilevel".to_string());
@@ -190,3 +194,32 @@ async fn test_reverse_traversal_multi_level_tree() {
     
     println!("\n✅ Multi-level tree reverse traversal tests passed!");
 }
+
+//================================================================================
+// Test Instantiation Macro
+//================================================================================
+
+macro_rules! instantiate_reverse_test {
+    ($test_fn:ident) => {
+        #[cfg(feature = "async_code")]
+        #[iomgr::iomanager_test]
+        async fn $test_fn() {
+            paste::paste! {
+                [<$test_fn _impl>]().await;
+            }
+        }
+
+        #[cfg(feature = "sync_code")]
+        #[test]
+        fn $test_fn() {
+            paste::paste! {
+                [<$test_fn _impl>]();
+            }
+        }
+    };
+}
+
+// Instantiate all tests
+instantiate_reverse_test!(test_reverse_traversal_query_basic);
+instantiate_reverse_test!(test_reverse_traversal_pagination);
+instantiate_reverse_test!(test_reverse_traversal_multi_level_tree);

@@ -185,6 +185,7 @@ where
     _phantom: PhantomData<N>,
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 impl<K, V, N> NodeTest<K, V, N>
 where
     K: BtreeKey + TestValue + 'static,
@@ -205,7 +206,7 @@ where
 
         let node_core = TArc::new(node_core);
         let node = unsafe {
-            let write_guard = node_core.lock.write_lock().await;
+            let write_guard = node_core.lock.write().await;
             let write_guard = std::mem::transmute(write_guard);
             Node {
                 core: node_core,
@@ -405,6 +406,7 @@ where
 // Generic Test Implementations (like C++ TYPED_TEST)
 //================================================================================
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 async fn test_sequential_insert<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
 
@@ -420,6 +422,7 @@ async fn test_sequential_insert<C: NodeTestConfig>() {
     test.validate_get_all();
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 async fn test_simple_insert<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
 
@@ -454,6 +457,7 @@ async fn test_simple_insert<C: NodeTestConfig>() {
     test.validate_get_all();
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 async fn test_reverse_insert<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
 
@@ -469,6 +473,7 @@ async fn test_reverse_insert<C: NodeTestConfig>() {
     test.dump_node();
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 async fn test_remove<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
 
@@ -490,6 +495,7 @@ async fn test_remove<C: NodeTestConfig>() {
     test.dump_node();
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 async fn test_update<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
 
@@ -509,6 +515,7 @@ async fn test_update<C: NodeTestConfig>() {
     test.dump_node();
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 async fn test_mixed_operations<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
 
@@ -533,6 +540,7 @@ async fn test_mixed_operations<C: NodeTestConfig>() {
     test.dump_node();
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 async fn test_remove_range_index<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
 
@@ -553,6 +561,7 @@ async fn test_remove_range_index<C: NodeTestConfig>() {
     test.dump_node();
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 async fn test_move<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
     let mut test2 = NodeTest::<C::K, C::V, C::Variant>::new().await;
@@ -610,6 +619,7 @@ async fn test_move<C: NodeTestConfig>() {
     test.dump_node();
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 async fn test_range_put_get<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
 
@@ -622,6 +632,7 @@ async fn test_range_put_get<C: NodeTestConfig>() {
     test.dump_node();
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 async fn test_random_insert_remove_update<C: NodeTestConfig>() {
     let mut test = NodeTest::<C::K, C::V, C::Variant>::new().await;
     let mut rng = StdRng::seed_from_u64(42);
@@ -682,9 +693,16 @@ async fn test_random_insert_remove_update<C: NodeTestConfig>() {
 macro_rules! instantiate_typed_test {
     ($test_fn:ident, $variant:ty) => {
         paste::paste! {
+            #[cfg(feature = "async_code")]
             #[iomgr::iomanager_test]
             async fn [<$test_fn _ $variant:snake>]() {
                 $test_fn::<$variant>().await;
+            }
+
+            #[cfg(feature = "sync_code")]
+            #[test]
+            fn [<$test_fn _ $variant:snake>]() {
+                $test_fn::<$variant>();
             }
         }
     };

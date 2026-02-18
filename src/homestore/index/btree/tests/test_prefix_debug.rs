@@ -1,3 +1,9 @@
+//! Btree Prefix Compress Node Debug Test
+
+// This test uses iomgr::iomanager_test which requires Send.
+// parking_lot locks are not Send, so this test is async-only.
+#![cfg(feature = "async_code")]
+
 use triomphe::Arc as TArc;
 use crate::btree_node::{Node, NodeCore, LockType, InternalLockGuard, NodeOps, PREFIX_COMPRESS_NODE_OPS};
 use crate::btree_kvs::ValueOrOverflow;
@@ -19,7 +25,7 @@ async fn test_prefix_compress_debug() {
     
     let node_core = TArc::new(node_core);
     let node = unsafe {
-        let write_guard = node_core.lock.write_lock().await;
+        let write_guard = node_core.lock.write().await;
         let write_guard = std::mem::transmute(write_guard);
         Node {
             core: node_core,

@@ -42,6 +42,11 @@ pub enum PutResult {
 // Internal Implementation (called from btree.rs public API)
 //================================================================================
 
+#[maybe_async_cfg::maybe(
+    keep_self,
+    sync(feature = "sync_code"),
+    async(feature = "async_code")
+)]
 impl<K, V> Btree<K, V>
 where
     K: BtreeKey + 'static,
@@ -103,7 +108,10 @@ where
             }
 
             drop(my_node); // Can unlock the parent node now
+            #[cfg(feature = "async_code")]
             return Box::pin(self.put_one_walk(child, req)).await;
+            #[cfg(feature = "sync_code")]
+            return self.put_one_walk(child, req);
         }
     }
 

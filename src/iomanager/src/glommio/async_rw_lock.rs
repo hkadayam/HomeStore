@@ -60,7 +60,7 @@ impl<T> AsyncRwLock<T> {
         }
     }
 
-    pub async fn write_lock(&self) -> AsyncRwWriteGuard<'_, T> {
+    pub async fn write(&self) -> AsyncRwWriteGuard<'_, T> {
         let rid = current_reactor_id().expect("AsyncRwLock::write_lock outside reactor");
         let lw = self.lockword.load(Ordering::Acquire);
         if lw == 0 && self.reader_count.load(Ordering::Acquire) == 0 {
@@ -72,7 +72,7 @@ impl<T> AsyncRwLock<T> {
         AsyncRwWriteGuard { rw: self }
     }
 
-    pub async fn write_lock_on(&self, rid: usize) -> AsyncRwWriteGuard<'_, T> {
+    pub async fn write_on(&self, rid: usize) -> AsyncRwWriteGuard<'_, T> {
         let lw = self.lockword.load(Ordering::Acquire);
         if lw == 0 && self.reader_count.load(Ordering::Acquire) == 0 {
             if self.lockword.compare_exchange(0, lock_bit(), Ordering::AcqRel, Ordering::Relaxed).is_ok() {
@@ -113,7 +113,7 @@ impl<T> AsyncRwLock<T> {
         }
     }
 
-    pub async fn read_lock(&self) -> AsyncRwReadGuard<'_, T> {
+    pub async fn read(&self) -> AsyncRwReadGuard<'_, T> {
         loop {
             let rid = current_reactor_id().expect("AsyncRwLock::read_lock outside reactor");
             let lw = self.lockword.load(Ordering::Acquire);
@@ -135,7 +135,7 @@ impl<T> AsyncRwLock<T> {
         }
     }
 
-    pub async fn read_lock_on(&self, rid: usize) -> AsyncRwReadGuard<'_, T> {
+    pub async fn read_on(&self, rid: usize) -> AsyncRwReadGuard<'_, T> {
         loop {
             let lw = self.lockword.load(Ordering::Acquire);
             let writer_waiting = (lw >> 1) != 0;
@@ -179,6 +179,7 @@ impl<T> AsyncRwLock<T> {
         self.lockword.fetch_and(mask, Ordering::AcqRel);
         iomgr().wake(rid, self.lock_id);
     }
+
 }
 
 pub struct AsyncRwWriteGuard<'a, T> {

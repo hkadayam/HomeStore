@@ -32,6 +32,11 @@ use super::btree_req::{
 // Helper for multi-get operations
 //================================================================================
 
+#[maybe_async_cfg::maybe(
+    keep_self,
+    sync(feature = "sync_code"),
+    async(feature = "async_code")
+)]
 impl<K, V> Btree<K, V>
 where
     K: BtreeKey + 'static,
@@ -65,7 +70,14 @@ where
         let child = self.read_and_lock_node(child_id, LockType::Read).await?;
 
         drop(node); // Release parent lock
-        Box::pin(self.get_one_walk(child, req)).await
+        #[cfg(feature = "async_code")]
+        {
+            Box::pin(self.get_one_walk(child, req)).await
+        }
+        #[cfg(feature = "sync_code")]
+        {
+            self.get_one_walk(child, req)
+        }
     }
 
     /// Read value from leaf node (with overflow resolution)
@@ -240,7 +252,14 @@ where
         let child = self.read_and_lock_node(child_id, LockType::Read).await?;
 
         drop(node);
-        Box::pin(self.get_any_walk(child, req)).await
+        #[cfg(feature = "async_code")]
+        {
+            Box::pin(self.get_any_walk(child, req)).await
+        }
+        #[cfg(feature = "sync_code")]
+        {
+            self.get_any_walk(child, req)
+        }
     }
 
     /// Get any key-value from leaf in range
@@ -379,7 +398,14 @@ where
         let child = self.read_and_lock_node(child_id, LockType::Read).await?;
 
         drop(my_node); // Release parent lock
-        Box::pin(self.sweep_query_walk(child, req, out_values)).await
+        #[cfg(feature = "async_code")]
+        {
+            Box::pin(self.sweep_query_walk(child, req, out_values)).await
+        }
+        #[cfg(feature = "sync_code")]
+        {
+            self.sweep_query_walk(child, req, out_values)
+        }
     }
 
     //================================================================================
@@ -509,7 +535,10 @@ where
             }
 
             // Recurse into child
+            #[cfg(feature = "async_code")]
             let has_more = Box::pin(self.traversal_query_walk(child, req, out_values)).await?;
+            #[cfg(feature = "sync_code")]
+            let has_more = self.traversal_query_walk(child, req, out_values)?;
 
             if has_more {
                 // Parent already dropped if is_last, otherwise need to drop

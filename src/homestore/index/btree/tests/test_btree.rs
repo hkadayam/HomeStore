@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- *********************************************** */
+ ********************************************************************* */
 
 //! Btree Integration Tests
 //!
@@ -50,6 +50,43 @@ use super::shadow_map::ShadowMap;
 
 // Test types and generators are now in btree_test_kvs.rs for reusability
 // across test_btree.rs, test_btree_node.rs, and future COW tests
+
+//================================================================================
+// Sync BackgroundTasks Wrapper (mimics async iomgr::BackgroundTasks API)
+//================================================================================
+
+#[cfg(feature = "sync_code")]
+mod sync_tasks {
+    use std::thread::JoinHandle;
+
+    /// Sync equivalent of iomgr::BackgroundTasks for thread-based concurrency
+    pub struct BackgroundTasks {
+        handles: Vec<JoinHandle<()>>,
+    }
+
+    impl BackgroundTasks {
+        pub fn new() -> Self { Self { handles: Vec::new() } }
+
+        pub fn spawn<F>(&mut self, f: F)
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            self.handles.push(std::thread::spawn(f));
+        }
+
+        pub fn join_all(self) {
+            for handle in self.handles {
+                handle.join().unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "sync_code")]
+use sync_tasks::{BackgroundTasks};
+
+#[cfg(feature = "async_code")]
+use iomgr::{BackgroundTasks, ReactorTarget};
 
 //================================================================================
 // Storage Type Trait
@@ -251,6 +288,7 @@ struct TestBtree<Variant: TestBtreeVariant> {
     _phantom: PhantomData<Variant>,
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 impl<Variant: TestBtreeVariant> TestBtree<Variant> {
     async fn new(opts: BtreeTestOptions) -> Result<Self, BtreeError> {
         // Initialize tracing once - disabled for concurrent tests to avoid stdout deadlock
@@ -270,7 +308,7 @@ impl<Variant: TestBtreeVariant> TestBtree<Variant> {
         let storage: Box<dyn UnderlyingBtree> = match Variant::Storage::name() {
             "mem" => {
                 // In-memory storage for testing
-                Box::new(MemBtree::new(config.node_size))
+                Box::new(MemBtree::new(config.node_size)) as Box<dyn UnderlyingBtree>
             }
             "cow" => {
                 // COW requires full homestore setup (VDevs, MetaClient, caches)
@@ -543,8 +581,58 @@ impl<Variant: TestBtreeVariant> TestBtree<Variant> {
     // Concurrent Multi-Ops
     //================================================================================
 
+    // Worker task extracted to support maybe-async-cfg transformation
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
+    async fn concurrent_worker(
+        btree: Arc<Btree<Variant::K, Variant::V>>,
+        worker_id: usize,
+        start_io: usize,
+        end_io: usize,
+        num_entries: u32,
+        total_pct: u32,
+        op_dist: OpDistribution,
+    ) {
+        use crate::index::btree::detail::btree_req::BtreeKeyRange;
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        // Create a Send-safe RNG with unique seed per worker
+        let mut local_rng = StdRng::seed_from_u64(42 + worker_id as u64);
+        let mut key_gen = Variant::create_key_generator();
+        let mut value_gen = Variant::create_value_generator();
+
+        for i in start_io..end_io {
+            let op_choice = local_rng.gen_range(0..total_pct);
+            let k = local_rng.gen_range(0..num_entries) as u64;
+
+            if op_choice < op_dist.put_pct {
+                // Single put (no shadow map validation in concurrent mode)
+                let (key, _) = key_gen.generate(Some(k));
+                let (value, _) = value_gen.generate(None);
+                let _ = btree.put_one(&key, &value, None).await;
+            } else if op_choice < op_dist.put_pct + op_dist.remove_pct {
+                // Single remove
+                let (key, _) = key_gen.generate(Some(k));
+                let _ = btree.remove_one(&key).await;
+            } else {
+                // Query
+                let end_k = (k + 100).min(num_entries as u64);
+                let (start_key, _) = key_gen.generate(Some(k));
+                let (end_key, _) = key_gen.generate(Some(end_k));
+                let range = BtreeKeyRange::new(start_key, true, end_key, true);
+                let _ = btree.query(range, 32, None).await;
+            }
+
+            if i > 0 && (i + 1) % 100 == 0 {
+                println!("    Worker {}: Completed {}/{} operations", worker_id, i + 1 - start_io, end_io - start_io);
+            }
+        }
+
+        println!("  Worker {} completed all operations", worker_id);
+    }
+
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
     async fn concurrent_multi_ops(&mut self, op_dist: OpDistribution) {
-        use iomgr::{BackgroundTasks, ReactorTarget, iomgr};
         use std::sync::Arc;
         use std::time::Instant;
 
@@ -553,8 +641,19 @@ impl<Variant: TestBtreeVariant> TestBtree<Variant> {
             self.preload(self.opts.preload_size).await;
         }
 
-        let num_reactors = iomgr().num_reactors;
-        println!("Starting TRULY concurrent multi-ops test on {} reactors", num_reactors);
+        let num_workers = {
+            #[cfg(feature = "async_code")]
+            {
+                iomgr::iomgr().num_reactors
+            }
+
+            #[cfg(feature = "sync_code")]
+            {
+                4
+            } // Hardcoded for sync mode
+        };
+
+        println!("Starting TRULY concurrent multi-ops test on {} workers", num_workers);
         println!("  Entries: {}", self.opts.num_entries);
         println!("  IOs: {}", self.opts.num_ios);
         println!(
@@ -567,87 +666,76 @@ impl<Variant: TestBtreeVariant> TestBtree<Variant> {
             op_dist.put_pct + op_dist.remove_pct + op_dist.range_put_pct + op_dist.range_remove_pct + op_dist.query_pct;
         let num_entries = self.opts.num_entries;
 
-        // Clone the Arc to share btree across reactors
+        // Clone the Arc to share btree across workers
         let btree = Arc::clone(&self.btree);
 
-        // Create background tasks to spawn on all reactors
-        let bg_tasks = BackgroundTasks::new();
-        let ios_per_reactor = num_ios / num_reactors as u32;
+        #[cfg(feature = "sync_code")]
+        let mut bg_tasks = BackgroundTasks::new();
 
-        for reactor_id in 0..num_reactors {
-            let start_io = reactor_id * ios_per_reactor as usize;
-            let end_io = if reactor_id == num_reactors - 1 {
-                num_ios as usize // Last reactor takes remaining
+        #[cfg(feature = "async_code")]
+        let bg_tasks = BackgroundTasks::new();
+        let ios_per_worker = num_ios / num_workers as u32;
+
+        for worker_id in 0..num_workers {
+            let start_io = worker_id * ios_per_worker as usize;
+            let end_io = if worker_id == num_workers - 1 {
+                num_ios as usize // Last worker takes remaining
             } else {
-                start_io + ios_per_reactor as usize
+                start_io + ios_per_worker as usize
             };
 
-            println!("  Spawning reactor {} with IOs [{}, {})", reactor_id, start_io, end_io);
+            println!("  Spawning worker {} with IOs [{}, {})", worker_id, start_io, end_io);
 
-            // Clone Arc for each reactor
-            let btree = Arc::clone(&btree);
+            // Clone Arc for each worker
+            let btree_clone = Arc::clone(&btree);
+            let op_dist_clone = op_dist.clone();
 
-            bg_tasks.spawn(ReactorTarget::Reactor(reactor_id), async move {
-                use crate::index::btree::detail::btree_req::BtreeKeyRange;
-                use rand::rngs::StdRng;
-                use rand::SeedableRng;
+            // Spawn worker using extracted function
+            // In async: spawns async task. In sync: spawns thread (via BackgroundTasks wrapper)
+            #[cfg(feature = "async_code")]
+            bg_tasks.spawn(
+                ReactorTarget::Reactor(worker_id),
+                Self::concurrent_worker(
+                    btree_clone,
+                    worker_id,
+                    start_io,
+                    end_io,
+                    num_entries,
+                    total_pct,
+                    op_dist_clone,
+                ),
+            );
 
-                // Create a Send-safe RNG with unique seed per reactor
-                let mut local_rng = StdRng::seed_from_u64(42 + reactor_id as u64);
-                let mut key_gen = Variant::create_key_generator();
-                let mut value_gen = Variant::create_value_generator();
-
-                for i in start_io..end_io {
-                    let op_choice = local_rng.gen_range(0..total_pct);
-                    let k = local_rng.gen_range(0..num_entries) as u64;
-
-                    if op_choice < op_dist.put_pct {
-                        // Single put (no shadow map validation in concurrent mode)
-                        let (key, _) = key_gen.generate(Some(k));
-                        let (value, _) = value_gen.generate(None);
-                        let _ = btree.put_one(&key, &value, None).await;
-                    } else if op_choice < op_dist.put_pct + op_dist.remove_pct {
-                        // Single remove
-                        let (key, _) = key_gen.generate(Some(k));
-                        let _ = btree.remove_one(&key).await;
-                    } else {
-                        // Query
-                        let end_k = (k + 100).min(num_entries as u64);
-                        let (start_key, _) = key_gen.generate(Some(k));
-                        let (end_key, _) = key_gen.generate(Some(end_k));
-                        let range = BtreeKeyRange::new(start_key, true, end_key, true);
-                        let _ = btree.query(range, 32, None).await;
-                    }
-
-                    if i > 0 && (i + 1) % 100 == 0 {
-                        println!(
-                            "    Reactor {}: Completed {}/{} operations",
-                            reactor_id,
-                            i + 1 - start_io,
-                            end_io - start_io
-                        );
-                    }
-                }
-
-                println!("  Reactor {} completed all operations", reactor_id);
+            #[cfg(feature = "sync_code")]
+            bg_tasks.spawn(move || {
+                Self::concurrent_worker(
+                    btree_clone,
+                    worker_id,
+                    start_io,
+                    end_io,
+                    num_entries,
+                    total_pct,
+                    op_dist_clone,
+                );
             });
         }
 
-        println!("Waiting for all reactors to complete...");
+        println!("Waiting for all workers to complete...");
         let concurrent_start = Instant::now();
         bg_tasks.join_all().await;
+
         let concurrent_elapsed = concurrent_start.elapsed();
         let concurrent_ops_per_sec = num_ios as f64 / concurrent_elapsed.as_secs_f64();
 
-        println!("All reactors completed!");
+        println!("All workers completed!");
         println!(
-            "Concurrent multi-ops test complete - executed {} operations across {} reactors in {:?} ({:.0} ops/sec)",
-            num_ios, num_reactors, concurrent_elapsed, concurrent_ops_per_sec
+            "Concurrent multi-ops test complete - executed {} operations across {} workers in {:?} ({:.0} ops/sec)",
+            num_ios, num_workers, concurrent_elapsed, concurrent_ops_per_sec
         );
 
         // Final validation - can't use shadow_map since we didn't track in concurrent mode
         // Just verify tree is still accessible
-        println!("Final validation: tree operations completed successfully across {} reactors", num_reactors);
+        println!("Final validation: tree operations completed successfully across {} workers", num_workers);
     }
 }
 
@@ -655,6 +743,7 @@ impl<Variant: TestBtreeVariant> TestBtree<Variant> {
 // Generic Test Implementations
 //================================================================================
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 async fn test_sequential_insert_impl<Variant: TestBtreeVariant>(test_btree: &mut TestBtree<Variant>) {
     println!("=== Sequential Insert Test ===");
 
@@ -693,6 +782,7 @@ async fn test_sequential_insert_impl<Variant: TestBtreeVariant>(test_btree: &mut
     println!("Sequential Insert test complete");
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 async fn test_random_insert_impl<Variant: TestBtreeVariant>(test_btree: &mut TestBtree<Variant>) {
     println!("=== Random Insert Test ===");
 
@@ -724,6 +814,7 @@ async fn test_random_insert_impl<Variant: TestBtreeVariant>(test_btree: &mut Tes
     println!("Random Insert test complete");
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 async fn test_sequential_remove_impl<Variant: TestBtreeVariant>(test_btree: &mut TestBtree<Variant>) {
     println!("=== Sequential Remove Test ===");
 
@@ -753,6 +844,7 @@ async fn test_sequential_remove_impl<Variant: TestBtreeVariant>(test_btree: &mut
     println!("Sequential Remove test complete");
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 async fn test_random_remove_impl<Variant: TestBtreeVariant>(test_btree: &mut TestBtree<Variant>) {
     println!("=== Random Remove Test ===");
 
@@ -782,7 +874,8 @@ async fn test_random_remove_impl<Variant: TestBtreeVariant>(test_btree: &mut Tes
 macro_rules! btree_tests {
     ($test_type:ty, $test_name:ident) => {
         paste::paste! {
-            // Sequential tests
+            // Sequential insert test
+            #[cfg(feature = "async_code")]
             #[iomgr::iomanager_test]
             async fn [<test_sequential_insert_ $test_name>]() {
                 let mut helper = TestBtree::<$test_type>::new(BtreeTestOptions::default())
@@ -790,6 +883,16 @@ macro_rules! btree_tests {
                 test_sequential_insert_impl(&mut helper).await;
             }
 
+            #[cfg(feature = "sync_code")]
+            #[test]
+            fn [<test_sequential_insert_ $test_name>]() {
+                let mut helper = TestBtree::<$test_type>::new(BtreeTestOptions::default())
+                    .expect("Failed to create TestBtree");
+                test_sequential_insert_impl(&mut helper);
+            }
+
+            // Random insert test
+            #[cfg(feature = "async_code")]
             #[iomgr::iomanager_test]
             async fn [<test_random_insert_ $test_name>]() {
                 let mut helper = TestBtree::<$test_type>::new(BtreeTestOptions::default())
@@ -797,6 +900,16 @@ macro_rules! btree_tests {
                 test_random_insert_impl(&mut helper).await;
             }
 
+            #[cfg(feature = "sync_code")]
+            #[test]
+            fn [<test_random_insert_ $test_name>]() {
+                let mut helper = TestBtree::<$test_type>::new(BtreeTestOptions::default())
+                    .expect("Failed to create TestBtree");
+                test_random_insert_impl(&mut helper);
+            }
+
+            // Sequential remove test
+            #[cfg(feature = "async_code")]
             #[iomgr::iomanager_test]
             async fn [<test_sequential_remove_ $test_name>]() {
                 let mut helper = TestBtree::<$test_type>::new(BtreeTestOptions::default())
@@ -804,6 +917,16 @@ macro_rules! btree_tests {
                 test_sequential_remove_impl(&mut helper).await;
             }
 
+            #[cfg(feature = "sync_code")]
+            #[test]
+            fn [<test_sequential_remove_ $test_name>]() {
+                let mut helper = TestBtree::<$test_type>::new(BtreeTestOptions::default())
+                    .expect("Failed to create TestBtree");
+                test_sequential_remove_impl(&mut helper);
+            }
+
+            // Random remove test
+            #[cfg(feature = "async_code")]
             #[iomgr::iomanager_test]
             async fn [<test_random_remove_ $test_name>]() {
                 let mut helper = TestBtree::<$test_type>::new(BtreeTestOptions::default())
@@ -811,7 +934,16 @@ macro_rules! btree_tests {
                 test_random_remove_impl(&mut helper).await;
             }
 
-            // Concurrent test
+            #[cfg(feature = "sync_code")]
+            #[test]
+            fn [<test_random_remove_ $test_name>]() {
+                let mut helper = TestBtree::<$test_type>::new(BtreeTestOptions::default())
+                    .expect("Failed to create TestBtree");
+                test_random_remove_impl(&mut helper);
+            }
+
+            // Concurrent test - 4 workers (reactors in async, threads in sync)
+            #[cfg(feature = "async_code")]
             #[iomgr::iomanager_test(4)]
             async fn [<test_concurrent_multi_ops_ $test_name>]() {
                 let mut helper = TestBtree::<$test_type>::new(BtreeTestOptions {
@@ -824,7 +956,21 @@ macro_rules! btree_tests {
                 helper.concurrent_multi_ops(OpDistribution::default()).await;
             }
 
-            // Stress test - 1M keys for true concurrent stress testing
+            #[cfg(feature = "sync_code")]
+            #[test]
+            fn [<test_concurrent_multi_ops_ $test_name>]() {
+                let mut helper = TestBtree::<$test_type>::new(BtreeTestOptions {
+                    num_entries: 100000,
+                    preload_size: 50000,
+                    num_ios: 50000,
+                    ..Default::default()
+                }).expect("Failed to create TestBtree");
+
+                helper.concurrent_multi_ops(OpDistribution::default());
+            }
+
+            // Stress test - 1M keys, 8 workers (async only due to time constraints)
+            #[cfg(feature = "async_code")]
             #[iomgr::iomanager_test(8)]
             async fn [<test_concurrent_stress_ $test_name>]() {
                 let mut helper = TestBtree::<$test_type>::new(BtreeTestOptions {

@@ -30,10 +30,18 @@
 
 use triomphe::Arc as TArc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use super::btree_types::{BtreeError, BtreeConfig};
-use async_trait::async_trait;
-use iomgr::{AsyncRwLock, AsyncRwReadGuard, AsyncRwWriteGuard, IOBuffer};
+use super::btree_types::{BtreeError, BtreeConfig, BtreeBuffer};
 use tracing;
+
+// Conditional imports based on sync/async mode
+#[cfg(feature = "async_code")]
+use async_trait::async_trait;
+
+#[cfg(feature = "async_code")]
+use iomgr::{AsyncRwLock, AsyncRwReadGuard, AsyncRwWriteGuard};
+
+#[cfg(feature = "sync_code")]
+use parking_lot::{RwLock as AsyncRwLock, RwLockReadGuard as AsyncRwReadGuard, RwLockWriteGuard as AsyncRwWriteGuard};
 
 //================================================================================
 // Global Operation Counter for Tracing
@@ -59,7 +67,12 @@ use super::detail::btree_req::{
 ///
 /// Storage layers handle ONLY persistence/storage, NO locking.
 /// All locking is handled by the Btree layer above.
-#[async_trait]
+#[cfg_attr(feature = "async_code", async_trait)]
+#[maybe_async_cfg::maybe(
+    keep_self,
+    sync(feature = "sync_code"),
+    async(feature = "async_code")
+)]
 pub trait UnderlyingBtree: Send + Sync {
     /// Read node from storage - returns UNLOCKED node
     ///
@@ -88,10 +101,10 @@ pub trait UnderlyingBtree: Send + Sync {
 
     /// Write data to overflow storage, returns allocated node_id
     /// Storage decides allocation size (MemBtree = exact, COWBtree = rounded to blocks)
-    async fn write_overflow(&self, data: IOBuffer) -> Result<BNodeId, BtreeError>;
+    async fn write_overflow(&self, data: BtreeBuffer) -> Result<BNodeId, BtreeError>;
 
-    /// Read overflow data by node_id, returns Arc<IOBuffer> for zero-copy sharing
-    async fn read_overflow(&self, node_id: BNodeId) -> Result<TArc<IOBuffer>, BtreeError>;
+    /// Read overflow data by node_id, returns Arc<BtreeBuffer> for zero-copy sharing
+    async fn read_overflow(&self, node_id: BNodeId) -> Result<TArc<BtreeBuffer>, BtreeError>;
 
     /// Delete overflow node
     async fn delete_overflow(&self, node_id: BNodeId) -> Result<(), BtreeError>;
@@ -154,6 +167,11 @@ where
     _phantom: std::marker::PhantomData<(K, V)>,
 }
 
+#[maybe_async_cfg::maybe(
+    keep_self,
+    sync(feature = "sync_code"),
+    async(feature = "async_code")
+)]
 impl<K, V> Btree<K, V>
 where
     K: BtreeKey + 'static,

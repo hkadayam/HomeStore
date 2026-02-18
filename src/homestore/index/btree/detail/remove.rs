@@ -36,6 +36,7 @@ use crate::{btree_io_err};
 
 /// Trait for different remove request types (compile-time polymorphism)
 /// This provides static dispatch similar to C++ template specialization.
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 trait RemoveContext<K: BtreeKey, V: BtreeValue>: Send {
     /// Execute removal on a leaf node
     async fn execute_on_leaf(&mut self, btree: &Btree<K, V>, leaf: &mut Node) -> Result<u32, BtreeError>;
@@ -52,6 +53,7 @@ struct RemoveOneContext<'a, K: BtreeKey, V: BtreeValue> {
     result: &'a mut Option<V>,
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 impl<'a, K: BtreeKey + 'static, V: BtreeValue + 'static> RemoveContext<K, V> for RemoveOneContext<'a, K, V> {
     async fn execute_on_leaf(&mut self, btree: &Btree<K, V>, leaf: &mut Node) -> Result<u32, BtreeError> {
         let (found, idx) = leaf.find::<K, V>(self.key);
@@ -95,6 +97,7 @@ struct RemoveAnyContext<'a, K: BtreeKey, V: BtreeValue> {
     result_value: &'a mut Option<V>,
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 impl<'a, K: BtreeKey + 'static, V: BtreeValue + 'static> RemoveContext<K, V> for RemoveAnyContext<'a, K, V> {
     async fn execute_on_leaf(&mut self, btree: &Btree<K, V>, leaf: &mut Node) -> Result<u32, BtreeError> {
         let (matched, start_idx, end_idx) = leaf.match_range::<K, V>(self.range);
@@ -138,6 +141,7 @@ struct RemoveRangeContext<'a, K: BtreeKey, V: BtreeValue> {
     _phantom: std::marker::PhantomData<V>,
 }
 
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 impl<'a, K: BtreeKey + 'static, V: BtreeValue + 'static> RemoveContext<K, V> for RemoveRangeContext<'a, K, V> {
     async fn execute_on_leaf(&mut self, btree: &Btree<K, V>, leaf: &mut Node) -> Result<u32, BtreeError> {
         // Remove all matching entries in this leaf (no batch limit)
@@ -161,6 +165,11 @@ impl<'a, K: BtreeKey + 'static, V: BtreeValue + 'static> RemoveContext<K, V> for
 // Internal Implementation (called from btree.rs public API)
 //================================================================================
 
+#[maybe_async_cfg::maybe(
+    keep_self,
+    sync(feature = "sync_code"),
+    async(feature = "async_code")
+)]
 impl<K, V> Btree<K, V>
 where
     K: BtreeKey + 'static,
@@ -230,6 +239,11 @@ where
 // Remove Context Implementations
 //================================================================================
 
+#[maybe_async_cfg::maybe(
+    keep_self,
+    sync(feature = "sync_code"),
+    async(feature = "async_code")
+)]
 impl<K, V> Btree<K, V>
 where
     K: BtreeKey + 'static,
@@ -412,11 +426,25 @@ where
             if curr_idx == end_idx {
                 drop(my_node);
                 // Need an explicit call to satisy the compiler, to ensure we drop and exit under same condition
-                total_removed += Box::pin(self.interior_walk_for_remove(child, ctx)).await?;
+                #[cfg(feature = "async_code")]
+                {
+                    total_removed += Box::pin(self.interior_walk_for_remove(child, ctx)).await?;
+                }
+                #[cfg(feature = "sync_code")]
+                {
+                    total_removed += self.interior_walk_for_remove(child, ctx)?;
+                }
                 break;
             }
 
-            total_removed += Box::pin(self.interior_walk_for_remove(child, ctx)).await?;
+            #[cfg(feature = "async_code")]
+            {
+                total_removed += Box::pin(self.interior_walk_for_remove(child, ctx)).await?;
+            }
+            #[cfg(feature = "sync_code")]
+            {
+                total_removed += self.interior_walk_for_remove(child, ctx)?;
+            }
             curr_idx += 1;
         }
         Ok(total_removed)

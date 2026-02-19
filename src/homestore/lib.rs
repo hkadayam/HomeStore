@@ -29,6 +29,7 @@ pub mod blob;
 #[cfg(feature = "streams")]
 pub mod streams;  // Stream-based Virtual Device implementations
 pub mod index;    // B-tree index implementations (always included)
+pub mod logstore; // LogStore implementations (always included)
 
 #[cfg(feature = "device")]
 pub use device::*;
@@ -45,6 +46,7 @@ pub use blob::*;
 #[cfg(feature = "streams")]
 pub use streams::*;
 pub use index::*;
+pub use logstore::*;
 
 //================================================================================
 // Tracing Initialization

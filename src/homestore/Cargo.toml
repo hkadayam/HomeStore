@@ -32,6 +32,8 @@ crc = "3.0"
 triomphe = "0.1"
 bitfield = "0.14"
 bytemuck = { version = "1.14", features = ["derive"] }
+bytes = "1.5"
+thiserror = "1.0"
 
 # io_uring is only available on Linux
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -70,3 +72,8 @@ name = "btree_bench"
 path = "tests/btree_bench.rs"
 required-features = ["btree-only"]
 harness = false  # Disable default test harness for benchmark-style output
+
+[[bin]]
+name = "logstore_bench"
+path = "logstore/benches/bench_mem_log_store.rs"
+required-features = ["async_code"]

@@ -138,18 +138,18 @@ impl Database {
     /// Put a key-value pair into a table
     pub async fn put_one(&self, table_name: &str, key: &[u8], value: &[u8]) -> Result<()> {
         let table = self.get_table(table_name)?;
-        table.put(key, value).await
+        table.put(key.to_vec(), value.to_vec()).await
     }
-    
+
     /// Get a value by key from a table
     pub async fn get(&self, table_name: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let table = self.get_table(table_name)?;
-        table.get(key).await
+        table.get(key.to_vec()).await
     }
-    
+
     /// Remove a key from a table
     pub async fn remove(&self, table_name: &str, key: &[u8]) -> Result<bool> {
         let table = self.get_table(table_name)?;
-        table.remove(key).await
+        table.remove(key.to_vec()).await.map(|opt| opt.is_some())
     }
 }

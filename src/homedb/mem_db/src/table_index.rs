@@ -6,14 +6,16 @@
 use std::sync::Arc;
 use homestore::index::btree::{
     btree::Btree,
-    BtreeConfig, // Re-exported from btree_types at btree module level
     btree_kvs::{BtreeKey, BtreeValue},
-    underlying::mem::MemBtree,
 };
-use crate::{
-    key_value_spec::{TableSpec, ValueSpec, KeyType},
-    error::{MemDbError, Result},
-};
+
+#[cfg(any(feature = "sync_mode", feature = "async_mode"))]
+use homestore::index::btree::{underlying::mem::MemBtree, BtreeConfig};
+use crate::key_value_spec::TableSpec;
+#[cfg(any(feature = "sync_mode", feature = "async_mode"))]
+use crate::key_value_spec::{KeyType, ValueSpec};
+#[cfg(any(feature = "sync_mode", feature = "async_mode"))]
+use crate::error::{MemDbError, Result};
 
 /// Data storage for DbKey - either owned or borrowed
 enum DbKeyData {
@@ -39,6 +41,7 @@ pub struct DbKey {
     pub(crate) fixed_size: Option<usize>, // None = variable, Some(n) = fixed n bytes
 }
 
+#[allow(dead_code)]
 impl DbKey {
     /// Create a new DbKey from owned data with schema information
     ///
@@ -174,6 +177,7 @@ pub struct DbValue {
     pub(crate) fixed_size: Option<usize>, // None = variable, Some(n) = fixed n bytes
 }
 
+#[allow(dead_code)]
 impl DbValue {
     /// Create a new DbValue from owned data with schema information
     ///
@@ -292,9 +296,11 @@ pub struct TableIndex {
     index_type: IndexType,
     spec: TableSpec,
     btree: Arc<Btree<DbKey, DbValue>>,
+    #[allow(dead_code)]
     max_key_size: u32, // Cached from btree config for runtime validation
 }
 
+#[allow(dead_code)]
 impl TableIndex {
     /// Create a new table index with the given specification
     ///
@@ -324,27 +330,27 @@ impl TableIndex {
             ValueSpec::Variable(max_size) => *max_size as u32,
         };
         config.suggest_inline_value_size(value_size);
-        
+
         // Save config values for error messages before moving config
         let node_size = config.node_size;
         let inline_value_size = config.inline_value_size;
-        
+
         // Create underlying storage
         let storage = Box::new(MemBtree::new(config.node_size));
-        
+
         // Create btree
         let btree = Btree::<DbKey, DbValue>::new(config, storage, None)
             .await
             .map_err(|e| MemDbError::BtreeError(format!("{:?}", e)))?;
-        
+
         let max_key_size = btree.max_key_size();
-        
+
         // Validate TableSpec key constraints against btree capacity
         let spec_max_key = match &spec.key_spec.key_type {
             KeyType::Fixed(fixed_size) => *fixed_size,
             KeyType::Variable(max_size) => *max_size,
         };
-        
+
         if spec_max_key as u32 > max_key_size {
             return Err(MemDbError::Config(format!(
                 "Key size {} exceeds btree capacity {} (node_size={}, inline_value_size={})",
@@ -370,6 +376,7 @@ impl TableIndex {
     /// - Variant 2 (VarValueNode): Fixed key + Variable value
     /// - Variant 3 (VarObjNode): Variable key + Variable value
     /// - Variant 4 (PrefixCompressNode): Fixed key + Fixed value with prefix compression
+    #[allow(dead_code)]
     fn determine_node_variant(spec: &TableSpec) -> u8 {
         use crate::key_value_spec::{KeyType, ValueSpec, PrefixType};
 

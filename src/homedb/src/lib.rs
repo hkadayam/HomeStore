@@ -28,6 +28,9 @@ mod error;
 mod key_value_spec;
 mod table;
 mod table_index;
+mod iterator;
+
+pub(crate) use mem_db_macros::reactor_method;
 
 pub use error::{HomeDbError, Result};
 pub use key_value_spec::{KeySpec, ValueSpec, TableSpec};

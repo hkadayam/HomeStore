@@ -9,6 +9,7 @@ description = "Unified database API supporting sync/async and in-memory/persiste
 [dependencies]
 homestore = { path = "../homestore", default-features = false, features = ["btree-only"] }
 maybe-async-cfg = "0.2"
+mem_db_macros = { path = "mem_db_macros" }
 parking_lot = "0.12"
 dashmap = "6.0"
 async-trait = "0.1"

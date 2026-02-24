@@ -47,8 +47,13 @@ where
     /// **MUST hold returned guard for entire operation!**
     ///
     /// Used for normal operations (GET/PUT/REMOVE) that don't modify root.
+    /// In single-threaded mode, returns a no-op guard (no lock acquired).
     pub(super) async fn lock_tree_shared(&self) -> super::btree::TreeLockGuard<'_> {
-        super::btree::TreeLockGuard { _guard: self.btree_lock.read().await }
+        if self.config.is_single_threaded {
+            super::btree::TreeLockGuard { _guard: None }
+        } else {
+            super::btree::TreeLockGuard { _guard: Some(self.btree_lock.read().await) }
+        }
     }
 
     /// Acquire exclusive tree lock (for root split/collapse)
@@ -56,8 +61,56 @@ where
     /// **MUST hold returned guard for entire operation!**
     ///
     /// Used for operations that modify the root node (split/collapse).
+    /// In single-threaded mode, returns a no-op guard (no lock acquired).
     pub(super) async fn lock_tree_exclusive(&self) -> super::btree::TreeLockGuardExclusive<'_> {
-        super::btree::TreeLockGuardExclusive { _guard: self.btree_lock.write().await }
+        if self.config.is_single_threaded {
+            super::btree::TreeLockGuardExclusive { _guard: None }
+        } else {
+            super::btree::TreeLockGuardExclusive { _guard: Some(self.btree_lock.write().await) }
+        }
+    }
+
+    //================================================================================
+    // Single-threaded Locking Helpers
+    //================================================================================
+
+    /// Create a Node with InternalLockGuard::None (single-threaded pass-through).
+    ///
+    /// In single-threaded mode there is no concurrent access, so we skip actual
+    /// lock acquisition and return a Node with an empty guard.
+    ///
+    /// Resolves `ReadInteriorWriteLeaf` to the actual lock type based on the node's
+    /// leaf status, matching the behaviour of `NodeCore::lock()`.
+    fn make_lockless_node(core: TArc<NodeCore>, lock_type: LockType) -> Node {
+        let actual_lock = match lock_type {
+            LockType::ReadInteriorWriteLeaf => {
+                if core.is_leaf() { LockType::Write } else { LockType::Read }
+            }
+            other => other,
+        };
+        Node { _guard: InternalLockGuard::None, core, lock_type: actual_lock }
+    }
+
+    /// Lock a node, or skip locking entirely when the btree is single-threaded.
+    async fn lock_node(&self, core: TArc<NodeCore>, lock_type: LockType) -> Node {
+        if self.config.is_single_threaded {
+            Self::make_lockless_node(core, lock_type)
+        } else {
+            NodeCore::lock(core, lock_type).await
+        }
+    }
+
+    /// Clone a temporary copy of a node, with or without locking.
+    ///
+    /// In single-threaded mode the copy is created without acquiring any lock.
+    pub(crate) async fn clone_temp_node(&self, node: &Node, lock_type: LockType) -> Node {
+        if self.config.is_single_threaded {
+            let buffer = node.core.get_phys_buf().as_ref().to_vec();
+            let temp_core = TArc::new(NodeCore::from_buffer(buffer));
+            Self::make_lockless_node(temp_core, lock_type)
+        } else {
+            node.clone_temp(lock_type).await
+        }
     }
 
     //================================================================================
@@ -87,8 +140,8 @@ where
         // Get UNLOCKED node from storage (storage layer handles persistence only)
         let node_core = self.storage.read_node(id).await?;
 
-        // Lock it (node manager handles all locking)
-        Ok(NodeCore::lock(node_core, lock_type).await)
+        // Lock it (or pass-through if single-threaded)
+        Ok(self.lock_node(node_core, lock_type).await)
     }
 
     pub(crate) async fn create_new_node(&self, is_leaf: bool, node_variant: u8) -> Result<Node, BtreeError> {
@@ -138,12 +191,19 @@ where
 
     /// Upgrade single node lock from READ to WRITE (matches C++ upgrade_node_lock)
     ///
-    /// # Process
+    /// In single-threaded mode, skips the drop-and-reacquire entirely.
+    ///
+    /// # Process (multi-threaded)
     /// 1. Drop current lock
     /// 2. Reacquire WRITE lock
     /// 3. Validate node wasn't modified (check node_gen and deleted flag)
     /// 4. Return Retry error if validation fails
     pub async fn upgrade_node_lock(&self, guard: Node) -> Result<Node, BtreeError> {
+        // Single-threaded: no concurrent modification possible, skip drop/re-acquire/validate.
+        if self.config.is_single_threaded {
+            return Ok(Self::make_lockless_node(guard.core, LockType::Write));
+        }
+
         let core = guard.core().clone();
         let prev_gen = core.node_gen();
 
@@ -170,9 +230,9 @@ where
 
     /// Upgrade parent and child node locks to WRITE (matches C++ upgrade_node_locks)
     ///
-    /// Upgrades both nodes atomically.
+    /// In single-threaded mode, skips the drop-and-reacquire entirely.
     ///
-    /// # Process
+    /// # Process (multi-threaded)
     /// 1. Drop both current locks
     /// 2. Reacquire WRITE locks for both (parent first, then child)
     /// 3. Validate both nodes weren't modified
@@ -182,6 +242,14 @@ where
         parent_guard: Node,
         child_guard: Node,
     ) -> Result<(Node, Node), BtreeError> {
+        // Single-threaded: no concurrent modification possible, skip drop/re-acquire/validate.
+        if self.config.is_single_threaded {
+            return Ok((
+                Self::make_lockless_node(parent_guard.core, LockType::Write),
+                Self::make_lockless_node(child_guard.core, LockType::Write),
+            ));
+        }
+
         let parent_core = parent_guard.core().clone();
         let child_core = child_guard.core().clone();
         let parent_prev_gen = parent_core.node_gen();
@@ -263,17 +331,8 @@ where
             }
         }
 
-        // Acquire write lock on initialized node
-        let write_guard = node_core.lock.write().await;
-
-        // SAFETY: Arc<NodeCore> in Node keeps the lock alive, so 'static transmute is safe
-        let write_guard = unsafe { std::mem::transmute(write_guard) };
-
-        Ok(Node {
-            core: node_core,
-            lock_type: LockType::Write,
-            _guard: InternalLockGuard::Write(write_guard),
-        })
+        // Lock the initialized node (or pass-through if single-threaded)
+        Ok(self.lock_node(node_core, LockType::Write).await)
     }
 }
 

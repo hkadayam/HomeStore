@@ -515,7 +515,7 @@ where
         // Collections for old and new nodes
         let mut old_nodes: Vec<Node> = Vec::with_capacity(3);
         let mut new_nodes: Vec<Node> = Vec::with_capacity(3);
-        let mut cur_new_node = leftmost_node.clone_temp(LockType::Write).await;
+        let mut cur_new_node = self.clone_temp_node(&leftmost_node, LockType::Write).await;
         let mut idx = start_idx + 1;
 
         // Main merge loop: read old nodes and pack into new nodes

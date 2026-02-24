@@ -119,14 +119,14 @@ pub trait UnderlyingBtree: Send + Sync {
 /// **CRITICAL**: This guard MUST be held for the entire operation scope!
 /// If it drops early, the tree becomes unprotected while still operating.
 pub struct TreeLockGuard<'a> {
-    pub(super) _guard: AsyncRwReadGuard<'a, ()>,
+    pub(super) _guard: Option<AsyncRwReadGuard<'a, ()>>,
 }
 
 /// Tree lock guard (exclusive) - for root split/collapse operations
 ///
 /// **CRITICAL**: This guard MUST be held for the entire operation scope!
 pub struct TreeLockGuardExclusive<'a> {
-    pub(super) _guard: AsyncRwWriteGuard<'a, ()>,
+    pub(super) _guard: Option<AsyncRwWriteGuard<'a, ()>>,
 }
 
 //================================================================================

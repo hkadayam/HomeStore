@@ -240,6 +240,7 @@ struct BtreeTestOptions {
     #[allow(dead_code)]
     run_time_secs: u32,
     disable_merge: bool,
+    is_single_threaded: bool,
     /// Full test name (e.g. "test_sequential_remove_var_key_mem") for btree logging. Set by the test macro.
     pub test_name: Option<String>,
 }
@@ -252,6 +253,7 @@ impl Default for BtreeTestOptions {
             num_ios: 1000,
             run_time_secs: 36000,
             disable_merge: false,
+            is_single_threaded: false,
             test_name: None,
         }
     }
@@ -314,6 +316,7 @@ impl<Variant: TestBtreeVariant> TestBtree<Variant> {
         config.merge_policy = if opts.disable_merge { MergePolicy::Never } else { MergePolicy::Aggressive };
         config.leaf_node_variant = Variant::node_variant();
         config.int_node_variant = Variant::node_variant();
+        config.is_single_threaded = opts.is_single_threaded;
 
         // Create storage based on storage type
         let storage: Box<dyn UnderlyingBtree> = match Variant::Storage::name() {
@@ -1049,3 +1052,35 @@ btree_tests!(VarValueSizeBtreeTest<CowStorage>, var_value_cow);
 // VarObjSizeBtree - COW storage (TestVarLenKey + TestVarLenValue)
 btree_tests!(VarObjSizeBtreeTest<CowStorage>, var_obj_cow);
 */
+
+//================================================================================
+// Single-threaded mode tests
+//================================================================================
+
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
+async fn test_single_threaded_fixed_size_mem_impl() {
+    let mut helper = TestBtree::<FixedSizeTestBtree<MemStorage>>::new(BtreeTestOptions {
+        test_name: Some("single_threaded_fixed_size_mem".to_string()),
+        is_single_threaded: true,
+        num_entries: 1000,
+        preload_size: 0,
+        ..Default::default()
+    })
+    .await
+    .expect("Failed to create single-threaded TestBtree");
+
+    test_sequential_insert_impl(&mut helper).await;
+    test_sequential_remove_impl(&mut helper).await;
+}
+
+#[cfg(feature = "async_code")]
+#[iomgr::iomanager_test]
+async fn test_single_threaded_fixed_size_mem() {
+    test_single_threaded_fixed_size_mem_impl().await;
+}
+
+#[cfg(feature = "sync_code")]
+#[test]
+fn test_single_threaded_fixed_size_mem() {
+    test_single_threaded_fixed_size_mem_impl();
+}

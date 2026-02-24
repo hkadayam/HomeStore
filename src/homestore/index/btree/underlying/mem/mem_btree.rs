@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ********************************************************************* */
+ ****************** */
 
 //! MemBtree - Simple In-Memory Storage for Btree Validation
 //!
@@ -31,7 +31,7 @@
 //!   ↓
 //! MemBtree (this - simple storage, NO locking)
 //!   ↓
-//! HashMap<BNodeId, Arc<NodeCore>> (in-memory)
+//! NodeMap<V> (DashMap for concurrent, lock-free HashMap for single-threaded)
 //! ```
 //!
 //! ## Implementation Strategy
@@ -40,6 +40,8 @@
 
 use dashmap::DashMap;
 use triomphe::Arc as TArc;
+use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "async_code")]
@@ -51,22 +53,81 @@ use crate::index::btree::btree::{Btree, UnderlyingBtree};
 use crate::index::btree::btree_kvs::{BtreeKey, BtreeValue};
 
 //================================================================================
-// Phase 8: MemBtree - In-Memory Storage Implementation
+// NodeMap - Dual-mode storage: concurrent DashMap or lock-free HashMap
+//================================================================================
+
+/// Dual-mode storage map.
+/// - `Concurrent`: DashMap (lock-free sharded, multi-threaded safe)
+/// - `LockFree`: plain HashMap behind UnsafeCell (zero overhead, single-threaded only)
+enum NodeMap<V: Clone + Send + 'static> {
+    Concurrent(DashMap<BNodeId, V>),
+    LockFree(UnsafeCell<HashMap<BNodeId, V>>),
+}
+
+// SAFETY: The LockFree variant is only constructed when BtreeConfig::is_single_threaded=true,
+// which guarantees no concurrent access to the UnsafeCell. The Concurrent variant uses
+// DashMap which is already Sync.
+unsafe impl<V: Clone + Send + 'static> Sync for NodeMap<V> {}
+unsafe impl<V: Clone + Send + 'static> Send for NodeMap<V> {}
+
+impl<V: Clone + Send + 'static> NodeMap<V> {
+    fn concurrent() -> Self { Self::Concurrent(DashMap::new()) }
+    fn lockfree() -> Self { Self::LockFree(UnsafeCell::new(HashMap::new())) }
+
+    fn get(&self, id: BNodeId) -> Option<V> {
+        match self {
+            Self::Concurrent(m) => m.get(&id).map(|r| r.value().clone()),
+            Self::LockFree(m)   => unsafe { &*m.get() }.get(&id).map(|v| v.clone()),
+        }
+    }
+
+    fn insert(&self, id: BNodeId, val: V) {
+        match self {
+            Self::Concurrent(m) => { m.insert(id, val); }
+            Self::LockFree(m)   => { unsafe { &mut *m.get() }.insert(id, val); }
+        }
+    }
+
+    fn remove(&self, id: BNodeId) {
+        match self {
+            Self::Concurrent(m) => { m.remove(&id); }
+            Self::LockFree(m)   => { unsafe { &mut *m.get() }.remove(&id); }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Concurrent(m) => m.len(),
+            Self::LockFree(m)   => unsafe { &*m.get() }.len(),
+        }
+    }
+
+    fn clear(&self) {
+        match self {
+            Self::Concurrent(m) => m.clear(),
+            Self::LockFree(m)   => unsafe { &mut *m.get() }.clear(),
+        }
+    }
+}
+
+//================================================================================
+// MemBtree - In-Memory Storage Implementation
 //================================================================================
 
 /// MemBtree - Simple in-memory storage for btree nodes
 ///
 /// **NO LOCKING** - All locking is handled by the Btree layer above.
-/// This layer handles ONLY storage/persistence (in-memory DashMap).
+/// This layer handles ONLY storage/persistence (in-memory map).
 ///
-/// Uses DashMap for lock-free concurrent access without global lock contention.
+/// When `is_single_threaded=true`, uses a lock-free `HashMap` (zero overhead).
+/// When `is_single_threaded=false`, uses `DashMap` for concurrent access.
 pub struct MemBtree {
-    /// In-memory node storage - concurrent HashMap without global lock
-    nodes: DashMap<BNodeId, TArc<NodeCore>>,
+    /// In-memory node storage
+    nodes: NodeMap<TArc<NodeCore>>,
 
     /// Overflow storage - separate from regular nodes
     /// Stores pure user data (no btree headers)
-    overflow: DashMap<BNodeId, TArc<BtreeBuffer>>,
+    overflow: NodeMap<TArc<BtreeBuffer>>,
 
     /// Node size for this btree (fixed size for all nodes)
     node_size: u32,
@@ -81,16 +142,20 @@ pub struct MemBtree {
 impl MemBtree {
     /// Create a new MemBtree from btree config
     ///
-    /// Uses config for node size and btree name (name is used in logs for debugging).
+    /// Uses config for node size, btree name, and concurrency mode.
     ///
     /// # Arguments
-    /// * `config` - Btree configuration (node_size, btree_name, etc.)
+    /// * `config` - Btree configuration (node_size, btree_name, is_single_threaded, etc.)
     pub fn new(config: &BtreeConfig) -> Self {
-        tracing::info!("MemBtree: Creating in-memory btree name={} node_size={}", config.btree_name, config.node_size);
+        tracing::info!(
+            "MemBtree: Creating in-memory btree name={} node_size={} single_threaded={}",
+            config.btree_name, config.node_size, config.is_single_threaded
+        );
 
+        let st = config.is_single_threaded;
         Self {
-            nodes: DashMap::new(),
-            overflow: DashMap::new(),
+            nodes:    if st { NodeMap::lockfree() } else { NodeMap::concurrent() },
+            overflow: if st { NodeMap::lockfree() } else { NodeMap::concurrent() },
             node_size: config.node_size,
             btree_name: config.btree_name.clone(),
             next_node_id: AtomicU64::new(1), // Start from 1
@@ -118,7 +183,7 @@ impl MemBtree {
 impl UnderlyingBtree for MemBtree {
     /// Read node from memory - returns UNLOCKED node
     ///
-    /// **Locking is Btree layer's responsibility** - this just fetches from HashMap.
+    /// **Locking is Btree layer's responsibility** - this just fetches from the map.
     ///
     /// # Arguments
     /// * `id` - Node ID to read
@@ -127,39 +192,22 @@ impl UnderlyingBtree for MemBtree {
     /// * `Ok(Arc<NodeCore>)` - Unlocked node (Btree layer will lock it)
     /// * `Err(BtreeError::NodeNotFound)` - Node doesn't exist
     async fn read_node(&self, id: BNodeId) -> Result<TArc<NodeCore>, BtreeError> {
-        self.nodes.get(&id).map(|entry| TArc::clone(entry.value())).ok_or(BtreeError::NodeNotFound)
+        self.nodes.get(id).ok_or(BtreeError::NodeNotFound)
     }
 
     /// Write node to storage
     ///
     /// For MemBtree, this is a no-op since nodes are already in memory.
     /// Node modifications happen in-place on the buffer - nothing to persist.
-    ///
-    /// **Note**: The node is already locked by Btree layer before this call.
-    ///
-    /// # Arguments
-    /// * `node` - Locked node to write (ignored for MemBtree)
-    ///
-    /// # Returns
-    /// * `Ok(())` - Always succeeds (no-op)
     async fn write_node(&self, _node: &Node) -> Result<(), BtreeError> {
-        // For MemBtree, nodes are already in memory, no-op
-        // Node modifications happen in-place on the buffer
         Ok(())
     }
 
     /// Create new node in memory
     ///
-    /// Creates a new node, allocating node_id internally, and adds it to the HashMap.
+    /// Creates a new node, allocating node_id internally, and adds it to the map.
     /// Returns UNLOCKED node that Btree layer will lock as needed.
-    ///
-    /// # Arguments
-    /// * `is_leaf` - Whether this is a leaf node
-    /// * `node_variant` - Node type (0=SimpleNode, 1=VarKeyNode)
-    ///
-    /// # Returns
-    /// * `Ok(Arc<NodeCore>)` - Unlocked new node
-    async fn create_node(&self, is_leaf: bool, node_variant: u8) -> Result<TArc<NodeCore>, BtreeError> {
+    async fn create_node(&self, is_leaf: bool, _node_variant: u8) -> Result<TArc<NodeCore>, BtreeError> {
         let node_id = self.allocate_node_id();
         let core = TArc::new(NodeCore::new(node_id, is_leaf, self.node_size));
         self.nodes.insert(node_id, TArc::clone(&core));
@@ -167,72 +215,36 @@ impl UnderlyingBtree for MemBtree {
     }
 
     /// Delete node from memory (for cleanup)
-    ///
-    /// Removes node from HashMap. Used for cleanup operations.
-    ///
-    /// # Arguments
-    /// * `id` - Node ID to delete
-    ///
-    /// # Returns
-    /// * `Ok(())` - Node deleted (or didn't exist)
     async fn delete_node(&self, id: BNodeId) -> Result<(), BtreeError> {
-        self.nodes.remove(&id);
+        self.nodes.remove(id);
         Ok(())
     }
 
     /// Notify storage that root node has changed
     ///
     /// For MemBtree, this is a no-op since there's no persistence.
-    /// In a persistent storage implementation (e.g., COWBtree), this would
-    /// persist the root node ID to metadata.
-    ///
-    /// # Arguments
-    /// * `root_node_id` - New root node ID
-    ///
-    /// # Returns
-    /// * `Ok(())` - Always succeeds (no-op for MemBtree)
     async fn on_root_changed(&self, root_node_id: BNodeId) -> Result<(), BtreeError> {
         tracing::debug!("MemBtree: Root changed to node {}", root_node_id);
         Ok(())
     }
 
     /// Write overflow data to memory and return allocated node_id
-    ///
-    /// # Arguments
-    /// * `data` - BtreeBuffer containing overflow data
-    ///
-    /// # Returns
-    /// * `Ok(BNodeId)` - Allocated node ID for this overflow data
     async fn write_overflow(&self, data: BtreeBuffer) -> Result<BNodeId, BtreeError> {
         let node_id = self.allocate_node_id();
         let len = data.len();
         self.overflow.insert(node_id, TArc::new(data));
-
         tracing::debug!("MemBtree: Wrote overflow node {} ({} bytes)", node_id, len);
         Ok(node_id)
     }
 
     /// Read overflow data by node_id
-    ///
-    /// # Arguments
-    /// * `node_id` - Overflow node ID to read
-    ///
-    /// # Returns
-    /// * `Ok(Arc<BtreeBuffer>)` - Shared overflow data (zero-copy)
-    /// * `Err(BtreeError::NodeNotFound)` - Overflow node doesn't exist
     async fn read_overflow(&self, node_id: BNodeId) -> Result<TArc<BtreeBuffer>, BtreeError> {
-        self.overflow.get(&node_id).map(|entry| TArc::clone(entry.value())).ok_or(BtreeError::NodeNotFound)
+        self.overflow.get(node_id).ok_or(BtreeError::NodeNotFound)
     }
 
     /// Delete overflow node from memory
-    ///
-    /// # Arguments
-    /// * `node_id` - Overflow node ID to delete
-    ///
-    /// # Returns
-    /// * `Ok(())` - Overflow node deleted (or didn't exist)
     async fn delete_overflow(&self, node_id: BNodeId) -> Result<(), BtreeError> {
-        self.overflow.remove(&node_id);
+        self.overflow.remove(node_id);
         tracing::debug!("MemBtree: Deleted overflow node {}", node_id);
         Ok(())
     }
@@ -246,13 +258,11 @@ impl UnderlyingBtree for MemBtree {
 impl MemBtree {
     /// Create a new Btree with MemBtree storage (for testing)
     ///
-    /// This is a convenience method that creates both the storage and the Btree.
-    ///
     /// # Arguments
     /// * `node_size` - Size of each node in bytes
     ///
     /// # Returns
-    /// * Result with Btree and MemBtree storage, or BtreeError
+    /// * Result with Btree, or BtreeError
     pub async fn create_btree<K, V>(node_size: u32) -> Result<Btree<K, V>, BtreeError>
     where
         K: BtreeKey + 'static,

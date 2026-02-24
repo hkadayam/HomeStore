@@ -226,7 +226,7 @@ async fn run_benchmark(args: BenchArgs) {
         config.leaf_node_variant = 0; // SimpleNode for raw performance
         config.int_node_variant = 0;
 
-        let storage: Box<dyn UnderlyingBtree> = Box::new(MemBtree::new(config.node_size));
+        let storage: Box<dyn UnderlyingBtree> = Box::new(MemBtree::new(&config));
         let btree = Arc::new(
             Btree::<BenchKey, BenchValue>::new(config, storage, None)
                 .await

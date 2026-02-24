@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- */
+ ************************************************************************ */
 
 //! Common B-tree types
 //!
@@ -39,50 +39,32 @@ pub struct BtreeBuffer(Vec<u8>);
 
 impl BtreeBuffer {
     #[cfg(feature = "persistent")]
-    pub fn new(size: usize) -> Self {
-        BtreeBuffer(iomgr::IOBuffer::new(size))
-    }
+    pub fn new(size: usize) -> Self { BtreeBuffer(iomgr::IOBuffer::new(size)) }
 
     #[cfg(not(feature = "persistent"))]
-    pub fn new(size: usize) -> Self {
-        BtreeBuffer(vec![0u8; size])
-    }
+    pub fn new(size: usize) -> Self { BtreeBuffer(vec![0u8; size]) }
 
     #[cfg(feature = "persistent")]
-    pub fn from_vec(buf: Vec<u8>) -> Self {
-        BtreeBuffer(iomgr::IOBuffer::from_vec(buf))
-    }
+    pub fn from_vec(buf: Vec<u8>) -> Self { BtreeBuffer(iomgr::IOBuffer::from_vec(buf)) }
 
     #[cfg(not(feature = "persistent"))]
-    pub fn from_vec(buf: Vec<u8>) -> Self {
-        BtreeBuffer(buf)
-    }
+    pub fn from_vec(buf: Vec<u8>) -> Self { BtreeBuffer(buf) }
 
-    pub fn as_slice(&self) -> &[u8] {
-        &self.0
-    }
+    pub fn as_slice(&self) -> &[u8] { &self.0 }
 
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.0
-    }
+    pub fn as_mut_slice(&mut self) -> &mut [u8] { &mut self.0 }
 
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
+    pub fn len(&self) -> usize { self.0.len() }
 }
 
 impl Deref for BtreeBuffer {
     type Target = [u8];
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+    fn deref(&self) -> &Self::Target { &self.0 }
 }
 
 impl AsRef<[u8]> for BtreeBuffer {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
+    fn as_ref(&self) -> &[u8] { &self.0 }
 }
 
 //================================================================================
@@ -173,19 +155,19 @@ pub struct BtreeConfig {
     pub int_node_variant: u8,      // Node variant for interior nodes
 
     // Overflow node configuration
-    pub overflow_threshold: u32,      // DEPRECATED: Use inline_value_size instead
     pub overflow_min_alloc_size: u32, // Whats the multiple of node_size to allocate for overflow storage
-    
-    // Value inlining configuration
-    pub inline_value_size: u32,    // Threshold for inlining values (vs overflow). Clamped: sizeof(BNodeId) <= x <= node_size/32
+    pub inline_value_size: u32,       /* Threshold for inlining values (vs overflow). Clamped: sizeof(BNodeId) <= x
+                                       * <= node_size/32 */
 
     // Prefix compression config (for PrefixCompressNode variant)
     pub expected_prefix_size: u16, // 0 = dynamic, >0 = fixed split point
 
+    pub is_single_threaded: bool, // Is the btree single threaded?
+
     // Precomputed values for faster calculations
     pub suggested_min_size: u32,
     pub ideal_fill_size: u32,
-    pub max_key_size: u32,         // Maximum key size that guarantees min 2 entries per node
+    pub max_key_size: u32, // Maximum key size that guarantees min 2 entries per node
 }
 
 impl BtreeConfig {
@@ -202,30 +184,29 @@ impl BtreeConfig {
             leaf_node_variant: 0, // Simple node
             int_node_variant: 0,  // Simple node
             btree_name,
-            overflow_threshold: inline_value_size,      // Keep in sync with inline_value_size for compatibility
             overflow_min_alloc_size: 512, // 512 minimum for persistence alignment
             inline_value_size,
             suggested_min_size: 0,
             ideal_fill_size: 0,
-            max_key_size: 0,      // Computed in finalize()
+            max_key_size: 0, // Computed in finalize()
+            is_single_threaded: false,
         };
         config.finalize();
         config
     }
-    
+
     /// Clamp inline_value_size to safe bounds
     fn clamp_inline_value_size(requested: u32, node_size: u32) -> u32 {
         const MIN_INLINE: u32 = std::mem::size_of::<super::btree_node::BNodeId>() as u32; // 8 bytes
         let max_inline = node_size / 32; // Conservative max (e.g., 128 for 4KB nodes)
-        
+
         requested.clamp(MIN_INLINE, max_inline)
     }
-    
+
     /// Suggest inline value size with automatic clamping
     /// This is a hint for performance optimization - values can exceed this via overflow
     pub fn suggest_inline_value_size(&mut self, size: u32) {
         self.inline_value_size = Self::clamp_inline_value_size(size, self.node_size);
-        self.overflow_threshold = self.inline_value_size; // Keep in sync
         self.finalize(); // Recalculate max_key_size
     }
 
@@ -234,15 +215,15 @@ impl BtreeConfig {
         let usable_size = self.node_size - node_header_size;
         self.ideal_fill_size = (usable_size * self.ideal_fill_pct as u32) / 100;
         self.suggested_min_size = (usable_size * self.suggested_min_pct as u32) / 100;
-        
+
         // Calculate max_key_size based on node variant
         self.max_key_size = self.calculate_max_key_size();
     }
-    
+
     /// Calculate maximum key size that guarantees at least 2 entries per node
     fn calculate_max_key_size(&self) -> u32 {
         use super::variant::{SimpleNodeOps, VarNodeOps, prefix_compress_node::PrefixCompressNodeOps};
-        
+
         // Get overhead from the variant
         let (header_size, per_entry_overhead) = match self.leaf_node_variant {
             0 => SimpleNodeOps::get_overhead_size(),
@@ -250,17 +231,15 @@ impl BtreeConfig {
             4 => PrefixCompressNodeOps::get_overhead_size(),
             _ => (std::mem::size_of::<super::btree_node::PersistentHeader>() as u32, 0),
         };
-        
+
         let usable_size = self.node_size.saturating_sub(header_size);
         let min_entries = 2; // Minimum for splits to work
-        
+
         // Space per entry: per_entry_overhead + key_size + value_size
         // Total: min_entries * (per_entry_overhead + key_size + inline_value_size) <= usable_size
         let space_per_entry = usable_size / min_entries;
-        
-        space_per_entry
-            .saturating_sub(per_entry_overhead)
-            .saturating_sub(self.inline_value_size)
+
+        space_per_entry.saturating_sub(per_entry_overhead).saturating_sub(self.inline_value_size)
     }
 
     pub fn split_size(&self, filled_size: u32) -> u32 { (filled_size * self.split_pct as u32) / 100 }
@@ -268,6 +247,6 @@ impl BtreeConfig {
     pub fn ideal_fill_size(&self) -> u32 { self.ideal_fill_size }
 
     pub fn suggested_min_size(&self) -> u32 { self.suggested_min_size }
-    
+
     pub fn max_key_size(&self) -> u32 { self.max_key_size }
 }

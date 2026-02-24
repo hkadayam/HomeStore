@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- */
+ ************************************************************************ */
 
 //! Btree Mutation Operations
 //!
@@ -42,11 +42,7 @@ pub enum PutResult {
 // Internal Implementation (called from btree.rs public API)
 //================================================================================
 
-#[maybe_async_cfg::maybe(
-    keep_self,
-    sync(feature = "sync_code"),
-    async(feature = "async_code")
-)]
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 impl<K, V> Btree<K, V>
 where
     K: BtreeKey + 'static,
@@ -167,7 +163,7 @@ where
                     return Err(BtreeError::KeyAlreadyExists);
                 }
                 // Build ValueOrOverflow, writing to overflow storage if needed
-                let v = ValueOrOverflow::build(self.storage.as_ref(), value, self.config.overflow_threshold).await?;
+                let v = ValueOrOverflow::build(self.storage.as_ref(), value, self.config.inline_value_size).await?;
                 node.insert::<K, V>(idx, key, &v)?;
             }
             BtreePutType::Update => {
@@ -180,8 +176,7 @@ where
                 if found {
                     self.replace_value(node, idx, value).await?;
                 } else {
-                    let v =
-                        ValueOrOverflow::build(self.storage.as_ref(), value, self.config.overflow_threshold).await?;
+                    let v = ValueOrOverflow::build(self.storage.as_ref(), value, self.config.inline_value_size).await?;
                     node.insert::<K, V>(idx, key, &v)?;
                 }
             }
@@ -222,6 +217,7 @@ where
     }
 
     /// Main PUT recursive traversal for range operations (matches C++ Btree::do_put lines 108-243)
+    #[cfg_attr(feature = "async_code", async_recursion::async_recursion)]
     async fn put_range_walk<'a>(
         &self,
         mut my_node: Node,
@@ -502,7 +498,7 @@ where
             old_overflow_id = Some(old_val.expect_overflow("Expected overflow value, got inline value"));
         }
 
-        let v = ValueOrOverflow::build(self.storage.as_ref(), value, self.config.overflow_threshold).await?;
+        let v = ValueOrOverflow::build(self.storage.as_ref(), value, self.config.inline_value_size).await?;
         node.update::<K, V>(idx, &v)?;
 
         // Cleanup old overflow if it existed

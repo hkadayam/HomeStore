@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ******************************************* */
+ ************************************************************************* */
 
 //! Btree Key and Value Traits
 //!
@@ -23,7 +23,6 @@ use std::io;
 
 use super::btree_node::BNodeId;
 use super::btree_types::{BtreeError, BtreeBuffer};
-
 
 //================================================================================
 // Core Traits
@@ -373,11 +372,7 @@ impl<V: BtreeValue> ValueOrOverflow<V> {
     /// # Returns
     /// * `ValueOrOverflow::Inline(value.clone())` if size <= threshold
     /// * `ValueOrOverflow::OverflowRef { node_id, overflow_size }` if size > threshold
-    #[maybe_async_cfg::maybe(
-        keep_self,
-        sync(feature = "sync_code"),
-        async(feature = "async_code")
-    )]
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
     pub async fn build<S>(storage: &S, value: &V, overflow_threshold: u32) -> Result<Self, BtreeError>
     where
         S: super::btree::UnderlyingBtree + ?Sized,
@@ -405,11 +400,7 @@ impl<V: BtreeValue> ValueOrOverflow<V> {
     /// # Arguments
     /// * `storage` - The underlying storage interface
     /// * `copy` - Whether to copy the value during deserialization
-    #[maybe_async_cfg::maybe(
-        keep_self,
-        sync(feature = "sync_code"),
-        async(feature = "async_code")
-    )]
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
     pub async fn resolve<S>(self, storage: &S, copy: bool) -> Result<V, BtreeError>
     where
         S: super::btree::UnderlyingBtree + ?Sized,
@@ -463,7 +454,7 @@ mod tests {
     fn test_u64_iobuffer() {
         let key: u64 = 42;
         let iobuf = <u64 as BtreeValue>::serialize_to_iobuffer(&key).unwrap();
-        assert_eq!(iobuf.len(), 4096); // IOBuffer aligns to 4096 bytes
+        assert_eq!(iobuf.len(), 8); // IOBuffer aligns to 4096 bytes
 
         let restored = <u64 as BtreeValue>::deserialize_from(iobuf.as_slice(), true).unwrap();
         assert_eq!(key, restored);

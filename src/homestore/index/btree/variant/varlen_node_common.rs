@@ -853,10 +853,11 @@ where
             size_to_move -= entry_size;
         }
 
-        // Remove moved entries from source
+        // Remove moved entries from source.
+        // Entries are always moved from the end, so the moved range is always
+        // [src_nentries - nmoved, src_nentries - 1] regardless of where idx ended up.
         if nmoved > 0 {
-            let remove_start = if idx == 0 && nmoved > 0 { 0 } else { idx + 1 };
-            NodeOps::<K, V>::remove_range(self, src_core, remove_start, src_nentries - 1).ok();
+            NodeOps::<K, V>::remove_range(self, src_core, src_nentries - nmoved, src_nentries - 1).ok();
         }
 
         // Handle edge transfer for interior nodes

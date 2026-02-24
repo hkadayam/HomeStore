@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- */
+ ********************************************************************** */
 
 //! B-tree Node Implementation
 //!
@@ -368,48 +368,42 @@ pub use variant::{VarNodeHeader, RecordHeader, VarKeyRecord, VarValueRecord, Var
 #[cfg(feature = "async_code")]
 pub struct NodeCore {
     pub lock: iomgr::AsyncRwLock<NodeInner>,
-    pub(super) phys_buf: TArc<BtreeBuffer>, // Physical buffer with PersistentHeader at offset 0
+    pub(super) phys_buf: TArc<BtreeBuffer>,
 }
 
 /// Core node data (sync version)
 #[cfg(feature = "sync_code")]
 pub struct NodeCore {
     pub lock: parking_lot::RwLock<NodeInner>,
-    pub(super) phys_buf: TArc<BtreeBuffer>, // Physical buffer with PersistentHeader at offset 0
+    pub(super) phys_buf: TArc<BtreeBuffer>,
 }
 
 impl NodeCore {
     /// Create a new node with given parameters
     #[cfg(feature = "async_code")]
     pub fn new(node_id: BNodeId, is_leaf: bool, node_size: u32) -> Self {
-        let mut buffer = vec![0u8; node_size as usize];
-
-        // Initialize PersistentHeader at the beginning of buffer
+        let mut buffer = BtreeBuffer::new(node_size as usize);
         unsafe {
-            let header_ptr = buffer.as_mut_ptr() as *mut PersistentHeader;
+            let header_ptr = buffer.as_mut_slice().as_mut_ptr() as *mut PersistentHeader;
             *header_ptr = PersistentHeader::new(node_id, is_leaf, node_size as u16);
         }
-
         Self {
             lock: iomgr::AsyncRwLock::new(NodeInner {}),
-            phys_buf: TArc::new(BtreeBuffer::from_vec(buffer)),
+            phys_buf: TArc::new(buffer),
         }
     }
 
     /// Create a new node with given parameters (sync version)
     #[cfg(feature = "sync_code")]
     pub fn new(node_id: BNodeId, is_leaf: bool, node_size: u32) -> Self {
-        let mut buffer = vec![0u8; node_size as usize];
-
-        // Initialize PersistentHeader at the beginning of buffer
+        let mut buffer = BtreeBuffer::new(node_size as usize);
         unsafe {
-            let header_ptr = buffer.as_mut_ptr() as *mut PersistentHeader;
+            let header_ptr = buffer.as_mut_slice().as_mut_ptr() as *mut PersistentHeader;
             *header_ptr = PersistentHeader::new(node_id, is_leaf, node_size as u16);
         }
-
         Self {
             lock: parking_lot::RwLock::new(NodeInner {}),
-            phys_buf: TArc::new(BtreeBuffer::from_vec(buffer)),
+            phys_buf: TArc::new(buffer),
         }
     }
 
@@ -564,10 +558,16 @@ impl std::fmt::Debug for NodeCore {
 
 /// Node guard - used by Btree layer (matches C++ BtreeNode interface)
 /// This is the ONLY public node type - NodeCore is private
+///
+/// IMPORTANT: field declaration order controls drop order (Rust drops in declaration order).
+/// `_guard` MUST be declared before `core` so the lock is released while NodeCore is still
+/// alive. If `core` dropped first and its refcount reached 0 (e.g. after delete_node removed
+/// the DashMap entry), the NodeCore (and its RwLock) would be freed before `_guard` releases
+/// the lock → use-after-free.
 pub struct Node {
-    pub core: TArc<NodeCore>,
+    pub _guard: InternalLockGuard, // dropped FIRST: releases lock while NodeCore still alive
+    pub core: TArc<NodeCore>,      // dropped SECOND: safe to free NodeCore after lock released
     pub lock_type: LockType,
-    pub _guard: InternalLockGuard,
     // NO variant field - dispatch via node_type in header (zero cost)
 }
 
@@ -689,7 +689,7 @@ impl Node {
     #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
     pub async fn clone_temp(&self, lock_type: LockType) -> Node {
         // Clone the physical buffer
-        let buffer = self.core.get_phys_buf().to_vec();
+        let buffer = self.core.get_phys_buf().as_ref().to_vec();
         let temp_core = TArc::new(NodeCore::from_buffer(buffer));
         NodeCore::lock(temp_core, lock_type).await
     }

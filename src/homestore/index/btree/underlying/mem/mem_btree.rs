@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ***************************** */
+ ********************************************************************* */
 
 //! MemBtree - Simple In-Memory Storage for Btree Validation
 //!
@@ -71,22 +71,28 @@ pub struct MemBtree {
     /// Node size for this btree (fixed size for all nodes)
     node_size: u32,
 
+    /// Btree name (from config) for logging and debugging
+    btree_name: String,
+
     /// Next node ID to allocate (atomic for thread-safety)
     next_node_id: AtomicU64,
 }
 
 impl MemBtree {
-    /// Create a new MemBtree with the given node size
+    /// Create a new MemBtree from btree config
+    ///
+    /// Uses config for node size and btree name (name is used in logs for debugging).
     ///
     /// # Arguments
-    /// * `node_size` - Size of each node in bytes (e.g., 4096)
-    pub fn new(node_size: u32) -> Self {
-        tracing::info!("MemBtree: Creating in-memory btree with node_size={}", node_size);
+    /// * `config` - Btree configuration (node_size, btree_name, etc.)
+    pub fn new(config: &BtreeConfig) -> Self {
+        tracing::info!("MemBtree: Creating in-memory btree name={} node_size={}", config.btree_name, config.node_size);
 
         Self {
             nodes: DashMap::new(),
             overflow: DashMap::new(),
-            node_size,
+            node_size: config.node_size,
+            btree_name: config.btree_name.clone(),
             next_node_id: AtomicU64::new(1), // Start from 1
         }
     }
@@ -154,13 +160,9 @@ impl UnderlyingBtree for MemBtree {
     /// # Returns
     /// * `Ok(Arc<NodeCore>)` - Unlocked new node
     async fn create_node(&self, is_leaf: bool, node_variant: u8) -> Result<TArc<NodeCore>, BtreeError> {
-        // Allocate new node ID
         let node_id = self.allocate_node_id();
         let core = TArc::new(NodeCore::new(node_id, is_leaf, self.node_size));
         self.nodes.insert(node_id, TArc::clone(&core));
-
-        tracing::info!("MemBtree: Created node {} (is_leaf={}, node_variant={})", node_id, is_leaf, node_variant);
-
         Ok(core)
     }
 
@@ -175,7 +177,6 @@ impl UnderlyingBtree for MemBtree {
     /// * `Ok(())` - Node deleted (or didn't exist)
     async fn delete_node(&self, id: BNodeId) -> Result<(), BtreeError> {
         self.nodes.remove(&id);
-        tracing::info!("MemBtree: Deleted node {}", id);
         Ok(())
     }
 
@@ -191,7 +192,7 @@ impl UnderlyingBtree for MemBtree {
     /// # Returns
     /// * `Ok(())` - Always succeeds (no-op for MemBtree)
     async fn on_root_changed(&self, root_node_id: BNodeId) -> Result<(), BtreeError> {
-        tracing::info!("MemBtree: Root changed to node {}", root_node_id);
+        tracing::debug!("MemBtree: Root changed to node {}", root_node_id);
         Ok(())
     }
 
@@ -257,8 +258,8 @@ impl MemBtree {
         K: BtreeKey + 'static,
         V: BtreeValue + 'static,
     {
-        let storage = Box::new(Self::new(node_size));
         let config = BtreeConfig::new(node_size, "mem_btree".to_string());
+        let storage = Box::new(Self::new(&config));
         Btree::new(config, storage, None).await
     }
 }
@@ -270,8 +271,9 @@ impl MemBtree {
 /// Example: Create and use MemBtree
 ///
 /// ```ignore
-/// // Create MemBtree storage
-/// let mem_btree = MemBtree::new(4096);
+/// // Create MemBtree storage (config supplies node_size and btree name for logs)
+/// let config = BtreeConfig::new(4096, "my_btree".to_string());
+/// let mem_btree = MemBtree::new(&config);
 ///
 /// // Create Btree with MemBtree storage
 /// let btree = Btree::<u64, u64>::new(Box::new(mem_btree), root_node_id);

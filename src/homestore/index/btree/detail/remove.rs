@@ -36,6 +36,8 @@ use crate::{btree_io_err};
 
 /// Trait for different remove request types (compile-time polymorphism)
 /// This provides static dispatch similar to C++ template specialization.
+/// With async_code we use async_trait so the returned future is Send (required by callers like LockFreeBtree::execute).
+#[cfg_attr(feature = "async_code", async_trait::async_trait)]
 #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 trait RemoveContext<K: BtreeKey, V: BtreeValue>: Send {
     /// Execute removal on a leaf node
@@ -53,6 +55,7 @@ struct RemoveOneContext<'a, K: BtreeKey, V: BtreeValue> {
     result: &'a mut Option<V>,
 }
 
+#[cfg_attr(feature = "async_code", async_trait::async_trait)]
 #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 impl<'a, K: BtreeKey + 'static, V: BtreeValue + 'static> RemoveContext<K, V> for RemoveOneContext<'a, K, V> {
     async fn execute_on_leaf(&mut self, btree: &Btree<K, V>, leaf: &mut Node) -> Result<u32, BtreeError> {
@@ -97,6 +100,7 @@ struct RemoveAnyContext<'a, K: BtreeKey, V: BtreeValue> {
     result_value: &'a mut Option<V>,
 }
 
+#[cfg_attr(feature = "async_code", async_trait::async_trait)]
 #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 impl<'a, K: BtreeKey + 'static, V: BtreeValue + 'static> RemoveContext<K, V> for RemoveAnyContext<'a, K, V> {
     async fn execute_on_leaf(&mut self, btree: &Btree<K, V>, leaf: &mut Node) -> Result<u32, BtreeError> {
@@ -141,6 +145,7 @@ struct RemoveRangeContext<'a, K: BtreeKey, V: BtreeValue> {
     _phantom: std::marker::PhantomData<V>,
 }
 
+#[cfg_attr(feature = "async_code", async_trait::async_trait)]
 #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 impl<'a, K: BtreeKey + 'static, V: BtreeValue + 'static> RemoveContext<K, V> for RemoveRangeContext<'a, K, V> {
     async fn execute_on_leaf(&mut self, btree: &Btree<K, V>, leaf: &mut Node) -> Result<u32, BtreeError> {
@@ -376,6 +381,10 @@ where
                 Err(BtreeError::Retry) => {
                     continue 'retry;
                 }
+                // Concurrent merge deleted a node we were about to read; retry from root (same as Retry).
+                Err(BtreeError::NodeNotFound) => {
+                    continue 'retry;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -385,6 +394,8 @@ where
     ///
     /// Recursively walks down the tree to find and remove the target key/range.
     /// Handles both leaf removal and interior node traversal with merge detection.
+    #[cfg_attr(feature = "async_code", async_recursion::async_recursion)]
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
     async fn interior_walk_for_remove<R>(&self, mut my_node: Node, ctx: &mut R) -> Result<u32, BtreeError>
     where
         R: RemoveContext<K, V>,
@@ -425,26 +436,11 @@ where
             // this lock. Holding this lock will impact performance unncessarily.
             if curr_idx == end_idx {
                 drop(my_node);
-                // Need an explicit call to satisy the compiler, to ensure we drop and exit under same condition
-                #[cfg(feature = "async_code")]
-                {
-                    total_removed += Box::pin(self.interior_walk_for_remove(child, ctx)).await?;
-                }
-                #[cfg(feature = "sync_code")]
-                {
-                    total_removed += self.interior_walk_for_remove(child, ctx)?;
-                }
+                total_removed += self.interior_walk_for_remove(child, ctx).await?;
                 break;
             }
 
-            #[cfg(feature = "async_code")]
-            {
-                total_removed += Box::pin(self.interior_walk_for_remove(child, ctx)).await?;
-            }
-            #[cfg(feature = "sync_code")]
-            {
-                total_removed += self.interior_walk_for_remove(child, ctx)?;
-            }
+            total_removed += self.interior_walk_for_remove(child, ctx).await?;
             curr_idx += 1;
         }
         Ok(total_removed)
@@ -587,19 +583,20 @@ where
                 format!("Merge resulted in all empty nodes - leftmost, {} old nodes were empty", old_nodes.len()));
         }
 
-        // Debug: Dump nodes before merge decision
-        tracing::trace!("Before merge decision - leftmost node: {}", leftmost_node.to_string::<K, V>());
-        for (i, node) in old_nodes.iter().enumerate() {
-            tracing::trace!("Before merge - old node {}: {}", i + 1, node.to_string::<K, V>());
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!("Before merge decision - leftmost node: {}", leftmost_node.to_string::<K, V>());
+            for (i, node) in old_nodes.iter().enumerate() {
+                tracing::trace!("Before merge - old node {}: {}", i + 1, node.to_string::<K, V>());
+            }
+            for (i, node) in new_nodes.iter().enumerate() {
+                tracing::trace!("Before merge - new node {}: {}", i, node.to_string::<K, V>());
+            }
+            tracing::trace!("Before merge - parent node: {}", parent_node.to_string::<K, BNodeId>());
         }
-        for (i, node) in new_nodes.iter().enumerate() {
-            tracing::trace!("Before merge - new node {}: {}", i, node.to_string::<K, V>());
-        }
-        tracing::trace!("Before merge - parent node: {}", parent_node.to_string::<K, BNodeId>());
 
         // Decision point: should we commit this merge?
         if !self.should_accept_merge(end_idx - start_idx + 1, old_nodes.len() + 1, new_nodes.len()) {
-            tracing::info!("Merge rejected by {:?} policy: attempted={}, old={}, new={}", 
+            tracing::debug!("Merge rejected by {:?} policy: attempted={}, old={}, new={}",
                 self.config.merge_policy, end_idx - start_idx + 1, old_nodes.len() + 1, new_nodes.len());
 
             // Cleanup: delete the new nodes we created
@@ -616,7 +613,7 @@ where
 
         // We are committing the merge at this point. We are going to overwrite the leftmost node with the temp node
         // and delete the temp node. We are also going to update the parent node entries for the new nodes.
-        tracing::info!("Committing merge: reducing {} nodes to {}", old_nodes.len() + 1, new_nodes.len());
+        tracing::debug!("Committing merge: reducing {} nodes to {}", old_nodes.len() + 1, new_nodes.len());
 
         // Step 1: Swap the contents of the first new node with the leftmost node, because leftmost node is updated
         // in-place. We will remove the first new node after this step.
@@ -650,12 +647,13 @@ where
         )))?;
         parent_node.update_child_with_key::<K>(start_idx, &last_key, &leftmost_node.node_id())?;
 
-        // Debug: Dump merged nodes state
-        tracing::trace!("Leftmost node after merge: {}", leftmost_node.to_string::<K, V>());
-        for (i, node) in new_nodes.iter().enumerate() {
-            tracing::trace!("New node {} after merge: {}", i + 1, node.to_string::<K, V>());
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!("Leftmost node after merge: {}", leftmost_node.to_string::<K, V>());
+            for (i, node) in new_nodes.iter().enumerate() {
+                tracing::trace!("New node {} after merge: {}", i + 1, node.to_string::<K, V>());
+            }
+            tracing::trace!("Parent after merge: {}", parent_node.to_string::<K, BNodeId>());
         }
-        tracing::trace!("Parent after merge: {}", parent_node.to_string::<K, BNodeId>());
 
         // Step 5: Delete the old nodes and write the leftmost node and parent node to the storage
         for node in old_nodes.iter() {

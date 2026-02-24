@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- ************************************************** */
+ ************************************************************************ */
 
 //! Btree Node Manager - Lock upgrade and node management operations
 //!

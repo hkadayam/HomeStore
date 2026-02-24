@@ -38,7 +38,7 @@ async fn test_reverse_traversal_query_basic_impl() {
     config.leaf_node_variant = 4; // PREFIX_COMPRESS
     config.int_node_variant = 4;
     
-    let storage: Box<dyn UnderlyingBtree> = Box::new(MemBtree::new(config.node_size));
+    let storage: Box<dyn UnderlyingBtree> = Box::new(MemBtree::new(&config));
     let btree = Btree::<u32, u64>::new(config, storage, None).await.expect("Failed to create btree");
     
     // Insert 100 entries
@@ -89,7 +89,7 @@ async fn test_reverse_traversal_pagination_impl() {
     config.leaf_node_variant = 4; // PREFIX_COMPRESS
     config.int_node_variant = 4;
     
-    let storage: Box<dyn UnderlyingBtree> = Box::new(MemBtree::new(config.node_size));
+    let storage: Box<dyn UnderlyingBtree> = Box::new(MemBtree::new(&config));
     let btree = Btree::<u32, u64>::new(config, storage, None).await.expect("Failed to create btree");
     
     // Insert 100 entries
@@ -159,10 +159,10 @@ async fn test_reverse_traversal_multi_level_tree_impl() {
     println!("=== Testing Reverse Traversal on Multi-Level Tree ===");
     
     let mut config = BtreeConfig::new(4096, "test_reverse_multilevel".to_string());
-    config.leaf_node_variant = 4; // PREFIX_COMPRESS
-    config.int_node_variant = 4;
+    config.leaf_node_variant = 1; // VarLen
+    config.int_node_variant = 1; // VarLen
     
-    let storage: Box<dyn UnderlyingBtree> = Box::new(MemBtree::new(config.node_size));
+    let storage: Box<dyn UnderlyingBtree> = Box::new(MemBtree::new(&config));
     let btree = Btree::<u32, u64>::new(config, storage, None).await.expect("Failed to create btree");
     
     // Insert 10,000 entries to force multi-level tree

@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- *************************************************************** */
+ ************************************************************************ */
 
 //! Btree Request Abstraction
 //!
@@ -23,7 +23,7 @@
 //! - BtreeRangeRequest: Base for range operations (input_range, working_range, batch_size)
 //! - BtreeRangePutRequest: Range PUT (embeds BtreeRangeRequest + put_type, value)
 //! - BtreeSinglePutRequest: Single PUT
-
+use std::sync::Arc;
 use super::super::btree_kvs::{BtreeKey, BtreeValue};
 
 //================================================================================
@@ -43,28 +43,6 @@ pub enum PutFilterDecision {
     NeedOldValue,
 }
 
-/// Decision from GET filter
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GetFilterDecision {
-    /// Skip this entry
-    Skip,
-    /// Include this entry
-    Include,
-    /// Need to resolve value before deciding
-    NeedValue,
-}
-
-/// Decision from REMOVE filter
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemoveFilterDecision {
-    /// Skip this entry (don't remove)
-    Skip,
-    /// Remove this entry
-    Remove,
-    /// Need to resolve value before deciding
-    NeedValue,
-}
-
 /// PUT filter trait: conditional updates with overflow optimization
 pub trait PutFilter<K: BtreeKey, V: BtreeValue>: Send + Sync {
     /// Hint: Does this filter always need old value?
@@ -78,54 +56,6 @@ pub trait PutFilter<K: BtreeKey, V: BtreeValue>: Send + Sync {
     /// Phase 2: Check with old value resolved
     /// MUST NOT return NeedOldValue (will panic)
     fn check_kv(&self, key: &K, old_value: &V) -> PutFilterDecision;
-}
-
-/// GET filter trait: conditional retrieval with overflow optimization
-pub trait GetFilter<K: BtreeKey, V: BtreeValue>: Send + Sync {
-    /// Hint: Does this filter always need value?
-    /// If true, btree layer will skip check_key() and go straight to check_kv()
-    fn always_needs_value(&self) -> bool { false }
-
-    /// Phase 1: Check key only
-    /// Return Skip/Include to decide immediately, or NeedValue to proceed to phase 2
-    fn check_key(&self, _key: &K) -> GetFilterDecision { GetFilterDecision::NeedValue }
-
-    /// Phase 2: Check with value resolved
-    /// MUST NOT return NeedValue (will panic)
-    fn check_kv(&self, key: &K, value: &V) -> GetFilterDecision;
-}
-
-/// REMOVE filter trait: conditional removal with overflow optimization
-pub trait RemoveFilter<K: BtreeKey, V: BtreeValue>: Send + Sync {
-    /// Hint: Does this filter always need value?
-    fn always_needs_value(&self) -> bool { false }
-
-    /// Phase 1: Check key only
-    fn check_key(&self, _key: &K) -> RemoveFilterDecision { RemoveFilterDecision::NeedValue }
-
-    /// Phase 2: Check with value resolved
-    /// MUST NOT return NeedValue (will panic)
-    fn check_kv(&self, key: &K, value: &V) -> RemoveFilterDecision;
-}
-
-//================================================================================
-// Blanket Implementations - Support closures for backward compatibility
-//================================================================================
-
-/// Blanket impl: Any closure Fn(&K, &V) -> bool becomes a GetFilter
-impl<K, V, F> GetFilter<K, V> for F
-where
-    K: BtreeKey,
-    V: BtreeValue,
-    F: Fn(&K, &V) -> bool + Send + Sync,
-{
-    fn always_needs_value(&self) -> bool {
-        true // Closures always need value (signature requires it)
-    }
-
-    fn check_kv(&self, key: &K, value: &V) -> GetFilterDecision {
-        if (self)(key, value) { GetFilterDecision::Include } else { GetFilterDecision::Skip }
-    }
 }
 
 /// Blanket impl: Any closure Fn(&K, &V) -> PutFilterDecision becomes a PutFilter
@@ -144,6 +74,31 @@ where
         debug_assert_ne!(decision, PutFilterDecision::NeedOldValue, "Closure-based filter returned NeedOldValue");
         decision
     }
+}
+
+/// REMOVE filter trait: conditional removal with overflow optimization
+
+/// Decision from REMOVE filter
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveFilterDecision {
+    /// Skip this entry (don't remove)
+    Skip,
+    /// Remove this entry
+    Remove,
+    /// Need to resolve value before deciding
+    NeedValue,
+}
+
+pub trait RemoveFilter<K: BtreeKey, V: BtreeValue>: Send + Sync {
+    /// Hint: Does this filter always need value?
+    fn always_needs_value(&self) -> bool { false }
+
+    /// Phase 1: Check key only
+    fn check_key(&self, _key: &K) -> RemoveFilterDecision { RemoveFilterDecision::NeedValue }
+
+    /// Phase 2: Check with value resolved
+    /// MUST NOT return NeedValue (will panic)
+    fn check_kv(&self, key: &K, value: &V) -> RemoveFilterDecision;
 }
 
 /// Blanket impl: Any closure Fn(&K, &V) -> bool becomes a RemoveFilter
@@ -202,7 +157,7 @@ pub trait BtreeRequest: Send {
     fn value_size(&self) -> u32;
 }
 
-/// Base for all range operations (matches C++ BtreeRangeRequest + BtreeTraversalState)
+/// Base for all range operations
 ///
 /// Contains:
 /// - input_range: Original range (never modified)
@@ -305,7 +260,7 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeSinglePutRequest<'a, K, V> {
 
     pub fn put_type(&self) -> BtreePutType { self.put_type }
 
-    pub fn filter(&self) -> Option<&dyn PutFilter<K, V>> { self.filter }
+    pub fn filter(&self) -> Option<&'a dyn PutFilter<K, V>> { self.filter }
 
     pub fn key_size(&self) -> u32 { self.key.serialized_size() }
 
@@ -343,11 +298,10 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeRangePutRequest<'a, K, V> {
         input_range: BtreeKeyRange<K>,
         put_type: BtreePutType,
         value: &'a V,
-        batch_size: u32,
         filter: Option<&'a dyn PutFilter<K, V>>,
     ) -> Self {
         Self {
-            range_request: BtreeRangeRequest::new(input_range, batch_size),
+            range_request: BtreeRangeRequest::new(input_range, 0),
             put_type,
             value,
             filter,
@@ -358,8 +312,6 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeRangePutRequest<'a, K, V> {
     pub fn input_range(&self) -> &BtreeKeyRange<K> { self.range_request.input_range() }
 
     pub fn working_range(&self) -> &BtreeKeyRange<K> { self.range_request.working_range() }
-
-    pub fn batch_size(&self) -> u32 { self.range_request.batch_size() }
 
     pub fn first_key(&self) -> K { self.range_request.first_key() }
 
@@ -378,7 +330,7 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeRangePutRequest<'a, K, V> {
 
     pub fn value_size(&self) -> u32 { self.value.serialized_size() }
 
-    pub fn filter(&self) -> Option<&dyn PutFilter<K, V>> { self.filter }
+    pub fn filter(&self) -> Option<&'a dyn PutFilter<K, V>> { self.filter }
 }
 
 impl<'a, K: BtreeKey, V: BtreeValue> BtreeRequest for BtreeRangePutRequest<'a, K, V> {
@@ -393,6 +345,48 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeRequest for BtreeRangePutRequest<'a, K
 // GET Request Types
 //================================================================================
 
+/// Decision from GET filter
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GetFilterDecision {
+    /// Skip this entry
+    Skip,
+    /// Include this entry
+    Include,
+    /// Need to resolve value before deciding
+    NeedValue,
+}
+
+/// GET filter trait: conditional retrieval with overflow optimization
+pub trait GetFilter<K: BtreeKey, V: BtreeValue>: Send + Sync {
+    /// Hint: Does this filter always need value?
+    /// If true, btree layer will skip check_key() and go straight to check_kv()
+    fn always_needs_value(&self) -> bool { false }
+
+    /// Phase 1: Check key only
+    /// Return Skip/Include to decide immediately, or NeedValue to proceed to phase 2
+    fn check_key(&self, _key: &K) -> GetFilterDecision { GetFilterDecision::NeedValue }
+
+    /// Phase 2: Check with value resolved
+    /// MUST NOT return NeedValue (will panic)
+    fn check_kv(&self, key: &K, value: &V) -> GetFilterDecision;
+}
+
+/// Blanket impl: Any closure Fn(&K, &V) -> bool becomes a GetFilter
+impl<K, V, F> GetFilter<K, V> for F
+where
+    K: BtreeKey,
+    V: BtreeValue,
+    F: Fn(&K, &V) -> bool + Send + Sync,
+{
+    fn always_needs_value(&self) -> bool {
+        true // Closures always need value (signature requires it)
+    }
+
+    fn check_kv(&self, key: &K, value: &V) -> GetFilterDecision {
+        if (self)(key, value) { GetFilterDecision::Include } else { GetFilterDecision::Skip }
+    }
+}
+
 /// Single key GET request
 pub struct BtreeGetRequest<'a, K: BtreeKey> {
     key: &'a K,
@@ -406,8 +400,7 @@ impl<'a, K: BtreeKey> BtreeGetRequest<'a, K> {
     pub fn key(&self) -> &K { self.key }
 }
 
-/// Get any key in range request (optimization for range queries)
-/// Returns the first key-value pair found in the range
+/// Get any key in range request. Returns the first key-value pair found in the range
 pub struct BtreeGetAnyRequest<K: BtreeKey> {
     range: BtreeKeyRange<K>,
 }
@@ -421,22 +414,23 @@ impl<K: BtreeKey> BtreeGetAnyRequest<K> {
 }
 
 //================================================================================
-// QUERY Request Types (Sweep Query)
+// QUERY Request Types
 //================================================================================
 
 /// Query request for sweep queries (follows sibling links)
 /// Corresponds to C++ BtreeQueryRequest in btree_query_impl.ipp
-pub struct BtreeQueryRequest<'a, K: BtreeKey, V: BtreeValue> {
+pub struct BtreeQueryRequest<K: BtreeKey, V: BtreeValue> {
     base: BtreeRangeRequest<K>,
-    filter: Option<&'a dyn GetFilter<K, V>>,
+    filter: Option<Arc<dyn GetFilter<K, V>>>,
     reverse_order: bool,
+    is_sweep_query: bool,
 }
 
 // Safety: BtreeQueryRequest can be Send when K and V are Send
 // filter_fn is already Send + Sync (see line 54)
-unsafe impl<'a, K: BtreeKey + Send, V: BtreeValue + Send> Send for BtreeQueryRequest<'a, K, V> {}
+unsafe impl<K: BtreeKey + Send, V: BtreeValue + Send> Send for BtreeQueryRequest<K, V> {}
 
-impl<'a, K: BtreeKey, V: BtreeValue> BtreeQueryRequest<'a, K, V> {
+impl<K: BtreeKey, V: BtreeValue> BtreeQueryRequest<K, V> {
     /// Create new query request
     ///
     /// # Arguments
@@ -447,13 +441,15 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeQueryRequest<'a, K, V> {
     pub fn new(
         range: BtreeKeyRange<K>,
         batch_size: u32,
-        filter: Option<&'a dyn GetFilter<K, V>>,
+        filter: Option<Arc<dyn GetFilter<K, V>>>,
         reverse_order: bool,
+        is_sweep_query: bool,
     ) -> Self {
         Self {
             base: BtreeRangeRequest::new(range, batch_size),
             filter,
             reverse_order,
+            is_sweep_query,
         }
     }
 
@@ -467,7 +463,7 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeQueryRequest<'a, K, V> {
     pub fn batch_size(&self) -> u32 { self.base.batch_size() }
 
     /// Get filter
-    pub fn filter(&self) -> Option<&dyn GetFilter<K, V>> { self.filter }
+    pub fn filter(&self) -> Option<&dyn GetFilter<K, V>> { self.filter.as_deref() }
 
     /// Get reverse order flag
     pub fn reverse_order(&self) -> bool { self.reverse_order }
@@ -497,26 +493,28 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeQueryRequest<'a, K, V> {
             self.base.working_range.end_incl = self.base.input_range.end_incl;
         }
     }
+
+    pub fn is_sweep_query(&self) -> bool { self.is_sweep_query }
 }
 
 /// Handle for query results with pagination support
 /// Contains results from a query batch and internal state for continuation
-pub struct QueryResultHandle<'a, K: BtreeKey, V: BtreeValue> {
+pub struct QueryResultHandle<K: BtreeKey, V: BtreeValue> {
     /// Results from this batch
     pub results: Vec<(K, V)>,
     /// Internal query request (used for query_next() continuation)
-    request: BtreeQueryRequest<'a, K, V>,
+    request: BtreeQueryRequest<K, V>,
     /// Whether there are more results beyond this batch
     has_more: bool,
 }
 
 // Safety: QueryResultHandle can be Send when K and V are Send
 // All fields are Send when K: Send and V: Send
-unsafe impl<'a, K: BtreeKey + Send, V: BtreeValue + Send> Send for QueryResultHandle<'a, K, V> {}
+unsafe impl<K: BtreeKey + Send, V: BtreeValue + Send> Send for QueryResultHandle<K, V> {}
 
-impl<'a, K: BtreeKey, V: BtreeValue> QueryResultHandle<'a, K, V> {
+impl<K: BtreeKey, V: BtreeValue> QueryResultHandle<K, V> {
     /// Create new result handle
-    pub fn new(results: Vec<(K, V)>, request: BtreeQueryRequest<'a, K, V>, has_more: bool) -> Self {
+    pub fn new(results: Vec<(K, V)>, request: BtreeQueryRequest<K, V>, has_more: bool) -> Self {
         Self { results, request, has_more }
     }
 
@@ -526,7 +524,78 @@ impl<'a, K: BtreeKey, V: BtreeValue> QueryResultHandle<'a, K, V> {
     pub fn has_more(&self) -> bool { self.has_more }
 
     /// Get the internal request (for query_next() continuation)
-    pub fn request(self) -> BtreeQueryRequest<'a, K, V> { self.request }
+    pub fn request(self) -> BtreeQueryRequest<K, V> { self.request }
+
+    /// Working range for the next batch (for routing / continuation).
+    pub fn working_range(&self) -> &BtreeKeyRange<K> { self.request.working_range() }
+}
+
+//================================================================================
+// REMOVE Request Types
+//================================================================================
+
+/// Single key REMOVE request (matches C++ BtreeSingleRemoveRequest)
+pub struct BtreeRemoveRequest<'a, K: BtreeKey, V: BtreeValue> {
+    key: &'a K,
+    filter: Option<&'a dyn RemoveFilter<K, V>>,
+}
+
+unsafe impl<'a, K: BtreeKey + Send, V: BtreeValue + Send> Send for BtreeRemoveRequest<'a, K, V> {}
+
+impl<'a, K: BtreeKey, V: BtreeValue> BtreeRemoveRequest<'a, K, V> {
+    pub fn new(key: &'a K, filter: Option<&'a dyn RemoveFilter<K, V>>) -> Self { Self { key, filter } }
+
+    pub fn key(&self) -> &K { self.key }
+
+    pub fn filter(&self) -> Option<&dyn RemoveFilter<K, V>> { self.filter }
+}
+
+/// Remove any key in range request
+pub struct BtreeRemoveAnyRequest<K: BtreeKey> {
+    range: BtreeKeyRange<K>,
+}
+
+unsafe impl<K: BtreeKey + Send> Send for BtreeRemoveAnyRequest<K> {}
+
+impl<K: BtreeKey> BtreeRemoveAnyRequest<K> {
+    pub fn new(range: BtreeKeyRange<K>) -> Self { Self { range } }
+
+    pub fn range(&self) -> &BtreeKeyRange<K> { &self.range }
+}
+
+/// Range remove request
+pub struct BtreeRangeRemoveRequest<'a, K: BtreeKey, V: BtreeValue> {
+    base: BtreeRangeRequest<K>,
+    filter: Option<&'a dyn RemoveFilter<K, V>>,
+    _phantom: std::marker::PhantomData<V>,
+}
+
+impl<'a, K: BtreeKey, V: BtreeValue> BtreeRangeRemoveRequest<'a, K, V> {
+    /// Create new range remove request
+    ///
+    /// # Arguments
+    /// * `range` - Key range to remove
+    /// * `batch_size` - Maximum number of entries to remove per operation
+    /// * `filter` - Optional filter to select which entries to remove
+    pub fn new(range: BtreeKeyRange<K>, filter: Option<&'a dyn RemoveFilter<K, V>>) -> Self {
+        Self {
+            base: BtreeRangeRequest::new(range, 0),
+            filter,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    pub fn working_range(&self) -> &BtreeKeyRange<K> { self.base.working_range() }
+
+    pub fn input_range(&self) -> &BtreeKeyRange<K> { self.base.input_range() }
+
+    pub fn filter(&self) -> Option<&'a dyn RemoveFilter<K, V>> { self.filter }
+
+    pub fn first_key(&self) -> K { self.base.first_key() }
+
+    pub fn trim_working_range(&mut self, end_key: K, end_incl: bool) { self.base.trim_working_range(end_key, end_incl) }
+
+    pub fn shift_working_range(&mut self, new_start_key: Option<K>) { self.base.shift_working_range(new_start_key) }
 }
 
 #[cfg(test)]
@@ -550,11 +619,10 @@ mod tests {
     fn test_range_request_creation() {
         let range = BtreeKeyRange::new(10u64, true, 100u64, false);
         let value = 999u64;
-        let req = BtreeRangePutRequest::new(range, BtreePutType::Update, &value, 1000, None);
+        let req = BtreeRangePutRequest::new(range, BtreePutType::Update, &value, None);
 
         assert_eq!(req.working_range().start_key, 10);
         assert_eq!(req.working_range().end_key, 100);
-        assert_eq!(req.batch_size(), 1000);
         assert_eq!(*req.value(), 999);
     }
 
@@ -562,7 +630,7 @@ mod tests {
     fn test_trim_working_range() {
         let range = BtreeKeyRange::new(10u64, true, 100u64, false);
         let value = 999u64;
-        let mut req = BtreeRangePutRequest::new(range, BtreePutType::Update, &value, 1000, None);
+        let mut req = BtreeRangePutRequest::new(range, BtreePutType::Update, &value, None);
 
         // Trim to [10, 50)
         req.trim_working_range(50, false);
@@ -577,7 +645,7 @@ mod tests {
     fn test_shift_working_range() {
         let range = BtreeKeyRange::new(10u64, true, 100u64, false);
         let value = 999u64;
-        let mut req = BtreeRangePutRequest::new(range, BtreePutType::Update, &value, 1000, None);
+        let mut req = BtreeRangePutRequest::new(range, BtreePutType::Update, &value, None);
 
         // Trim to [10, 50)
         req.trim_working_range(50, false);
@@ -588,76 +656,4 @@ mod tests {
         assert_eq!(req.working_range().start_incl, true); // Flipped from false
         assert_eq!(req.working_range().end_key, 100); // Reset to input end
     }
-}
-
-//================================================================================
-// REMOVE Request Types
-//================================================================================
-
-/// Single key REMOVE request (matches C++ BtreeSingleRemoveRequest)
-pub struct BtreeRemoveRequest<'a, K: BtreeKey, V: BtreeValue> {
-    key: &'a K,
-    filter: Option<&'a dyn RemoveFilter<K, V>>,
-}
-
-unsafe impl<'a, K: BtreeKey + Send, V: BtreeValue + Send> Send for BtreeRemoveRequest<'a, K, V> {}
-
-impl<'a, K: BtreeKey, V: BtreeValue> BtreeRemoveRequest<'a, K, V> {
-    pub fn new(key: &'a K) -> Self { Self { key, filter: None } }
-
-    pub fn with_filter(key: &'a K, filter: &'a dyn RemoveFilter<K, V>) -> Self { Self { key, filter: Some(filter) } }
-
-    pub fn key(&self) -> &K { self.key }
-
-    pub fn filter(&self) -> Option<&dyn RemoveFilter<K, V>> { self.filter }
-}
-
-/// Remove any key in range request (matches C++ BtreeRemoveAnyRequest)
-pub struct BtreeRemoveAnyRequest<K: BtreeKey> {
-    range: BtreeKeyRange<K>,
-}
-
-unsafe impl<K: BtreeKey + Send> Send for BtreeRemoveAnyRequest<K> {}
-
-impl<K: BtreeKey> BtreeRemoveAnyRequest<K> {
-    pub fn new(range: BtreeKeyRange<K>) -> Self { Self { range } }
-
-    pub fn range(&self) -> &BtreeKeyRange<K> { &self.range }
-}
-
-/// Range remove request (matches C++ BtreeRangeRemoveRequest)
-pub struct BtreeRangeRemoveRequest<'a, K: BtreeKey, V: BtreeValue> {
-    base: BtreeRangeRequest<K>,
-    filter: Option<&'a dyn RemoveFilter<K, V>>,
-    _phantom: std::marker::PhantomData<V>,
-}
-
-impl<'a, K: BtreeKey, V: BtreeValue> BtreeRangeRemoveRequest<'a, K, V> {
-    /// Create new range remove request
-    ///
-    /// # Arguments
-    /// * `range` - Key range to remove
-    /// * `batch_size` - Maximum number of entries to remove per operation
-    /// * `filter` - Optional filter to select which entries to remove
-    pub fn new(range: BtreeKeyRange<K>, batch_size: u32, filter: Option<&'a dyn RemoveFilter<K, V>>) -> Self {
-        Self {
-            base: BtreeRangeRequest::new(range, batch_size),
-            filter,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
-    pub fn working_range(&self) -> &BtreeKeyRange<K> { self.base.working_range() }
-
-    pub fn input_range(&self) -> &BtreeKeyRange<K> { self.base.input_range() }
-
-    pub fn batch_size(&self) -> u32 { self.base.batch_size() }
-
-    pub fn filter(&self) -> Option<&dyn RemoveFilter<K, V>> { self.filter }
-
-    pub fn first_key(&self) -> K { self.base.first_key() }
-
-    pub fn trim_working_range(&mut self, end_key: K, end_incl: bool) { self.base.trim_working_range(end_key, end_incl) }
-
-    pub fn shift_working_range(&mut self, new_start_key: Option<K>) { self.base.shift_working_range(new_start_key) }
 }

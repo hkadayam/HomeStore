@@ -12,7 +12,7 @@
  * under the License.
  *
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
- */
+ ******************************************************************** */
 
 //! Btree Query Operations
 //!
@@ -32,11 +32,7 @@ use super::btree_req::{
 // Helper for multi-get operations
 //================================================================================
 
-#[maybe_async_cfg::maybe(
-    keep_self,
-    sync(feature = "sync_code"),
-    async(feature = "async_code")
-)]
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 impl<K, V> Btree<K, V>
 where
     K: BtreeKey + 'static,
@@ -59,6 +55,7 @@ where
     }
 
     /// Recursive GET traversal
+    #[cfg_attr(feature = "async_code", async_recursion::async_recursion)]
     async fn get_one_walk<'a>(&self, node: Node, req: &'a BtreeGetRequest<'a, K>) -> Result<Option<V>, BtreeError> {
         if node.is_leaf() {
             return self.get_one_in_leaf(&node, req.key()).await;
@@ -70,14 +67,7 @@ where
         let child = self.read_and_lock_node(child_id, LockType::Read).await?;
 
         drop(node); // Release parent lock
-        #[cfg(feature = "async_code")]
-        {
-            Box::pin(self.get_one_walk(child, req)).await
-        }
-        #[cfg(feature = "sync_code")]
-        {
-            self.get_one_walk(child, req)
-        }
+        self.get_one_walk(child, req).await
     }
 
     /// Read value from leaf node (with overflow resolution)
@@ -232,6 +222,7 @@ where
     }
 
     /// Recursive GET_ANY traversal
+    #[cfg_attr(feature = "async_code", async_recursion::async_recursion)]
     async fn get_any_walk(&self, node: Node, req: &BtreeGetAnyRequest<K>) -> Result<Option<(K, V)>, BtreeError> {
         if node.is_leaf() {
             let result = self.get_any_in_leaf(&node, req.range())?;
@@ -252,14 +243,7 @@ where
         let child = self.read_and_lock_node(child_id, LockType::Read).await?;
 
         drop(node);
-        #[cfg(feature = "async_code")]
-        {
-            Box::pin(self.get_any_walk(child, req)).await
-        }
-        #[cfg(feature = "sync_code")]
-        {
-            self.get_any_walk(child, req)
-        }
+        self.get_any_walk(child, req).await
     }
 
     /// Get any key-value from leaf in range
@@ -294,10 +278,10 @@ where
     /// # Returns
     /// * `Ok(QueryResultHandle)` - Handle with results and has_more() indicator
     /// * `Err(BtreeError)` - Internal errors (not HasMore, which is converted to handle.has_more())
-    pub(in super::super) async fn query_internal<'a>(
+    pub(in super::super) async fn sweep_query_internal<'a>(
         &self,
-        mut req: BtreeQueryRequest<'a, K, V>,
-    ) -> Result<QueryResultHandle<'a, K, V>, BtreeError> {
+        mut req: BtreeQueryRequest<K, V>,
+    ) -> Result<QueryResultHandle<K, V>, BtreeError> {
         if req.batch_size() == 0 {
             return Ok(QueryResultHandle::new(Vec::new(), req, false));
         }
@@ -334,10 +318,11 @@ where
     ///
     /// Recursively descends to leaf level, then uses multi_get() to extract entries
     /// and follows sibling links to collect up to batch_size results.
+    #[cfg_attr(feature = "async_code", async_recursion::async_recursion)]
     async fn sweep_query_walk<'a>(
         &self,
         mut my_node: Node,
-        req: &mut BtreeQueryRequest<'a, K, V>,
+        req: &mut BtreeQueryRequest<K, V>,
         out_values: &mut Vec<(K, V)>,
     ) -> Result<bool, BtreeError> {
         if my_node.is_leaf() {
@@ -398,14 +383,7 @@ where
         let child = self.read_and_lock_node(child_id, LockType::Read).await?;
 
         drop(my_node); // Release parent lock
-        #[cfg(feature = "async_code")]
-        {
-            Box::pin(self.sweep_query_walk(child, req, out_values)).await
-        }
-        #[cfg(feature = "sync_code")]
-        {
-            self.sweep_query_walk(child, req, out_values)
-        }
+        self.sweep_query_walk(child, req, out_values).await
     }
 
     //================================================================================
@@ -432,8 +410,8 @@ where
     /// * `Err(BtreeError)` - Internal error
     pub(in super::super) async fn traversal_query_internal<'a>(
         &self,
-        mut req: BtreeQueryRequest<'a, K, V>,
-    ) -> Result<QueryResultHandle<'a, K, V>, BtreeError> {
+        mut req: BtreeQueryRequest<K, V>,
+    ) -> Result<QueryResultHandle<K, V>, BtreeError> {
         if req.batch_size() == 0 {
             return Ok(QueryResultHandle::new(Vec::new(), req, false));
         }
@@ -463,10 +441,11 @@ where
     }
 
     /// Recursive traversal query walk
+    #[cfg_attr(feature = "async_code", async_recursion::async_recursion)]
     async fn traversal_query_walk<'a>(
         &self,
         my_node: Node,
-        req: &mut BtreeQueryRequest<'a, K, V>,
+        req: &mut BtreeQueryRequest<K, V>,
         out_values: &mut Vec<(K, V)>,
     ) -> Result<bool, BtreeError> {
         if my_node.is_leaf() {
@@ -535,10 +514,7 @@ where
             }
 
             // Recurse into child
-            #[cfg(feature = "async_code")]
-            let has_more = Box::pin(self.traversal_query_walk(child, req, out_values)).await?;
-            #[cfg(feature = "sync_code")]
-            let has_more = self.traversal_query_walk(child, req, out_values)?;
+            let has_more = self.traversal_query_walk(child, req, out_values).await?;
 
             if has_more {
                 // Parent already dropped if is_last, otherwise need to drop

@@ -2,7 +2,6 @@ pub mod async_mutex;
 pub mod async_rw_lock;
 pub mod drive_interface;
 mod iomanager_impl;
-pub(crate) mod result_channel;
 mod reactor;
 mod task_completion;
 

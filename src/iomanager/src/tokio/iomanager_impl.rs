@@ -1,25 +1,40 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::future::Future;
 
 use super::{Reactor, ReactorId};
 use crate::iomanager::IOManagerImplTrait;
 
+type BoxAny = Box<dyn std::any::Any + Send + 'static>;
+type WaiterPair = (tokio::sync::mpsc::Sender<BoxAny>, tokio::sync::mpsc::Receiver<BoxAny>);
+
+// Per-thread pool of reusable mpsc::channel(1) pairs.
+// Hot path: pop from pool (zero allocation).
+// Pool grows on demand when concurrency exceeds current capacity.
+// Works from any async context — reactor thread, tokio task, or external tokio runtime.
+thread_local! {
+    static WAITER_POOL: RefCell<VecDeque<WaiterPair>> = RefCell::new(VecDeque::new());
+}
+
+fn acquire_waiter() -> WaiterPair {
+    WAITER_POOL.with(|p| p.borrow_mut().pop_front())
+        .unwrap_or_else(|| tokio::sync::mpsc::channel(1))
+}
+
+fn release_waiter(pair: WaiterPair) {
+    WAITER_POOL.with(|p| p.borrow_mut().push_back(pair));
+}
+
 /// Tokio-specific implementation of IOManager backend.
-/// This is a zero-sized type that provides static methods only.
 pub struct IOManagerImpl;
 
 impl IOManagerImplTrait for IOManagerImpl {
     fn spawn_reactors(num_reactors: usize) -> Result<Vec<Reactor>, &'static str> {
-        // Reactors create their own channels internally!
         Ok(Reactor::spawn_all(num_reactors))
     }
 
     fn current_reactor_id() -> ReactorId {
-        // Check if we're on a reactor thread
-        if super::reactor::is_reactor_thread() {
-            0 // Tokio doesn't have thread affinity, but mark as reactor thread
-        } else {
-            usize::MAX // Not on a reactor thread
-        }
+        super::reactor::current_reactor_id().unwrap_or(usize::MAX)
     }
 
     fn spawn_detached<F>(reactor: &Reactor, fut: F)
@@ -41,14 +56,21 @@ impl IOManagerImplTrait for IOManagerImpl {
         F: Future<Output = R> + 'static + Send,
         R: Send + 'static,
     {
-        let (result_tx, result_rx) = reactor.create_result_handle();
+        let (tx, mut rx) = acquire_waiter();
+        let tx_clone = tx.clone();
 
         reactor.spawn_future(Box::pin(async move {
             let result = fut.await;
-            let _ = result_tx.send_result(result).await;
+            // try_send always succeeds: slot is empty (just popped from pool)
+            let _ = tx_clone.try_send(Box::new(result) as BoxAny);
         }));
 
-        result_rx.wait().await
+        let result_box = rx.recv().await
+            .expect("spawn_waitable: reactor dropped before sending result");
+
+        release_waiter((tx, rx));
+
+        *result_box.downcast::<R>().expect("spawn_waitable: type mismatch")
     }
 
     async fn spawn_waitable_all<F, Fut, R>(reactors: &[Reactor], f: F) -> Vec<R>
@@ -58,22 +80,10 @@ impl IOManagerImplTrait for IOManagerImpl {
         R: Send + 'static,
     {
         let mut results = Vec::with_capacity(reactors.len());
-
         for (rid, reactor) in reactors.iter().enumerate() {
-            let (result_tx, result_rx) = reactor.create_result_handle();
-            let fut = f(rid);
-
-            // Spawn on the specific reactor
-            Self::spawn_detached(reactor, async move {
-                let result = fut.await; // Runs on reactor rid
-                let _ = result_tx.send_result(result).await;
-            });
-
-            // Await result from this reactor before proceeding to next
-            let result = result_rx.wait().await;
+            let result = Self::spawn_waitable(reactor, f(rid)).await;
             results.push(result);
         }
-
         results
     }
 
@@ -85,7 +95,6 @@ impl IOManagerImplTrait for IOManagerImpl {
     }
 
     async fn yield_now() {
-        // Use tokio's unconditional yielding
         tokio::task::yield_now().await
     }
 
@@ -95,38 +104,17 @@ impl IOManagerImplTrait for IOManagerImpl {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        // Create tokio runtime on main thread to run async operations
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("Failed to create tokio runtime");
 
         rt.block_on(async {
-            // Get iomanager (reactors already running)
             let io_mgr = crate::iomanager::iomgr();
-
-            /*
-            // Create a oneshot channel for completion notification
-            let (tx, rx) = tokio::sync::oneshot::channel();
-
-            // Spawn test on reactor 0
-            io_mgr.spawn_detached(crate::iomanager::ReactorTarget::Reactor(0), async move {
-                fut.await;
-                let _ = tx.send(()); // Signal completion
-            });
-
-            // Wait for test completion
-            let _ = rx.await;
-            */
-            // Spawn test on any reactor and get handle
             let handle = io_mgr.spawn(async move {
                 fut.await;
             });
-
-            // Wait for completion
             let _ = handle.await;
-
-            // Shutdown iomanager
             let _ = crate::iomanager::shutdown_iomgr().await;
         });
     }

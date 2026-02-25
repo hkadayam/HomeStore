@@ -1,5 +1,4 @@
 mod iomanager;
-mod result_channel;
 mod reactor_local;
 
 #[cfg(feature = "glommio")]

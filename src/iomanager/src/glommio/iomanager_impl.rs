@@ -1,19 +1,44 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::future::Future;
+
+use glommio::channels::shared_channel;
 
 use super::{current_reactor_id, Reactor, ReactorId};
 use crate::iomanager::IOManagerImplTrait;
 
+type BoxAny = Box<dyn std::any::Any + Send + 'static>;
+type WaiterPair = (
+    shared_channel::SharedSender<BoxAny>,
+    shared_channel::SharedReceiver<BoxAny>,
+);
+
+// Per-thread pool of reusable shared_channel::new_bounded(1) pairs.
+// Hot path: pop from pool (zero allocation).
+// Pool grows on demand when concurrency exceeds current capacity.
+// Works from any glommio async context.
+thread_local! {
+    static WAITER_POOL: RefCell<VecDeque<WaiterPair>> = RefCell::new(VecDeque::new());
+}
+
+fn acquire_waiter() -> WaiterPair {
+    WAITER_POOL.with(|p| p.borrow_mut().pop_front())
+        .unwrap_or_else(|| shared_channel::new_bounded(1))
+}
+
+fn release_waiter(pair: WaiterPair) {
+    WAITER_POOL.with(|p| p.borrow_mut().push_back(pair));
+}
+
 /// Glommio-specific implementation of IOManager backend.
-/// This is a zero-sized type that provides static methods only.
 pub struct IOManagerImpl;
 
 impl IOManagerImplTrait for IOManagerImpl {
     fn spawn_reactors(num_reactors: usize) -> Result<Vec<Reactor>, &'static str> {
-        // Reactors create their own channels internally!
         Reactor::spawn_all(num_reactors).map_err(|_| "executor spawn failed")
     }
 
-    fn current_reactor_id() -> ReactorId { current_reactor_id().unwrap_or(0) }
+    fn current_reactor_id() -> ReactorId { current_reactor_id().unwrap_or(usize::MAX) }
 
     fn spawn_detached<F>(reactor: &Reactor, fut: F)
     where
@@ -21,20 +46,34 @@ impl IOManagerImplTrait for IOManagerImpl {
     {
         reactor.spawn_future(Box::pin(fut));
     }
-    
+
+    fn spawn_local<F>(reactor: &Reactor, fut: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        reactor.spawn_local_future(Box::pin(fut));
+    }
+
     async fn spawn_waitable<F, R>(reactor: &Reactor, fut: F) -> R
     where
         F: Future<Output = R> + 'static + Send,
         R: Send + 'static,
     {
-        let (result_tx, result_rx) = reactor.create_result_handle();
-        
+        let (tx, rx) = acquire_waiter();
+        let tx_clone = tx.clone();
+
         Self::spawn_detached(reactor, async move {
             let result = fut.await;
-            let _ = result_tx.send_result(result).await;
+            // try_send always succeeds: slot is empty (just popped from pool)
+            let _ = tx_clone.try_send(Box::new(result) as BoxAny);
         });
-        
-        result_rx.wait().await
+
+        let result_box = rx.recv().await
+            .expect("spawn_waitable: reactor dropped before sending result");
+
+        release_waiter((tx, rx));
+
+        *result_box.downcast::<R>().expect("spawn_waitable: type mismatch")
     }
 
     async fn spawn_waitable_all<F, Fut, R>(reactors: &[Reactor], f: F) -> Vec<R>
@@ -44,21 +83,10 @@ impl IOManagerImplTrait for IOManagerImpl {
         R: Send + 'static,
     {
         let mut results = Vec::with_capacity(reactors.len());
-
         for (rid, reactor) in reactors.iter().enumerate() {
-            let (result_tx, result_rx) = reactor.create_result_handle();
-            let fut = f(rid);
-
-            Self::spawn_detached(reactor, async move {
-                let result = fut.await;
-                let _ = result_tx.send_result(result).await;
-            });
-
-            // Await result from this reactor before proceeding to next
-            let result = result_rx.wait().await;
+            let result = Self::spawn_waitable(reactor, f(rid)).await;
             results.push(result);
         }
-
         results
     }
 
@@ -70,7 +98,6 @@ impl IOManagerImplTrait for IOManagerImpl {
     }
 
     async fn yield_now() {
-        // Use glommio's smart yielding - only yields if necessary
         glommio::yield_if_needed().await
     }
 
@@ -78,26 +105,19 @@ impl IOManagerImplTrait for IOManagerImpl {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        // Create glommio executor on main thread to run async operations
         glommio::LocalExecutorBuilder::new()
             .spawn(|| async move {
-                // Get iomanager (reactors already running)
                 let io_mgr = crate::iomanager::iomgr();
-                
-                // Create a shared_channel for completion notification
+
                 use glommio::channels::shared_channel;
                 let (tx, rx) = shared_channel::new_bounded(1);
-                
-                // Spawn test on reactor 0
+
                 io_mgr.spawn_detached(crate::iomanager::ReactorTarget::Reactor(0), async move {
                     fut.await;
-                    let _ = tx.try_send(()); // Signal completion
+                    let _ = tx.try_send(());
                 });
-                
-                // Wait for completion signal
+
                 let _ = rx.recv().await;
-                
-                // Shutdown iomanager
                 let _ = crate::iomanager::shutdown_iomgr().await;
             })
             .expect("Failed to spawn glommio executor")

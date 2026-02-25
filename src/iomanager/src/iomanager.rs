@@ -201,11 +201,6 @@ impl IOManager {
             panic!("spawn_waitable doesn't support ReactorTarget::All");
         }
 
-        let calling_reactor_id = IOManagerImpl::current_reactor_id();
-        if calling_reactor_id >= self.num_reactors() {
-            panic!("spawn_waitable can only be called from a reactor thread");
-        }
-
         let target_reactor_id = self.resolve_target(target);
 
         // We need to return a 'static future, so we use the reactor ID and re-fetch from IOManager

@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static TABLE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Helper to create test index with unique table name
-#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
 async fn create_test_index() -> (MemoryDB, Arc<mem_db::TableIndex>) {
-    let db = MemoryDB::new().unwrap();
+    let db = MemoryDB::new(2).unwrap();
     let spec = TableSpec::new(KeySpec::variable(1024), ValueSpec::variable(1024));
     let table_name = format!("test_table_{}", TABLE_COUNTER.fetch_add(1, Ordering::SeqCst));
     let table = db.create_table(&table_name, spec).await.unwrap();
@@ -19,8 +19,8 @@ async fn create_test_index() -> (MemoryDB, Arc<mem_db::TableIndex>) {
 
 mod test_impls {
     use super::*;
-    
-    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
+
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
     pub(super) async fn test_seek_before_iteration() {
     let (_db, index) = create_test_index().await;
 
@@ -39,10 +39,10 @@ mod test_impls {
     let (k, v) = iter.next().await.unwrap().unwrap();
     assert_eq!(k, b"key050");
     assert_eq!(v, b"v50");
-    
+
 }
 
-#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
 pub(super) async fn test_seek_during_iteration() {
     let (_db, index) = create_test_index().await;
 
@@ -67,10 +67,10 @@ pub(super) async fn test_seek_during_iteration() {
     // Jump back to key025
     assert!(iter.seek(b"key025").await.unwrap());
     assert_eq!(iter.next().await.unwrap().unwrap().0, b"key025");
-    
+
 }
 
-#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
 pub(super) async fn test_seek_to_missing_key() {
     let (_db, index) = create_test_index().await;
 
@@ -88,10 +88,10 @@ pub(super) async fn test_seek_to_missing_key() {
 
     // Should position at next available key (key026)
     assert_eq!(iter.next().await.unwrap().unwrap().0, b"key026");
-    
+
 }
 
-#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
 pub(super) async fn test_seek_beyond_end() {
     let (_db, index) = create_test_index().await;
 
@@ -108,10 +108,10 @@ pub(super) async fn test_seek_beyond_end() {
 
     // Next should return None
     assert!(iter.next().await.unwrap().is_none());
-    
+
 }
 
-#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
 pub(super) async fn test_reverse_seek() {
     let (_db, index) = create_test_index().await;
 
@@ -130,10 +130,10 @@ pub(super) async fn test_reverse_seek() {
     assert!(iter.seek_for_prev(b"key050").await.unwrap());
     assert_eq!(iter.next().await.unwrap().unwrap().0, b"key050");
     assert_eq!(iter.next().await.unwrap().unwrap().0, b"key049");
-    
+
 }
 
-#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
 pub(super) async fn test_multiple_seeks() {
     let (_db, index) = create_test_index().await;
 
@@ -157,10 +157,10 @@ pub(super) async fn test_multiple_seeks() {
 
     assert!(iter.seek(b"key020").await.unwrap());
     assert_eq!(iter.next().await.unwrap().unwrap().0, b"key020");
-    
+
 }
 
-#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
 pub(super) async fn test_seek_for_prev_on_forward_iterator_fails() {
     let (_db, index) = create_test_index().await;
 
@@ -176,7 +176,7 @@ pub(super) async fn test_seek_for_prev_on_forward_iterator_fails() {
     let result = iter.seek_for_prev(b"key005").await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("only valid for reverse iterators"));
-    
+
 }
 } // end test_impls module
 
@@ -184,16 +184,18 @@ pub(super) async fn test_seek_for_prev_on_forward_iterator_fails() {
 macro_rules! generate_tests {
     ($($test_fn:ident),* $(,)?) => {
         $(
-            #[cfg(feature = "async_mode")]
-            #[iomgr::iomanager_test]
-            async fn $test_fn() {
-                test_impls::$test_fn().await;
-            }
-            
-            #[cfg(feature = "sync_mode")]
-            #[test]
-            fn $test_fn() {
-                test_impls::$test_fn();
+            cfg_if::cfg_if! {
+                if #[cfg(feature = "async_frontend")] {
+                    #[iomgr::iomanager_test]
+                    async fn $test_fn() {
+                        test_impls::$test_fn().await;
+                    }
+                } else if #[cfg(feature = "sync_frontend")] {
+                    #[test]
+                    fn $test_fn() {
+                        test_impls::$test_fn();
+                    }
+                }
             }
         )*
     };

@@ -1,27 +1,27 @@
-//! Error types for MemDB
+//! Error types for HomeDB
 
 use std::fmt;
 
 #[derive(Debug)]
-pub enum MemDbError {
+pub enum HomeDbError {
     /// Table already exists
     TableExists(String),
-    
+
     /// Table not found
     TableNotFound(String),
-    
+
     /// Key size mismatch (expected, actual)
     KeySizeMismatch(usize, usize),
-    
+
     /// Key too large for btree node capacity (actual, max)
     KeyTooLarge { size: usize, max: usize },
-    
+
     /// Value size mismatch (expected, actual)
     ValueSizeMismatch(usize, usize),
-    
+
     /// Configuration error
     Config(String),
-    
+
     /// Btree operation error
     BtreeError(String),
 
@@ -32,28 +32,28 @@ pub enum MemDbError {
     InvalidOperation(String),
 }
 
-impl fmt::Display for MemDbError {
+impl fmt::Display for HomeDbError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            MemDbError::TableExists(name) => write!(f, "Table '{}' already exists", name),
-            MemDbError::TableNotFound(name) => write!(f, "Table '{}' not found", name),
-            MemDbError::KeySizeMismatch(expected, actual) => {
+            HomeDbError::TableExists(name) => write!(f, "Table '{}' already exists", name),
+            HomeDbError::TableNotFound(name) => write!(f, "Table '{}' not found", name),
+            HomeDbError::KeySizeMismatch(expected, actual) => {
                 write!(f, "Key size mismatch: expected {} bytes, got {} bytes", expected, actual)
             }
-            MemDbError::KeyTooLarge { size, max } => {
+            HomeDbError::KeyTooLarge { size, max } => {
                 write!(f, "Key size {} bytes exceeds btree capacity {} bytes", size, max)
             }
-            MemDbError::ValueSizeMismatch(expected, actual) => {
+            HomeDbError::ValueSizeMismatch(expected, actual) => {
                 write!(f, "Value size mismatch: expected {} bytes, got {} bytes", expected, actual)
             }
-            MemDbError::Config(msg) => write!(f, "Configuration error: {}", msg),
-            MemDbError::BtreeError(msg) => write!(f, "Btree error: {}", msg),
-            MemDbError::InvalidConfig(msg) => write!(f, "Invalid configuration: {}", msg),
-            MemDbError::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
+            HomeDbError::Config(msg) => write!(f, "Configuration error: {}", msg),
+            HomeDbError::BtreeError(msg) => write!(f, "Btree error: {}", msg),
+            HomeDbError::InvalidConfig(msg) => write!(f, "Invalid configuration: {}", msg),
+            HomeDbError::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
         }
     }
 }
 
-impl std::error::Error for MemDbError {}
+impl std::error::Error for HomeDbError {}
 
-pub type Result<T> = std::result::Result<T, MemDbError>;
+pub type Result<T> = std::result::Result<T, HomeDbError>;

@@ -25,13 +25,22 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 default = ["persistent"]
 
 # Storage mode features
-persistent = ["homestore/persistent", "dep:iomgr", "dep:tokio"]  # Full persistent DB (requires iomanager)
-inmem = ["homestore/inmem"]  # In-memory only (btree only, no device layer)
+persistent = ["homestore/persistent", "dep:iomgr", "dep:tokio"]
+inmem      = ["homestore/inmem"]
 
-# Sync/async mode features
-sync_code = ["homestore/sync_code"]  # Sync mode (strips async/await)
+# Top-level compilation modes — specify exactly one.
+sync_code          = ["sync_frontend", "sync_backend"]
+async_code         = ["async_frontend", "async_backend", "dep:iomgr", "dep:tokio"]
+sync_over_async_code = ["sync_frontend", "async_backend", "dep:iomgr", "dep:tokio"]
 
-# Note: Lock type (async vs sync) is now controlled by sync_code/async_code features
+# Orthogonal sub-flags used in .rs source code.
+sync_frontend  = []
+async_frontend = []
+sync_backend   = ["homestore/sync_code"]
+async_backend  = ["homestore/async_code", "dep:iomgr", "dep:tokio"]
+
+# Note: Lock type (async vs sync) is controlled by sync_code vs async_code/sync_over_async.
+# Router (in homedb/common) is the only place that branches on direct call vs spawn.
 
 [lib]
 name = "homedb"

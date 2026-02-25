@@ -1,6 +1,6 @@
 //! Key and Value specifications for table schema
 
-use crate::error::{MemDbError, Result};
+use crate::error::{HomeDbError, Result};
 
 /// Key type specification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +37,7 @@ impl KeySpec {
             prefix_type: PrefixType::Regular,
         }
     }
-    
+
     /// Create a variable-size key spec
     pub fn variable(max_size: usize) -> Self {
         Self {
@@ -45,13 +45,13 @@ impl KeySpec {
             prefix_type: PrefixType::Regular,
         }
     }
-    
+
     /// Enable prefix compression on this key spec
     pub fn prefixable(mut self, prefix_size: Option<usize>) -> Self {
         self.prefix_type = PrefixType::Prefixable(prefix_size);
         self
     }
-    
+
     /// Get the maximum key size in bytes
     pub fn max_size(&self) -> usize {
         match self.key_type {
@@ -59,28 +59,28 @@ impl KeySpec {
             KeyType::Variable(max_size) => max_size,
         }
     }
-    
+
     /// Check if this is a fixed-size key
     pub fn is_fixed(&self) -> bool {
         matches!(self.key_type, KeyType::Fixed(_))
     }
-    
+
     /// Check if prefix compression is enabled
     pub fn is_prefixable(&self) -> bool {
         matches!(self.prefix_type, PrefixType::Prefixable(_))
     }
-    
+
     /// Validate a key buffer against this spec
     pub fn validate_key(&self, key: &[u8]) -> Result<()> {
         match self.key_type {
             KeyType::Fixed(size) => {
                 if key.len() != size {
-                    return Err(MemDbError::KeySizeMismatch(size, key.len()));
+                    return Err(HomeDbError::KeySizeMismatch(size, key.len()));
                 }
             }
             KeyType::Variable(max_size) => {
                 if key.len() > max_size {
-                    return Err(MemDbError::KeySizeMismatch(max_size, key.len()));
+                    return Err(HomeDbError::KeySizeMismatch(max_size, key.len()));
                 }
             }
         }
@@ -102,12 +102,12 @@ impl ValueSpec {
     pub fn fixed(size: usize) -> Self {
         ValueSpec::Fixed(size)
     }
-    
+
     /// Create a variable-size value spec
     pub fn variable(max_size: usize) -> Self {
         ValueSpec::Variable(max_size)
     }
-    
+
     /// Get the maximum value size in bytes
     pub fn max_size(&self) -> usize {
         match self {
@@ -115,23 +115,23 @@ impl ValueSpec {
             ValueSpec::Variable(max_size) => *max_size,
         }
     }
-    
+
     /// Check if this is a fixed-size value
     pub fn is_fixed(&self) -> bool {
         matches!(self, ValueSpec::Fixed(_))
     }
-    
+
     /// Validate a value buffer against this spec
     pub fn validate_value(&self, value: &[u8]) -> Result<()> {
         match self {
             ValueSpec::Fixed(size) => {
                 if value.len() != *size {
-                    return Err(MemDbError::ValueSizeMismatch(*size, value.len()));
+                    return Err(HomeDbError::ValueSizeMismatch(*size, value.len()));
                 }
             }
             ValueSpec::Variable(max_size) => {
                 if value.len() > *max_size {
-                    return Err(MemDbError::ValueSizeMismatch(*max_size, value.len()));
+                    return Err(HomeDbError::ValueSizeMismatch(*max_size, value.len()));
                 }
             }
         }
@@ -144,22 +144,43 @@ impl ValueSpec {
 pub struct TableSpec {
     pub key_spec: KeySpec,
     pub value_spec: ValueSpec,
+    /// Number of leading key bytes used to route to a LockFreeBtree partition/reactor.
+    /// `0` means no partitioning (single btree). Default is `2`.
+    pub partition_key_size: usize,
+    /// If true, the BTree is configured as single-threaded: all internal locks become
+    /// no-ops and the node map uses a plain HashMap instead of DashMap.
+    /// Only safe when the table is accessed from a single thread at a time.
+    pub single_threaded: bool,
 }
 
 impl TableSpec {
-    /// Create a new table specification
+    /// Create a new table specification (partition_key_size defaults to 2).
     pub fn new(key_spec: KeySpec, value_spec: ValueSpec) -> Self {
-        Self { key_spec, value_spec }
+        Self { key_spec, value_spec, partition_key_size: 2, single_threaded: false }
     }
-    
-    /// Create a table spec with fixed-size keys and values
+
+    /// Create a table spec with fixed-size keys and values (partition_key_size defaults to 2).
     pub fn fixed_kv(key_size: usize, value_size: usize) -> Self {
         Self {
             key_spec: KeySpec::fixed(key_size),
             value_spec: ValueSpec::fixed(value_size),
+            partition_key_size: 2,
+            single_threaded: false,
         }
     }
-    
+
+    /// Override the partition key size (builder-style).
+    pub fn partition_key_size(mut self, size: usize) -> Self {
+        self.partition_key_size = size;
+        self
+    }
+
+    /// Enable single-threaded pass-through mode (builder-style).
+    pub fn single_threaded(mut self) -> Self {
+        self.single_threaded = true;
+        self
+    }
+
     /// Validate key and value buffers
     pub fn validate(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.key_spec.validate_key(key)?;
@@ -171,65 +192,50 @@ impl TableSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_key_spec_fixed() {
         let spec = KeySpec::fixed(8);
         assert!(spec.is_fixed());
         assert_eq!(spec.max_size(), 8);
         assert!(!spec.is_prefixable());
-        
-        // Valid key
+
         assert!(spec.validate_key(&[0u8; 8]).is_ok());
-        
-        // Invalid sizes
         assert!(spec.validate_key(&[0u8; 7]).is_err());
         assert!(spec.validate_key(&[0u8; 9]).is_err());
     }
-    
+
     #[test]
     fn test_key_spec_variable() {
         let spec = KeySpec::variable(16);
         assert!(!spec.is_fixed());
         assert_eq!(spec.max_size(), 16);
-        
-        // Valid keys (any size up to max)
         assert!(spec.validate_key(&[0u8; 1]).is_ok());
-        assert!(spec.validate_key(&[0u8; 8]).is_ok());
         assert!(spec.validate_key(&[0u8; 16]).is_ok());
-        
-        // Too large
         assert!(spec.validate_key(&[0u8; 17]).is_err());
     }
-    
+
     #[test]
     fn test_key_spec_prefixable() {
         let spec = KeySpec::fixed(8).prefixable(Some(4));
         assert!(spec.is_fixed());
         assert!(spec.is_prefixable());
     }
-    
+
     #[test]
     fn test_value_spec() {
         let spec = ValueSpec::fixed(16);
         assert!(spec.is_fixed());
         assert_eq!(spec.max_size(), 16);
-        
         assert!(spec.validate_value(&[0u8; 16]).is_ok());
         assert!(spec.validate_value(&[0u8; 15]).is_err());
     }
-    
+
     #[test]
     fn test_table_spec() {
         let spec = TableSpec::fixed_kv(8, 16);
-        
-        // Valid
         assert!(spec.validate(&[0u8; 8], &[0u8; 16]).is_ok());
-        
-        // Invalid key
         assert!(spec.validate(&[0u8; 7], &[0u8; 16]).is_err());
-        
-        // Invalid value
         assert!(spec.validate(&[0u8; 8], &[0u8; 15]).is_err());
     }
 }

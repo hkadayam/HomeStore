@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Create a simple in-memory btree
     let config = BtreeConfig::new(4096, "example_btree".to_string());
-    let storage = Box::new(MemBtree::new());
+    let storage = Box::new(MemBtree::new(&config));
     let btree: Btree<FixedSizeTestKey, FixedSizeTestValue> = 
         Btree::new(config, storage, None).await?;
     

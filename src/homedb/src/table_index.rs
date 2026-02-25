@@ -336,7 +336,7 @@ impl TableIndex {
         }
         
         // Create underlying storage
-        let storage = Box::new(MemBtree::new(config.node_size));
+        let storage = Box::new(MemBtree::new(&config));
         
         // Create btree
         let btree = Btree::<DbKey, DbValue>::new(config, storage, None)

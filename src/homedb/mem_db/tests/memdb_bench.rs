@@ -7,25 +7,23 @@
 //! - No assertions or validation overhead
 //!
 //! Run with (sync):
-//!   cargo test --release --package mem_db --test memdb_bench --features sync_mode -- \
+//!   cargo test --release --package mem_db --test memdb_bench --features sync_code -- \
 //!     --workers 8 --ops 2000000 --key-range 1000000 --preload 100000 --put-pct 70
 //!
 //! Run with (async):
-//!   cargo test --release --package mem_db --test memdb_bench --features async_mode -- \
+//!   cargo test --release --package mem_db --test memdb_bench --features async_code -- \
 //!     --workers 8 --ops 2000000 --key-range 1000000 --preload 100000 --put-pct 70
 //!
 //! Run with multiple tables (like RocksDB Column Families):
-//!   cargo test --release --package mem_db --test memdb_bench --features sync_mode -- \
+//!   cargo test --release --package mem_db --test memdb_bench --features sync_code -- \
 //!     --workers 16 --ops 4000000 --tables 8 --put-pct 30
 //!
 //! Debug small workload:
-//!   cargo test --package mem_db --test memdb_bench --features sync_mode -- \
+//!   cargo test --package mem_db --test memdb_bench --features sync_code -- \
 //!     --workers 2 --ops 1000 --key-range 100 --preload 10
 
 use mem_db::{MemoryDB, TableSpec};
 
-#[cfg(feature = "async_mode")]
-use mem_db::init_mem_homedb;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::sync::Arc;
 use std::time::Instant;
@@ -65,13 +63,18 @@ struct BenchArgs {
     /// Number of independent tables (like RocksDB Column Families)
     #[clap(short = 't', long = "tables", default_value = "1")]
     num_tables: usize,
+
+    /// Use single-threaded BTree mode (no-op locks, plain HashMap node map).
+    /// Only safe when each table is accessed by exactly one thread at a time.
+    #[clap(long = "single-threaded", default_value = "false")]
+    single_threaded: bool,
 }
 
 //================================================================================
 // Sync BackgroundTasks Wrapper (mimics async iomgr::BackgroundTasks API)
 //================================================================================
 
-#[cfg(feature = "sync_mode")]
+#[cfg(feature = "sync_frontend")]
 mod sync_tasks {
     use std::thread::JoinHandle;
 
@@ -105,19 +108,24 @@ mod sync_tasks {
     }
 }
 
-#[cfg(feature = "sync_mode")]
-use sync_tasks::{BackgroundTasks, ReactorTarget};
+cfg_if::cfg_if! {
+    if #[cfg(feature = "sync_frontend")] {
+        use sync_tasks::{BackgroundTasks, ReactorTarget};
+    } else if #[cfg(feature = "async_frontend")] {
+        use iomgr::{BackgroundTasks, ReactorTarget};
+    }
+}
 
-#[cfg(feature = "async_mode")]
-use iomgr::{init_iomgr, BackgroundTasks, ReactorTarget};
-
-#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_mode"), async(feature = "async_mode"))]
+#[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
 async fn run_benchmark(args: BenchArgs) {
     println!("=== MEMDB CONCURRENT PERFORMANCE BENCHMARK ===");
-    #[cfg(feature = "async_mode")]
-    println!("Mode: Async (reactors)");
-    #[cfg(feature = "sync_mode")]
-    println!("Mode: Sync (threads)");
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "async_frontend")] {
+            println!("Mode: Async (reactors)");
+        } else if #[cfg(feature = "sync_frontend")] {
+            println!("Mode: Sync (threads)");
+        }
+    }
 
     println!("Configuration:");
     println!("  Workers: {}", args.workers);
@@ -128,14 +136,12 @@ async fn run_benchmark(args: BenchArgs) {
     println!("  Value size: {} bytes", args.value_size);
     println!("  Preload per table: {}", args.preload / args.num_tables as u64);
     println!("  Operation mix: {}% PUT, {}% GET", args.put_pct, 100 - args.put_pct);
+    println!("  BTree mode: {}", if args.single_threaded { "single-threaded (no locks)" } else { "concurrent (parking_lot)" });
     println!();
 
-    // Initialize iomanager with N reactors (async only)
-    #[cfg(feature = "async_mode")]
-    init_iomgr(args.workers).expect("Failed to initialize iomanager");
-
-    // Create MemoryDB
-    let db = MemoryDB::new().expect("Failed to create MemoryDB");
+    // Create MemoryDB — passes num_reactors so MemoryDB can init IOManager internally.
+    // In sync_backend mode the parameter is ignored; in async_backend mode it sets reactor count.
+    let db = MemoryDB::new(args.workers).expect("Failed to create MemoryDB");
 
     // Create multiple tables (like RocksDB Column Families)
     let mut tables = Vec::new();
@@ -143,7 +149,8 @@ async fn run_benchmark(args: BenchArgs) {
     println!("Creating {} tables...", args.num_tables);
     for i in 0..args.num_tables {
         let table_name = format!("benchmark_{}", i);
-        let spec = TableSpec::fixed_kv(args.key_size, args.value_size);
+        let mut spec = TableSpec::fixed_kv(args.key_size, args.value_size);
+        if args.single_threaded { spec = spec.single_threaded(); }
         let table = db.create_table(&table_name, spec).await.unwrap();
         tables.push(table);
     }
@@ -172,11 +179,13 @@ async fn run_benchmark(args: BenchArgs) {
     println!("Phase 2: Running {} concurrent operations across {} workers ({} tables)...",
         args.ops, args.workers, args.num_tables);
 
-    #[cfg(feature = "sync_mode")]
-    let mut bg_tasks = BackgroundTasks::new();
-
-    #[cfg(feature = "async_mode")]
-    let bg_tasks = BackgroundTasks::new();
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "sync_frontend")] {
+            let mut bg_tasks = BackgroundTasks::new();
+        } else if #[cfg(feature = "async_frontend")] {
+            let bg_tasks = BackgroundTasks::new();
+        }
+    }
 
     let ops_per_worker = args.ops / args.workers as u64;
 
@@ -199,7 +208,7 @@ async fn run_benchmark(args: BenchArgs) {
         let key_size = args.key_size;
         let value_size = args.value_size;
 
-        #[cfg(feature = "async_mode")]
+        #[cfg(feature = "async_frontend")]
         bg_tasks.spawn(ReactorTarget::Reactor(worker_id), async move {
             let mut rng = StdRng::seed_from_u64(42 + worker_id as u64);
 
@@ -208,19 +217,17 @@ async fn run_benchmark(args: BenchArgs) {
                 let op_choice = rng.gen_range(0..100);
 
                 if op_choice < put_pct {
-                    // PUT operation
                     let key = generate_key(key_id, key_size);
                     let value = generate_value(key_id, value_size);
                     let _ = table.put(key, value).await;
                 } else {
-                    // GET operation
                     let key = generate_key(key_id, key_size);
                     let _ = table.get(key).await;
                 }
             }
         });
 
-        #[cfg(feature = "sync_mode")]
+        #[cfg(feature = "sync_frontend")]
         bg_tasks.spawn(ReactorTarget::Reactor(worker_id), move || {
             let mut rng = StdRng::seed_from_u64(42 + worker_id as u64);
 
@@ -229,12 +236,10 @@ async fn run_benchmark(args: BenchArgs) {
                 let op_choice = rng.gen_range(0..100);
 
                 if op_choice < put_pct {
-                    // PUT operation
                     let key = generate_key(key_id, key_size);
                     let value = generate_value(key_id, value_size);
                     let _ = table.put(key, value);
                 } else {
-                    // GET operation
                     let key = generate_key(key_id, key_size);
                     let _ = table.get(key);
                 }
@@ -256,13 +261,6 @@ async fn run_benchmark(args: BenchArgs) {
     println!("Preload (sequential):   {:.0} ops/sec", preload_ops_per_sec);
     println!("Concurrent ({} workers): {:.0} ops/sec", args.workers, concurrent_ops_per_sec);
     println!("Speedup: {:.2}x", concurrent_ops_per_sec / preload_ops_per_sec);
-    println!();
-
-    // Shutdown (async only)
-    #[cfg(feature = "async_mode")]
-    {
-        let _ = iomgr::shutdown_iomgr().await;
-    }
 }
 
 // Helper functions to generate keys and values
@@ -291,13 +289,11 @@ fn generate_value(id: u64, size: usize) -> Vec<u8> {
 fn main() {
     let args = BenchArgs::parse();
 
-    #[cfg(feature = "async_mode")]
-    {
-        tokio::runtime::Runtime::new().unwrap().block_on(run_benchmark(args));
-    }
-
-    #[cfg(feature = "sync_mode")]
-    {
-        run_benchmark(args);
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "async_frontend")] {
+            tokio::runtime::Runtime::new().unwrap().block_on(run_benchmark(args));
+        } else if #[cfg(feature = "sync_frontend")] {
+            run_benchmark(args);
+        }
     }
 }

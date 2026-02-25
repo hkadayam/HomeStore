@@ -8,12 +8,14 @@ description = "In-memory database built on Homestore Btree"
 
 [dependencies]
 homestore = { path = "../../homestore", default-features = false, features = ["btree-only", "inmem"] }
+homedb_common = { path = "../common", default-features = false }
 tokio = { version = "1.35", features = ["full"], optional = true }
 iomgr = { path = "../../iomanager", optional = true }
 async-trait = "0.1"
 parking_lot = "0.12"
 dashmap = "6.0"
 maybe-async-cfg = "0.2"
+cfg-if = "1"
 mem_db_macros = { path = "../mem_db_macros" }
 
 [dev-dependencies]
@@ -30,9 +32,20 @@ name = "mem_db"
 path = "src/lib.rs"
 
 [features]
-default = []  # Explicitly choose sync_mode or async_mode
-sync_mode = ["homestore/sync_code"]
-async_mode = ["homestore/async_code", "dep:iomgr", "dep:tokio"]
+default = []
+# Top-level compilation modes — specify exactly one.
+sync_code          = ["sync_frontend", "sync_backend",
+                      "homedb_common/sync_frontend", "homedb_common/sync_backend"]
+async_code         = ["async_frontend", "async_backend", "dep:iomgr", "dep:tokio",
+                      "homedb_common/async_frontend", "homedb_common/async_backend"]
+sync_over_async_code = ["sync_frontend", "async_backend", "dep:iomgr", "dep:tokio",
+                         "homedb_common/sync_frontend", "homedb_common/async_backend"]
+# Orthogonal sub-flags used directly in .rs source code.
+# sync_frontend/async_frontend: API surface. sync_backend/async_backend: execution engine.
+sync_frontend  = []
+async_frontend = []
+sync_backend   = []
+async_backend  = ["dep:iomgr", "dep:tokio"]
 
 [[bench]]
 name = "bench_memdb_vs_rocksdb"

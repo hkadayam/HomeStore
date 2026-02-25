@@ -918,6 +918,37 @@ impl Node {
         }
     }
 
+    /// Fill this node from `src_node`, absorbing the entire source when this node is currently
+    /// empty, or doing a standard size-limited fill otherwise.
+    ///
+    /// Two modes:
+    ///   **absorb** (`self.total_entries() == 0 && *other_cursor == 0`): copy every entry from
+    ///   `src_node` regardless of `ideal_fill_size` or `copy_only_if_fits`.  Used when the
+    ///   destination node is brand-new (e.g. a leftmost node that was emptied by deletions) so
+    ///   that the merge logic can always eliminate the empty node in one pass.
+    ///
+    ///   **fill** (all other cases): delegate to `append_copy_in_upto_size` with the supplied
+    ///   limits unchanged.
+    ///
+    /// # Returns
+    /// `true` if `src_node` still has entries that were not copied (caller must create another
+    /// destination node); `false` if the source was fully consumed.
+    pub fn absorb_or_fill<K: BtreeKey + 'static, V: BtreeValue + 'static>(
+        &self,
+        src_node: &Node,
+        other_cursor: &mut u32,
+        ideal_fill_size: u32,
+        copy_only_if_fits: bool,
+    ) -> bool {
+        if self.total_entries() == 0 && *other_cursor == 0 {
+            // Absorb mode: take the entire source node.  node_data_size() is an upper bound
+            // that is always large enough because src_node is a valid node of the same size.
+            self.append_copy_in_upto_size::<K, V>(src_node, other_cursor, self.node_data_size(), /* copy_only_if_fits= */ false)
+        } else {
+            self.append_copy_in_upto_size::<K, V>(src_node, other_cursor, ideal_fill_size, copy_only_if_fits)
+        }
+    }
+
     /// Get the first key in the node
     pub fn get_first_key<K: BtreeKey + 'static, V: BtreeValue + 'static>(&self) -> K {
         self.get_nth_key::<K, V>(0, /* copy= */ true)

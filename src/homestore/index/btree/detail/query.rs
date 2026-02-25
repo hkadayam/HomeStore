@@ -107,6 +107,12 @@ where
     ) -> (u32, PaginationStatus) {
         debug_assert!(node.is_leaf(), "multi_get only for leaf nodes");
 
+        // An empty leaf is a structural artifact left after aggressive removal.
+        // It does not mean the range is exhausted — follow the sibling link.
+        if node.total_entries() == 0 {
+            return (0, PaginationStatus::Unknown);
+        }
+
         let (matched, start_idx, end_idx) = node.match_range::<K, V>(range);
         if !matched {
             return (0, PaginationStatus::Completed);

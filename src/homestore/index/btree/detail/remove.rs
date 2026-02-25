@@ -535,7 +535,7 @@ where
             // Inner loop: Pack all entries from this old_node into new nodes
             while src_has_more {
                 let prev_cursor = src_cursor;
-                src_has_more = cur_new_node.append_copy_in_upto_size::<K, V>(
+                src_has_more = cur_new_node.absorb_or_fill::<K, V>(
                     &old_node,
                     &mut src_cursor,
                     self.config.ideal_fill_size,

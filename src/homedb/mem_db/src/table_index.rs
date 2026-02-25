@@ -37,7 +37,7 @@ impl TableIndex {
     pub async fn new(name: String, index_type: IndexType, spec: TableSpec) -> Result<Self> {
         let node_variant = Self::determine_node_variant(&spec);
 
-        let mut config = BtreeConfig::new(4096, name.clone());
+        let mut config = BtreeConfig::new(spec.node_size, name.clone());
         config.leaf_node_variant = node_variant;
         config.int_node_variant = node_variant;
         config.is_single_threaded = spec.single_threaded;

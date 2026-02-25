@@ -68,6 +68,11 @@ struct BenchArgs {
     /// Only safe when each table is accessed by exactly one thread at a time.
     #[clap(long = "single-threaded", default_value = "false")]
     single_threaded: bool,
+
+    /// BTree node size in bytes (e.g. 4096, 8192, 16384).
+    /// Larger nodes hold more entries per page; inline value threshold = node_size/32.
+    #[clap(long = "node-size", default_value = "4096")]
+    node_size: u32,
 }
 
 //================================================================================
@@ -137,6 +142,7 @@ async fn run_benchmark(args: BenchArgs) {
     println!("  Preload per table: {}", args.preload / args.num_tables as u64);
     println!("  Operation mix: {}% PUT, {}% GET", args.put_pct, 100 - args.put_pct);
     println!("  BTree mode: {}", if args.single_threaded { "single-threaded (no locks)" } else { "concurrent (parking_lot)" });
+    println!("  Node size: {} bytes (inline value cap: {} bytes)", args.node_size, args.node_size / 32);
     println!();
 
     // Create MemoryDB — passes num_reactors so MemoryDB can init IOManager internally.
@@ -149,7 +155,7 @@ async fn run_benchmark(args: BenchArgs) {
     println!("Creating {} tables...", args.num_tables);
     for i in 0..args.num_tables {
         let table_name = format!("benchmark_{}", i);
-        let mut spec = TableSpec::fixed_kv(args.key_size, args.value_size);
+        let mut spec = TableSpec::fixed_kv(args.key_size, args.value_size).node_size(args.node_size);
         if args.single_threaded { spec = spec.single_threaded(); }
         let table = db.create_table(&table_name, spec).await.unwrap();
         tables.push(table);

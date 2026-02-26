@@ -2,9 +2,9 @@
 //!
 //! Tests variable-size key/value pairs across all three compilation modes.
 //! Sequential and random operations are fully verified against a reference BTreeMap.
-//! Concurrent tests exercise LockFreeBtree partition routing with many partitions.
+//! Concurrent tests exercise ShardedBtree partition routing with many partitions.
 //!
-//! Key sizing is chosen to maximise partition coverage in LockFreeBtree:
+//! Key sizing is chosen to maximise shard spread in ShardedBtree:
 //!   MIN_KEY_SIZE = 4, MAX_KEY_SIZE = 16
 //!   PARTITION_KEY_SIZE = MIN_KEY_SIZE - 1 = 3  ← forces many distinct partitions
 //!
@@ -24,10 +24,9 @@ use rand::{rngs::StdRng, Rng, SeedableRng, seq::SliceRandom};
 const MIN_KEY_SIZE: usize = 4;
 /// Maximum key size in bytes.
 const MAX_KEY_SIZE: usize = 16;
-/// Number of leading bytes used to route to a LockFreeBtree partition.
-/// 1 byte = 256 possible prefixes — enough to spread keys across all 4 reactors
-/// while keeping range scan iteration bounded (at most 256 partitions per pass,
-/// not 16M as with 3 bytes which makes full-range scans extremely slow).
+/// Number of leading bytes used to identify a ShardedBtree partition.
+/// 1 byte = 256 possible prefixes — enough to spread keys across shards while
+/// keeping range scan iteration bounded (at most 256 active partitions per pass).
 const PARTITION_KEY_SIZE: usize = 1;
 
 const MIN_VALUE_SIZE: usize = 4;

@@ -1,4 +1,4 @@
-//! ConcurrentBtree: wraps a single homestore Btree and implements BtreeIndex.
+//! UnshardedBtree: wraps a single homestore Btree and implements BtreeIndex.
 //! Pass-through: sync_code -> homestore sync; async_code -> homestore async.
 
 use std::sync::Arc;
@@ -25,7 +25,7 @@ fn to_single_query_handle(
         .map_err(|_| {
             BtreeError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "ConcurrentBtree requires SingleQueryHandle",
+                "UnshardedBtree requires SingleQueryHandle",
             ))
         })
 }
@@ -40,12 +40,12 @@ impl IndexQueryHandle for SingleQueryHandle {
     }
 }
 
-pub struct ConcurrentBtree {
+pub struct UnshardedBtree {
     btree: Arc<Btree<DbKey, DbValue>>,
 }
 
-impl ConcurrentBtree {
-    /// Builds from config and storage factory. Same pattern as LockFreeBtree::new (single btree).
+impl UnshardedBtree {
+    /// Builds from config and storage factory (single btree, no sharding).
     #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
     pub async fn new(
         config: BtreeConfig,
@@ -61,9 +61,9 @@ impl ConcurrentBtree {
 
 #[cfg_attr(feature = "async_frontend", async_trait::async_trait)]
 #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
-impl BtreeIndex for ConcurrentBtree {
+impl BtreeIndex for UnshardedBtree {
     async fn put(&self, key: &DbKey, value: &DbValue) -> Result<(), BtreeError> {
-        self.btree.put_one(key, value, None).await
+        self.btree.put_one(key, value, None).await.map(|_| ())
     }
 
     async fn put_range(

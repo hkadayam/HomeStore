@@ -56,7 +56,7 @@ where
     pub(in super::super) async fn put_one_internal<'a>(
         &self,
         req: &'a BtreeSinglePutRequest<'a, K, V>,
-    ) -> Result<(), BtreeError> {
+    ) -> Result<PutResult, BtreeError> {
         loop {
             let tree_lock = self.lock_tree_shared().await;
             let root_id = self.root_node_id();
@@ -70,7 +70,7 @@ where
             }
 
             match self.put_one_walk(root, req).await {
-                Ok(()) => return Ok(()),
+                Ok(r) => return Ok(r),
                 Err(BtreeError::Retry) => continue, // Retriable errors
                 Err(e) => return Err(e),            // Non-retriable errors
             }
@@ -82,7 +82,7 @@ where
         &self,
         mut my_node: Node,
         req: &'a BtreeSinglePutRequest<'a, K, V>,
-    ) -> Result<(), BtreeError> {
+    ) -> Result<PutResult, BtreeError> {
         if my_node.is_leaf() {
             return self.put_one_in_leaf(&my_node, req).await;
         }
@@ -121,7 +121,7 @@ where
         &self,
         node: &Node,
         req: &'a BtreeSinglePutRequest<'a, K, V>,
-    ) -> Result<(), BtreeError> {
+    ) -> Result<PutResult, BtreeError> {
         use super::btree_req::{BtreePutType, PutFilterDecision};
 
         debug_assert!(node.is_leaf(), "Put operation on node is supported only for leaf nodes");
@@ -140,14 +140,14 @@ where
             let decision = self.apply_put_filter(node, idx, filter).await?;
             match decision {
                 PutFilterDecision::Keep => {
-                    // No change needed
-                    return Ok(());
+                    // Key existed but no change made
+                    return Ok(PutResult::Updated);
                 }
                 PutFilterDecision::Remove => {
-                    // Remove the entry
+                    // Key existed but was removed by filter
                     node.remove::<K, V>(idx)?;
                     self.storage.write_node(node).await?;
-                    return Ok(());
+                    return Ok(PutResult::Updated);
                 }
                 PutFilterDecision::Replace => {
                     // Fall through to update logic below
@@ -157,7 +157,7 @@ where
         }
 
         // Dispatch based on put_type
-        match put_type {
+        let result = match put_type {
             BtreePutType::Insert => {
                 if found {
                     return Err(BtreeError::KeyAlreadyExists);
@@ -165,26 +165,30 @@ where
                 // Build ValueOrOverflow, writing to overflow storage if needed
                 let v = ValueOrOverflow::build(self.storage.as_ref(), value, self.config.inline_value_size).await?;
                 node.insert::<K, V>(idx, key, &v)?;
+                PutResult::Success
             }
             BtreePutType::Update => {
                 if !found {
                     return Err(BtreeError::KeyNotFound);
                 }
                 self.replace_value(node, idx, value).await?;
+                PutResult::Updated
             }
             BtreePutType::Upsert => {
                 if found {
                     self.replace_value(node, idx, value).await?;
+                    PutResult::Updated
                 } else {
                     let v = ValueOrOverflow::build(self.storage.as_ref(), value, self.config.inline_value_size).await?;
                     node.insert::<K, V>(idx, key, &v)?;
+                    PutResult::Success
                 }
             }
-        }
+        };
 
         tracing::debug!(node = node.node_id(), entries = node.total_entries(), "Mutation done");
         self.storage.write_node(node).await?;
-        Ok(())
+        Ok(result)
     }
 
     //================================================================================

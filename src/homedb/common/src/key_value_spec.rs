@@ -144,13 +144,11 @@ impl ValueSpec {
 pub struct TableSpec {
     pub key_spec: KeySpec,
     pub value_spec: ValueSpec,
-    /// Number of leading key bytes used to route to a LockFreeBtree partition/reactor.
-    /// `0` means no partitioning (single btree). Default is `2`.
+    /// Number of leading key bytes that identify a partition (routing prefix).
+    /// `0` means no partitioning — a single UnshardedBtree is used.
+    /// `>= 1` enables ShardedBtree: keys with the same leading bytes share a shard.
+    /// Default is `2`.
     pub partition_key_size: usize,
-    /// If true, the BTree is configured as single-threaded: all internal locks become
-    /// no-ops and the node map uses a plain HashMap instead of DashMap.
-    /// Only safe when the table is accessed from a single thread at a time.
-    pub single_threaded: bool,
     /// BTree node size in bytes. Larger nodes hold more entries per page, reducing tree
     /// height and cache misses at the cost of higher per-node I/O. Default is 4096.
     /// Inline value threshold is clamped to node_size/32 by BtreeConfig.
@@ -160,7 +158,7 @@ pub struct TableSpec {
 impl TableSpec {
     /// Create a new table specification (partition_key_size defaults to 2).
     pub fn new(key_spec: KeySpec, value_spec: ValueSpec) -> Self {
-        Self { key_spec, value_spec, partition_key_size: 2, single_threaded: false, node_size: 4096 }
+        Self { key_spec, value_spec, partition_key_size: 2, node_size: 4096 }
     }
 
     /// Create a table spec with fixed-size keys and values (partition_key_size defaults to 2).
@@ -169,7 +167,6 @@ impl TableSpec {
             key_spec: KeySpec::fixed(key_size),
             value_spec: ValueSpec::fixed(value_size),
             partition_key_size: 2,
-            single_threaded: false,
             node_size: 4096,
         }
     }
@@ -177,12 +174,6 @@ impl TableSpec {
     /// Override the partition key size (builder-style).
     pub fn partition_key_size(mut self, size: usize) -> Self {
         self.partition_key_size = size;
-        self
-    }
-
-    /// Enable single-threaded pass-through mode (builder-style).
-    pub fn single_threaded(mut self) -> Self {
-        self.single_threaded = true;
         self
     }
 

@@ -27,9 +27,9 @@
 //!
 //! ## Feature flags
 //! Specify exactly one top-level mode:
-//! - `sync_code`           — sync API + ConcurrentBtree backend
-//! - `async_code`          — async API + LockFreeBtree backend
-//! - `sync_over_async_code` — sync API + LockFreeBtree backend
+//! - `sync_code`           — sync API + UnshardedBtree backend
+//! - `async_code`          — async API + ShardedBtree backend
+//! - `sync_over_async_code` — sync API + ShardedBtree backend (async execution, sync API)
 
 mod memory_db;
 mod table;

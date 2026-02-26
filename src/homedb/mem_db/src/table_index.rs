@@ -1,8 +1,8 @@
 //! TableIndex implementation - wraps a BtreeIndex backend with schema validation.
 //!
-//! The backend is selected at compile time via feature flags:
-//!   sync_backend   → ConcurrentBtree (RwLock, single-process)
-//!   async_backend  → LockFreeBtree (per-reactor, lock-free)
+//! Backend selection (runtime `partition_key_size`):
+//!   partition_key_size == 0  → UnshardedBtree  (single btree, no sharding)
+//!   partition_key_size >= 1  → ShardedBtree    (hash-sharded by partition key prefix)
 
 use std::sync::Arc;
 use homestore::index::btree::{underlying::mem::MemBtree, BtreeConfig};
@@ -40,7 +40,6 @@ impl TableIndex {
         let mut config = BtreeConfig::new(spec.node_size, name.clone());
         config.leaf_node_variant = node_variant;
         config.int_node_variant = node_variant;
-        config.is_single_threaded = spec.single_threaded;
 
         if let crate::PrefixType::Prefixable(Some(prefix_size)) = spec.key_spec.prefix_type {
             config.expected_prefix_size = prefix_size as u16;
@@ -59,18 +58,20 @@ impl TableIndex {
         let partition_key_size = spec.partition_key_size;
 
         // Create the index backend. The .await is stripped by maybe_async_cfg in sync modes.
-        #[cfg(feature = "sync_backend")]
-        let btree: Arc<dyn BtreeIndex> = Arc::new(
-            homedb_common::ConcurrentBtree::new(config, |c| Box::new(MemBtree::new(&c)))
-                .await
-                .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?,
-        );
-        #[cfg(feature = "async_backend")]
-        let btree: Arc<dyn BtreeIndex> = Arc::new(
-            homedb_common::LockFreeBtree::new(config, partition_key_size, |c| Box::new(MemBtree::new(&c)))
-                .await
-                .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?,
-        );
+        // partition_key_size == 0 → single UnshardedBtree; >= 1 → ShardedBtree.
+        let btree: Arc<dyn BtreeIndex> = if partition_key_size == 0 {
+            Arc::new(
+                homedb_common::UnshardedBtree::new(config, |c| Box::new(MemBtree::new(&c)))
+                    .await
+                    .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?,
+            )
+        } else {
+            Arc::new(
+                homedb_common::ShardedBtree::new(config, partition_key_size, |c| Box::new(MemBtree::new(&c)))
+                    .await
+                    .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?,
+            )
+        };
 
         // Validate TableSpec key constraints against btree capacity.
         let spec_max_key = match &spec.key_spec.key_type {

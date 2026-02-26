@@ -6,15 +6,12 @@ mod error;
 mod iterator;
 mod key_value_spec;
 
-cfg_if::cfg_if! {
-    if #[cfg(feature = "sync_backend")] {
-        mod concurrent_btree;
-        pub use concurrent_btree::ConcurrentBtree;
-    } else if #[cfg(feature = "async_backend")] {
-        mod lockfree_btree;
-        pub use lockfree_btree::LockFreeBtree;
-    }
-}
+mod unsharded_btree;
+pub use unsharded_btree::UnshardedBtree;
+
+mod sharded_btree;
+pub use sharded_btree::ShardedBtree;
+
 
 pub use btree_index::{BtreeIndex, IndexQueryHandle};
 pub use db_kv::{DbKey, DbValue};

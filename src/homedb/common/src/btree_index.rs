@@ -1,7 +1,4 @@
-//! Common trait for a single ConcurrentBtree or LockFreeBtree.
-//!
-//! TableIndex holds either a ConcurrentBtree
-//!  or a LockFreeBtree; both implement this trait.
+//! Common trait implemented by UnshardedBtree and ShardedBtree.
 
 use std::sync::Arc;
 
@@ -17,7 +14,7 @@ pub trait IndexQueryHandle: Send + std::any::Any {
 }
 
 /// Convert to Box<dyn Any> for downcast in query_next_batch. Requires IndexQueryHandle: Any.
-/// Used by both ConcurrentBtree and LockFreeBtree; callers are cfg-gated so rust-analyzer
+/// Used by both UnshardedBtree and ShardedBtree; callers are cfg-gated so rust-analyzer
 /// may not see both at once — suppress the spurious dead_code lint.
 #[allow(dead_code)]
 pub fn index_query_handle_into_any(me: Box<dyn IndexQueryHandle>) -> Box<dyn std::any::Any + Send> {

@@ -59,6 +59,7 @@ use super::detail::btree_req::{
     BtreeGetAnyRequest, BtreeQueryRequest, QueryResultHandle, GetFilter, BtreeSinglePutRequest, BtreeRangePutRequest,
     BtreePutType, PutFilter,
 };
+use super::detail::PutResult;
 
 #[inline]
 fn op_counter() -> u64 { GLOBAL_OP_COUNTER.fetch_add(1, Ordering::Relaxed) }
@@ -234,9 +235,9 @@ where
     /// Returns:
     /// - PutResult::Success if new key was inserted
     /// - PutResult::Updated if existing key was updated
-    #[tracing::instrument(skip(self, key, value, filter), 
+    #[tracing::instrument(skip(self, key, value, filter),
                           fields(op_id=op_counter(), btree=%self.config.btree_name, key=?key))]
-    pub async fn put_one(&self, key: &K, value: &V, filter: Option<&dyn PutFilter<K, V>>) -> Result<(), BtreeError> {
+    pub async fn put_one(&self, key: &K, value: &V, filter: Option<&dyn PutFilter<K, V>>) -> Result<PutResult, BtreeError> {
         tracing::debug!("Starting put operation");
         let req = BtreeSinglePutRequest::new(key, value, BtreePutType::Upsert, filter);
         let result = self.put_one_internal(&req).await;

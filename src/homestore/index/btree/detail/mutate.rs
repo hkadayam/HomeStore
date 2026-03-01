@@ -19,7 +19,7 @@
 //! This module contains PUT, REMOVE, and other mutation operations.
 //! Corresponds to btree mutate operations in C++ btree implementation.
 
-use super::super::btree_node::{Node, BNodeId, LockType};
+use super::super::btree_node::{Node, BNodeId, LockType, EMPTY_BNODEID};
 use super::super::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow};
 use super::super::btree::Btree;
 use super::super::btree_types::BtreeError;
@@ -52,24 +52,26 @@ where
     // Single-key PUT Implementation
     //================================================================================
 
-    /// Single-key PUT request with retry loop
+    /// Single-key PUT request with retry loop.
+    /// Returns `(PutResult, hit_boundary)` where `hit_boundary` is `true` when a scan-and-put
+    /// scan range extends beyond the target leaf (caller should schedule deferred GC).
     pub(in super::super) async fn put_one_internal<'a>(
         &self,
-        req: &'a BtreeSinglePutRequest<'a, K, V>,
-    ) -> Result<PutResult, BtreeError> {
+        mut req: BtreeSinglePutRequest<'a, K, V>,
+    ) -> Result<(PutResult, bool), BtreeError> {
         loop {
             let tree_lock = self.lock_tree_shared().await;
             let root_id = self.root_node_id();
             let root = self.read_and_lock_node(root_id, LockType::ReadInteriorWriteLeaf).await?;
 
-            if self.is_split_needed(&root, req) {
+            if self.is_split_needed(&root, &req) {
                 drop(root);
                 drop(tree_lock);
-                self.check_split_root(req).await?;
+                self.check_split_root(&req).await?;
                 continue; // Retry from root
             }
 
-            match self.put_one_walk(root, req).await {
+            match self.put_one_walk(root, &mut req).await {
                 Ok(r) => return Ok(r),
                 Err(BtreeError::Retry) => continue, // Retriable errors
                 Err(e) => return Err(e),            // Non-retriable errors
@@ -78,13 +80,18 @@ where
     }
 
     /// Recursive PUT for single-key requests
+    #[cfg_attr(feature = "async_code", async_recursion::async_recursion)]
     async fn put_one_walk<'a>(
         &self,
         mut my_node: Node,
-        req: &'a BtreeSinglePutRequest<'a, K, V>,
-    ) -> Result<PutResult, BtreeError> {
+        req: &mut BtreeSinglePutRequest<'a, K, V>,
+    ) -> Result<(PutResult, bool), BtreeError> {
         if my_node.is_leaf() {
-            return self.put_one_in_leaf(&my_node, req).await;
+            return if req.is_scan_put() {
+                self.scan_and_put_one_in_leaf(&my_node, req).await
+            } else {
+                self.put_one_in_leaf(&my_node, req).await.map(|r| (r, false))
+            };
         }
 
         // Interior node: find child and traverse
@@ -104,27 +111,18 @@ where
             }
 
             drop(my_node); // Can unlock the parent node now
-            #[cfg(feature = "async_code")]
-            return Box::pin(self.put_one_walk(child, req)).await;
-            #[cfg(feature = "sync_code")]
-            return self.put_one_walk(child, req);
+            return self.put_one_walk(child, req).await;
         }
     }
 
-    /// Write to leaf node for single-key request (matches C++ mutate_write_leaf_node lines 259-269)
-    ///
-    /// Now at Btree layer to support:
-    /// - Async overflow value resolution for filters
-    /// - Overflow value writing/cleanup
-    /// - Two-phase filter execution
+    /// Write to leaf node for a direct (non-scan) single-key PUT request.
     async fn put_one_in_leaf<'a>(
         &self,
         node: &Node,
-        req: &'a BtreeSinglePutRequest<'a, K, V>,
+        req: &mut BtreeSinglePutRequest<'a, K, V>,
     ) -> Result<PutResult, BtreeError> {
-        use super::btree_req::{BtreePutType, PutFilterDecision};
-
         debug_assert!(node.is_leaf(), "Put operation on node is supported only for leaf nodes");
+        debug_assert!(!req.is_scan_put(), "put_one_in_leaf called with scan-and-put request");
         tracing::trace!(node=node.node_id(), key=?req.key(), "Leaf mutation");
 
         let key = req.key();
@@ -132,45 +130,31 @@ where
         let put_type = req.put_type();
         let filter = req.filter();
 
-        // Find the key
         let (found, idx) = node.find::<K, V>(key);
 
-        // If found and filter provided, apply filter with async overflow resolution
         if found {
             let decision = self.apply_put_filter(node, idx, filter).await?;
             match decision {
-                PutFilterDecision::Keep => {
-                    // Key existed but no change made
-                    return Ok(PutResult::Updated);
-                }
+                PutFilterDecision::Keep => return Ok(PutResult::Updated),
                 PutFilterDecision::Remove => {
-                    // Key existed but was removed by filter
                     node.remove::<K, V>(idx)?;
                     self.storage.write_node(node).await?;
                     return Ok(PutResult::Updated);
                 }
-                PutFilterDecision::Replace => {
-                    // Fall through to update logic below
-                }
+                PutFilterDecision::Replace => {} // Fall through
                 PutFilterDecision::NeedOldValue => unreachable!(),
             }
         }
 
-        // Dispatch based on put_type
         let result = match put_type {
             BtreePutType::Insert => {
-                if found {
-                    return Err(BtreeError::KeyAlreadyExists);
-                }
-                // Build ValueOrOverflow, writing to overflow storage if needed
+                if found { return Err(BtreeError::KeyAlreadyExists); }
                 let v = ValueOrOverflow::build(self.storage.as_ref(), value, self.config.inline_value_size).await?;
                 node.insert::<K, V>(idx, key, &v)?;
                 PutResult::Success
             }
             BtreePutType::Update => {
-                if !found {
-                    return Err(BtreeError::KeyNotFound);
-                }
+                if !found { return Err(BtreeError::KeyNotFound); }
                 self.replace_value(node, idx, value).await?;
                 PutResult::Updated
             }
@@ -189,6 +173,74 @@ where
         tracing::debug!(node = node.node_id(), entries = node.total_entries(), "Mutation done");
         self.storage.write_node(node).await?;
         Ok(result)
+    }
+
+    /// Scan-and-put leaf operation (MVCC write path).
+    ///
+    /// 1. Checks whether `scan_range` extends past this leaf into a sibling → `hit_boundary`.
+    /// 2. Scans entries in `scan_range` within this leaf; applies `filter` to each for
+    ///    inline GC (removes eligible old versions in the same `write_node` call).
+    /// 3. Stamps `insert_key` via `filter.mutate_key()` inside the leaf write lock.
+    /// 4. Inserts the stamped key and writes the node once.
+    ///
+    /// Returns `(PutResult::Success, hit_boundary)`.
+    async fn scan_and_put_one_in_leaf<'a>(
+        &self,
+        node: &Node,
+        req: &mut BtreeSinglePutRequest<'a, K, V>,
+    ) -> Result<(PutResult, bool), BtreeError> {
+        debug_assert!(node.is_leaf(), "Put operation on node is supported only for leaf nodes");
+
+        let (insert_key, scan_range, filter, value) =
+            req.scan_put_info_mut().expect("scan_and_put_one_in_leaf called without ScanPutInfo");
+        tracing::trace!(node=node.node_id(), "Scan-and-put leaf mutation");
+
+        // 1. Determine hit_boundary before any modifications.
+        let hit_boundary = node.get_next_node() != EMPTY_BNODEID
+            && node
+                .get_last_key::<K, V>()
+                .map(|last_key| {
+                    scan_range.end_key > last_key
+                        || (scan_range.end_key == last_key && scan_range.end_incl)
+                })
+                .unwrap_or(false);
+
+        // 2. Scan scan_range within this leaf; apply GC filter to each old entry.
+        // end_idx is maintained manually: each removal shifts entries down by one,
+        // so we decrement end_idx instead of re-calling match_range each iteration.
+        let (matched, start_idx, mut end_idx) = node.match_range::<K, V>(scan_range);
+        if matched {
+            let mut idx = start_idx;
+            while idx <= end_idx {
+                let decision = self.apply_put_filter(node, idx, filter).await?;
+                if decision == PutFilterDecision::Remove {
+                    node.remove::<K, V>(idx)?;
+                    // Removal shifts all subsequent entries down; decrement end_idx.
+                    // checked_sub handles the end_idx == 0 case without usize underflow.
+                    match end_idx.checked_sub(1) {
+                        Some(new_end) => end_idx = new_end,
+                        None => break, // end_idx was 0; no more entries in range
+                    }
+                    // Don't increment idx: the next entry has shifted into position idx.
+                } else {
+                    idx += 1;
+                }
+            }
+        }
+
+        // 3. Stamp the insert key inside the write lock.
+        if let Some(f) = filter {
+            f.mutate_key(insert_key);
+        }
+
+        // 4. Insert the stamped key and write the node once (covers GC removals + insert).
+        let (_, insert_idx) = node.find::<K, V>(insert_key);
+        let v = ValueOrOverflow::build(self.storage.as_ref(), value, self.config.inline_value_size).await?;
+        node.insert::<K, V>(insert_idx, insert_key, &v)?;
+
+        tracing::debug!(node=node.node_id(), entries=node.total_entries(), hit_boundary, "Scan-and-put done");
+        self.storage.write_node(node).await?;
+        Ok((PutResult::Success, hit_boundary))
     }
 
     //================================================================================

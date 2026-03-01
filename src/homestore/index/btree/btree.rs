@@ -240,11 +240,40 @@ where
     pub async fn put_one(&self, key: &K, value: &V, filter: Option<&dyn PutFilter<K, V>>) -> Result<PutResult, BtreeError> {
         tracing::debug!("Starting put operation");
         let req = BtreeSinglePutRequest::new(key, value, BtreePutType::Upsert, filter);
-        let result = self.put_one_internal(&req).await;
+        let result = self.put_one_internal(req).await.map(|(r, _)| r);
         if result.is_ok() {
             tracing::info!("Put completed");
         } else {
             tracing::warn!(?result, "Put failed");
+        }
+        result
+    }
+
+    /// Scan-and-put: scan `scan_range` entries within the target leaf, apply `filter` to
+    /// each (inline GC), then stamp `insert_key` via `filter.mutate_key()` inside the leaf
+    /// write lock and insert it.
+    ///
+    /// Returns `(PutResult, hit_boundary)`.  `hit_boundary = true` means the `scan_range`
+    /// extended beyond the target leaf; the caller should schedule deferred GC for the
+    /// sibling nodes.
+    ///
+    /// **`insert_key` and `scan_range.start_key` MUST be different objects (no aliasing).**
+    #[tracing::instrument(skip(self, insert_key, value, scan_range, filter),
+                          fields(op_id=op_counter(), btree=%self.config.btree_name))]
+    pub async fn scan_and_put_one(
+        &self,
+        insert_key: &mut K,
+        value: &V,
+        scan_range: &BtreeKeyRange<K>,
+        filter: Option<&dyn PutFilter<K, V>>,
+    ) -> Result<(PutResult, bool), BtreeError> {
+        tracing::debug!("Starting scan-and-put operation");
+        let req = BtreeSinglePutRequest::new_scan_put(insert_key, value, scan_range, filter);
+        let result = self.put_one_internal(req).await;
+        if result.is_ok() {
+            tracing::info!("Scan-and-put completed");
+        } else {
+            tracing::warn!(?result, "Scan-and-put failed");
         }
         result
     }

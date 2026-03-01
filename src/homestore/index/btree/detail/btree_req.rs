@@ -56,6 +56,14 @@ pub trait PutFilter<K: BtreeKey, V: BtreeValue>: Send + Sync {
     /// Phase 2: Check with old value resolved
     /// MUST NOT return NeedOldValue (will panic)
     fn check_kv(&self, key: &K, old_value: &V) -> PutFilterDecision;
+
+    /// Stamp the new key in-place before it is inserted.
+    ///
+    /// Called exactly once inside the btree leaf write lock (in `scan_and_put_one`).
+    /// The default no-op implementation is zero-cost for non-MVCC callers.
+    ///
+    /// MVCC use: appends `!commit_ts` bytes to `key` (seq_id assigned here, inside lock).
+    fn mutate_key(&self, _key: &mut K) {}
 }
 
 /// Blanket impl: Any closure Fn(&K, &V) -> PutFilterDecision becomes a PutFilter
@@ -231,9 +239,31 @@ impl<K: BtreeKey> BtreeRangeRequest<K> {
     }
 }
 
+/// Sub-struct for scan-and-put mode.
+///
+/// Carries the key to be inserted (`insert_key`) and the range to scan within the target
+/// leaf for inline GC (`scan_range`).  `insert_key` and `scan_range.start_key` MUST be
+/// different objects (no aliasing) — the start_key is used only for tree navigation while
+/// `insert_key` is the key that gets stamped and physically inserted.
+pub struct ScanPutInfo<'a, K: BtreeKey> {
+    /// Key stamped via `filter.mutate_key()` inside the leaf write lock, then inserted.
+    pub insert_key: &'a mut K,
+    /// Range scanned within the target leaf for inline GC before the new key is inserted.
+    pub scan_range: &'a BtreeKeyRange<K>,
+}
+
+/// Discriminates between a direct single-key PUT and a scan-and-put.
+pub enum SinglePutKind<'a, K: BtreeKey> {
+    /// Navigate to the leaf using this key and insert it directly.
+    DirectPut(&'a K),
+    /// Navigate using `scan_range.start_key`, GC-scan the range, stamp `insert_key`
+    /// inside the leaf write lock, then insert.
+    ScanPut(ScanPutInfo<'a, K>),
+}
+
 /// Single key-value PUT request (matches C++ BtreeSinglePutRequest)
 pub struct BtreeSinglePutRequest<'a, K: BtreeKey, V: BtreeValue> {
-    key: &'a K,
+    kind: SinglePutKind<'a, K>,
     value: &'a V,
     put_type: BtreePutType,
     filter: Option<&'a dyn PutFilter<K, V>>,
@@ -243,18 +273,39 @@ pub struct BtreeSinglePutRequest<'a, K: BtreeKey, V: BtreeValue> {
 unsafe impl<'a, K: BtreeKey + Send, V: BtreeValue + Send> Send for BtreeSinglePutRequest<'a, K, V> {}
 
 impl<'a, K: BtreeKey, V: BtreeValue> BtreeSinglePutRequest<'a, K, V> {
-    /// Create a new single PUT request (matches C++ constructor)
-    ///
-    /// # Arguments
-    /// * `key` - Key to insert/update
-    /// * `value` - Value to insert/update
-    /// * `put_type` - Type of put operation (Insert/Update/Upsert)
-    /// * `filter_fn` - Optional filter function for conditional updates
+    /// Create a direct single PUT request.
     pub fn new(key: &'a K, value: &'a V, put_type: BtreePutType, filter: Option<&'a dyn PutFilter<K, V>>) -> Self {
-        Self { key, value, put_type, filter }
+        Self { kind: SinglePutKind::DirectPut(key), value, put_type, filter }
     }
 
-    pub fn key(&self) -> &K { self.key }
+    /// Create a scan-and-put request.
+    ///
+    /// Navigates to the leaf via `scan_range.start_key`, scans entries in `scan_range`
+    /// applying `filter` (inline GC), stamps `insert_key` via `filter.mutate_key()` inside
+    /// the leaf write lock, then inserts the stamped key.
+    ///
+    /// **`insert_key` and `scan_range.start_key` MUST be different objects (no aliasing).**
+    pub fn new_scan_put(
+        insert_key: &'a mut K,
+        value: &'a V,
+        scan_range: &'a BtreeKeyRange<K>,
+        filter: Option<&'a dyn PutFilter<K, V>>,
+    ) -> Self {
+        Self {
+            kind: SinglePutKind::ScanPut(ScanPutInfo { insert_key, scan_range }),
+            value,
+            put_type: BtreePutType::Insert,
+            filter,
+        }
+    }
+
+    /// Navigation key used to locate the correct leaf during tree traversal.
+    pub fn key(&self) -> &K {
+        match &self.kind {
+            SinglePutKind::DirectPut(k) => k,
+            SinglePutKind::ScanPut(info) => &info.scan_range.start_key,
+        }
+    }
 
     pub fn value(&self) -> &V { self.value }
 
@@ -262,7 +313,30 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeSinglePutRequest<'a, K, V> {
 
     pub fn filter(&self) -> Option<&'a dyn PutFilter<K, V>> { self.filter }
 
-    pub fn key_size(&self) -> u32 { self.key.serialized_size() }
+    /// Returns `true` when this is a scan-and-put request.
+    pub fn is_scan_put(&self) -> bool { matches!(self.kind, SinglePutKind::ScanPut(_)) }
+
+    /// Destructures the scan-and-put info for use in `scan_and_put_one_in_leaf`.
+    /// Returns `(insert_key, scan_range, filter, value)` or `None` for direct puts.
+    ///
+    /// `filter` and `value` are copied out before the mutable borrow of `self.kind` so
+    /// they carry the independent `'a` lifetime.
+    pub fn scan_put_info_mut(&mut self) -> Option<(&mut K, &'a BtreeKeyRange<K>, Option<&'a dyn PutFilter<K, V>>, &'a V)> {
+        let filter = self.filter; // Copy out 'a-lifetime refs before borrowing kind
+        let value = self.value;
+        match &mut self.kind {
+            SinglePutKind::ScanPut(info) => Some((&mut *info.insert_key, info.scan_range, filter, value)),
+            _ => None,
+        }
+    }
+
+    /// Key size for split-needed checks: uses `insert_key` size in scan-and-put mode.
+    pub fn key_size(&self) -> u32 {
+        match &self.kind {
+            SinglePutKind::DirectPut(k) => k.serialized_size(),
+            SinglePutKind::ScanPut(info) => info.insert_key.serialized_size(),
+        }
+    }
 
     pub fn value_size(&self) -> u32 { self.value.serialized_size() }
 }

@@ -80,6 +80,42 @@ pub trait BtreeKey: Sized + Send + Sync + Clone + Ord + PartialOrd + Eq + Partia
     fn get_max_size() -> u32;
 }
 
+/// Trait for keys that can provide a partition-routing byte slice.
+///
+/// Separate from `BtreeKey` so that types used only in tests (`u64`) and types that
+/// require sharding (`DbKey`, `MvccKey`) can implement it independently.
+///
+/// The callback pattern (`with_partition_bytes`) is zero-copy for `Vec<u8>`-backed keys
+/// (the closure borrows the internal slice) and stack-only for `u64` (uses `to_le_bytes()`).
+pub trait Partitionable: BtreeKey {
+    /// Call `f` with the raw bytes that identify this key's partition.
+    ///
+    /// The `partition_key_len` prefix of these bytes determines the shard.
+    fn with_partition_bytes<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R;
+}
+
+/// `u64` keys are stack-only; partition bytes are the little-endian representation.
+impl Partitionable for u64 {
+    fn with_partition_bytes<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        f(&self.to_le_bytes())
+    }
+}
+
+/// `u32` keys: same approach as `u64`.
+impl Partitionable for u32 {
+    fn with_partition_bytes<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        f(&self.to_le_bytes())
+    }
+}
+
 /// Trait for B-tree values (matches C++ BtreeValue concept)
 ///
 /// Values must be:

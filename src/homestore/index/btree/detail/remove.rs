@@ -201,7 +201,7 @@ where
     ) -> Result<u32, BtreeError> {
         debug_assert!(node.is_leaf(), "Multi remove only for leaf nodes");
 
-        let (matched, start_idx, end_idx) = node.match_range::<K, V>(range);
+        let (matched, start_idx, mut end_idx) = node.match_range::<K, V>(range);
         if !matched {
             return Ok(0); // No matches, return 0
         }
@@ -225,7 +225,13 @@ where
                     // Remove the entry from the node
                     node.remove::<K, V>(idx)?;
                     removed += 1;
-                    // Don't increment idx - entries shift down after removal
+                    // Entries after idx shifted down; adjust end_idx to match.
+                    // If end_idx was 0 we just removed the only in-range entry — stop.
+                    match end_idx.checked_sub(1) {
+                        Some(new_end) => end_idx = new_end,
+                        None => break,
+                    }
+                    // Don't increment idx - the next entry is now at the same position.
                 }
                 RemoveFilterDecision::Skip => {
                     idx += 1; // Skip this entry
@@ -333,9 +339,9 @@ where
         let copy = true;
         let value = node.get_nth_value::<K, V>(idx, copy).resolve(self.storage.as_ref(), copy).await?;
         if decision == RemoveFilterDecision::NeedValue {
-            let decision = filter.check_kv(&key, &value);
+            decision = filter.check_kv(&key, &value);
             #[rustfmt::skip]
-            debug_assert_ne!(decision, RemoveFilterDecision::NeedValue, 
+            debug_assert_ne!(decision, RemoveFilterDecision::NeedValue,
                 "Filter returned NeedValue after receiving value");
         }
 

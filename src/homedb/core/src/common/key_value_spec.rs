@@ -1,6 +1,6 @@
 //! Key and Value specifications for table schema
 
-use crate::error::{HomeDbError, Result};
+use super::error::{HomeDbError, Result};
 
 /// Key type specification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,12 +153,22 @@ pub struct TableSpec {
     /// height and cache misses at the cost of higher per-node I/O. Default is 4096.
     /// Inline value threshold is clamped to node_size/32 by BtreeConfig.
     pub node_size: u32,
+    /// Enable MVCC (key-level snapshot isolation) for this table.
+    ///
+    /// When `true`, keys are stored as `MvccKey<DbKey>` with a version suffix so multiple
+    /// historical versions coexist in the btree. Writes use `scan_and_put_one` to stamp
+    /// a monotonically-increasing `commit_ts` inside the leaf write lock. Reads without a
+    /// snapshot return the latest live version; `snapshot_get` / `snapshot_get_range` return
+    /// the version visible at the given snapshot's timestamp.
+    ///
+    /// Default is `false`.
+    pub mvcc_supported: bool,
 }
 
 impl TableSpec {
     /// Create a new table specification (partition_key_size defaults to 2).
     pub fn new(key_spec: KeySpec, value_spec: ValueSpec) -> Self {
-        Self { key_spec, value_spec, partition_key_size: 2, node_size: 4096 }
+        Self { key_spec, value_spec, partition_key_size: 2, node_size: 4096, mvcc_supported: false }
     }
 
     /// Create a table spec with fixed-size keys and values (partition_key_size defaults to 2).
@@ -168,6 +178,7 @@ impl TableSpec {
             value_spec: ValueSpec::fixed(value_size),
             partition_key_size: 2,
             node_size: 4096,
+            mvcc_supported: false,
         }
     }
 
@@ -180,6 +191,12 @@ impl TableSpec {
     /// Override the BTree node size (builder-style).
     pub fn node_size(mut self, size: u32) -> Self {
         self.node_size = size;
+        self
+    }
+
+    /// Enable MVCC snapshot isolation (builder-style).
+    pub fn mvcc(mut self) -> Self {
+        self.mvcc_supported = true;
         self
     }
 

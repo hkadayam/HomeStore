@@ -155,7 +155,7 @@ impl Table {
         start_key: Vec<u8>,
         end_key: Vec<u8>,
         batch_size: u32,
-    ) -> Result<homedb_common::RangeIterator> {
+    ) -> Result<homedb_core::RangeIterator> {
         self.primary_index().get_range(start_key, end_key, batch_size).await
     }
 
@@ -166,7 +166,7 @@ impl Table {
         start_key: Vec<u8>,
         end_key: Vec<u8>,
         batch_size: u32,
-    ) -> Result<homedb_common::RangeIterator> {
+    ) -> Result<homedb_core::RangeIterator> {
         self.primary_index().get_range_reverse(start_key, end_key, batch_size).await
     }
 

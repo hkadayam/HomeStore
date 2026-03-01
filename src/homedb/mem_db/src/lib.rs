@@ -35,8 +35,9 @@ mod memory_db;
 mod table;
 mod table_index;
 
-pub use homedb_common::{
+pub use homedb_core::{
     HomeDbError, KeySpec, KeyType, PrefixType, RangeIterator, Result, TableSpec, ValueSpec,
+    MvccGc, MvccGcFilter, MvccKey, MvccValue, Snapshot, SnapshotOps, SnapshotRegistry, GLOBAL_SEQ,
 };
 pub use mem_db_macros::reactor_method;
 pub use table_index::{IndexType, TableIndex};

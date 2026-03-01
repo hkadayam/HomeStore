@@ -5,7 +5,7 @@ members = [
     "src/homestore",
     "src/iomanager",
     "src/iomanager/macros",
-    "src/homedb/common",
+    "src/homedb/core",
     "src/homedb/mem_db",
     "src/homedb/mem_db_macros",
 ]

@@ -12,14 +12,13 @@ use parking_lot::RwLock;
 use smallvec::SmallVec;
 
 use homestore::index::btree::btree::Btree;
-use homestore::index::btree::btree_kvs::BtreeKey;
+use homestore::index::btree::btree_kvs::{BtreeKey, BtreeValue, Partitionable};
 use homestore::index::btree::btree_types::{BtreeConfig, BtreeError};
 use homestore::index::btree::detail::btree_req::{BtreeKeyRange, GetFilter, PutFilter, QueryResultHandle, RemoveFilter};
 use homestore::index::btree::detail::PutResult;
 use homestore::index::btree::UnderlyingBtree;
 
 use super::btree_index::{BtreeIndex, IndexQueryHandle};
-use super::db_kv::{DbKey, DbValue};
 
 /// Default shard count for sync_backend.
 #[cfg(feature = "sync_backend")]
@@ -89,20 +88,21 @@ struct Partition {
 }
 
 impl Partition {
-    fn from_key(key: &DbKey, partition_key_len: usize) -> Self {
-        let bytes = key.as_bytes();
-        let plen = if partition_key_len == 0 { bytes.len() } else { partition_key_len.min(bytes.len()) };
-        Self { part_key: bytes[..plen].iter().copied().collect() }
+    fn from_key<K: Partitionable>(key: &K, partition_key_len: usize) -> Self {
+        key.with_partition_bytes(|bytes| {
+            let plen = if partition_key_len == 0 { bytes.len() } else { partition_key_len.min(bytes.len()) };
+            Self { part_key: bytes[..plen].iter().copied().collect() }
+        })
     }
 
-    fn from_range(range: &BtreeKeyRange<DbKey>, partition_key_len: usize) -> Self {
+    fn from_range<K: Partitionable>(range: &BtreeKeyRange<K>, partition_key_len: usize) -> Self {
         if partition_key_len == 0 { return Self { part_key: PartitionKey::new() }; }
         Self::from_key(&range.start_key, partition_key_len)
     }
 
-    fn first_key(&self) -> DbKey {
-        <DbKey as BtreeKey>::deserialize_from(self.part_key.as_ref(), true)
-            .expect("DbKey from partition key")
+    fn first_key<K: BtreeKey>(&self) -> K {
+        K::deserialize_from(self.part_key.as_ref(), true)
+            .expect("K from partition key")
     }
 
     fn next(&self) -> Option<Partition> {
@@ -117,8 +117,9 @@ impl Partition {
         None
     }
 
-    fn is_out_of_range(&self, range: &BtreeKeyRange<DbKey>) -> bool {
-        if range.end_incl { self.first_key() > range.end_key } else { self.first_key() >= range.end_key }
+    fn is_out_of_range<K: BtreeKey>(&self, range: &BtreeKeyRange<K>) -> bool {
+        let first: K = self.first_key();
+        if range.end_incl { first > range.end_key } else { first >= range.end_key }
     }
 }
 
@@ -130,8 +131,8 @@ impl Hash for Partition {
 // Core data structures
 //==============================================================================
 
-struct Shard {
-    btree: Arc<Btree<DbKey, DbValue>>,
+struct Shard<K: 'static + BtreeKey, V: 'static + BtreeValue> {
+    btree: Arc<Btree<K, V>>,
     #[cfg(feature = "async_backend")]
     reactor_id: usize,
 }
@@ -141,32 +142,34 @@ struct PartitionEntry {
 }
 
 /// Pagination handle for ShardedBtree queries.
-pub struct ShardedQueryHandle {
-    results: Vec<(DbKey, DbValue)>,
-    input_range: BtreeKeyRange<DbKey>,
+pub struct ShardedQueryHandle<K: 'static + BtreeKey, V: 'static + BtreeValue> {
+    results: Vec<(K, V)>,
+    input_range: BtreeKeyRange<K>,
     batch_size: u32,
-    filter: Option<Arc<dyn GetFilter<DbKey, DbValue>>>,
+    filter: Option<Arc<dyn GetFilter<K, V>>>,
     reverse: bool,
     partitions: Vec<PartitionKey>,
     cur_part_idx: usize,
-    cur_handle: Option<QueryResultHandle<DbKey, DbValue>>,
+    cur_handle: Option<QueryResultHandle<K, V>>,
 }
 
-impl ShardedQueryHandle {
+impl<K: 'static + BtreeKey, V: 'static + BtreeValue> ShardedQueryHandle<K, V> {
     fn has_more_impl(&self) -> bool {
         self.cur_handle.as_ref().map_or(false, |h| h.has_more())
             || self.cur_part_idx < self.partitions.len()
     }
 }
 
-impl IndexQueryHandle for ShardedQueryHandle {
-    fn results(&self) -> &[(DbKey, DbValue)] { &self.results }
+impl<K: 'static + BtreeKey, V: 'static + BtreeValue> IndexQueryHandle<K, V> for ShardedQueryHandle<K, V> {
+    fn results(&self) -> &[(K, V)] { &self.results }
     fn has_more(&self) -> bool { self.has_more_impl() }
 }
 
-fn to_sharded_query_handle(handle: Box<dyn IndexQueryHandle>) -> Result<ShardedQueryHandle, BtreeError> {
+fn to_sharded_query_handle<K: 'static + BtreeKey, V: 'static + BtreeValue>(
+    handle: Box<dyn IndexQueryHandle<K, V>>,
+) -> Result<ShardedQueryHandle<K, V>, BtreeError> {
     super::btree_index::index_query_handle_into_any(handle)
-        .downcast::<ShardedQueryHandle>()
+        .downcast::<ShardedQueryHandle<K, V>>()
         .map(|b| *b)
         .map_err(|_| BtreeError::Io(std::io::Error::new(
             std::io::ErrorKind::Other, "ShardedBtree requires ShardedQueryHandle",
@@ -177,8 +180,8 @@ fn to_sharded_query_handle(handle: Box<dyn IndexQueryHandle>) -> Result<ShardedQ
 // ShardedBtree
 //==============================================================================
 
-pub struct ShardedBtree {
-    shards: Vec<Arc<Shard>>,
+pub struct ShardedBtree<K: 'static + Partitionable, V: 'static + BtreeValue> {
+    shards: Vec<Arc<Shard<K, V>>>,
     registry: RwLock<BTreeMap<PartitionKey, Arc<PartitionEntry>>>,
     partition_key_len: usize,
 }
@@ -188,29 +191,29 @@ pub struct ShardedBtree {
 //==============================================================================
 
 #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
-async fn new_btree_on_shard(
+async fn new_btree_on_shard<K: 'static + BtreeKey, V: 'static + BtreeValue>(
     shard_id: usize,
     cfg: BtreeConfig,
     storage: Box<dyn UnderlyingBtree>,
-) -> Result<Btree<DbKey, DbValue>, BtreeError> {
+) -> Result<Btree<K, V>, BtreeError> {
     cfg_if::cfg_if! {
         if #[cfg(feature = "async_backend")] {
             cfg_if::cfg_if! {
                 if #[cfg(feature = "async_frontend")] {
                     iomgr::spawn_waitable(
                         iomgr::ReactorTarget::Reactor(shard_id),
-                        async move { Btree::<DbKey, DbValue>::new(cfg, storage, None).await },
+                        async move { Btree::<K, V>::new(cfg, storage, None).await },
                     ).await
                 } else {
                     iomgr::spawn_and_block(
                         iomgr::ReactorTarget::Reactor(shard_id),
-                        async move { Btree::<DbKey, DbValue>::new(cfg, storage, None).await },
+                        async move { Btree::<K, V>::new(cfg, storage, None).await },
                     )
                 }
             }
         } else {
             let _ = shard_id;
-            Btree::<DbKey, DbValue>::new(cfg, storage, None)
+            Btree::<K, V>::new(cfg, storage, None)
         }
     }
 }
@@ -219,7 +222,7 @@ async fn new_btree_on_shard(
 // Construction
 //==============================================================================
 
-impl ShardedBtree {
+impl<K: 'static + Partitionable, V: 'static + BtreeValue> ShardedBtree<K, V> {
     #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
     pub async fn new(
         config: BtreeConfig,
@@ -242,7 +245,7 @@ impl ShardedBtree {
                 if #[cfg(feature = "async_backend")] { cfg.is_single_threaded = true; }
             }
             let storage = storage_factory(cfg.clone());
-            let btree = new_btree_on_shard(i, cfg, storage).await?;
+            let btree = new_btree_on_shard::<K, V>(i, cfg, storage).await?;
             cfg_if::cfg_if! {
                 if #[cfg(feature = "async_backend")] {
                     shards.push(Arc::new(Shard { btree: Arc::new(btree), reactor_id: i }));
@@ -260,20 +263,21 @@ impl ShardedBtree {
 // Helper methods
 //==============================================================================
 
-impl ShardedBtree {
+impl<K: 'static + Partitionable, V: 'static + BtreeValue> ShardedBtree<K, V> {
     fn num_shards(&self) -> usize { self.shards.len() }
 
-    fn shard_from_part_key(&self, part_key: &PartitionKey) -> &Arc<Shard> {
+    fn shard_from_part_key(&self, part_key: &PartitionKey) -> &Arc<Shard<K, V>> {
         use std::collections::hash_map::DefaultHasher;
         let mut h = DefaultHasher::new();
         part_key.as_ref().hash(&mut h);
         &self.shards[(h.finish() as usize) % self.num_shards()]
     }
 
-    fn get_part_key(&self, key: &DbKey) -> PartitionKey {
-        let b = key.as_bytes();
-        let plen = if self.partition_key_len == 0 { b.len() } else { self.partition_key_len.min(b.len()) };
-        SmallVec::from_slice(&b[..plen])
+    fn get_part_key(&self, key: &K) -> PartitionKey {
+        key.with_partition_bytes(|b| {
+            let plen = if self.partition_key_len == 0 { b.len() } else { self.partition_key_len.min(b.len()) };
+            SmallVec::from_slice(&b[..plen])
+        })
     }
 
     fn get_or_create_entry(&self, part_key: &PartitionKey) -> Arc<PartitionEntry> {
@@ -305,13 +309,13 @@ impl ShardedBtree {
             .collect()
     }
 
-    fn clamp_range(&self, range: &BtreeKeyRange<DbKey>, partition: &Partition) -> BtreeKeyRange<DbKey> {
+    fn clamp_range(&self, range: &BtreeKeyRange<K>, partition: &Partition) -> BtreeKeyRange<K> {
         if self.partition_key_len == 0 { return range.clone(); }
         let mut ret = range.clone();
-        let first = partition.first_key();
+        let first: K = partition.first_key();
         if range.start_key < first { ret.start_key = first; ret.start_incl = true; }
         if let Some(next) = partition.next() {
-            let nf = next.first_key();
+            let nf: K = next.first_key();
             if range.end_key >= nf { ret.end_key = nf; ret.end_incl = false; }
         }
         ret
@@ -324,7 +328,7 @@ impl ShardedBtree {
 
     /// Fill the query handle with the next batch across partitions.
     #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
-    async fn fill_query_handle(&self, handle: &mut ShardedQueryHandle) -> Result<(), BtreeError> {
+    async fn fill_query_handle(&self, handle: &mut ShardedQueryHandle<K, V>) -> Result<(), BtreeError> {
         while handle.cur_part_idx < handle.partitions.len()
             && (handle.results.len() as u32) < handle.batch_size
         {
@@ -356,8 +360,8 @@ impl ShardedBtree {
 
 #[cfg_attr(feature = "async_frontend", async_trait::async_trait)]
 #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
-impl BtreeIndex for ShardedBtree {
-    async fn put(&self, key: &DbKey, value: &DbValue) -> Result<(), BtreeError> {
+impl<K: 'static + Partitionable, V: 'static + BtreeValue> BtreeIndex<K, V> for ShardedBtree<K, V> {
+    async fn put(&self, key: &K, value: &V) -> Result<(), BtreeError> {
         let part_key = self.get_part_key(key);
         let shard = self.shard_from_part_key(&part_key);
 
@@ -370,9 +374,9 @@ impl BtreeIndex for ShardedBtree {
 
     async fn put_range(
         &self,
-        range: BtreeKeyRange<DbKey>,
-        value: &DbValue,
-        filter: Option<Arc<dyn PutFilter<DbKey, DbValue>>>,
+        range: BtreeKeyRange<K>,
+        value: &V,
+        filter: Option<Arc<dyn PutFilter<K, V>>>,
     ) -> Result<(), BtreeError> {
         let mut cur_part = Some(Partition::from_range(&range, self.partition_key_len));
         while let Some(ref part) = cur_part {
@@ -386,7 +390,7 @@ impl BtreeIndex for ShardedBtree {
         Ok(())
     }
 
-    async fn remove(&self, key: &DbKey) -> Result<Option<DbValue>, BtreeError> {
+    async fn remove(&self, key: &K) -> Result<Option<V>, BtreeError> {
         let part_key = self.get_part_key(key);
         let shard = self.shard_from_part_key(&part_key);
         let result = shard_call!(shard, [key], remove_one(&key, None));
@@ -396,8 +400,8 @@ impl BtreeIndex for ShardedBtree {
 
     async fn remove_range(
         &self,
-        range: BtreeKeyRange<DbKey>,
-        filter: Option<Arc<dyn RemoveFilter<DbKey, DbValue>>>,
+        range: BtreeKeyRange<K>,
+        filter: Option<Arc<dyn RemoveFilter<K, V>>>,
     ) -> Result<u32, BtreeError> {
         let start_part = self.get_part_key(&range.start_key);
         let end_part = self.get_part_key(&range.end_key);
@@ -418,7 +422,7 @@ impl BtreeIndex for ShardedBtree {
         Ok(total)
     }
 
-    async fn get(&self, key: &DbKey) -> Result<Option<DbValue>, BtreeError> {
+    async fn get(&self, key: &K) -> Result<Option<V>, BtreeError> {
         let part_key = self.get_part_key(key);
         let shard = self.shard_from_part_key(&part_key);
         shard_call!(shard, [key], get(&key))
@@ -426,11 +430,11 @@ impl BtreeIndex for ShardedBtree {
 
     async fn query(
         &self,
-        range: BtreeKeyRange<DbKey>,
+        range: BtreeKeyRange<K>,
         batch_size: u32,
-        filter: Option<Arc<dyn GetFilter<DbKey, DbValue>>>,
+        filter: Option<Arc<dyn GetFilter<K, V>>>,
         reverse: bool,
-    ) -> Result<Box<dyn IndexQueryHandle>, BtreeError> {
+    ) -> Result<Box<dyn IndexQueryHandle<K, V>>, BtreeError> {
         let start_part = self.get_part_key(&range.start_key);
         let end_part = self.get_part_key(&range.end_key);
         let partitions = self.active_partitions_in_range(&start_part, &end_part);
@@ -445,8 +449,8 @@ impl BtreeIndex for ShardedBtree {
 
     async fn query_next_batch(
         &self,
-        h: Box<dyn IndexQueryHandle>,
-    ) -> Result<Box<dyn IndexQueryHandle>, BtreeError> {
+        h: Box<dyn IndexQueryHandle<K, V>>,
+    ) -> Result<Box<dyn IndexQueryHandle<K, V>>, BtreeError> {
         let mut handle = to_sharded_query_handle(h)?;
         handle.results.clear();
 
@@ -461,5 +465,29 @@ impl BtreeIndex for ShardedBtree {
 
         self.fill_query_handle(&mut handle).await?;
         Ok(Box::new(handle))
+    }
+
+    async fn scan_and_put_one(
+        &self,
+        mut insert_key: K,
+        value: V,
+        scan_range: BtreeKeyRange<K>,
+        filter: Option<Arc<dyn PutFilter<K, V>>>,
+    ) -> Result<(PutResult, bool), BtreeError> {
+        // Route by scan_range.start_key: all versions of the same user key share identical
+        // partition bytes (MvccKey<K: Partitionable> delegates to inner key), so all versions
+        // land in the same shard. No cross-shard coordination needed.
+        //
+        // insert_key is owned (mut) and NOT in the shard_call clone list — it is captured by
+        // move into the async block, where &mut insert_key is valid as a local borrow.
+        let part_key = self.get_part_key(&scan_range.start_key);
+        let shard = self.shard_from_part_key(&part_key);
+        let result = shard_call!(shard, [value, scan_range, filter], scan_and_put_one(&mut insert_key, &value, &scan_range, filter.as_ref().map(|f| f.as_ref())));
+        // Register the partition so that query() can find it via active_partitions_in_range.
+        // scan_and_put_one always inserts one new key (MVCC keys are unique per commit_ts).
+        if result.is_ok() {
+            self.get_or_create_entry(&part_key).entry_count.fetch_add(1, Relaxed);
+        }
+        result
     }
 }

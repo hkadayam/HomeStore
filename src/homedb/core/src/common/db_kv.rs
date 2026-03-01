@@ -1,5 +1,5 @@
-use homestore::index::btree::btree_kvs::{BtreeKey, BtreeValue};
-use crate::key_value_spec::{KeySpec, ValueSpec};
+use homestore::index::btree::btree_kvs::{BtreeKey, BtreeValue, Partitionable};
+use super::key_value_spec::{KeySpec, ValueSpec};
 
 /// Data storage for DbKey - either owned or borrowed
 enum DbKeyData {
@@ -33,7 +33,7 @@ impl DbKey {
     ///
     /// Data is moved (not copied) into the DbKey.
     pub fn new(data: Vec<u8>, key_spec: &KeySpec) -> Self {
-        use crate::key_value_spec::KeyType;
+        use super::key_value_spec::KeyType;
         let fixed_size = match key_spec.key_type {
             KeyType::Fixed(size) => Some(size),
             KeyType::Variable(_) => None,
@@ -136,6 +136,15 @@ impl BtreeKey for DbKey {
     }
 }
 
+impl Partitionable for DbKey {
+    fn with_partition_bytes<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        f(self.as_bytes())
+    }
+}
+
 /// Data storage for DbValue - either owned or borrowed
 enum DbValueData {
     Owned(Vec<u8>),             // User input or copy=true deserialization
@@ -168,7 +177,7 @@ impl DbValue {
     ///
     /// Data is moved (not copied) into the DbValue.
     pub fn new(data: Vec<u8>, value_spec: &ValueSpec) -> Self {
-        use crate::key_value_spec::ValueSpec;
+        use super::key_value_spec::ValueSpec;
         let fixed_size = match value_spec {
             ValueSpec::Fixed(size) => Some(*size),
             ValueSpec::Variable(_) => None,

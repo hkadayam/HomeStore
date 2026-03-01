@@ -6,8 +6,9 @@
 
 use std::sync::Arc;
 use dashmap::DashMap;
-use crate::{table::Table, HomeDbError, Result, TableSpec};
-use homedb_common::RangeIterator;
+use crate::{table::Table, Snapshot, HomeDbError, Result, TableSpec};
+use crate::table_index::TableIndex;
+use homedb_core::RangeIterator;
 
 /// In-memory database managing multiple tables.
 ///
@@ -140,6 +141,21 @@ impl MemoryDB {
         end_key: Vec<u8>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         self.get_table(table_name)?.remove_any(start_key, end_key).await
+    }
+
+    // =========================================================================
+    // Snapshot convenience method (MVCC tables only)
+    // =========================================================================
+
+    /// Create a `Snapshot` on the primary index of `table_name`.
+    ///
+    /// The returned `Snapshot` is self-contained: call `snap.get(key).await`,
+    /// `snap.get_range(start, end, batch_size).await`, etc. directly on it.
+    ///
+    /// Returns `Err(InvalidOperation)` if the table was not created with
+    /// `mvcc_supported = true` in its `TableSpec`.
+    pub fn get_snapshot(&self, table_name: &str) -> Result<Snapshot> {
+        TableIndex::get_snapshot(self.get_table(table_name)?.primary_index())
     }
 }
 

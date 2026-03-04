@@ -10,6 +10,7 @@ use homestore::index::btree::detail::btree_req::{BtreeKeyRange, GetFilter, PutFi
 pub trait IndexQueryHandle<K: 'static + BtreeKey, V: 'static + BtreeValue>: Send + std::any::Any {
     fn results(&self) -> &[(K, V)];
     fn has_more(&self) -> bool;
+    fn into_any_send(self: Box<Self>) -> Box<dyn std::any::Any + Send>;
 }
 
 /// Convert to Box<dyn Any> for downcast in query_next_batch. Requires IndexQueryHandle: Any.
@@ -19,7 +20,7 @@ pub trait IndexQueryHandle<K: 'static + BtreeKey, V: 'static + BtreeValue>: Send
 pub fn index_query_handle_into_any<K: 'static + BtreeKey, V: 'static + BtreeValue>(
     me: Box<dyn IndexQueryHandle<K, V>>,
 ) -> Box<dyn std::any::Any + Send> {
-    unsafe { Box::from_raw(Box::into_raw(me) as *mut (dyn std::any::Any + Send)) }
+    me.into_any_send()
 }
 
 #[cfg_attr(feature = "async_frontend", async_trait::async_trait)]

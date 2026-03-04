@@ -1,7 +1,22 @@
 # MemDB Concurrent Performance Benchmark Results
 
-**Setup:** Sharded BTree (`partition_key_size=2`), key=32 bytes, value=128 bytes, node_size=4096,
-snake preload (stride=256, parallel workers), 4M benchmark ops per run, sync mode.
+## Machine Configuration
+
+| Property       | Value                                          |
+|----------------|------------------------------------------------|
+| **CPU**        | Apple M4 Pro                                   |
+| **Cores**      | 14 (10 Performance + 4 Efficiency)             |
+| **Memory**     | 48 GB unified memory                           |
+| **L1 cache**   | 128 KB instruction / 64 KB data per core       |
+| **L2 cache**   | 4 MB (shared per cluster)                      |
+| **OS**         | macOS 26.3 (Build 25D125)                      |
+| **Mode**       | Sync (std::thread workers, no async runtime)   |
+
+## Benchmark Setup
+
+**BTree:** Sharded (`partition_key_size=2`), key=32 bytes, value=128 bytes, `node_size=4096`
+**Preload:** Snake pattern (stride=256, parallel workers) — ensures ~90%+ node fill factor vs ~50% for sequential insertion
+**Benchmark:** 4M random ops per run, keys drawn uniformly from `[0, key_range)`
 
 ---
 

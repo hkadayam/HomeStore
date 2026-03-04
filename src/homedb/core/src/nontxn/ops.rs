@@ -13,7 +13,7 @@ use crate::index::index_ops::{IndexOps, err_not_mvcc};
 use crate::index::iterator::RangeIterator;
 use crate::common::key_value_spec::{KeySpec, ValueSpec};
 use crate::index::unsharded_btree::UnshardedBtree;
-use crate::index::sharded_btree::ShardedBtree;
+use crate::index::sharded_btree::{ShardedBtree, DEFAULT_MAX_PARTITIONS};
 
 pub struct NonTxnOps {
     pub(crate) btree: Arc<dyn BtreeIndex<DbKey, DbValue>>,
@@ -41,7 +41,7 @@ impl NonTxnOps {
             )
         } else {
             Arc::new(
-                ShardedBtree::new(config, partition_key_size, |c| Box::new(MemBtree::new(&c)))
+                ShardedBtree::new(config, partition_key_size, DEFAULT_MAX_PARTITIONS, |c| Box::new(MemBtree::new(&c)))
                     .await
                     .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?,
             )
@@ -59,6 +59,7 @@ impl IndexOps for NonTxnOps {
         self.btree
             .put(&db_key, &db_value)
             .await
+            .map(|_| ())
             .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))
     }
 
@@ -80,13 +81,7 @@ impl IndexOps for NonTxnOps {
             .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))
     }
 
-    async fn get_range(
-        &self,
-        start: Vec<u8>,
-        end: Vec<u8>,
-        batch_size: u32,
-        reverse: bool,
-    ) -> Result<RangeIterator> {
+    async fn get_range(&self, start: Vec<u8>, end: Vec<u8>, batch_size: u32, reverse: bool) -> Result<RangeIterator> {
         let start_copy = start.clone();
         let end_copy = end.clone();
         let db_start = DbKey::new(start, &self.key_spec);
@@ -107,22 +102,7 @@ impl IndexOps for NonTxnOps {
         ))
     }
 
-    async fn get_any(&self, start: Vec<u8>, end: Vec<u8>) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        let db_start = DbKey::new(start, &self.key_spec);
-        let db_end = DbKey::new(end, &self.key_spec);
-        let handle = self
-            .btree
-            .query(BtreeKeyRange::new(db_start, true, db_end, false), 1, None, false)
-            .await
-            .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
-        Ok(handle.results().first().map(|(k, v)| (k.clone().into_vec(), v.clone().into_vec())))
-    }
-
-    async fn remove_any(
-        &self,
-        start: Vec<u8>,
-        end: Vec<u8>,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    async fn remove_any(&self, start: Vec<u8>, end: Vec<u8>) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         let db_start = DbKey::new(start, &self.key_spec);
         let db_end = DbKey::new(end, &self.key_spec);
         let handle = self
@@ -134,22 +114,16 @@ impl IndexOps for NonTxnOps {
         drop(handle);
 
         if let Some(key) = maybe_key {
-            let removed = self
-                .btree
-                .remove(&key)
-                .await
-                .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
+            let removed = self.btree.remove(&key).await.map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
             Ok(removed.map(|v| (key.into_vec(), v.into_vec())))
         } else {
             Ok(None)
         }
     }
 
-    fn register_snapshot(&self, _ts: u64) -> Result<u64> {
-        Err(err_not_mvcc("get_snapshot"))
-    }
+    fn register_snapshot(&self) -> Result<u64> { Err(err_not_mvcc("get_snapshot")) }
 
-    fn release_snapshot(&self, _ts: u64, _id: u64) {
+    fn release_snapshot(&self, _ts: u64) {
         // Non-transactional tables have no snapshot registry — no-op.
     }
 

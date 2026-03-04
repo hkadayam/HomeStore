@@ -1,12 +1,13 @@
 //! ShardedBtree: fixed shards + dynamic partition registry.
 //!
-//! Routing: shard_id = hash(key[..partition_key_len]) % num_shards
+//! Routing: shard_id = bytes_to_part_id(key[..partition_key_len]) % num_shards
+//! Registry key = part_id (order-preserving), enabling O(log n) range queries.
 //! Backend dispatch via shard_call! macro — single impl BtreeIndex block.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
-use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::Duration;
 
 use parking_lot::RwLock;
 use smallvec::SmallVec;
@@ -14,8 +15,7 @@ use smallvec::SmallVec;
 use homestore::index::btree::btree::Btree;
 use homestore::index::btree::btree_kvs::{BtreeKey, BtreeValue, Partitionable};
 use homestore::index::btree::btree_types::{BtreeConfig, BtreeError};
-use homestore::index::btree::detail::btree_req::{BtreeKeyRange, GetFilter, PutFilter, QueryResultHandle, RemoveFilter};
-use homestore::index::btree::detail::PutResult;
+use homestore::index::btree::detail::btree_req::{BtreeKeyRange, GetFilter, PutFilter, PutStats, QueryResultHandle, RemoveFilter};
 use homestore::index::btree::UnderlyingBtree;
 
 use super::btree_index::{BtreeIndex, IndexQueryHandle};
@@ -23,6 +23,15 @@ use super::btree_index::{BtreeIndex, IndexQueryHandle};
 /// Default shard count for sync_backend.
 #[cfg(feature = "sync_backend")]
 pub const DEFAULT_NUM_SHARDS: usize = 64;
+
+/// Default maximum number of partition registry entries.
+/// Must be a multiple of DEFAULT_NUM_SHARDS so that shard_id = part_id % num_shards
+/// is consistent (same part_id → same shard).
+pub const DEFAULT_MAX_PARTITIONS: usize = 8192;
+
+/// Maximum number of partition key bytes used for part_id computation and storage.
+/// Capped at 16 so that the full key prefix fits in a u128 for order-preserving quantization.
+pub const MAX_PARTITION_KEY_BYTES: usize = 16;
 
 /// Partition key: leading bytes of a full key used as partition identifier.
 type PartitionKey = SmallVec<[u8; 16]>;
@@ -80,51 +89,77 @@ macro_rules! shard_call {
 }
 
 //==============================================================================
-// Partition — boundary helper for range-clamping
+// bytes_to_part_id — order-preserving linear quantization (u128, up to 16 bytes)
+//
+// Maps partition key bytes to a u32 bucket in [0, max_partitions).
+// Property: key1 ≤ key2 (lexicographically) ⟹ part_id(key1) ≤ part_id(key2).
+// This allows BTreeMap<u32, …> range queries to be used for key-range scans.
+//==============================================================================
+
+fn bytes_to_part_id(bytes: &[u8], max_partitions: usize) -> u32 {
+    if max_partitions <= 1 { return 0; }
+    // Interpret the leading (up to 16) bytes as a big-endian u128.
+    // Shorter keys occupy the high bits; remaining bits are 0.
+    // This preserves lexicographic order within the integer domain.
+    let mut val: u128 = 0;
+    for &b in bytes.iter().take(MAX_PARTITION_KEY_BYTES) {
+        val = (val << 8) | b as u128;
+    }
+    // If the key is shorter than 16 bytes, shift left so it occupies the MSBs.
+    // This ensures [0x01] maps to 0x01_00...00 (128-bit), not 0x01.
+    let actual_len = bytes.len().min(MAX_PARTITION_KEY_BYTES);
+    if actual_len < MAX_PARTITION_KEY_BYTES {
+        val <<= 8 * (MAX_PARTITION_KEY_BYTES - actual_len);
+    }
+    // Linear quantization: divide [0, 2^128) into max_partitions equal buckets.
+    let bucket_size = (u128::MAX / max_partitions as u128).saturating_add(1);
+    (val / bucket_size).min(max_partitions as u128 - 1) as u32
+}
+
+//==============================================================================
+// Partition — boundary helper + bloom-filter hint (unified, replaces old split)
+//
+// One struct holds: the representative partition key bytes (for range clamping
+// and shard routing), plus an approximate live-entry count (bloom-filter hint).
+//
+// Registry entries are Arc<Partition> in BTreeMap<u32, Arc<Partition>>.
+// Temporary "boundary cursor" values (used in put_range and put_range-like
+// walking) are plain owned Partition with count=0, never inserted in the registry.
 //==============================================================================
 
 struct Partition {
-    part_key: PartitionKey,
+    part_key: PartitionKey, // Partition key bytes: prefix of the keys in this partition,
+                            // used for routing and range clamping.
+    shard_id: usize, // Caching the shard_id this partition belongs to, avoid computing it repeatedly from part_key.
+    count: AtomicI64, // Approx. count of live entries in this partition. A hint so that if count is 0, we could
+                      // potentially remove the partition for registry. It would prevent routing to empty partitions.
 }
 
 impl Partition {
-    fn from_key<K: Partitionable>(key: &K, partition_key_len: usize) -> Self {
-        key.with_partition_bytes(|bytes| {
-            let plen = if partition_key_len == 0 { bytes.len() } else { partition_key_len.min(bytes.len()) };
-            Self { part_key: bytes[..plen].iter().copied().collect() }
-        })
+    fn new(part_key: PartitionKey, shard_id: usize) -> Self {
+        Self { part_key, shard_id, count: AtomicI64::new(0) }
     }
 
-    fn from_range<K: Partitionable>(range: &BtreeKeyRange<K>, partition_key_len: usize) -> Self {
-        if partition_key_len == 0 { return Self { part_key: PartitionKey::new() }; }
-        Self::from_key(&range.start_key, partition_key_len)
-    }
-
+    /// The first (smallest) key that belongs to this partition.
     fn first_key<K: BtreeKey>(&self) -> K {
         K::deserialize_from(self.part_key.as_ref(), true)
             .expect("K from partition key")
     }
 
-    fn next(&self) -> Option<Partition> {
+    /// The next partition boundary key (all-bytes increment of part_key), used by clamp_range.
+    fn next_first_key<K: BtreeKey>(&self) -> Option<K> {
         let len = self.part_key.len();
         if len == 0 { return None; }
         let mut nxt = self.part_key.clone();
         for i in (0..len).rev() {
             let (v, carry) = nxt[i].overflowing_add(1);
             nxt[i] = v;
-            if !carry { return Some(Self { part_key: nxt }); }
+            if !carry {
+                return Some(K::deserialize_from(nxt.as_ref(), true).expect("K from next partition key"));
+            }
         }
         None
     }
-
-    fn is_out_of_range<K: BtreeKey>(&self, range: &BtreeKeyRange<K>) -> bool {
-        let first: K = self.first_key();
-        if range.end_incl { first > range.end_key } else { first >= range.end_key }
-    }
-}
-
-impl Hash for Partition {
-    fn hash<H: Hasher>(&self, state: &mut H) { self.part_key.as_ref().hash(state); }
 }
 
 //==============================================================================
@@ -137,10 +172,6 @@ struct Shard<K: 'static + BtreeKey, V: 'static + BtreeValue> {
     reactor_id: usize,
 }
 
-struct PartitionEntry {
-    entry_count: AtomicI64,
-}
-
 /// Pagination handle for ShardedBtree queries.
 pub struct ShardedQueryHandle<K: 'static + BtreeKey, V: 'static + BtreeValue> {
     results: Vec<(K, V)>,
@@ -148,7 +179,9 @@ pub struct ShardedQueryHandle<K: 'static + BtreeKey, V: 'static + BtreeValue> {
     batch_size: u32,
     filter: Option<Arc<dyn GetFilter<K, V>>>,
     reverse: bool,
-    partitions: Vec<PartitionKey>,
+    /// Partitions to iterate (in order). Each entry has the part_key for shard routing
+    /// and range clamping. For single-partition queries this is a temporary Arc (count=0).
+    partitions: Vec<Arc<Partition>>,
     cur_part_idx: usize,
     cur_handle: Option<QueryResultHandle<K, V>>,
 }
@@ -181,9 +214,22 @@ fn to_sharded_query_handle<K: 'static + BtreeKey, V: 'static + BtreeValue>(
 //==============================================================================
 
 pub struct ShardedBtree<K: 'static + Partitionable, V: 'static + BtreeValue> {
-    shards: Vec<Arc<Shard<K, V>>>,
-    registry: RwLock<BTreeMap<PartitionKey, Arc<PartitionEntry>>>,
+    shards: Arc<Vec<Arc<Shard<K, V>>>>,
+    /// Bounded partition registry. Key = part_id = bytes_to_part_id(part_key, max_partitions).
+    /// part_id order ≈ lexicographic key order, so BTreeMap::range enables O(log n) range queries.
+    /// At most max_partitions entries. Stale entries (count ≤ 0) are evicted lazily by
+    /// PartitionCleaner after confirming the btree partition is truly empty.
+    registry: Arc<RwLock<BTreeMap<u32, Arc<Partition>>>>,
     partition_key_len: usize,
+    max_partitions: usize,
+    /// Signals the PartitionCleaner background task to stop on drop.
+    shutdown: Arc<AtomicBool>,
+}
+
+impl<K: 'static + Partitionable, V: 'static + BtreeValue> Drop for ShardedBtree<K, V> {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
 }
 
 //==============================================================================
@@ -227,6 +273,7 @@ impl<K: 'static + Partitionable, V: 'static + BtreeValue> ShardedBtree<K, V> {
     pub async fn new(
         config: BtreeConfig,
         partition_key_len: usize,
+        max_partitions: usize,
         storage_factory: impl Fn(BtreeConfig) -> Box<dyn UnderlyingBtree>,
     ) -> Result<Self, BtreeError> {
         cfg_if::cfg_if! {
@@ -255,7 +302,27 @@ impl<K: 'static + Partitionable, V: 'static + BtreeValue> ShardedBtree<K, V> {
             }
         }
 
-        Ok(Self { shards, registry: RwLock::new(BTreeMap::new()), partition_key_len })
+        // Cap partition_key_len at MAX_PARTITION_KEY_BYTES: bytes beyond the 16-byte boundary
+        // are indistinguishable in the u128 quantization, so they add no routing precision.
+        let partition_key_len = if partition_key_len == 0 {
+            0
+        } else {
+            partition_key_len.min(MAX_PARTITION_KEY_BYTES)
+        };
+        let max_partitions = if max_partitions == 0 { DEFAULT_MAX_PARTITIONS } else { max_partitions };
+
+        let shards = Arc::new(shards);
+        let registry = Arc::new(RwLock::new(BTreeMap::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        Arc::new(PartitionCleaner {
+            shards: Arc::clone(&shards),
+            registry: Arc::clone(&registry),
+            partition_key_len,
+            shutdown: Arc::clone(&shutdown),
+        }).spawn();
+
+        Ok(Self { shards, registry, partition_key_len, max_partitions, shutdown })
     }
 }
 
@@ -266,64 +333,74 @@ impl<K: 'static + Partitionable, V: 'static + BtreeValue> ShardedBtree<K, V> {
 impl<K: 'static + Partitionable, V: 'static + BtreeValue> ShardedBtree<K, V> {
     fn num_shards(&self) -> usize { self.shards.len() }
 
-    fn shard_from_part_key(&self, part_key: &PartitionKey) -> &Arc<Shard<K, V>> {
-        use std::collections::hash_map::DefaultHasher;
-        let mut h = DefaultHasher::new();
-        part_key.as_ref().hash(&mut h);
-        &self.shards[(h.finish() as usize) % self.num_shards()]
-    }
-
     fn get_part_key(&self, key: &K) -> PartitionKey {
         key.with_partition_bytes(|b| {
-            let plen = if self.partition_key_len == 0 { b.len() } else { self.partition_key_len.min(b.len()) };
+            let plen = if self.partition_key_len == 0 {
+                b.len().min(MAX_PARTITION_KEY_BYTES)
+            } else {
+                self.partition_key_len.min(b.len())
+            };
             SmallVec::from_slice(&b[..plen])
         })
     }
 
-    fn get_or_create_entry(&self, part_key: &PartitionKey) -> Arc<PartitionEntry> {
-        if let Some(e) = self.registry.read().get(part_key) { return Arc::clone(e); }
-        Arc::clone(
-            self.registry.write()
-                .entry(part_key.clone())
-                .or_insert_with(|| Arc::new(PartitionEntry { entry_count: AtomicI64::new(0) })),
-        )
+    fn get_part_id(&self, part_key: &PartitionKey) -> u32 {
+        bytes_to_part_id(part_key.as_ref(), self.max_partitions)
     }
 
-    fn decrement_and_cleanup(&self, part_key: &PartitionKey, count: i64) {
-        let maybe_zero = self.registry.read().get(part_key)
-            .map(|e| e.entry_count.fetch_sub(count, Relaxed) - count == 0)
-            .unwrap_or(false);
-        if maybe_zero {
-            let mut map = self.registry.write();
-            if let Some(e) = map.get(part_key) {
-                if e.entry_count.load(Relaxed) == 0 { map.remove(part_key); }
+    /// Route `key` to its partition entry.
+    ///
+    /// `register_if_missing = true`  — write path: check registry, create if absent, bump count.
+    ///                                  Call BEFORE the btree write to close the scan-stability race.
+    /// `register_if_missing = false` — read path: pure math, no registry access. Returns a
+    ///                                  temporary partition with the correct shard_id.
+    fn route(&self, key: &K, register_if_missing: bool) -> Arc<Partition> {
+        let part_key = self.get_part_key(key);
+        let part_id  = self.get_part_id(&part_key);
+        let shard_id = part_id as usize % self.num_shards();
+
+        // Fast path: entry already in registry.
+        {
+            let reg = self.registry.read();
+            if let Some(entry) = reg.get(&part_id) {
+                if register_if_missing { entry.count.fetch_add(1, Ordering::Relaxed); }
+                return entry.clone();
             }
         }
+
+        if !register_if_missing {
+            // Partition not registered: never written to (or evicted). Return temp for routing.
+            // The shard will return None for the key; no count to bump.
+            return Arc::new(Partition::new(part_key, shard_id));
+        }
+
+        // Slow path: create new registry entry (no eviction — PartitionCleaner handles that lazily).
+        let mut reg = self.registry.write();
+        let entry = reg.entry(part_id)
+            .or_insert_with(|| Arc::new(Partition::new(part_key, shard_id)))
+            .clone();
+        entry.count.fetch_add(1, Ordering::Relaxed);
+        entry
     }
 
-    /// List partition keys within [start_part_key, end_part_key] from the registry.
-    fn active_partitions_in_range(&self, start_part_key: &PartitionKey, end_part_key: &PartitionKey) -> Vec<PartitionKey> {
-        self.registry.read()
-            .range(start_part_key.clone()..=end_part_key.clone())
-            .map(|(k, _)| k.clone())
-            .collect()
+    /// Return all registered partitions whose part_id falls in the key range. O(log n + k).
+    fn route_range(&self, range: &BtreeKeyRange<K>) -> Vec<Arc<Partition>> {
+        let start_id = self.get_part_id(&self.get_part_key(&range.start_key));
+        let end_id   = self.get_part_id(&self.get_part_key(&range.end_key));
+        let reg = self.registry.read();
+        reg.range(start_id..=end_id).map(|(_, e)| e.clone()).collect()
     }
 
+    // Clamp the input key range to the partition boundaries
     fn clamp_range(&self, range: &BtreeKeyRange<K>, partition: &Partition) -> BtreeKeyRange<K> {
         if self.partition_key_len == 0 { return range.clone(); }
         let mut ret = range.clone();
         let first: K = partition.first_key();
         if range.start_key < first { ret.start_key = first; ret.start_incl = true; }
-        if let Some(next) = partition.next() {
-            let nf: K = next.first_key();
+        if let Some(nf) = partition.next_first_key::<K>() {
             if range.end_key >= nf { ret.end_key = nf; ret.end_incl = false; }
         }
         ret
-    }
-
-    /// Return the partition at position `idx` in a snapshotted partition list.
-    fn nth_partition(parts: &[PartitionKey], idx: usize) -> Partition {
-        Partition { part_key: parts[idx].clone() }
     }
 
     /// Fill the query handle with the next batch across partitions.
@@ -332,10 +409,9 @@ impl<K: 'static + Partitionable, V: 'static + BtreeValue> ShardedBtree<K, V> {
         while handle.cur_part_idx < handle.partitions.len()
             && (handle.results.len() as u32) < handle.batch_size
         {
-            let part_key = handle.partitions[handle.cur_part_idx].clone();
-            let shard = self.shard_from_part_key(&part_key);
-            let part = Self::nth_partition(&handle.partitions, handle.cur_part_idx);
-            let this_range = self.clamp_range(&handle.input_range, &part);
+            let entry = handle.partitions[handle.cur_part_idx].clone();
+            let shard = &self.shards[entry.shard_id];
+            let this_range = self.clamp_range(&handle.input_range, &entry);
             let remaining = handle.batch_size - handle.results.len() as u32;
             let filter = handle.filter.clone();
             let reverse = handle.reverse;
@@ -361,15 +437,14 @@ impl<K: 'static + Partitionable, V: 'static + BtreeValue> ShardedBtree<K, V> {
 #[cfg_attr(feature = "async_frontend", async_trait::async_trait)]
 #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
 impl<K: 'static + Partitionable, V: 'static + BtreeValue> BtreeIndex<K, V> for ShardedBtree<K, V> {
-    async fn put(&self, key: &K, value: &V) -> Result<(), BtreeError> {
-        let part_key = self.get_part_key(key);
-        let shard = self.shard_from_part_key(&part_key);
-
-        let result = shard_call!(shard, [key, value], put_one(&key, &value, None));
-        if matches!(result, Ok(PutResult::Success)) {
-            self.get_or_create_entry(&part_key).entry_count.fetch_add(1, Relaxed);
+    async fn put(&self, key: &K, value: &V) -> Result<PutStats, BtreeError> {
+        let part = self.route(key, /*register_if_missing=*/true);
+        let result = shard_call!(&self.shards[part.shard_id], [key, value], put_one(&key, &value, None));
+        match &result {
+            Ok(stats) => { part.count.fetch_add(stats.count_delta() - 1, Ordering::Relaxed); }
+            Err(_)    => { part.count.fetch_add(-1, Ordering::Relaxed); }
         }
-        result.map(|_| ())
+        result
     }
 
     async fn put_range(
@@ -377,24 +452,23 @@ impl<K: 'static + Partitionable, V: 'static + BtreeValue> BtreeIndex<K, V> for S
         range: BtreeKeyRange<K>,
         value: &V,
         filter: Option<Arc<dyn PutFilter<K, V>>>,
-    ) -> Result<(), BtreeError> {
-        let mut cur_part = Some(Partition::from_range(&range, self.partition_key_len));
-        while let Some(ref part) = cur_part {
-            if part.is_out_of_range(&range) { break; }
-
-            let this_range = self.clamp_range(&range, part);
-            let shard = self.shard_from_part_key(&part.part_key);
-            shard_call!(shard, [value, filter], put_range(this_range, &value, filter.as_ref().map(|f| f.as_ref())))?;
-            cur_part = part.next();
+    ) -> Result<PutStats, BtreeError> {
+        let mut total = PutStats::default();
+        for part in self.route_range(&range) {
+            let shard = &self.shards[part.shard_id];
+            let this_range = self.clamp_range(&range, &part);
+            let stats = shard_call!(shard, [value, filter], put_range(this_range, &value, filter.as_ref().map(|f| f.as_ref())))?;
+            part.count.fetch_add(stats.count_delta(), Ordering::Relaxed);
+            total.merge(&stats);
         }
-        Ok(())
+        Ok(total)
     }
 
     async fn remove(&self, key: &K) -> Result<Option<V>, BtreeError> {
-        let part_key = self.get_part_key(key);
-        let shard = self.shard_from_part_key(&part_key);
+        let part = self.route(key, false);
+        let shard = &self.shards[part.shard_id];
         let result = shard_call!(shard, [key], remove_one(&key, None));
-        if let Ok(Some(_)) = &result { self.decrement_and_cleanup(&part_key, 1); }
+        if let Ok(Some(_)) = &result { part.count.fetch_add(-1, Ordering::Relaxed); }
         result
     }
 
@@ -403,29 +477,33 @@ impl<K: 'static + Partitionable, V: 'static + BtreeValue> BtreeIndex<K, V> for S
         range: BtreeKeyRange<K>,
         filter: Option<Arc<dyn RemoveFilter<K, V>>>,
     ) -> Result<u32, BtreeError> {
-        let start_part = self.get_part_key(&range.start_key);
-        let end_part = self.get_part_key(&range.end_key);
-
-        let parts = self.active_partitions_in_range(&start_part, &end_part);
         let mut total: u32 = 0;
 
-        for idx in 0..parts.len() {
-            let part = Self::nth_partition(&parts, idx);
-            let shard = self.shard_from_part_key(&parts[idx]);
+        for part in self.route_range(&range) {
+            let shard = &self.shards[part.shard_id];
             let this_range = self.clamp_range(&range, &part);
             let count = shard_call!(shard, [filter], remove_range(this_range, filter.as_ref().map(|f| f.as_ref())))?;
             if count > 0 {
                 total += count;
-                self.decrement_and_cleanup(&parts[idx], count as i64);
+                part.count.fetch_add(-(count as i64), Ordering::Relaxed);
             }
         }
         Ok(total)
     }
 
     async fn get(&self, key: &K) -> Result<Option<V>, BtreeError> {
-        let part_key = self.get_part_key(key);
-        let shard = self.shard_from_part_key(&part_key);
-        shard_call!(shard, [key], get(&key))
+        let part = self.route(key, false);
+        shard_call!(&self.shards[part.shard_id], [key], get(&key))
+    }
+
+    async fn get_first(
+        &self,
+        range: BtreeKeyRange<K>,
+        _filter: Option<Arc<dyn GetFilter<K, V>>>,
+    ) -> Result<Option<(K, V)>, BtreeError> {
+        let part = self.route(&range.start_key, false);
+        let shard = &self.shards[part.shard_id];
+        shard_call!(shard, [range], get_first(range))
     }
 
     async fn query(
@@ -435,9 +513,7 @@ impl<K: 'static + Partitionable, V: 'static + BtreeValue> BtreeIndex<K, V> for S
         filter: Option<Arc<dyn GetFilter<K, V>>>,
         reverse: bool,
     ) -> Result<Box<dyn IndexQueryHandle<K, V>>, BtreeError> {
-        let start_part = self.get_part_key(&range.start_key);
-        let end_part = self.get_part_key(&range.end_key);
-        let partitions = self.active_partitions_in_range(&start_part, &end_part);
+        let partitions = self.route_range(&range);
 
         let mut handle = ShardedQueryHandle {
             results: Vec::new(), input_range: range, batch_size, filter, reverse,
@@ -455,7 +531,7 @@ impl<K: 'static + Partitionable, V: 'static + BtreeValue> BtreeIndex<K, V> for S
         handle.results.clear();
 
         if let Some(inner_h) = handle.cur_handle.take() {
-            let shard = self.shard_from_part_key(&handle.partitions[handle.cur_part_idx]);
+            let shard = &self.shards[handle.partitions[handle.cur_part_idx].shard_id];
             let mut next = shard_call!(shard, [], query_next_batch(inner_h))?;
             handle.results.append(&mut next.results);
 
@@ -473,21 +549,116 @@ impl<K: 'static + Partitionable, V: 'static + BtreeValue> BtreeIndex<K, V> for S
         value: V,
         scan_range: BtreeKeyRange<K>,
         filter: Option<Arc<dyn PutFilter<K, V>>>,
-    ) -> Result<(PutResult, bool), BtreeError> {
+        max_scan: usize,
+    ) -> Result<(PutStats, bool), BtreeError> {
         // Route by scan_range.start_key: all versions of the same user key share identical
         // partition bytes (MvccKey<K: Partitionable> delegates to inner key), so all versions
         // land in the same shard. No cross-shard coordination needed.
         //
         // insert_key is owned (mut) and NOT in the shard_call clone list — it is captured by
         // move into the async block, where &mut insert_key is valid as a local borrow.
-        let part_key = self.get_part_key(&scan_range.start_key);
-        let shard = self.shard_from_part_key(&part_key);
-        let result = shard_call!(shard, [value, scan_range, filter], scan_and_put_one(&mut insert_key, &value, &scan_range, filter.as_ref().map(|f| f.as_ref())));
-        // Register the partition so that query() can find it via active_partitions_in_range.
-        // scan_and_put_one always inserts one new key (MVCC keys are unique per commit_ts).
-        if result.is_ok() {
-            self.get_or_create_entry(&part_key).entry_count.fetch_add(1, Relaxed);
+        // Pre-register BEFORE the btree write (see route() doc for race details).
+        let entry = self.route(&scan_range.start_key, true);
+        let shard = &self.shards[entry.shard_id];
+
+        let result = shard_call!(shard, [value, scan_range, filter], scan_and_put_one(&mut insert_key, &value, &scan_range, filter.as_ref().map(|f| f.as_ref()), max_scan));
+        match &result {
+            Ok((stats, _)) => { entry.count.fetch_add(stats.count_delta() - 1, Ordering::Relaxed); }
+            Err(_)         => { entry.count.fetch_add(-1, Ordering::Relaxed); }
         }
         result
     }
+}
+
+//==============================================================================
+// PartitionCleaner — background task that lazily evicts truly-empty partitions.
+//
+// count is a hint (can go negative with inline GC). If count ≤ 0 we query the
+// actual btree shard to confirm the partition has no data before removing it
+// from the registry. This avoids evicting partitions with live MVCC history.
+//
+// Spawned by ShardedBtree::new(); stopped via `shutdown` flag on Drop.
+// Uses the same cfg_if! pattern as MvccGc::spawn_background: iomgr::spawn for
+// async_backend, std::thread::spawn for sync_backend.
+//==============================================================================
+
+struct PartitionCleaner<K: 'static + Partitionable, V: 'static + BtreeValue> {
+    shards: Arc<Vec<Arc<Shard<K, V>>>>,
+    registry: Arc<RwLock<BTreeMap<u32, Arc<Partition>>>>,
+    partition_key_len: usize,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl<K: 'static + Partitionable, V: 'static + BtreeValue> PartitionCleaner<K, V> {
+    fn spawn(self: Arc<Self>) {
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "async_backend")] {
+                iomgr::spawn(async move {
+                    while !self.shutdown.load(Ordering::Relaxed) {
+                        iomgr::sleep(Duration::from_secs(5)).await;
+                        self.run_cycle().await;
+                    }
+                });
+            } else {
+                std::thread::spawn(move || {
+                    while !self.shutdown.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_secs(5));
+                        self.run_cycle();
+                    }
+                });
+            }
+        }
+    }
+
+    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
+    async fn run_cycle(&self) {
+        // Snapshot all count ≤ 0 candidates under read lock (no write lock held during btree query).
+        let candidates: Vec<(u32, Arc<Partition>)> = {
+            let reg = self.registry.read();
+            reg.iter()
+                .filter(|(_, e)| e.count.load(Ordering::Relaxed) <= 0)
+                .map(|(k, e)| (*k, e.clone()))
+                .collect()
+        };
+
+        for (part_id, entry) in candidates {
+            if self.shutdown.load(Ordering::Relaxed) { break; }
+
+            // Re-check count (a concurrent write may have bumped it since we snapshotted).
+            let count_before = entry.count.load(Ordering::Relaxed);
+            if count_before > 0 { continue; }
+
+            // Build a range covering exactly this partition's key space.
+            let first_key: K = entry.first_key();
+            let end_key = match entry.next_first_key::<K>() {
+                Some(k) => k,
+                None    => continue, // all-0xFF key: can't determine upper bound, skip.
+            };
+            let range = BtreeKeyRange::new(first_key, true, end_key, false);
+            let shard = &self.shards[entry.shard_id];
+
+            // Query with batch_size=1; if result is empty the partition has no live data.
+            let is_empty = shard_call!(shard, [range], query(range, 1, None))
+                .map(|h| h.results.is_empty() && !h.has_more())
+                .unwrap_or(false);
+
+            if is_empty {
+                // Only remove if count has not changed since the query started (no concurrent writes).
+                let count_after = entry.count.load(Ordering::Relaxed);
+                if count_after == count_before {
+                    let mut reg = self.registry.write();
+                    // Re-check under write lock in case a writer sneaked in.
+                    if let Some(e) = reg.get(&part_id) {
+                        if e.count.load(Ordering::Relaxed) <= 0 {
+                            reg.remove(&part_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns `partition_key_len` (kept for potential future use in cleaner logic).
+    #[allow(dead_code)]
+    fn partition_key_len(&self) -> usize { self.partition_key_len }
 }

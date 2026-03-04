@@ -24,7 +24,7 @@ use super::super::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow};
 use super::super::btree::Btree;
 use super::super::btree_types::BtreeError;
 use super::btree_req::{
-    BtreeGetRequest, BtreeGetAnyRequest, BtreeKeyRange, BtreeQueryRequest, QueryResultHandle, GetFilter,
+    BtreeGetRequest, BtreeGetFirstRequest, BtreeKeyRange, BtreeQueryRequest, QueryResultHandle, GetFilter,
     GetFilterDecision,
 };
 
@@ -212,48 +212,47 @@ where
     }
 
     //================================================================================
-    // GET_ANY Implementation (optimization for range queries)
+    // GET_FIRST Implementation (direct descent, no sibling sweep)
     //================================================================================
 
-    /// Get any key in range (returns first found)
-    pub(in super::super) async fn get_any_internal(
+    /// Get first key in range (direct descent, returns first found)
+    pub(in super::super) async fn get_first_internal(
         &self,
-        req: &BtreeGetAnyRequest<K>,
+        req: &BtreeGetFirstRequest<K>,
     ) -> Result<Option<(K, V)>, BtreeError> {
         let _tree_lock = self.lock_tree_shared().await;
         let root_id = self.root_node_id();
         let root = self.read_and_lock_node(root_id, LockType::Read).await?;
 
-        self.get_any_walk(root, req).await
+        self.get_first_walk(root, req).await
     }
 
-    /// Recursive GET_ANY traversal
+    /// Recursive GET_FIRST traversal
     #[cfg_attr(feature = "async_code", async_recursion::async_recursion)]
-    async fn get_any_walk(&self, node: Node, req: &BtreeGetAnyRequest<K>) -> Result<Option<(K, V)>, BtreeError> {
+    async fn get_first_walk(&self, node: Node, req: &BtreeGetFirstRequest<K>) -> Result<Option<(K, V)>, BtreeError> {
         if node.is_leaf() {
-            let result = self.get_any_in_leaf(&node, req.range())?;
-            if let Some((key, value_ref)) = result {
-                let value = value_ref.resolve(self.storage.as_ref(), true).await?;
-                return Ok(Some((key, value)));
+            let (matched, start_idx, _end_idx) = node.match_range::<K, V>(req.range());
+            if !matched {
+                return Ok(None);
             }
-            return Ok(None);
+            let key = node.get_nth_key::<K, V>(start_idx, true);
+            let value_ref = node.get_nth_value::<K, V>(start_idx, true);
+            let value = value_ref.resolve(self.storage.as_ref(), true).await?;
+            return Ok(Some((key, value)));
         }
 
         // Interior node: match range and pick first child
-        let (matched, start_idx, _) = node.match_range::<K, V>(req.range());
-        if !matched {
-            return Ok(None);
-        }
-
+        let (_matched, start_idx, _end_idx) = node.match_range::<K, V>(req.range());
         let child_id = node.get_nth_child_id::<K>(start_idx);
         let child = self.read_and_lock_node(child_id, LockType::Read).await?;
 
         drop(node);
-        self.get_any_walk(child, req).await
+        self.get_first_walk(child, req).await
     }
 
-    /// Get any key-value from leaf in range
-    fn get_any_in_leaf(
+    /// Get first key-value from leaf in range (unused — inlined into get_first_walk above)
+    #[allow(dead_code)]
+    fn get_first_in_leaf(
         &self,
         node: &Node,
         range: &BtreeKeyRange<K>,
@@ -384,7 +383,7 @@ where
         }
 
         // Interior node: find first matching child and descend (C++ lines 119-129)
-        let (_, idx) = my_node.find::<K, V>(&req.first_key());
+        let (_found, idx) = my_node.find::<K, V>(&req.first_key());
         let child_id = my_node.get_nth_child_id::<K>(idx);
         let child = self.read_and_lock_node(child_id, LockType::Read).await?;
 

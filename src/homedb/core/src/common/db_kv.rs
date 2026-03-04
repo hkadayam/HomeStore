@@ -88,10 +88,11 @@ impl Ord for DbKey {
 
 impl std::fmt::Debug for DbKey {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self.fixed_size {
-            Some(size) => write!(f, "DbKey(fixed {} bytes)", size),
-            None => write!(f, "DbKey(var {} bytes)", self.as_bytes().len()),
-        }
+        let bytes = self.as_bytes();
+        write!(f, "[")?;
+        for b in bytes.iter().take(8) { write!(f, "{:02x}", b)?; }
+        if bytes.len() > 8 { write!(f, "..({})", bytes.len())?; }
+        write!(f, "]")
     }
 }
 

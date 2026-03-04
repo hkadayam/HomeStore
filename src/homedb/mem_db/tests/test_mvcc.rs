@@ -262,18 +262,20 @@ mod test_impls {
 
         assert!(registry.is_empty(), "registry should be empty before any snapshots");
 
-        let id1 = registry.register(10);
-        let id2 = registry.register(20);
+        let ts1 = registry.register();
+        let ts2 = registry.register();
+        assert!(ts1 < ts2, "each registration must produce a strictly larger ts");
 
         assert!(!registry.is_empty());
-        assert_eq!(registry.min_active_snapshot_ts(), 10);
+        assert_eq!(registry.min_active_snapshot_ts(), ts1);
 
-        registry.release(10, id1);
-        assert_eq!(registry.min_active_snapshot_ts(), 20);
+        registry.release(ts1);
+        assert_eq!(registry.min_active_snapshot_ts(), ts2);
 
-        registry.release(20, id2);
+        registry.release(ts2);
         assert!(registry.is_empty(), "registry should be empty after all snapshots dropped");
-        assert_eq!(registry.min_active_snapshot_ts(), u64::MAX);
+        // When empty, min_active_snapshot_ts() returns GLOBAL_SEQ (>= ts2 + 1).
+        assert!(registry.min_active_snapshot_ts() > ts2);
     }
 
     // ── 9. Snapshot RAII — Snapshot::drop unregisters via TableIndex ──────
@@ -303,26 +305,27 @@ mod test_impls {
         assert_eq!(index.get(key(1)).await.unwrap(), Some(value(1, 2)));
     }
 
-    // ── 10. Multiple snapshots at same ts (unique-id composite key) ───────
+    // ── 10. Multiple concurrent snapshots — min reflects oldest ──────────
 
     #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
-    pub(super) async fn test_multiple_snapshots_same_ts() {
+    pub(super) async fn test_multiple_snapshots_min_tracking() {
         let registry = SnapshotRegistry::new();
 
-        let ts = 42u64;
-        let id1 = registry.register(ts);
-        let id2 = registry.register(ts);
-        let id3 = registry.register(ts);
+        let ts1 = registry.register();
+        let ts2 = registry.register();
+        let ts3 = registry.register();
+        assert!(ts1 < ts2 && ts2 < ts3);
 
-        assert_eq!(registry.min_active_snapshot_ts(), ts);
+        assert_eq!(registry.min_active_snapshot_ts(), ts1);
 
-        // Release two of the three — min should still be ts (one remains)
-        registry.release(ts, id1);
-        registry.release(ts, id2);
-        assert_eq!(registry.min_active_snapshot_ts(), ts);
+        // Release oldest two — min advances to ts3
+        registry.release(ts1);
+        assert_eq!(registry.min_active_snapshot_ts(), ts2);
+        registry.release(ts2);
+        assert_eq!(registry.min_active_snapshot_ts(), ts3);
 
-        // Release the last one
-        registry.release(ts, id3);
+        // Release last
+        registry.release(ts3);
         assert!(registry.is_empty());
     }
 
@@ -501,7 +504,7 @@ generate_tests!(
     test_snapshot_on_plain_table_errors,
     test_snapshot_drop_deregisters,
     test_snapshot_raii_drop,
-    test_multiple_snapshots_same_ts,
+    test_multiple_snapshots_min_tracking,
     test_inline_gc_no_active_snapshot,
     test_inline_gc_respects_snapshot,
     test_deferred_gc_tombstone_cleanup,

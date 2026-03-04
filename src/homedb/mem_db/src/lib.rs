@@ -37,7 +37,8 @@ mod table_index;
 
 pub use homedb_core::{
     HomeDbError, KeySpec, KeyType, PrefixType, RangeIterator, Result, TableSpec, ValueSpec,
-    MvccGc, MvccGcFilter, MvccKey, MvccValue, Snapshot, SnapshotOps, SnapshotRegistry, GLOBAL_SEQ,
+    MvccDeferredGcFilter, MvccGc, MvccInlineGcFilter, MvccKey, MvccQueryFilter, MvccValue,
+    Snapshot, SnapshotOps, SnapshotRegistry, GLOBAL_SEQ,
 };
 pub use mem_db_macros::reactor_method;
 pub use table_index::{IndexType, TableIndex};

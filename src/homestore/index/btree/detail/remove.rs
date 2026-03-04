@@ -138,19 +138,21 @@ impl<'a, K: BtreeKey + 'static, V: BtreeValue + 'static> RemoveContext<K, V> for
     }
 }
 
-/// Context for range removal (remove all keys in range)
+/// Context for range removal (remove all keys in range).
+///
+/// Owns the `BtreeRangeRemoveRequest` so `execute_on_leaf` can pass it directly
+/// to `multi_remove_from_leaf`, which advances `working_range` after each leaf.
+/// On btree retry (triggered by a node merge), the updated `working_range` causes
+/// `find_child_indices` to skip already-processed leaves.
 struct RemoveRangeContext<'a, K: BtreeKey, V: BtreeValue> {
-    range: &'a BtreeKeyRange<K>,
-    filter: Option<&'a dyn RemoveFilter<K, V>>,
-    _phantom: std::marker::PhantomData<V>,
+    request: BtreeRangeRemoveRequest<'a, K, V>,
 }
 
 #[cfg_attr(feature = "async_code", async_trait::async_trait)]
 #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_code"), async(feature = "async_code"))]
 impl<'a, K: BtreeKey + 'static, V: BtreeValue + 'static> RemoveContext<K, V> for RemoveRangeContext<'a, K, V> {
     async fn execute_on_leaf(&mut self, btree: &Btree<K, V>, leaf: &mut Node) -> Result<u32, BtreeError> {
-        // Remove all matching entries in this leaf (no batch limit)
-        let num_removed = btree.multi_remove_from_leaf(leaf, self.range, u32::MAX, self.filter).await?;
+        let num_removed = btree.multi_remove_from_leaf(leaf, &mut self.request, u32::MAX).await?;
         if num_removed > 0 {
             btree.storage.write_node(leaf).await?;
         }
@@ -158,11 +160,11 @@ impl<'a, K: BtreeKey + 'static, V: BtreeValue + 'static> RemoveContext<K, V> for
     }
 
     fn find_child_indices(&self, interior: &Node) -> (u32, u32) {
-        let (matched, start_idx, end_idx) = interior.match_range::<K, V>(self.range);
+        let (matched, start_idx, end_idx) = interior.match_range::<K, V>(self.request.working_range());
         if !matched {
             return (0, 0);
         }
-        (start_idx, end_idx) // Return FULL range for range operations
+        (start_idx, end_idx)
     }
 }
 
@@ -184,63 +186,56 @@ where
     // Multi-REMOVE: Remove multiple entries from leaf with overflow and filtering
     //================================================================================
 
-    /// Remove multiple entries from leaf node matching range
+    /// Remove multiple entries from leaf node matching the request's working range.
     ///
-    /// Implementation with:
-    /// - Async overflow value resolution
-    /// - Two-phase filtering (check_key, then check_kv)
-    ///
-    /// # Returns
-    /// Number of entries actually removed
+    /// Takes the full `BtreeRangeRemoveRequest` so it can advance `working_range`
+    /// via `shift_working_range_after` after processing the leaf.  On btree retry
+    /// (triggered by a node merge in a later leaf) the caller's `find_child_indices`
+    /// will use the updated working range and skip this already-processed leaf.
     async fn multi_remove_from_leaf(
         &self,
         node: &Node,
-        range: &BtreeKeyRange<K>,
+        request: &mut BtreeRangeRemoveRequest<'_, K, V>,
         max_count: u32,
-        filter: Option<&dyn RemoveFilter<K, V>>,
     ) -> Result<u32, BtreeError> {
         debug_assert!(node.is_leaf(), "Multi remove only for leaf nodes");
 
-        let (matched, start_idx, mut end_idx) = node.match_range::<K, V>(range);
+        let filter = request.filter();
+        let (matched, start_idx, mut end_idx) = node.match_range::<K, V>(request.working_range());
         if !matched {
-            return Ok(0); // No matches, return 0
+            return Ok(0);
         }
+
+        // Capture the last in-range key BEFORE any removal for working range advancement.
+        let last_range_key = node.get_nth_key::<K, V>(end_idx, /* copy= */ true);
 
         let mut removed = 0u32;
         let mut idx = start_idx;
 
-        // Iterate through range entries
         while idx <= end_idx && removed < max_count {
-            let _ = node.get_nth_key::<K, V>(idx, /* copy= */ true);
-
             let (decision, _value) = self.apply_remove_filter(node, idx, filter).await?;
             match decision {
                 RemoveFilterDecision::Remove => {
-                    // Remove existing overflow node if was overflowed
                     if node.is_nth_value_overflow::<K, V>(idx) {
                         let old_val = node.get_nth_value::<K, V>(idx, false);
                         self.storage.delete_overflow(old_val.unwrap_overflow()).await?;
                     }
-
-                    // Remove the entry from the node
                     node.remove::<K, V>(idx)?;
                     removed += 1;
-                    // Entries after idx shifted down; adjust end_idx to match.
-                    // If end_idx was 0 we just removed the only in-range entry — stop.
                     match end_idx.checked_sub(1) {
                         Some(new_end) => end_idx = new_end,
                         None => break,
                     }
-                    // Don't increment idx - the next entry is now at the same position.
                 }
-                RemoveFilterDecision::Skip => {
-                    idx += 1; // Skip this entry
-                }
+                RemoveFilterDecision::Skip => { idx += 1; }
                 RemoveFilterDecision::NeedValue => {
                     panic!("apply_remove_filter returned NeedValue - this should not happen");
                 }
             }
         }
+
+        // Advance working range past this leaf (exclusive) so btree retries skip it.
+        request.shift_working_range_after(last_range_key);
 
         Ok(removed)
     }
@@ -300,11 +295,7 @@ where
         &self,
         req: BtreeRangeRemoveRequest<'a, K, V>,
     ) -> Result<u32, BtreeError> {
-        let mut ctx = RemoveRangeContext::<K, V> {
-            range: req.input_range(),
-            filter: req.filter(),
-            _phantom: std::marker::PhantomData,
-        };
+        let mut ctx = RemoveRangeContext { request: req };
         self.root_walk_for_remove(&mut ctx).await
     }
 
@@ -584,9 +575,10 @@ where
         }
 
         if new_nodes.len() == 0 {
-            debug_assert!(false, "Turns out that commit merge result in all empty nodes");
-            return btree_io_err!(InvalidData,
-                format!("Merge resulted in all empty nodes - leftmost, {} old nodes were empty", old_nodes.len()));
+            // cur_new_node is empty and no old nodes were fully absorbed (copy_only_if_fits
+            // prevented a partial copy because the right sibling is larger than ideal_fill_size).
+            // Nothing was modified — skip this merge attempt.
+            return Ok(false);
         }
 
         if tracing::enabled!(tracing::Level::TRACE) {

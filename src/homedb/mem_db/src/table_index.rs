@@ -4,7 +4,7 @@
 //!   `partition_key_size == 0`  → `UnshardedBtree` (single btree, no sharding)
 //!   `partition_key_size >= 1`  → `ShardedBtree`   (hash-sharded by partition key prefix)
 //!
-//! When `TableSpec::mvcc_supported = true`, the btree stores `MvccKey<DbKey>` /
+//! When `TableSpec::mvcc_enabled = true`, the btree stores `MvccKey<DbKey>` /
 //! `MvccValue<DbValue>` instead of plain `DbKey` / `DbValue`. All existing methods
 //! (put, get, remove, get_range, etc.) return the latest live version. Snapshot-
 //! isolated reads are obtained by calling `TableIndex::get_snapshot(Arc<Self>)`,
@@ -20,10 +20,7 @@
 
 use std::sync::Arc;
 use homestore::index::btree::BtreeConfig;
-use homedb_core::{
-    IndexOps, MvccGc, MvccOps, NonTxnOps,
-    RangeIterator, Snapshot, SnapshotOps, GLOBAL_SEQ,
-};
+use homedb_core::{IndexOps, MvccGc, MvccOps, NonTxnOps, RangeIterator, Snapshot, SnapshotOps};
 use crate::{HomeDbError, KeySpec, KeyType, PrefixType, Result, TableSpec, ValueSpec};
 
 // ============================================================================
@@ -71,15 +68,14 @@ impl TableIndex {
     #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
     pub async fn new(name: String, index_type: IndexType, spec: TableSpec) -> Result<Self> {
         // MVCC always requires VarObjNode (3); plain chooses based on key/value types.
-        let node_variant =
-            if spec.mvcc_supported { 3 } else { Self::determine_node_variant(&spec) };
+        let node_variant = if spec.mvcc_enabled { 3 } else { Self::determine_node_variant(&spec) };
 
         let mut config = BtreeConfig::new(spec.node_size, name.clone());
         config.leaf_node_variant = node_variant;
         config.int_node_variant = node_variant;
 
         // Prefix compression is only meaningful for plain tables.
-        if !spec.mvcc_supported {
+        if !spec.mvcc_enabled {
             if let PrefixType::Prefixable(Some(prefix_size)) = spec.key_spec.prefix_type {
                 config.expected_prefix_size = prefix_size as u16;
             }
@@ -87,20 +83,17 @@ impl TableIndex {
 
         // MvccValue serialized size = 1 (tombstone flag) + user_value_size.
         let raw_value_size = spec.value_spec.max_size() as u32;
-        config.suggest_inline_value_size(
-            if spec.mvcc_supported { 1 + raw_value_size } else { raw_value_size },
-        );
+        config.suggest_inline_value_size(if spec.mvcc_enabled { 1 + raw_value_size } else { raw_value_size });
 
         let node_size = config.node_size;
         let inline_value_size = config.inline_value_size;
         let btree_max_key = config.max_key_size();
         // MVCC key = user_key + 8-byte inv_seq; subtract 8 to get user-facing capacity.
-        let max_key_size =
-            if spec.mvcc_supported { btree_max_key.saturating_sub(8) } else { btree_max_key };
+        let max_key_size = if spec.mvcc_enabled { btree_max_key.saturating_sub(8) } else { btree_max_key };
 
         let spec_max_key = spec.key_spec.max_size() as u32;
         if spec_max_key > max_key_size {
-            return if spec.mvcc_supported {
+            return if spec.mvcc_enabled {
                 Err(HomeDbError::Config(format!(
                     "Key size {} exceeds MVCC btree capacity {} \
                      (node_size={}, inline_value_size={}, 8 bytes reserved for seq_id)",
@@ -114,29 +107,23 @@ impl TableIndex {
             };
         }
 
-        let ops: Arc<dyn IndexOps> = if spec.mvcc_supported {
+        let ops: Arc<dyn IndexOps> = if spec.mvcc_enabled {
             Arc::new(
-                MvccOps::new(
-                    config,
-                    spec.partition_key_size,
-                    spec.key_spec.clone(),
-                    spec.value_spec.clone(),
-                )
-                .await?,
+                MvccOps::new(config, spec.partition_key_size, spec.key_spec.clone(), spec.value_spec.clone(), spec.inline_gc).await?,
             )
         } else {
             Arc::new(
-                NonTxnOps::new(
-                    config,
-                    spec.partition_key_size,
-                    spec.key_spec.clone(),
-                    spec.value_spec.clone(),
-                )
-                .await?,
+                NonTxnOps::new(config, spec.partition_key_size, spec.key_spec.clone(), spec.value_spec.clone()).await?,
             )
         };
 
-        Ok(Self { name, index_type, spec, ops, max_key_size })
+        Ok(Self {
+            name,
+            index_type,
+            spec,
+            ops,
+            max_key_size,
+        })
     }
 
     /// Determine btree node variant for plain (non-MVCC) tables.
@@ -178,18 +165,15 @@ impl TableIndex {
     /// let val  = snap.get(key).await?;
     /// ```
     pub fn get_snapshot(this: Arc<Self>) -> Result<Snapshot> {
-        let ts = GLOBAL_SEQ.load(std::sync::atomic::Ordering::Acquire);
-        let id = this.ops.register_snapshot(ts)?; // Err for NonTxnOps
-        Ok(Snapshot::new(ts, id, this))
+        let ts = this.ops.register_snapshot()?; // bumps GLOBAL_SEQ; Err for NonTxnOps
+        Ok(Snapshot::new(ts, this))
     }
 
     /// Return the deferred GC controller for MVCC tables, or `None` for plain tables.
     ///
     /// Primarily used in tests to drive `run_cycle` directly without waiting for
     /// the background task.
-    pub fn mvcc_gc(&self) -> Option<Arc<MvccGc>> {
-        self.ops.mvcc_gc()
-    }
+    pub fn mvcc_gc(&self) -> Option<Arc<MvccGc>> { self.ops.mvcc_gc() }
 
     // =========================================================================
     // Write operations
@@ -243,12 +227,7 @@ impl TableIndex {
 
     /// Query `[start_key, end_key)`, returning a batch iterator (forward order).
     #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
-    pub async fn get_range(
-        &self,
-        start_key: Vec<u8>,
-        end_key: Vec<u8>,
-        batch_size: u32,
-    ) -> Result<RangeIterator> {
+    pub async fn get_range(&self, start_key: Vec<u8>, end_key: Vec<u8>, batch_size: u32) -> Result<RangeIterator> {
         self.spec.key_spec.validate_key(&start_key)?;
         self.spec.key_spec.validate_key(&end_key)?;
         self.ops.get_range(start_key, end_key, batch_size, false).await
@@ -267,29 +246,14 @@ impl TableIndex {
         self.ops.get_range(start_key, end_key, batch_size, true).await
     }
 
-    /// Return any one key-value pair in `[start_key, end_key)`, or `None`.
-    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
-    pub async fn get_any(
-        &self,
-        start_key: Vec<u8>,
-        end_key: Vec<u8>,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        self.spec.key_spec.validate_key(&start_key)?;
-        self.spec.key_spec.validate_key(&end_key)?;
-        self.ops.get_any(start_key, end_key).await
-    }
-
     /// Remove any one key in `[start_key, end_key)`. Returns the removed pair if found.
     #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
-    pub async fn remove_any(
-        &self,
-        start_key: Vec<u8>,
-        end_key: Vec<u8>,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    pub async fn remove_any(&self, start_key: Vec<u8>, end_key: Vec<u8>) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         self.spec.key_spec.validate_key(&start_key)?;
         self.spec.key_spec.validate_key(&end_key)?;
         self.ops.remove_any(start_key, end_key).await
     }
+
 }
 
 // ============================================================================
@@ -320,7 +284,5 @@ impl SnapshotOps for TableIndex {
         self.ops.snapshot_get_range(start, end, batch_size, reverse, ts).await
     }
 
-    fn release_snapshot(&self, ts: u64, id: u64) {
-        self.ops.release_snapshot(ts, id);
-    }
+    fn release_snapshot(&self, ts: u64) { self.ops.release_snapshot(ts); }
 }

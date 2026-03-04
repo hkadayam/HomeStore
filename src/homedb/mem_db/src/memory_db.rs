@@ -124,16 +124,6 @@ impl MemoryDB {
     }
 
     #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
-    pub async fn get_any(
-        &self,
-        table_name: &str,
-        start_key: Vec<u8>,
-        end_key: Vec<u8>,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        self.get_table(table_name)?.get_any(start_key, end_key).await
-    }
-
-    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
     pub async fn remove_any(
         &self,
         table_name: &str,
@@ -153,7 +143,7 @@ impl MemoryDB {
     /// `snap.get_range(start, end, batch_size).await`, etc. directly on it.
     ///
     /// Returns `Err(InvalidOperation)` if the table was not created with
-    /// `mvcc_supported = true` in its `TableSpec`.
+    /// `mvcc_enabled = true` in its `TableSpec`.
     pub fn get_snapshot(&self, table_name: &str) -> Result<Snapshot> {
         TableIndex::get_snapshot(self.get_table(table_name)?.primary_index())
     }

@@ -548,27 +548,27 @@ impl<Variant: TestBtreeVariant> TestBtree<Variant> {
     }
 
     #[allow(dead_code)]
-    async fn get_any(&mut self, start_key_id: u64, end_key_id: u64) {
+    async fn get_first(&mut self, start_key_id: u64, end_key_id: u64) {
         let (start_key, _) = self.key_gen.generate(Some(start_key_id));
         let (end_key, _) = self.key_gen.generate(Some(end_key_id));
 
-        println!("Get any in range [{}, {}]", start_key_id, end_key_id);
+        println!("Get first in range [{}, {}]", start_key_id, end_key_id);
 
-        match self.btree.get_any(&start_key, &end_key).await {
+        let range = BtreeKeyRange::new(start_key.clone(), true, end_key.clone(), false);
+        match self.btree.get_first(range).await {
             Ok(Some((key, value))) => {
-                // Validate the returned key/value is in shadow map and in range
                 assert!(
                     self.shadow_map.exists_in_range(&key, &start_key, &end_key),
-                    "get_any returned key not in range"
+                    "get_first returned key not in range"
                 );
                 let shadow_value = self.shadow_map.get(&key).expect("Key in btree but not in shadow map");
                 assert_eq!(&value, shadow_value, "Value mismatch for key {:?}", key);
-                println!("get_any found key in range");
+                println!("get_first found key in range");
             }
             Ok(None) => {
-                println!("get_any returned None (no keys in range)");
+                println!("get_first returned None (no keys in range)");
             }
-            Err(e) => panic!("get_any failed: {:?}", e),
+            Err(e) => panic!("get_first failed: {:?}", e),
         }
     }
 

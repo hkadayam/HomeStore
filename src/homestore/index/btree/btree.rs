@@ -56,10 +56,9 @@ use super::btree_node::{BNodeId, Node, NodeCore};
 use super::btree_kvs::{BtreeKey, BtreeValue};
 use super::detail::btree_req::{
     BtreeKeyRange, BtreeRemoveRequest, BtreeRemoveAnyRequest, BtreeRangeRemoveRequest, RemoveFilter, BtreeGetRequest,
-    BtreeGetAnyRequest, BtreeQueryRequest, QueryResultHandle, GetFilter, BtreeSinglePutRequest, BtreeRangePutRequest,
-    BtreePutType, PutFilter,
+    BtreeGetFirstRequest, BtreeQueryRequest, QueryResultHandle, GetFilter, BtreeSinglePutRequest, BtreeRangePutRequest,
+    BtreePutType, PutFilter, PutStats,
 };
-use super::detail::PutResult;
 
 #[inline]
 fn op_counter() -> u64 { GLOBAL_OP_COUNTER.fetch_add(1, Ordering::Relaxed) }
@@ -230,17 +229,14 @@ where
     // Public API Methods
     //================================================================================
 
-    /// Insert or update a single key-value pair (matches C++ Btree::put)
-    ///
-    /// Returns:
-    /// - PutResult::Success if new key was inserted
-    /// - PutResult::Updated if existing key was updated
+    /// Insert or update a single key-value pair.
+    /// Returns `PutStats` with inserted/updated/removed counts.
     #[tracing::instrument(skip(self, key, value, filter),
                           fields(op_id=op_counter(), btree=%self.config.btree_name, key=?key))]
-    pub async fn put_one(&self, key: &K, value: &V, filter: Option<&dyn PutFilter<K, V>>) -> Result<PutResult, BtreeError> {
+    pub async fn put_one(&self, key: &K, value: &V, filter: Option<&dyn PutFilter<K, V>>) -> Result<PutStats, BtreeError> {
         tracing::debug!("Starting put operation");
         let req = BtreeSinglePutRequest::new(key, value, BtreePutType::Upsert, filter);
-        let result = self.put_one_internal(req).await.map(|(r, _)| r);
+        let result = self.put_one_internal(req).await.map(|(stats, _)| stats);
         if result.is_ok() {
             tracing::info!("Put completed");
         } else {
@@ -250,12 +246,11 @@ where
     }
 
     /// Scan-and-put: scan `scan_range` entries within the target leaf, apply `filter` to
-    /// each (inline GC), then stamp `insert_key` via `filter.mutate_key()` inside the leaf
-    /// write lock and insert it.
+    /// each (removes eligible old entries), then stamp `insert_key` via `filter.mutate_key()`
+    /// inside the leaf write lock and insert it.
     ///
-    /// Returns `(PutResult, hit_boundary)`.  `hit_boundary = true` means the `scan_range`
-    /// extended beyond the target leaf; the caller should schedule deferred GC for the
-    /// sibling nodes.
+    /// Returns `(PutStats, hit_boundary)`.  `hit_boundary = true` means the `scan_range`
+    /// extended beyond the target leaf; the caller should schedule deferred cleanup.
     ///
     /// **`insert_key` and `scan_range.start_key` MUST be different objects (no aliasing).**
     #[tracing::instrument(skip(self, insert_key, value, scan_range, filter),
@@ -266,9 +261,10 @@ where
         value: &V,
         scan_range: &BtreeKeyRange<K>,
         filter: Option<&dyn PutFilter<K, V>>,
-    ) -> Result<(PutResult, bool), BtreeError> {
+        max_scan: usize,
+    ) -> Result<(PutStats, bool), BtreeError> {
         tracing::debug!("Starting scan-and-put operation");
-        let req = BtreeSinglePutRequest::new_scan_put(insert_key, value, scan_range, filter);
+        let req = BtreeSinglePutRequest::new_scan_put(insert_key, value, scan_range, filter, max_scan);
         let result = self.put_one_internal(req).await;
         if result.is_ok() {
             tracing::info!("Scan-and-put completed");
@@ -278,27 +274,16 @@ where
         result
     }
 
-    /// Range PUT - Update multiple keys in a range with the same value
-    ///
-    /// Inserts or updates all keys in the range [start, end) with the given value.
-    ///
-    /// # Arguments
-    /// * `start` - Start key (inclusive)
-    /// * `end` - End key (exclusive)
-    /// * `value` - Value to insert/update for all keys in range
-    /// * `filter` - Optional filter function for conditional updates
-    ///
-    /// Returns:
-    /// - PutResult::Success if operation completed successfully
+    /// Range PUT — update or remove entries in a key range per the supplied filter.
+    /// Returns `PutStats` with updated/removed counts across all touched leaves.
     #[tracing::instrument(skip(self, value, filter),
                           fields(op_id=op_counter(), btree=%self.config.btree_name, range=?range))]
-
     pub async fn put_range(
         &self,
         range: BtreeKeyRange<K>,
         value: &V,
         filter: Option<&dyn PutFilter<K, V>>,
-    ) -> Result<(), BtreeError> {
+    ) -> Result<PutStats, BtreeError> {
         tracing::debug!("Starting range put");
         let req = BtreeRangePutRequest::new(range, BtreePutType::Upsert, value, filter);
         let result = self.put_range_internal(req).await;
@@ -415,30 +400,20 @@ where
         result
     }
 
-    /// Get any key-value pair in the given range (optimization, matches C++ Btree::get_any)
-    ///
-    /// Returns the first match found during traversal.
-    /// Useful when you need to check existence or get a sample from a range.
-    ///
-    /// # Arguments
-    /// * `start` - Start key (inclusive)
-    /// * `end` - End key (exclusive)
+    /// Get the first key-value pair in the given range (direct descent, no sibling sweep).
     ///
     /// Returns:
     /// - Some((key, value)) if any key exists in range
     /// - None if range is empty
-    #[tracing::instrument(skip(self, start, end),
-                          fields(op_id=op_counter(), btree=%self.config.btree_name, start=?start, end=?end))]
-
-    pub async fn get_any(&self, start: &K, end: &K) -> Result<Option<(K, V)>, BtreeError> {
-        tracing::debug!(start = ?start, end = ?end, "Starting get_any");
-        let range = BtreeKeyRange::new(start.clone(), true, end.clone(), false);
-        let req = BtreeGetAnyRequest::new(range);
-        let result = self.get_any_internal(&req).await;
+    #[tracing::instrument(skip(self, range),
+                          fields(op_id=op_counter(), btree=%self.config.btree_name))]
+    pub async fn get_first(&self, range: BtreeKeyRange<K>) -> Result<Option<(K, V)>, BtreeError> {
+        let req = BtreeGetFirstRequest::new(range);
+        let result = self.get_first_internal(&req).await;
         match &result {
             Ok(Some((k, _))) => tracing::debug!(key = ?k, "Found key in range"),
             Ok(None) => tracing::debug!("No keys in range"),
-            Err(_) => tracing::warn!("Get_any failed"),
+            Err(_) => tracing::warn!("get_first failed"),
         }
         result
     }

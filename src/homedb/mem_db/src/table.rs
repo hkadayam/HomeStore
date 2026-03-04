@@ -170,12 +170,6 @@ impl Table {
         self.primary_index().get_range_reverse(start_key, end_key, batch_size).await
     }
 
-    /// Get any key-value pair in the given range (convenience method, delegates to primary index)
-    #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
-    pub async fn get_any(&self, start_key: Vec<u8>, end_key: Vec<u8>) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        self.primary_index().get_any(start_key, end_key).await
-    }
-
     /// Remove any key in the given range (convenience method, delegates to primary index)
     #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
     pub async fn remove_any(&self, start_key: Vec<u8>, end_key: Vec<u8>) -> Result<Option<(Vec<u8>, Vec<u8>)>> {

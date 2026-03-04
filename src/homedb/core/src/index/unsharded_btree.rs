@@ -6,8 +6,7 @@ use std::sync::Arc;
 use homestore::index::btree::btree::Btree;
 use homestore::index::btree::btree_kvs::{BtreeKey, BtreeValue};
 use homestore::index::btree::btree_types::{BtreeConfig, BtreeError};
-use homestore::index::btree::detail::PutResult;
-use homestore::index::btree::detail::btree_req::{BtreeKeyRange, GetFilter, PutFilter, QueryResultHandle, RemoveFilter};
+use homestore::index::btree::detail::btree_req::{BtreeKeyRange, GetFilter, PutFilter, PutStats, QueryResultHandle, RemoveFilter};
 use homestore::index::btree::UnderlyingBtree;
 
 use super::btree_index::{BtreeIndex, IndexQueryHandle};
@@ -61,8 +60,8 @@ impl<K: 'static + BtreeKey, V: 'static + BtreeValue> UnshardedBtree<K, V> {
 #[cfg_attr(feature = "async_frontend", async_trait::async_trait)]
 #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
 impl<K: 'static + BtreeKey, V: 'static + BtreeValue> BtreeIndex<K, V> for UnshardedBtree<K, V> {
-    async fn put(&self, key: &K, value: &V) -> Result<(), BtreeError> {
-        self.btree.put_one(key, value, None).await.map(|_| ())
+    async fn put(&self, key: &K, value: &V) -> Result<PutStats, BtreeError> {
+        self.btree.put_one(key, value, None).await
     }
 
     async fn put_range(
@@ -70,7 +69,7 @@ impl<K: 'static + BtreeKey, V: 'static + BtreeValue> BtreeIndex<K, V> for Unshar
         range: BtreeKeyRange<K>,
         value: &V,
         filter: Option<Arc<dyn PutFilter<K, V>>>,
-    ) -> Result<(), BtreeError> {
+    ) -> Result<PutStats, BtreeError> {
         self.btree.put_range(range, value, filter.as_ref().map(|a| a.as_ref())).await
     }
 
@@ -87,6 +86,14 @@ impl<K: 'static + BtreeKey, V: 'static + BtreeValue> BtreeIndex<K, V> for Unshar
     }
 
     async fn get(&self, key: &K) -> Result<Option<V>, BtreeError> { self.btree.get(key).await }
+
+    async fn get_first(
+        &self,
+        range: BtreeKeyRange<K>,
+        _filter: Option<Arc<dyn GetFilter<K, V>>>,
+    ) -> Result<Option<(K, V)>, BtreeError> {
+        self.btree.get_first(range).await
+    }
 
     async fn query(
         &self,
@@ -118,7 +125,8 @@ impl<K: 'static + BtreeKey, V: 'static + BtreeValue> BtreeIndex<K, V> for Unshar
         value: V,
         scan_range: BtreeKeyRange<K>,
         filter: Option<Arc<dyn PutFilter<K, V>>>,
-    ) -> Result<(PutResult, bool), BtreeError> {
-        self.btree.scan_and_put_one(&mut insert_key, &value, &scan_range, filter.as_ref().map(|f| f.as_ref())).await
+        max_scan: usize,
+    ) -> Result<(PutStats, bool), BtreeError> {
+        self.btree.scan_and_put_one(&mut insert_key, &value, &scan_range, filter.as_ref().map(|f| f.as_ref()), max_scan).await
     }
 }

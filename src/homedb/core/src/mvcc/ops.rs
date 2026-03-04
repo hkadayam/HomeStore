@@ -6,12 +6,16 @@
 //!
 //! # Write path
 //! `put` and `remove` use `scan_and_put_one` so that the commit timestamp is
-//! stamped by `MvccGcFilter::mutate_key` **inside the btree leaf write lock**,
-//! and inline GC removes old versions below the oldest active snapshot in the
-//! same `write_node()` call.
+//! stamped by the filter's `mutate_key` **inside the btree leaf write lock**.
 //!
-//! For versions that spill across leaf boundaries, `MvccGcFilter` emits
-//! `GcEvent`s into the `MvccGc` queue for deferred cleanup by the background task.
+//! When `inline_gc = true` (default): `MvccInlineGcFilter` removes stale versions
+//! inline inside the same `write_node()` call, at the cost of calling
+//! `min_active_snapshot_ts()` (gc_fence write lock) on every write.
+//!
+//! When `inline_gc = false`: `MvccDeferredGcFilter` skips inline removal and
+//! enqueues GC candidates for the background task, eliminating gc_fence contention
+//! on the write path. Use `max_scan = 1` so only the most recent existing version
+//! is visited.
 //!
 //! # Read path
 //! `get` queries all versions of a key (newest-first) and returns the first
@@ -20,7 +24,7 @@
 
 use std::sync::Arc;
 use homestore::index::btree::{underlying::mem::MemBtree, BtreeConfig};
-use homestore::index::btree::detail::btree_req::{BtreeKeyRange, PutFilter};
+use homestore::index::btree::detail::btree_req::{BtreeKeyRange, GetFilter};
 use crate::index::btree_index::BtreeIndex;
 use crate::common::db_kv::{DbKey, DbValue};
 use crate::common::error::{HomeDbError, Result};
@@ -28,10 +32,11 @@ use crate::index::index_ops::IndexOps;
 use crate::index::iterator::RangeIterator;
 use crate::common::key_value_spec::{KeySpec, ValueSpec};
 use super::gc::{GcEvent, MvccGc};
-use super::key::{MvccGcFilter, MvccKey, MvccValue};
-use super::snapshot::SnapshotRegistry;
+use super::insert::{MvccDeferredGcFilter, MvccInlineGcFilter};
+use super::key::{MvccKey, MvccValue};
+use super::snapshot::{MvccQueryFilter, SnapshotRegistry};
 use crate::index::unsharded_btree::UnshardedBtree;
-use crate::index::sharded_btree::ShardedBtree;
+use crate::index::sharded_btree::{ShardedBtree, DEFAULT_MAX_PARTITIONS};
 
 pub struct MvccOps {
     pub(crate) btree: Arc<dyn BtreeIndex<MvccKey<DbKey>, MvccValue<DbValue>>>,
@@ -39,6 +44,19 @@ pub struct MvccOps {
     pub(crate) key_spec: KeySpec,
     pub(crate) value_spec: ValueSpec,
     pub(crate) gc: Arc<MvccGc>,
+    /// When `true` (default): use `MvccInlineGcFilter` — removes stale versions inside the
+    /// btree leaf write lock; requires `min_active_snapshot_ts()` on every write and more
+    /// perf penalty to process, but the benefit is huge for persistent backends where you
+    /// could leverage the current writes (including locks) to do the GC work of removing old versions without extra
+    /// read/write cycles.
+    ///
+    /// When `false`: use `MvccDeferredGcFilter` — no inline removal, no gc_fence contention;
+    /// background GC handles all cleanup. Use when write-path latency is critical. Typically beneficial for in-memory
+    /// backends where the cost of deferred GC is lower and you want to minimize write latency, or when your workload
+    /// has a high write-to-read ratio and you want to avoid the overhead of inline GC on every write.
+    ///
+    /// TODO: expose `max_scan: usize` to allow a tunable middle ground.
+    pub inline_gc: bool,
 }
 
 impl MvccOps {
@@ -52,32 +70,37 @@ impl MvccOps {
         partition_key_size: usize,
         key_spec: KeySpec,
         value_spec: ValueSpec,
+        inline_gc: bool,
     ) -> Result<Self> {
-        let btree: Arc<dyn BtreeIndex<MvccKey<DbKey>, MvccValue<DbValue>>> =
-            if partition_key_size == 0 {
-                Arc::new(
-                    UnshardedBtree::<MvccKey<DbKey>, MvccValue<DbValue>>::new(
-                        config,
-                        |c| Box::new(MemBtree::new(&c)),
-                    )
+        let btree: Arc<dyn BtreeIndex<MvccKey<DbKey>, MvccValue<DbValue>>> = if partition_key_size == 0 {
+            Arc::new(
+                UnshardedBtree::<MvccKey<DbKey>, MvccValue<DbValue>>::new(config, |c| Box::new(MemBtree::new(&c)))
                     .await
                     .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?,
+            )
+        } else {
+            Arc::new(
+                ShardedBtree::<MvccKey<DbKey>, MvccValue<DbValue>>::new(
+                    config,
+                    partition_key_size,
+                    DEFAULT_MAX_PARTITIONS,
+                    |c| Box::new(MemBtree::new(&c)),
                 )
-            } else {
-                Arc::new(
-                    ShardedBtree::<MvccKey<DbKey>, MvccValue<DbValue>>::new(
-                        config,
-                        partition_key_size,
-                        |c| Box::new(MemBtree::new(&c)),
-                    )
-                    .await
-                    .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?,
-                )
-            };
+                .await
+                .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?,
+            )
+        };
         let registry = SnapshotRegistry::new();
         let gc = MvccGc::new(Arc::clone(&btree), Arc::clone(&registry), key_spec.clone());
         Arc::clone(&gc).spawn_background();
-        Ok(Self { btree, registry, key_spec, value_spec, gc })
+        Ok(Self {
+            btree,
+            registry,
+            key_spec,
+            value_spec,
+            gc,
+            inline_gc,
+        })
     }
 
     /// Build an `MvccRangeIterator`-backed `RangeIterator` for `[start_key, end_key)`.
@@ -97,16 +120,14 @@ impl MvccOps {
     ) -> Result<RangeIterator> {
         let mvcc_start = MvccKey::placeholder(start_key.clone(), &self.key_spec);
         let mvcc_end = MvccKey::placeholder(end_key.clone(), &self.key_spec);
+        let filter: Arc<dyn GetFilter<MvccKey<DbKey>, MvccValue<DbValue>>> =
+            Arc::new(MvccQueryFilter::new(snapshot_ts));
         let handle = self
             .btree
-            .query(
-                BtreeKeyRange::new(mvcc_start, true, mvcc_end, false),
-                batch_size,
-                None,
-                reverse,
-            )
+            .query(BtreeKeyRange::new(mvcc_start, true, mvcc_end, false), batch_size, Some(filter), reverse)
             .await
             .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
+
         Ok(RangeIterator::new_mvcc(
             Arc::clone(&self.btree),
             handle,
@@ -127,15 +148,24 @@ impl IndexOps for MvccOps {
         let insert_key = MvccKey::placeholder(key.clone(), &self.key_spec);
         let mvcc_val = MvccValue::live(value, &self.value_spec);
         let scan_range = MvccKey::all_versions_for(key, &self.key_spec);
-        let filter = Arc::new(MvccGcFilter::new(
-            self.registry.min_active_snapshot_ts(),
-            Some(Arc::clone(&self.gc.queue)),
-        ));
-        self.btree
-            .scan_and_put_one(insert_key, mvcc_val, scan_range, Some(filter))
-            .await
-            .map(|_| ())
-            .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))
+        if self.inline_gc {
+            let filter = Arc::new(MvccInlineGcFilter::new(
+                self.registry.min_active_snapshot_ts(),
+                Some(Arc::clone(&self.gc.queue)),
+            ));
+            self.btree
+                .scan_and_put_one(insert_key, mvcc_val, scan_range, Some(filter), usize::MAX)
+                .await
+                .map(|_| ())
+                .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))
+        } else {
+            let filter = Arc::new(MvccDeferredGcFilter::new(Some(Arc::clone(&self.gc.queue))));
+            self.btree
+                .scan_and_put_one(insert_key, mvcc_val, scan_range, Some(filter), 1)
+                .await
+                .map(|_| ())
+                .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))
+        }
     }
 
     async fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
@@ -146,6 +176,7 @@ impl IndexOps for MvccOps {
             .query(scan_range, 1, None, false)
             .await
             .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
+
         match handle.results().first() {
             None => Ok(None),
             Some((_, mvcc_val)) => {
@@ -162,18 +193,28 @@ impl IndexOps for MvccOps {
         let insert_key = MvccKey::placeholder(key.clone(), &self.key_spec);
         let tombstone = MvccValue::<DbValue>::tombstone();
         let scan_range = MvccKey::all_versions_for(key.clone(), &self.key_spec);
-        let filter = Arc::new(MvccGcFilter::new(
-            self.registry.min_active_snapshot_ts(),
-            Some(Arc::clone(&self.gc.queue)),
-        ));
-        let filter_dyn: Arc<dyn PutFilter<MvccKey<DbKey>, MvccValue<DbValue>>> = filter.clone();
-        self.btree
-            .scan_and_put_one(insert_key, tombstone, scan_range, Some(filter_dyn))
-            .await
-            .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
+
+        let commit_ts = if self.inline_gc {
+            let filter = Arc::new(MvccInlineGcFilter::new(
+                self.registry.min_active_snapshot_ts(),
+                Some(Arc::clone(&self.gc.queue)),
+            ));
+            self.btree
+                .scan_and_put_one(insert_key, tombstone, scan_range, Some(filter.clone()), usize::MAX)
+                .await
+                .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
+            filter.last_commit_ts.get()
+        } else {
+            let filter = Arc::new(MvccDeferredGcFilter::new(Some(Arc::clone(&self.gc.queue))));
+            self.btree
+                .scan_and_put_one(insert_key, tombstone, scan_range, Some(filter.clone()), 1)
+                .await
+                .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
+            filter.last_commit_ts.get()
+        };
+
         // Tombstone needs deferred GC — emit Add so the background task can eventually
         // remove it (and everything below it) once no snapshot pins it.
-        let commit_ts = filter.last_commit_ts.get();
         self.gc.queue.push(GcEvent::Add {
             key_bytes: DbKey::new(key, &self.key_spec).into_vec(),
             seq_id: commit_ts,
@@ -181,11 +222,7 @@ impl IndexOps for MvccOps {
         Ok(None) // MVCC remove always returns None; caller must get() first if old value needed.
     }
 
-    async fn remove_any(
-        &self,
-        start: Vec<u8>,
-        end: Vec<u8>,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    async fn remove_any(&self, start: Vec<u8>, end: Vec<u8>) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         let found = {
             let mut iter = self.range_iter(start, end, 16, false, u64::MAX).await?;
             iter.next().await?
@@ -195,17 +232,27 @@ impl IndexOps for MvccOps {
             let insert_key = MvccKey::placeholder(key_bytes.clone(), &self.key_spec);
             let tombstone = MvccValue::<DbValue>::tombstone();
             let scan_range = MvccKey::all_versions_for(key_bytes.clone(), &self.key_spec);
-            let filter = Arc::new(MvccGcFilter::new(
-                self.registry.min_active_snapshot_ts(),
-                Some(Arc::clone(&self.gc.queue)),
-            ));
-            let filter_dyn: Arc<dyn PutFilter<MvccKey<DbKey>, MvccValue<DbValue>>> = filter.clone();
-            self.btree
-                .scan_and_put_one(insert_key, tombstone, scan_range, Some(filter_dyn))
-                .await
-                .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
+
+            let commit_ts = if self.inline_gc {
+                let filter = Arc::new(MvccInlineGcFilter::new(
+                    self.registry.min_active_snapshot_ts(),
+                    Some(Arc::clone(&self.gc.queue)),
+                ));
+                self.btree
+                    .scan_and_put_one(insert_key, tombstone, scan_range, Some(filter.clone()), usize::MAX)
+                    .await
+                    .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
+                filter.last_commit_ts.get()
+            } else {
+                let filter = Arc::new(MvccDeferredGcFilter::new(Some(Arc::clone(&self.gc.queue))));
+                self.btree
+                    .scan_and_put_one(insert_key, tombstone, scan_range, Some(filter.clone()), 1)
+                    .await
+                    .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
+                filter.last_commit_ts.get()
+            };
+
             // Emit Add for the tombstone (same logic as remove).
-            let commit_ts = filter.last_commit_ts.get();
             self.gc.queue.push(GcEvent::Add {
                 key_bytes: DbKey::new(key_bytes.clone(), &self.key_spec).into_vec(),
                 seq_id: commit_ts,
@@ -216,47 +263,29 @@ impl IndexOps for MvccOps {
         }
     }
 
-    async fn get_range(
-        &self,
-        start: Vec<u8>,
-        end: Vec<u8>,
-        batch_size: u32,
-        reverse: bool,
-    ) -> Result<RangeIterator> {
+    async fn get_range(&self, start: Vec<u8>, end: Vec<u8>, batch_size: u32, reverse: bool) -> Result<RangeIterator> {
         self.range_iter(start, end, batch_size, reverse, u64::MAX).await
     }
 
-    async fn get_any(&self, start: Vec<u8>, end: Vec<u8>) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        let mut iter = self.range_iter(start, end, 16, false, u64::MAX).await?;
-        iter.next().await
-    }
+    fn register_snapshot(&self) -> Result<u64> { Ok(self.registry.register()) }
 
-    fn register_snapshot(&self, ts: u64) -> Result<u64> {
-        Ok(self.registry.register(ts))
-    }
+    fn release_snapshot(&self, ts: u64) { self.registry.release(ts); }
 
-    fn release_snapshot(&self, ts: u64, id: u64) {
-        self.registry.release(ts, id);
-    }
-
-    fn mvcc_gc(&self) -> Option<Arc<MvccGc>> {
-        Some(Arc::clone(&self.gc))
-    }
+    fn mvcc_gc(&self) -> Option<Arc<MvccGc>> { Some(Arc::clone(&self.gc)) }
 
     async fn snapshot_get(&self, key: Vec<u8>, ts: u64) -> Result<Option<Vec<u8>>> {
         // A snapshot at ts sees versions with seq_id < ts (exclusive).
         // Seeking to inv_seq = !(ts-1) finds the newest version with seq_id ≤ ts-1.
         // ts=0 means nothing was committed before snapshot creation — return None immediately.
-        if ts == 0 { return Ok(None); }
-        let seek_start = MvccKey::seek(key.clone(), &self.key_spec, ts - 1);
-        let range_end = MvccKey::oldest_bound(key, &self.key_spec);
-        let range = BtreeKeyRange::new(seek_start, true, range_end, true);
-        let handle = self
-            .btree
-            .query(range, 1, None, false)
-            .await
-            .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
-        match handle.results().first() {
+        if ts == 0 {
+            return Ok(None);
+        }
+
+        let range_start = MvccKey::newest_since(key.clone(), &self.key_spec, ts - 1);
+        let range_end = MvccKey::oldest(key, &self.key_spec);
+        let range = BtreeKeyRange::new(range_start, true, range_end, true);
+
+        match self.btree.get_first(range, None).await.map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))? {
             None => Ok(None),
             Some((_, mvcc_val)) => {
                 if mvcc_val.is_tombstone() {
@@ -278,10 +307,9 @@ impl IndexOps for MvccOps {
     ) -> Result<RangeIterator> {
         self.range_iter(start, end, batch_size, reverse, ts).await
     }
+
 }
 
 impl Drop for MvccOps {
-    fn drop(&mut self) {
-        self.gc.shutdown();
-    }
+    fn drop(&mut self) { self.gc.shutdown(); }
 }

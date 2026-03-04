@@ -20,12 +20,10 @@
 //! For variable-size inner keys the inv_seq is always the last 8 bytes, so
 //! `deserialize_from` uses `buf.len() - 8` as the inner key boundary.
 
-use std::sync::Arc;
 use homestore::index::btree::btree_kvs::{BtreeKey, BtreeValue, Partitionable};
-use homestore::index::btree::detail::btree_req::{BtreeKeyRange, PutFilter, PutFilterDecision};
+use homestore::index::btree::detail::btree_req::BtreeKeyRange;
 use crate::common::db_kv::{DbKey, DbValue};
 use crate::common::key_value_spec::{KeySpec, ValueSpec};
-use super::gc::{GcEvent, GcQueue};
 
 // ============================================================================
 // MvccKey
@@ -48,29 +46,6 @@ impl<K> MvccKey<K> {
 
     /// The sequence id (commit timestamp) recovered from the stored inverted value.
     pub fn seq_id(&self) -> u64 { !self.inv_seq }
-}
-
-impl<K: BtreeKey> MvccKey<K> {
-    /// Range covering ALL versions of `user_key` (newest to oldest in btree order).
-    ///
-    /// Expressed in seq_id space: from seq_id=u64::MAX (newest) to seq_id=0 (oldest).
-    /// After inversion: inv_seq = !u64::MAX = 0 (start) → inv_seq = !0 = u64::MAX (end).
-    pub fn all_versions_range(user_key: &K) -> BtreeKeyRange<MvccKey<K>> {
-        BtreeKeyRange::new(
-            MvccKey::new(user_key.clone(), u64::MAX), // seq_id=MAX → inv_seq=0 (newest)
-            true,
-            MvccKey::new(user_key.clone(), 0),         // seq_id=0   → inv_seq=MAX (oldest)
-            true,
-        )
-    }
-
-    /// Key to seek to in order to find the latest version with `seq_id ≤ snapshot_ts`.
-    ///
-    /// A forward scan starting at this key returns exactly the version committed
-    /// at or before `snapshot_ts` (the first entry with `inv_seq ≥ !snapshot_ts`).
-    pub fn seek_key(user_key: &K, snapshot_ts: u64) -> MvccKey<K> {
-        MvccKey::new(user_key.clone(), snapshot_ts)
-    }
 }
 
 // --- Clone, PartialEq, Eq, PartialOrd, Ord, Debug ---------------------------
@@ -158,6 +133,37 @@ impl<K: BtreeKey> BtreeKey for MvccKey<K> {
 
     fn get_max_size() -> u32 {
         K::get_max_size() + 8
+    }
+}
+
+impl MvccKey<DbKey> {
+    /// Placeholder insert key — `inv_seq = 0` so `mutate_key` can stamp the real
+    /// `commit_ts` (via `GLOBAL_SEQ.fetch_add`) inside the btree write lock.
+    pub fn placeholder(key_bytes: Vec<u8>, key_spec: &KeySpec) -> Self {
+        Self { inner: DbKey::new(key_bytes, key_spec), inv_seq: 0 }
+    }
+
+    /// Seek key for snapshot-isolated reads: finds the latest version with
+    /// `seq_id ≤ ts` in one forward btree step.
+    pub fn newest_since(key_bytes: Vec<u8>, key_spec: &KeySpec, ts: u64) -> Self {
+        MvccKey::new(DbKey::new(key_bytes, key_spec), ts)
+    }
+
+    /// `BtreeKeyRange` covering all versions of the given user key bytes.
+    pub fn all_versions_for(key_bytes: Vec<u8>, key_spec: &KeySpec) -> BtreeKeyRange<Self> {
+        let key = DbKey::new(key_bytes, key_spec);
+        BtreeKeyRange::new(
+            MvccKey::new(key.clone(), u64::MAX), // seq_id=MAX → inv_seq=0 (newest)
+            true,
+            MvccKey::new(key, 0),         // seq_id=0   → inv_seq=MAX (oldest)
+            true,
+        )
+    }
+
+    /// Range-end bound at seq_id=0 (oldest possible version of this key).
+    /// seq_id=0 → inv_seq = !0 = u64::MAX.
+    pub fn oldest(key_bytes: Vec<u8>, key_spec: &KeySpec) -> Self {
+        Self::new(DbKey::new(key_bytes, key_spec), 0)
     }
 }
 
@@ -278,145 +284,9 @@ impl<V: BtreeValue> BtreeValue for MvccValue<V> {
 // key_spec) or (value_bytes, value_spec) need to be passed in.
 // ============================================================================
 
-impl MvccKey<DbKey> {
-    /// Placeholder insert key — `inv_seq = 0` so `mutate_key` can stamp the real
-    /// `commit_ts` (via `GLOBAL_SEQ.fetch_add`) inside the btree write lock.
-    pub fn placeholder(key_bytes: Vec<u8>, key_spec: &KeySpec) -> Self {
-        Self { inner: DbKey::new(key_bytes, key_spec), inv_seq: 0 }
-    }
-
-    /// Seek key for snapshot-isolated reads: finds the latest version with
-    /// `seq_id ≤ ts` in one forward btree step.
-    pub fn seek(key_bytes: Vec<u8>, key_spec: &KeySpec, ts: u64) -> Self {
-        Self::seek_key(&DbKey::new(key_bytes, key_spec), ts)
-    }
-
-    /// `BtreeKeyRange` covering all versions of the given user key bytes.
-    pub fn all_versions_for(key_bytes: Vec<u8>, key_spec: &KeySpec) -> BtreeKeyRange<Self> {
-        Self::all_versions_range(&DbKey::new(key_bytes, key_spec))
-    }
-
-    /// Range-end bound at seq_id=0 (oldest possible version of this key).
-    /// seq_id=0 → inv_seq = !0 = u64::MAX.
-    pub fn oldest_bound(key_bytes: Vec<u8>, key_spec: &KeySpec) -> Self {
-        Self::new(DbKey::new(key_bytes, key_spec), 0)
-    }
-}
-
 impl MvccValue<DbValue> {
     /// Wrap a live user value — convenience constructor that hides `DbValue::new`.
     pub fn live(value_bytes: Vec<u8>, value_spec: &ValueSpec) -> Self {
         Self::new(DbValue::new(value_bytes, value_spec))
-    }
-}
-
-// ============================================================================
-
-/// `PutFilter` for inline GC during `scan_and_put_one`.
-///
-/// Scans existing versions of a user key (newest-first in btree order) and keeps only
-/// those that are still needed:
-/// - Versions with `seq_id >= min_snap`: kept (some snapshot may need them).
-/// - The **first** version below `min_snap` (the anchor — newest visible to oldest snapshot):
-///   - Inspects the old value via `check_kv` to decide what event to push.
-///   - If the old value is a live entry, pushes `GcEvent::Add` for deferred GC.
-///   - If the old value is a tombstone, pushes nothing (tombstone is tracked by
-///     `MvccOps::remove` / `remove_any` when the tombstone was first written).
-/// - All **subsequent** versions below `min_snap`: removed inline; pushes `GcEvent::Removed`
-///   to cancel any outstanding `Add` for those seq_ids.
-///
-/// The new key's `commit_ts` is stamped via `mutate_key` inside the write lock.
-/// `last_commit_ts` captures that value so `MvccOps` can emit tombstone events.
-///
-/// Concrete over `MvccKey<DbKey>` / `MvccValue<DbValue>` (not generic) because it needs
-/// `DbKey::as_bytes()` to extract inner key bytes for `GcEvent` payloads.
-pub struct MvccGcFilter {
-    /// Minimum active snapshot timestamp.
-    pub min_snap: u64,
-    /// Set to `true` once the anchor has been found. All subsequent older versions are
-    /// shadowed by the anchor and will be removed inline.
-    ///
-    /// Access is always under the btree leaf write lock, so `Cell<bool>` is sufficient.
-    older_than_min_snap: std::cell::Cell<bool>,
-    /// Lock-free queue to push `GcEvent`s into. `None` if GC is not wired up.
-    gc_queue: Option<Arc<GcQueue>>,
-    /// Captures the `commit_ts` stamped by `mutate_key` so `MvccOps` can emit the
-    /// tombstone `GcEvent::Add` after `scan_and_put_one` returns.
-    pub last_commit_ts: std::cell::Cell<u64>,
-}
-
-// Safety: `MvccGcFilter` is only ever accessed under the btree leaf write lock,
-// which provides the necessary mutual exclusion. `Cell` fields are used instead of
-// atomics because no concurrent access occurs.
-unsafe impl Sync for MvccGcFilter {}
-
-impl MvccGcFilter {
-    pub fn new(min_snap: u64, gc_queue: Option<Arc<GcQueue>>) -> Self {
-        Self {
-            min_snap,
-            older_than_min_snap: std::cell::Cell::new(false),
-            gc_queue,
-            last_commit_ts: std::cell::Cell::new(0),
-        }
-    }
-}
-
-impl PutFilter<MvccKey<DbKey>, MvccValue<DbValue>> for MvccGcFilter {
-    fn check_key(&self, key: &MvccKey<DbKey>) -> PutFilterDecision {
-        let seq = key.seq_id();
-        if seq >= self.min_snap {
-            // Too new to GC — some snapshot at or above min_snap may need this version.
-            PutFilterDecision::Keep
-        } else if !self.older_than_min_snap.get() {
-            // First version below min_snap: the anchor.
-            // Need the old value to decide which GcEvent to emit.
-            self.older_than_min_snap.set(true);
-            PutFilterDecision::NeedOldValue
-        } else {
-            // Anchor already found; this older version is shadowed — remove inline.
-            if let Some(ref q) = self.gc_queue {
-                q.push(GcEvent::Removed {
-                    key_bytes: key.inner.as_bytes().to_vec(),
-                    seq_id: seq,
-                });
-            }
-            PutFilterDecision::Remove
-        }
-    }
-
-    /// Called for the anchor position (when `check_key` returned `NeedOldValue`).
-    ///
-    /// - Live anchor: push `GcEvent::Add` so the deferred GC can eventually clean
-    ///   up versions below it.
-    /// - Tombstone anchor: push nothing — the tombstone's own `Add` event was already
-    ///   emitted by `MvccOps::remove` / `remove_any` when the tombstone was written.
-    ///
-    /// In both cases the anchor is kept in the btree.
-    fn check_kv(&self, key: &MvccKey<DbKey>, val: &MvccValue<DbValue>) -> PutFilterDecision {
-        if !val.is_tombstone() {
-            if let Some(ref q) = self.gc_queue {
-                q.push(GcEvent::Add {
-                    key_bytes: key.inner.as_bytes().to_vec(),
-                    seq_id: key.seq_id(),
-                });
-            }
-        }
-        PutFilterDecision::Keep
-    }
-
-    /// Stamp the new key's `inv_seq` with a freshly-acquired `commit_ts`.
-    ///
-    /// Called exactly once, inside the btree leaf write lock. `GLOBAL_SEQ.fetch_add`
-    /// here is the sole atomicity mechanism: readers loading `GLOBAL_SEQ` (Acquire)
-    /// at snapshot creation time see either this `commit_ts` or they don't, depending
-    /// on the ordering w.r.t. this SeqCst fetch_add.
-    ///
-    /// `last_commit_ts` is set so `MvccOps` can read it after `scan_and_put_one`
-    /// returns to emit the tombstone `GcEvent::Add` for remove operations.
-    fn mutate_key(&self, key: &mut MvccKey<DbKey>) {
-        let commit_ts = super::snapshot::GLOBAL_SEQ
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        key.inv_seq = !commit_ts;
-        self.last_commit_ts.set(commit_ts);
     }
 }

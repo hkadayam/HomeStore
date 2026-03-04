@@ -61,14 +61,10 @@ impl KeySpec {
     }
 
     /// Check if this is a fixed-size key
-    pub fn is_fixed(&self) -> bool {
-        matches!(self.key_type, KeyType::Fixed(_))
-    }
+    pub fn is_fixed(&self) -> bool { matches!(self.key_type, KeyType::Fixed(_)) }
 
     /// Check if prefix compression is enabled
-    pub fn is_prefixable(&self) -> bool {
-        matches!(self.prefix_type, PrefixType::Prefixable(_))
-    }
+    pub fn is_prefixable(&self) -> bool { matches!(self.prefix_type, PrefixType::Prefixable(_)) }
 
     /// Validate a key buffer against this spec
     pub fn validate_key(&self, key: &[u8]) -> Result<()> {
@@ -99,14 +95,10 @@ pub enum ValueSpec {
 
 impl ValueSpec {
     /// Create a fixed-size value spec
-    pub fn fixed(size: usize) -> Self {
-        ValueSpec::Fixed(size)
-    }
+    pub fn fixed(size: usize) -> Self { ValueSpec::Fixed(size) }
 
     /// Create a variable-size value spec
-    pub fn variable(max_size: usize) -> Self {
-        ValueSpec::Variable(max_size)
-    }
+    pub fn variable(max_size: usize) -> Self { ValueSpec::Variable(max_size) }
 
     /// Get the maximum value size in bytes
     pub fn max_size(&self) -> usize {
@@ -117,9 +109,7 @@ impl ValueSpec {
     }
 
     /// Check if this is a fixed-size value
-    pub fn is_fixed(&self) -> bool {
-        matches!(self, ValueSpec::Fixed(_))
-    }
+    pub fn is_fixed(&self) -> bool { matches!(self, ValueSpec::Fixed(_)) }
 
     /// Validate a value buffer against this spec
     pub fn validate_value(&self, value: &[u8]) -> Result<()> {
@@ -144,15 +134,18 @@ impl ValueSpec {
 pub struct TableSpec {
     pub key_spec: KeySpec,
     pub value_spec: ValueSpec,
+
     /// Number of leading key bytes that identify a partition (routing prefix).
     /// `0` means no partitioning — a single UnshardedBtree is used.
     /// `>= 1` enables ShardedBtree: keys with the same leading bytes share a shard.
     /// Default is `2`.
     pub partition_key_size: usize,
+
     /// BTree node size in bytes. Larger nodes hold more entries per page, reducing tree
     /// height and cache misses at the cost of higher per-node I/O. Default is 4096.
     /// Inline value threshold is clamped to node_size/32 by BtreeConfig.
     pub node_size: u32,
+
     /// Enable MVCC (key-level snapshot isolation) for this table.
     ///
     /// When `true`, keys are stored as `MvccKey<DbKey>` with a version suffix so multiple
@@ -162,13 +155,31 @@ pub struct TableSpec {
     /// the version visible at the given snapshot's timestamp.
     ///
     /// Default is `false`.
-    pub mvcc_supported: bool,
+    pub mvcc_enabled: bool,
+
+    /// Use inline GC on the write path (only meaningful when `mvcc_enabled = true`).
+    ///
+    /// `true` — `MvccInlineGcFilter`: removes stale versions inside the btree leaf write lock;
+    /// calls `min_active_snapshot_ts()` (gc_fence write lock) on every write. Preferred for
+    /// persistent backends where amortising GC over existing I/O is worthwhile.
+    ///
+    /// `false` (default) — `MvccDeferredGcFilter`: no inline removal; background GC handles
+    /// all cleanup. Eliminates gc_fence contention on the write path. Preferred for in-memory
+    /// backends and write-heavy workloads.
+    pub inline_gc: bool,
 }
 
 impl TableSpec {
     /// Create a new table specification (partition_key_size defaults to 2).
     pub fn new(key_spec: KeySpec, value_spec: ValueSpec) -> Self {
-        Self { key_spec, value_spec, partition_key_size: 2, node_size: 4096, mvcc_supported: false }
+        Self {
+            key_spec,
+            value_spec,
+            partition_key_size: 2,
+            node_size: 4096,
+            mvcc_enabled: false,
+            inline_gc: false,
+        }
     }
 
     /// Create a table spec with fixed-size keys and values (partition_key_size defaults to 2).
@@ -178,7 +189,8 @@ impl TableSpec {
             value_spec: ValueSpec::fixed(value_size),
             partition_key_size: 2,
             node_size: 4096,
-            mvcc_supported: false,
+            mvcc_enabled: false,
+            inline_gc: false,
         }
     }
 
@@ -196,7 +208,13 @@ impl TableSpec {
 
     /// Enable MVCC snapshot isolation (builder-style).
     pub fn mvcc(mut self) -> Self {
-        self.mvcc_supported = true;
+        self.mvcc_enabled = true;
+        self
+    }
+
+    /// Enable inline GC on the MVCC write path (builder-style).
+    pub fn inline_gc(mut self) -> Self {
+        self.inline_gc = true;
         self
     }
 

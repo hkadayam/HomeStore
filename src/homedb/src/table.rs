@@ -192,13 +192,13 @@ impl Table {
         self.primary_index().get_range_reverse(start_key, end_key, batch_size).await
     }
     
-    /// Get any key-value pair in the given range (convenience method, delegates to primary index)
-    pub async fn get_any(
+    /// Get first key-value pair in the given range (convenience method, delegates to primary index)
+    pub async fn get_first(
         &self,
         start_key: Vec<u8>,
         end_key: Vec<u8>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        self.primary_index().get_any(start_key, end_key).await
+        self.primary_index().get_first(start_key, end_key).await
     }
     
     /// Remove any key in the given range (convenience method, delegates to primary index)

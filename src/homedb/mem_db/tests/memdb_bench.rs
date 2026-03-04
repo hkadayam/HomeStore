@@ -72,6 +72,23 @@ struct BenchArgs {
     /// Partition key size in bytes (0 = UnshardedBtree, >=1 = ShardedBtree).
     #[clap(long = "partition-key-size", default_value = "2")]
     partition_key_size: usize,
+
+    /// Enable MVCC snapshot isolation on the table.
+    #[clap(long = "use-mvcc", default_value = "false")]
+    use_mvcc: bool,
+
+    /// Use inline GC (only meaningful when --use-mvcc is set).
+    /// When false (default), uses deferred background GC.
+    #[clap(long = "inline-gc", default_value = "false")]
+    inline_gc: bool,
+
+    /// Preload insertion stride / gap (snake pattern).
+    /// Sequential insertion leaves B-tree nodes ~50% full (every split abandons the left half).
+    /// With stride=256: pass 0 inserts keys 0, 256, 512, ...; pass 1 inserts 769, 513, 257, 1
+    /// (reversed); pass 2 inserts 2, 258, 514, 770 ... filling both sides of every node.
+    /// Set to 1 to disable (pure sequential).
+    #[clap(long = "preload-stride", default_value = "256")]
+    preload_stride: u64,
 }
 
 //================================================================================
@@ -143,38 +160,94 @@ async fn run_benchmark(args: BenchArgs) {
     let btree_mode = if args.partition_key_size == 0 { "concurrent (no sharding)" } else { "sharded" };
     println!("  BTree mode: {} (partition_key_size={})", btree_mode, args.partition_key_size);
     println!("  Node size: {} bytes (inline value cap: {} bytes)", args.node_size, args.node_size / 32);
+    let mvcc_mode = if !args.use_mvcc { "disabled" } else if args.inline_gc { "inline GC" } else { "deferred GC" };
+    println!("  MVCC: {}", mvcc_mode);
+    let stride_desc = if args.preload_stride <= 1 { "sequential (stride=1)".to_string() } else { format!("snake (stride={})", args.preload_stride) };
+    println!("  Preload order: {}", stride_desc);
     println!();
 
-    // Create MemoryDB — passes num_reactors so MemoryDB can init IOManager internally.
-    // In sync_backend mode the parameter is ignored; in async_backend mode it sets reactor count.
     let db = MemoryDB::new(args.workers).expect("Failed to create MemoryDB");
 
-    // Create multiple tables (like RocksDB Column Families)
     let mut tables = Vec::new();
 
     println!("Creating {} tables...", args.num_tables);
     for i in 0..args.num_tables {
         let table_name = format!("benchmark_{}", i);
-        let spec = TableSpec::fixed_kv(args.key_size, args.value_size)
+        let mut spec = TableSpec::fixed_kv(args.key_size, args.value_size)
             .partition_key_size(args.partition_key_size)
             .node_size(args.node_size);
+        if args.use_mvcc { spec = spec.mvcc(); if args.inline_gc { spec = spec.inline_gc(); } }
         let table = db.create_table(&table_name, spec).await.unwrap();
         tables.push(table);
     }
 
-    // Phase 1: Preload each table
+    // Phase 1: Parallel preload — divide the flat key space [0, preload) across workers.
+    // Global key k maps to: table_idx = k / preload_per_table, key_id = k.
+    // Within each worker's slice the snake pattern is applied (stride sub-passes, alternating direction).
     let preload_per_table = args.preload / args.num_tables as u64;
-    println!("Phase 1: Preloading {} keys per table ({} total)...", preload_per_table, args.preload);
+    println!("Phase 1: Preloading {} keys per table ({} total) using {} parallel workers...",
+        preload_per_table, args.preload, args.workers);
     let preload_start = Instant::now();
 
-    for (table_idx, table) in tables.iter().enumerate() {
-        let start_key = table_idx as u64 * preload_per_table;
-        for i in 0..preload_per_table {
-            let key_id = start_key + i;
-            let key = generate_key(key_id, args.key_size);
-            let value = generate_value(key_id, args.value_size);
-            table.put(key, value).await.unwrap();
+    {
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "sync_frontend")] {
+                let mut bg_pre = BackgroundTasks::new();
+            } else if #[cfg(feature = "async_frontend")] {
+                let bg_pre = BackgroundTasks::new();
+            }
         }
+
+        let total_keys = preload_per_table * args.num_tables as u64;
+        let chunk = total_keys.div_ceil(args.workers as u64);
+        let stride = args.preload_stride.max(1);
+        let ppt = preload_per_table;
+
+        for worker_id in 0..args.workers {
+            let g_start = (worker_id as u64 * chunk).min(total_keys);
+            let g_end = ((worker_id as u64 + 1) * chunk).min(total_keys);
+            if g_start >= g_end { continue; }
+
+            let tables_w: Vec<_> = tables.iter().map(Arc::clone).collect();
+            let key_size = args.key_size;
+            let value_size = args.value_size;
+
+            #[cfg(feature = "async_frontend")]
+            bg_pre.spawn(ReactorTarget::Reactor(worker_id), async move {
+                let count = g_end - g_start;
+                let cols = count.div_ceil(stride);
+                for i in 0..count {
+                    let pass = i % stride;
+                    let step = i / stride;
+                    let snake_step = if pass % 2 == 0 { step } else { cols.saturating_sub(1).saturating_sub(step) };
+                    let offset = (pass + snake_step * stride).min(count - 1);
+                    let key_id = g_start + offset;
+                    let table_idx = (key_id / ppt) as usize;
+                    let key = generate_key(key_id, key_size);
+                    let value = generate_value(key_id, value_size);
+                    let _ = tables_w[table_idx].put(key, value).await;
+                }
+            });
+
+            #[cfg(feature = "sync_frontend")]
+            bg_pre.spawn(ReactorTarget::Reactor(worker_id), move || {
+                let count = g_end - g_start;
+                let cols = count.div_ceil(stride);
+                for i in 0..count {
+                    let pass = i % stride;
+                    let step = i / stride;
+                    let snake_step = if pass % 2 == 0 { step } else { cols.saturating_sub(1).saturating_sub(step) };
+                    let offset = (pass + snake_step * stride).min(count - 1);
+                    let key_id = g_start + offset;
+                    let table_idx = (key_id / ppt) as usize;
+                    let key = generate_key(key_id, key_size);
+                    let value = generate_value(key_id, value_size);
+                    let _ = tables_w[table_idx].put(key, value);
+                }
+            });
+        }
+
+        bg_pre.join_all().await;
     }
 
     let preload_elapsed = preload_start.elapsed();
@@ -199,14 +272,12 @@ async fn run_benchmark(args: BenchArgs) {
     let concurrent_start = Instant::now();
 
     for worker_id in 0..args.workers {
-        // Each worker is assigned to a specific table (round-robin)
-        // This simulates RocksDB's Column Family isolation
         let table_idx = worker_id % args.num_tables;
         let table = Arc::clone(&tables[table_idx]);
 
         let start_op = worker_id as u64 * ops_per_worker;
         let end_op = if worker_id == args.workers - 1 {
-            args.ops // Last worker takes remaining
+            args.ops
         } else {
             start_op + ops_per_worker
         };
@@ -263,19 +334,15 @@ async fn run_benchmark(args: BenchArgs) {
     );
     println!();
 
-    // Summary
     println!("=== PERFORMANCE SUMMARY ===");
     println!("Preload (sequential):   {:.0} ops/sec", preload_ops_per_sec);
     println!("Concurrent ({} workers): {:.0} ops/sec", args.workers, concurrent_ops_per_sec);
     println!("Speedup: {:.2}x", concurrent_ops_per_sec / preload_ops_per_sec);
 }
 
-// Helper functions to generate keys and values
 fn generate_key(id: u64, size: usize) -> Vec<u8> {
     let mut key = vec![0u8; size];
-    // Store the ID in the first 8 bytes for uniqueness and ordering
     key[0..8].copy_from_slice(&id.to_le_bytes());
-    // Fill the rest with a pattern based on the ID for variety
     for i in 8..size.min(key.len()) {
         key[i] = ((id.wrapping_mul(31).wrapping_add(i as u64)) % 256) as u8;
     }
@@ -284,9 +351,7 @@ fn generate_key(id: u64, size: usize) -> Vec<u8> {
 
 fn generate_value(id: u64, size: usize) -> Vec<u8> {
     let mut value = vec![0u8; size];
-    // Store the ID in the first 8 bytes
     value[0..8].copy_from_slice(&id.to_le_bytes());
-    // Fill the rest with a pattern based on the ID
     for i in 8..size.min(value.len()) {
         value[i] = ((id.wrapping_mul(37).wrapping_add(i as u64)) % 256) as u8;
     }

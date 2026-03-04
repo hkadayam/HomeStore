@@ -23,6 +23,11 @@
 
 use std::io;
 use std::ops::Deref;
+use std::sync::atomic::AtomicBool;
+
+/// When `true`, `get_first_walk` and `sweep_query_walk` emit per-node trace lines to stderr.
+/// Toggle via `TableIndex::enable_btree_trace(bool)` before diagnostic queries.
+pub static BTREE_TRACE: AtomicBool = AtomicBool::new(false);
 
 //================================================================================
 // BtreeBuffer - Abstraction over IOBuffer (persistent) and Vec<u8> (inmem)

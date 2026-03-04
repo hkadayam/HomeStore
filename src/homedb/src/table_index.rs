@@ -10,6 +10,8 @@ use homestore::index::btree::{
     btree_kvs::{BtreeKey, BtreeValue},
     underlying::mem::MemBtree,
 };
+use homestore::index::btree::detail::btree_req::BtreeKeyRange;
+
 use crate::{
     key_value_spec::TableSpec,
     error::{HomeDbError, Result},
@@ -474,9 +476,7 @@ impl TableIndex {
         start_key: Vec<u8>,
         end_key: Vec<u8>,
         batch_size: u32,
-    ) -> Result<crate::iterator::RangeIterator> {
-        use homestore::index::btree::detail::btree_req::BtreeKeyRange;
-        
+    ) -> Result<crate::iterator::RangeIterator> {     
         // Validate keys
         self.spec.key_spec.validate_key(&start_key)?;
         self.spec.key_spec.validate_key(&end_key)?;
@@ -512,8 +512,6 @@ impl TableIndex {
         end_key: Vec<u8>,
         batch_size: u32,
     ) -> Result<crate::iterator::RangeIterator> {
-        use homestore::index::btree::detail::btree_req::BtreeKeyRange;
-        
         // Validate keys
         self.spec.key_spec.validate_key(&start_key)?;
         self.spec.key_spec.validate_key(&end_key)?;
@@ -544,7 +542,7 @@ impl TableIndex {
     /// - `start_key`: Start of range (inclusive)
     /// - `end_key`: End of range (exclusive)
     #[crate::reactor_method]
-    pub async fn get_any(
+    pub async fn get_first(
         &self,
         start_key: Vec<u8>,
         end_key: Vec<u8>,
@@ -552,16 +550,17 @@ impl TableIndex {
         // Validate keys
         self.spec.key_spec.validate_key(&start_key)?;
         self.spec.key_spec.validate_key(&end_key)?;
-        
+
         // Create keys with spec info (moved)
         let start = DbKey::new(start_key, &self.spec.key_spec);
         let end = DbKey::new(end_key, &self.spec.key_spec);
-        
+
+        let range = BtreeKeyRange::new(start, true, end, false);
         let result = self.btree
-            .get_any(&start, &end)
+            .get_first(range)
             .await
             .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
-        
+
         Ok(result.map(|(k, v)| (k.into_vec(), v.into_vec())))
     }
     
@@ -577,9 +576,7 @@ impl TableIndex {
         &self,
         start_key: Vec<u8>,
         end_key: Vec<u8>,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        use homestore::index::btree::detail::btree_req::BtreeKeyRange;
-        
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {       
         // Validate keys
         self.spec.key_spec.validate_key(&start_key)?;
         self.spec.key_spec.validate_key(&end_key)?;

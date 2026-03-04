@@ -8,9 +8,11 @@ use std::sync::Arc;
 
 use homestore::index::btree::detail::btree_req::BtreeKeyRange;
 
+use homestore::index::btree::detail::btree_req::GetFilter;
 use super::btree_index::{BtreeIndex, IndexQueryHandle};
 use crate::common::db_kv::{DbKey, DbValue};
 use crate::mvcc::key::{MvccKey, MvccValue};
+use crate::mvcc::snapshot::MvccQueryFilter;
 use crate::common::error::{HomeDbError, Result};
 use crate::common::key_value_spec::KeySpec;
 
@@ -127,7 +129,6 @@ struct MvccRangeIterator {
     handle: Option<Box<dyn IndexQueryHandle<MvccKey<DbKey>, MvccValue<DbValue>>>>,
     current_batch: Vec<(MvccKey<DbKey>, MvccValue<DbValue>)>,
     snapshot_ts: u64,
-    last_user_key: Option<DbKey>,
     start_key: Vec<u8>,
     end_key: Vec<u8>,
     batch_size: u32,
@@ -155,7 +156,6 @@ impl MvccRangeIterator {
             handle: if has_more { Some(handle) } else { None },
             current_batch: results,
             snapshot_ts,
-            last_user_key: None,
             start_key,
             end_key,
             batch_size,
@@ -167,35 +167,12 @@ impl MvccRangeIterator {
     #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
     async fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         loop {
-            // Drain the current batch with MVCC filtering.
-            while !self.current_batch.is_empty() {
+            // The MvccQueryFilter passed at query time already removed all MVCC duplicates,
+            // too-new versions, and tombstones.  Drain the batch as plain key-value pairs.
+            if !self.current_batch.is_empty() {
                 let (mvcc_key, mvcc_val) = self.current_batch.remove(0);
-
-                // Skip entries that are at or newer than the snapshot (exclusive upper bound).
-                // A snapshot at ts sees versions with seq_id < ts only.
-                if mvcc_key.seq_id() >= self.snapshot_ts {
-                    continue;
-                }
-
-                // If we already resolved this user key in a previous iteration, skip all
-                // remaining versions of it (they are older and would be shadowed).
-                if self.last_user_key.as_ref() == Some(&mvcc_key.inner) {
-                    continue;
-                }
-
-                // First visible version for this user key — record it.
-                self.last_user_key = Some(mvcc_key.inner.clone());
-
-                if mvcc_val.is_tombstone() {
-                    // Key is deleted at or before snapshot_ts — skip the key.
-                    continue;
-                }
-
-                // Live version — emit (user_key_bytes, value_bytes).
                 let user_key_bytes = mvcc_key.inner.into_vec();
-                let value_bytes = mvcc_val.into_inner()
-                    .map(|v| v.into_vec())
-                    .unwrap_or_default();
+                let value_bytes = mvcc_val.into_inner().map(|v| v.into_vec()).unwrap_or_default();
                 return Ok(Some((user_key_bytes, value_bytes)));
             }
 
@@ -219,7 +196,6 @@ impl MvccRangeIterator {
     async fn seek(&mut self, key: &[u8]) -> Result<bool> {
         self.handle = None;
         self.current_batch.clear();
-        self.last_user_key = None;
 
         // Build the MvccKey seek target: (user_key, inv_seq=0) → newest version of user_key.
         let user_key = DbKey::new(key.to_vec(), &self.key_spec);
@@ -236,9 +212,11 @@ impl MvccRangeIterator {
         };
 
         let range = BtreeKeyRange::new(range_start, true, range_end, self.reverse);
+        let filter: Arc<dyn GetFilter<MvccKey<DbKey>, MvccValue<DbValue>>> =
+            Arc::new(MvccQueryFilter::new(self.snapshot_ts));
         let new_handle = self
             .index
-            .query(range, self.batch_size, None, self.reverse)
+            .query(range, self.batch_size, Some(filter), self.reverse)
             .await
             .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
 

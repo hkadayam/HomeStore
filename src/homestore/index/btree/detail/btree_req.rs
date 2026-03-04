@@ -149,6 +149,31 @@ pub enum BtreePutType {
     Upsert,
 }
 
+/// Statistics returned by every PUT operation.
+///
+/// All counts are non-negative. `count_delta()` gives the net change in the
+/// number of entries (positive = more entries, negative = fewer).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PutStats {
+    /// Number of new keys inserted.
+    pub inserted: u32,
+    /// Number of existing keys whose value was updated.
+    pub updated: u32,
+    /// Number of existing keys removed by the caller's PutFilter.
+    pub removed: u32,
+}
+
+impl PutStats {
+    /// Net entry-count delta: inserted - removed.
+    pub fn count_delta(&self) -> i64 { self.inserted as i64 - self.removed as i64 }
+
+    pub fn merge(&mut self, other: &PutStats) {
+        self.inserted += other.inserted;
+        self.updated += other.updated;
+        self.removed += other.removed;
+    }
+}
+
 /// Base trait for all btree requests (matches C++ BtreeRequest)
 ///
 /// Provides common methods needed for split decisions and operation type identification.
@@ -237,6 +262,17 @@ impl<K: BtreeKey> BtreeRangeRequest<K> {
         self.working_range.end_key = self.input_range.end_key.clone();
         self.working_range.end_incl = self.input_range.end_incl;
     }
+
+    /// Advance the working range to start AFTER `last_processed_key` (exclusive).
+    ///
+    /// Used after finishing a leaf so that on btree retry (triggered by a node
+    /// merge in a later leaf) the already-processed leaf is not revisited.
+    pub fn shift_working_range_after(&mut self, last_processed_key: K) {
+        self.working_range.start_key = last_processed_key;
+        self.working_range.start_incl = false; // exclusive: skip the last processed key
+        self.working_range.end_key = self.input_range.end_key.clone();
+        self.working_range.end_incl = self.input_range.end_incl;
+    }
 }
 
 /// Sub-struct for scan-and-put mode.
@@ -250,6 +286,10 @@ pub struct ScanPutInfo<'a, K: BtreeKey> {
     pub insert_key: &'a mut K,
     /// Range scanned within the target leaf for inline GC before the new key is inserted.
     pub scan_range: &'a BtreeKeyRange<K>,
+    /// Maximum number of existing entries to inspect during the scan (inline GC depth).
+    /// Pass `usize::MAX` for full inline GC; pass `1` to only capture the latest version
+    /// for deferred GC without removing anything inline.
+    pub max_scan: usize,
 }
 
 /// Discriminates between a direct single-key PUT and a scan-and-put.
@@ -267,6 +307,8 @@ pub struct BtreeSinglePutRequest<'a, K: BtreeKey, V: BtreeValue> {
     value: &'a V,
     put_type: BtreePutType,
     filter: Option<&'a dyn PutFilter<K, V>>,
+    /// Accumulated operation statistics (updated in-place by leaf functions).
+    pub stats: PutStats,
 }
 
 // Safety: BtreeSinglePutRequest can be Send when K and V are Send
@@ -275,7 +317,7 @@ unsafe impl<'a, K: BtreeKey + Send, V: BtreeValue + Send> Send for BtreeSinglePu
 impl<'a, K: BtreeKey, V: BtreeValue> BtreeSinglePutRequest<'a, K, V> {
     /// Create a direct single PUT request.
     pub fn new(key: &'a K, value: &'a V, put_type: BtreePutType, filter: Option<&'a dyn PutFilter<K, V>>) -> Self {
-        Self { kind: SinglePutKind::DirectPut(key), value, put_type, filter }
+        Self { kind: SinglePutKind::DirectPut(key), value, put_type, filter, stats: PutStats::default() }
     }
 
     /// Create a scan-and-put request.
@@ -290,12 +332,14 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeSinglePutRequest<'a, K, V> {
         value: &'a V,
         scan_range: &'a BtreeKeyRange<K>,
         filter: Option<&'a dyn PutFilter<K, V>>,
+        max_scan: usize,
     ) -> Self {
         Self {
-            kind: SinglePutKind::ScanPut(ScanPutInfo { insert_key, scan_range }),
+            kind: SinglePutKind::ScanPut(ScanPutInfo { insert_key, scan_range, max_scan }),
             value,
             put_type: BtreePutType::Insert,
             filter,
+            stats: PutStats::default(),
         }
     }
 
@@ -321,14 +365,17 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeSinglePutRequest<'a, K, V> {
     ///
     /// `filter` and `value` are copied out before the mutable borrow of `self.kind` so
     /// they carry the independent `'a` lifetime.
-    pub fn scan_put_info_mut(&mut self) -> Option<(&mut K, &'a BtreeKeyRange<K>, Option<&'a dyn PutFilter<K, V>>, &'a V)> {
+    pub fn scan_put_info_mut(&mut self) -> Option<(&mut K, &'a BtreeKeyRange<K>, Option<&'a dyn PutFilter<K, V>>, &'a V, usize)> {
         let filter = self.filter; // Copy out 'a-lifetime refs before borrowing kind
         let value = self.value;
         match &mut self.kind {
-            SinglePutKind::ScanPut(info) => Some((&mut *info.insert_key, info.scan_range, filter, value)),
+            SinglePutKind::ScanPut(info) => Some((&mut *info.insert_key, info.scan_range, filter, value, info.max_scan)),
             _ => None,
         }
     }
+
+    /// Consume the request and return the accumulated statistics.
+    pub fn into_stats(self) -> PutStats { self.stats }
 
     /// Key size for split-needed checks: uses `insert_key` size in scan-and-put mode.
     pub fn key_size(&self) -> u32 {
@@ -357,6 +404,8 @@ pub struct BtreeRangePutRequest<'a, K: BtreeKey, V: BtreeValue> {
     put_type: BtreePutType,
     value: &'a V,
     filter: Option<&'a dyn PutFilter<K, V>>,
+    /// Accumulated operation statistics (updated in-place by leaf functions).
+    pub stats: PutStats,
 }
 
 impl<'a, K: BtreeKey, V: BtreeValue> BtreeRangePutRequest<'a, K, V> {
@@ -379,6 +428,7 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeRangePutRequest<'a, K, V> {
             put_type,
             value,
             filter,
+            stats: PutStats::default(),
         }
     }
 
@@ -405,6 +455,9 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeRangePutRequest<'a, K, V> {
     pub fn value_size(&self) -> u32 { self.value.serialized_size() }
 
     pub fn filter(&self) -> Option<&'a dyn PutFilter<K, V>> { self.filter }
+
+    /// Consume the request and return the accumulated statistics.
+    pub fn into_stats(self) -> PutStats { self.stats }
 }
 
 impl<'a, K: BtreeKey, V: BtreeValue> BtreeRequest for BtreeRangePutRequest<'a, K, V> {
@@ -475,13 +528,13 @@ impl<'a, K: BtreeKey> BtreeGetRequest<'a, K> {
 }
 
 /// Get any key in range request. Returns the first key-value pair found in the range
-pub struct BtreeGetAnyRequest<K: BtreeKey> {
+pub struct BtreeGetFirstRequest<K: BtreeKey> {
     range: BtreeKeyRange<K>,
 }
 
-unsafe impl<K: BtreeKey + Send> Send for BtreeGetAnyRequest<K> {}
+unsafe impl<K: BtreeKey + Send> Send for BtreeGetFirstRequest<K> {}
 
-impl<K: BtreeKey> BtreeGetAnyRequest<K> {
+impl<K: BtreeKey> BtreeGetFirstRequest<K> {
     pub fn new(range: BtreeKeyRange<K>) -> Self { Self { range } }
 
     pub fn range(&self) -> &BtreeKeyRange<K> { &self.range }
@@ -670,6 +723,8 @@ impl<'a, K: BtreeKey, V: BtreeValue> BtreeRangeRemoveRequest<'a, K, V> {
     pub fn trim_working_range(&mut self, end_key: K, end_incl: bool) { self.base.trim_working_range(end_key, end_incl) }
 
     pub fn shift_working_range(&mut self, new_start_key: Option<K>) { self.base.shift_working_range(new_start_key) }
+
+    pub fn shift_working_range_after(&mut self, last_processed_key: K) { self.base.shift_working_range_after(last_processed_key) }
 }
 
 #[cfg(test)]

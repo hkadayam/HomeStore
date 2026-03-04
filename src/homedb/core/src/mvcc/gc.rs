@@ -119,25 +119,27 @@ impl GcQueue {
 ///
 /// - `seq_id ≥ min_snap` → `Skip`           (still visible to some active snapshot)
 /// - First `seq_id < min_snap` → `NeedValue` (the GC anchor; value decides fate)
-///   - Tombstone → `Remove`;  `anchor_kept` stays `None`
-///   - Live value → `Skip`;   `anchor_kept` set to `Some(seq_id)`
-/// - All subsequent `seq_id < min_snap` → `Remove`  (below anchor; always stale)
+///   - Tombstone → `Remove`;  `live_anchor_seq` stays `None`
+///   - Live value → `Skip`;   `live_anchor_seq` set to `Some(seq_id)`
+/// - All `seq_id < anchor_seq` → `Remove`    (below anchor; always stale)
 ///
-/// After `remove_range`, read `anchor_kept`:
-/// - `None`      → tombstone removed; key fully gone.
+/// `anchor_seq` (always set in `check_kv`) acts as the boundary: on btree retry
+/// (triggered by a node merge), re-visiting the anchor entry returns `NeedValue`
+/// again (seq == anchor_seq) rather than `Remove`, so the anchor is never deleted
+/// by stale boolean state.
+///
+/// After `remove_range`, call `live_anchor_seq()`:
+/// - `None`      → tombstone removed; key fully gone (`all_cleaned_up()` = true).
 /// - `Some(seq)` → live anchor at `seq` was kept; everything below it was removed.
 struct MvccGcRemoveFilter {
     min_snap: u64,
-
-    /// True once `check_kv` has been called for the anchor.
-    /// After that, all subsequent `check_key` calls return `Remove` without reading values.
-    ///
-    /// Accessed from a single thread inside one `remove_range` traversal.
-    /// `Cell` is sufficient; `unsafe impl Sync` satisfies the `Arc<dyn RemoveFilter>` bound.
-    anchor_found: std::cell::Cell<bool>,
-    
-    /// Set inside `check_kv`: `Some(seq_id)` for a live anchor, `None` for a tombstone.
-    anchor_kept: std::cell::Cell<Option<u64>>,
+    /// seq_id of the GC anchor (first version below min_snap).  Set in `check_kv`.
+    /// Used in `check_key` so that re-visiting the anchor on btree retry returns
+    /// `NeedValue` (re-evaluate) instead of `Remove`.
+    anchor_seq: std::cell::Cell<Option<u64>>,
+    /// seq_id of the live anchor, set only when `check_kv` finds a non-tombstone.
+    /// `None` means either no anchor yet or the anchor was a tombstone (fully cleaned up).
+    live_anchor_seq: std::cell::Cell<Option<u64>>,
 }
 
 unsafe impl Sync for MvccGcRemoveFilter {}
@@ -146,10 +148,14 @@ impl MvccGcRemoveFilter {
     fn new(min_snap: u64) -> Self {
         Self {
             min_snap,
-            anchor_found: std::cell::Cell::new(false),
-            anchor_kept: std::cell::Cell::new(None),
+            anchor_seq: std::cell::Cell::new(None),
+            live_anchor_seq: std::cell::Cell::new(None),
         }
     }
+
+    /// Returns `Some(seq)` if a live anchor at `seq` was kept; `None` if the key
+    /// was fully cleaned up (tombstone anchor, all versions removed).
+    pub fn live_anchor_seq(&self) -> Option<u64> { self.live_anchor_seq.get() }
 }
 
 impl RemoveFilter<MvccKey<DbKey>, MvccValue<DbValue>> for MvccGcRemoveFilter {
@@ -157,19 +163,27 @@ impl RemoveFilter<MvccKey<DbKey>, MvccValue<DbValue>> for MvccGcRemoveFilter {
         let seq = key.seq_id();
         if seq >= self.min_snap {
             RemoveFilterDecision::Skip
-        } else if !self.anchor_found.get() {
-            RemoveFilterDecision::NeedValue
         } else {
-            RemoveFilterDecision::Remove
+            match self.anchor_seq.get() {
+                // No anchor yet — this is the first candidate; need value to decide.
+                None => RemoveFilterDecision::NeedValue,
+                // Strictly below the anchor — always stale.
+                Some(x) if seq < x => RemoveFilterDecision::Remove,
+                // seq == anchor_seq: re-encountered on btree retry; re-evaluate via check_kv.
+                Some(_) => RemoveFilterDecision::NeedValue,
+            }
         }
     }
 
     fn check_kv(&self, key: &MvccKey<DbKey>, val: &MvccValue<DbValue>) -> RemoveFilterDecision {
-        self.anchor_found.set(true);
+        let seq = key.seq_id();
+        // Record the anchor boundary regardless of tombstone/live so that check_key
+        // can use it as a watermark on btree retry.
+        self.anchor_seq.set(Some(seq));
         if val.is_tombstone() {
             RemoveFilterDecision::Remove
         } else {
-            self.anchor_kept.set(Some(key.seq_id()));
+            self.live_anchor_seq.set(Some(seq));
             RemoveFilterDecision::Skip
         }
     }
@@ -195,6 +209,9 @@ pub struct MvccGc {
 
     /// Signals the background task to stop (set by `MvccOps` on drop).
     pub shutdown: Arc<AtomicBool>,
+
+    /// When set, the background task skips `run_cycle` (used by tests to freeze GC state).
+    pub paused: Arc<AtomicBool>,
 }
 
 impl MvccGc {
@@ -209,12 +226,19 @@ impl MvccGc {
             registry,
             key_spec,
             shutdown: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
         })
     }
 
     /// Signal the background task to stop.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Freeze GC: the background task will skip `run_cycle` until unpaused.
+    /// Used in tests to prevent GC from running during diagnostic queries.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
     }
 
     /// Spawn a single long-running background task that wakes every 100 ms and
@@ -237,7 +261,9 @@ impl MvccGc {
                     let mut pending: HashMap<Vec<u8>, BTreeSet<u64>> = HashMap::new();
                     while !self.shutdown.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(100));
-                        self.run_cycle(&mut pending);
+                        if !self.paused.load(Ordering::Relaxed) {
+                            self.run_cycle(&mut pending);
+                        }
                     }
                 });
             }
@@ -290,7 +316,7 @@ impl MvccGc {
             let filter_dyn: Arc<dyn RemoveFilter<MvccKey<DbKey>, MvccValue<DbValue>>> = filter.clone();
             let _ = self.btree.remove_range(range, Some(filter_dyn)).await;
 
-            match filter.anchor_kept.get() {
+            match filter.live_anchor_seq() {
                 None => {
                     // Tombstone (and all history) removed — key fully gone.
                     pending.remove(&key_bytes);

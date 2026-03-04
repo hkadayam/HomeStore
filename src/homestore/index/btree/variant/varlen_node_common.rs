@@ -32,6 +32,7 @@ use super::super::btree_kvs::{BtreeKey, BtreeValue, ValueOrOverflow};
 use super::super::btree_types::BtreeError;
 use super::super::detail::btree_req::BtreePutType;
 use std::io;
+use std::mem::size_of;
 
 //================================================================================
 // Variable-Length Node Header

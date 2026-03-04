@@ -196,6 +196,7 @@ impl<K: 'static + BtreeKey, V: 'static + BtreeValue> ShardedQueryHandle<K, V> {
 impl<K: 'static + BtreeKey, V: 'static + BtreeValue> IndexQueryHandle<K, V> for ShardedQueryHandle<K, V> {
     fn results(&self) -> &[(K, V)] { &self.results }
     fn has_more(&self) -> bool { self.has_more_impl() }
+    fn into_any_send(self: Box<Self>) -> Box<dyn std::any::Any + Send> { self }
 }
 
 fn to_sharded_query_handle<K: 'static + BtreeKey, V: 'static + BtreeValue>(

@@ -97,7 +97,7 @@ macro_rules! shard_call {
 //==============================================================================
 
 fn bytes_to_part_id(bytes: &[u8], max_partitions: usize) -> u32 {
-    if max_partitions <= 1 { return 0; }
+    if max_partitions <= 1 || bytes.is_empty() { return 0; }
     // Interpret the leading (up to 16) bytes as a big-endian u128.
     // Shorter keys occupy the high bits; remaining bits are 0.
     // This preserves lexicographic order within the integer domain.
@@ -514,7 +514,12 @@ impl<K: 'static + Partitionable, V: 'static + BtreeValue> BtreeIndex<K, V> for S
         filter: Option<Arc<dyn GetFilter<K, V>>>,
         reverse: bool,
     ) -> Result<Box<dyn IndexQueryHandle<K, V>>, BtreeError> {
-        let partitions = self.route_range(&range);
+        let mut partitions = self.route_range(&range);
+        // For reverse queries, traverse partitions from highest to lowest
+        // so fill_query_handle visits the largest keys first.
+        if reverse {
+            partitions.reverse();
+        }
 
         let mut handle = ShardedQueryHandle {
             results: Vec::new(), input_range: range, batch_size, filter, reverse,

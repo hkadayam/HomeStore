@@ -418,6 +418,23 @@ where
         result
     }
 
+    /// Return the first entry with key >= `key`, or `None`.
+    ///
+    /// Uses single binary search (find) per node — faster than get_first which
+    /// uses match_range (double binary search) at every level.
+    #[tracing::instrument(skip(self, key),
+                          fields(op_id=op_counter(), btree=%self.config.btree_name))]
+    pub async fn seek_gte(&self, key: &K) -> Result<Option<(K, V)>, BtreeError> {
+        tracing::debug!("Starting seek_gte operation");
+        let result = self.seek_gte_internal(key).await;
+        match &result {
+            Ok(Some((k, _))) => tracing::debug!(key = ?k, "Found key >= target"),
+            Ok(None) => tracing::debug!("No key >= target"),
+            Err(_) => tracing::warn!("seek_gte failed"),
+        }
+        result
+    }
+
     /// Sweep query - returns multiple key-value pairs in range
     ///
     ///

@@ -64,8 +64,8 @@ where
 
             match self.put_one_walk(root, &mut req).await {
                 Ok(hb) => { hit_boundary = hb; break; }
-                Err(BtreeError::Retry) => continue, // Retriable errors
-                Err(e) => return Err(e),            // Non-retriable errors
+                Err(BtreeError::Retry) => continue,
+                Err(e) => return Err(e),
             }
         }
         Ok((req.into_stats(), hit_boundary))

@@ -36,9 +36,13 @@ impl<K: 'static + BtreeKey, V: 'static + BtreeValue> IndexQueryHandle<K, V> for 
     fn has_more(&self) -> bool {
         self.0.has_more()
     }
- 
+
     fn into_any_send(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
         self
+    }
+
+    fn into_results(self: Box<Self>) -> Vec<(K, V)> {
+        self.0.results
     }
 }
 

@@ -43,11 +43,15 @@ impl PlainRangeIterator {
         reverse: bool,
         key_spec: KeySpec,
     ) -> Self {
-        let results = handle.results().to_vec();
-        let has_more = handle.has_more();
+        let (mut results, handle) = if handle.has_more() {
+            (handle.results().to_vec(), Some(handle))
+        } else {
+            (handle.into_results(), None)
+        };
+        results.reverse();
         Self {
             index,
-            handle: if has_more { Some(handle) } else { None },
+            handle,
             current_batch: results,
             start_key,
             end_key,
@@ -60,8 +64,7 @@ impl PlainRangeIterator {
     #[maybe_async_cfg::maybe(keep_self, sync(feature = "sync_frontend"), async(feature = "async_frontend"))]
     async fn next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         loop {
-            if !self.current_batch.is_empty() {
-                let (key, value) = self.current_batch.remove(0);
+            if let Some((key, value)) = self.current_batch.pop() {
                 return Ok(Some((key.into_vec(), value.into_vec())));
             }
 
@@ -72,8 +75,14 @@ impl PlainRangeIterator {
                         .query_next_batch(h)
                         .await
                         .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
-                    self.current_batch = next_handle.results().to_vec();
-                    self.handle = if next_handle.has_more() { Some(next_handle) } else { None };
+                    let (mut results, handle) = if next_handle.has_more() {
+                        (next_handle.results().to_vec(), Some(next_handle))
+                    } else {
+                        (next_handle.into_results(), None)
+                    };
+                    results.reverse();
+                    self.current_batch = results;
+                    self.handle = handle;
                 }
                 _ => return Ok(None),
             }
@@ -102,8 +111,14 @@ impl PlainRangeIterator {
             return Ok(false);
         }
 
-        self.current_batch = new_handle.results().to_vec();
-        self.handle = if new_handle.has_more() { Some(new_handle) } else { None };
+        let (mut results, handle) = if new_handle.has_more() {
+            (new_handle.results().to_vec(), Some(new_handle))
+        } else {
+            (new_handle.into_results(), None)
+        };
+        results.reverse();
+        self.current_batch = results;
+        self.handle = handle;
         Ok(true)
     }
 }
@@ -129,6 +144,7 @@ struct MvccRangeIterator {
     handle: Option<Box<dyn IndexQueryHandle<MvccKey<DbKey>, MvccValue<DbValue>>>>,
     current_batch: Vec<(MvccKey<DbKey>, MvccValue<DbValue>)>,
     snapshot_ts: u64,
+    filter: Arc<dyn GetFilter<MvccKey<DbKey>, MvccValue<DbValue>>>,
     start_key: Vec<u8>,
     end_key: Vec<u8>,
     batch_size: u32,
@@ -149,13 +165,20 @@ impl MvccRangeIterator {
         snapshot_ts: u64,
         key_spec: KeySpec,
     ) -> Self {
-        let results = handle.results().to_vec();
-        let has_more = handle.has_more();
+        let filter: Arc<dyn GetFilter<MvccKey<DbKey>, MvccValue<DbValue>>> =
+            Arc::new(MvccQueryFilter::new(snapshot_ts));
+        let (mut results, handle) = if handle.has_more() {
+            (handle.results().to_vec(), Some(handle))
+        } else {
+            (handle.into_results(), None)
+        };
+        results.reverse();
         Self {
             index,
-            handle: if has_more { Some(handle) } else { None },
+            handle,
             current_batch: results,
             snapshot_ts,
+            filter,
             start_key,
             end_key,
             batch_size,
@@ -169,8 +192,7 @@ impl MvccRangeIterator {
         loop {
             // The MvccQueryFilter passed at query time already removed all MVCC duplicates,
             // too-new versions, and tombstones.  Drain the batch as plain key-value pairs.
-            if !self.current_batch.is_empty() {
-                let (mvcc_key, mvcc_val) = self.current_batch.remove(0);
+            if let Some((mvcc_key, mvcc_val)) = self.current_batch.pop() {
                 let user_key_bytes = mvcc_key.inner.into_vec();
                 let value_bytes = mvcc_val.into_inner().map(|v| v.into_vec()).unwrap_or_default();
                 return Ok(Some((user_key_bytes, value_bytes)));
@@ -184,8 +206,14 @@ impl MvccRangeIterator {
                         .query_next_batch(h)
                         .await
                         .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
-                    self.current_batch = next_handle.results().to_vec();
-                    self.handle = if next_handle.has_more() { Some(next_handle) } else { None };
+                    let (mut results, handle) = if next_handle.has_more() {
+                        (next_handle.results().to_vec(), Some(next_handle))
+                    } else {
+                        (next_handle.into_results(), None)
+                    };
+                    results.reverse();
+                    self.current_batch = results;
+                    self.handle = handle;
                 }
                 _ => return Ok(None),
             }
@@ -212,11 +240,9 @@ impl MvccRangeIterator {
         };
 
         let range = BtreeKeyRange::new(range_start, true, range_end, self.reverse);
-        let filter: Arc<dyn GetFilter<MvccKey<DbKey>, MvccValue<DbValue>>> =
-            Arc::new(MvccQueryFilter::new(self.snapshot_ts));
         let new_handle = self
             .index
-            .query(range, self.batch_size, Some(filter), self.reverse)
+            .query(range, self.batch_size, Some(Arc::clone(&self.filter)), self.reverse)
             .await
             .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
 
@@ -224,8 +250,14 @@ impl MvccRangeIterator {
             return Ok(false);
         }
 
-        self.current_batch = new_handle.results().to_vec();
-        self.handle = if new_handle.has_more() { Some(new_handle) } else { None };
+        let (mut results, handle) = if new_handle.has_more() {
+            (new_handle.results().to_vec(), Some(new_handle))
+        } else {
+            (new_handle.into_results(), None)
+        };
+        results.reverse();
+        self.current_batch = results;
+        self.handle = handle;
         Ok(true)
     }
 }

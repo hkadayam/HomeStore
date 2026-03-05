@@ -11,6 +11,8 @@ pub trait IndexQueryHandle<K: 'static + BtreeKey, V: 'static + BtreeValue>: Send
     fn results(&self) -> &[(K, V)];
     fn has_more(&self) -> bool;
     fn into_any_send(self: Box<Self>) -> Box<dyn std::any::Any + Send>;
+    /// Take ownership of the results, avoiding a clone. Default falls back to `to_vec()`.
+    fn into_results(self: Box<Self>) -> Vec<(K, V)>;
 }
 
 /// Convert to Box<dyn Any> for downcast in query_next_batch. Requires IndexQueryHandle: Any.

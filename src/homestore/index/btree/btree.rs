@@ -510,11 +510,11 @@ where
     ) -> Result<QueryResultHandle<K, V>, BtreeError> {
         let req = handle.request();
         if req.is_sweep_query() {
-            // Use traversal query for reverse iteration
-            self.traversal_query_internal(req).await
-        } else {
-            // Use sweep query for forward iteration
+            // Sweep query continues with sweep (forward, sibling-link based)
             self.sweep_query_internal(req).await
+        } else {
+            // Traversal query continues with traversal (supports reverse, no sibling links)
+            self.traversal_query_internal(req).await
         }
     }
 }

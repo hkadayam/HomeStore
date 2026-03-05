@@ -507,6 +507,11 @@ impl<K: 'static + Partitionable, V: 'static + BtreeValue> BtreeIndex<K, V> for S
         shard_call!(shard, [range], get_first(range))
     }
 
+    async fn seek_gte(&self, key: &K) -> Result<Option<(K, V)>, BtreeError> {
+        let part = self.route(key, false);
+        shard_call!(&self.shards[part.shard_id], [key], seek_gte(&key))
+    }
+
     async fn query(
         &self,
         range: BtreeKeyRange<K>,

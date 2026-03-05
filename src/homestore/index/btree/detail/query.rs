@@ -270,6 +270,99 @@ where
     }
 
     //================================================================================
+    // SEEK_GTE: Single binary search per node (faster than get_first for point reads)
+    //================================================================================
+
+    /// Like get() but returns the first entry >= key instead of exact match only.
+    /// Uses single binary search per node (find) instead of double (match_range).
+    pub(in super::super) async fn seek_gte_internal(
+        &self,
+        key: &K,
+    ) -> Result<Option<(K, V)>, BtreeError> {
+        let _tree_lock = self.lock_tree_shared().await;
+        let root_id = self.root_node_id();
+        let root = self.read_and_lock_node(root_id, LockType::Read).await?;
+
+        self.seek_gte_walk(root, key).await
+    }
+
+    /// Recursive seek_gte traversal
+    ///
+    /// At interior nodes: uses find() (single binary search) to route to the correct child.
+    /// If the child's subtree has no entry >= key, falls back to the next child's leftmost entry.
+    #[cfg_attr(feature = "async_code", async_recursion::async_recursion)]
+    async fn seek_gte_walk(&self, node: Node, key: &K) -> Result<Option<(K, V)>, BtreeError> {
+        if node.is_leaf() {
+            return self.seek_gte_in_leaf(&node, key).await;
+        }
+
+        // Interior node: single binary search to find target child
+        let nentries = node.total_entries();
+        let (_, idx) = node.find::<K, V>(key);
+
+        // Save next child ID before dropping parent (for cross-leaf fallback)
+        let next_idx = idx + 1;
+        let next_child_id = if next_idx <= nentries && (next_idx < nentries || node.has_valid_edge()) {
+            Some(node.get_nth_child_id::<K>(next_idx))
+        } else {
+            None
+        };
+
+        let child_id = node.get_nth_child_id::<K>(idx);
+        let child = self.read_and_lock_node(child_id, LockType::Read).await?;
+        drop(node); // Release parent lock (standard lock coupling)
+
+        let result = self.seek_gte_walk(child, key).await?;
+        if result.is_some() {
+            return Ok(result);
+        }
+
+        // Cross-leaf fallback: key was at boundary, entry is in next child's subtree
+        if let Some(next_id) = next_child_id {
+            let next_child = self.read_and_lock_node(next_id, LockType::Read).await?;
+            return self.leftmost_entry(next_child).await;
+        }
+
+        Ok(None)
+    }
+
+    /// Read first entry >= key from leaf node
+    async fn seek_gte_in_leaf(&self, node: &Node, key: &K) -> Result<Option<(K, V)>, BtreeError> {
+        debug_assert!(node.is_leaf());
+
+        let nentries = node.total_entries();
+        let (found, idx) = node.find::<K, V>(key);
+
+        if found || idx < nentries {
+            let k = node.get_nth_key::<K, V>(idx, /* copy= */ true);
+            let v = node.get_nth_value::<K, V>(idx, /* copy= */ true)
+                .resolve(self.storage.as_ref(), true).await?;
+            Ok(Some((k, v)))
+        } else {
+            Ok(None) // Key > all entries in this leaf; caller tries next sibling
+        }
+    }
+
+    /// Descend to the leftmost entry of a subtree
+    #[cfg_attr(feature = "async_code", async_recursion::async_recursion)]
+    async fn leftmost_entry(&self, node: Node) -> Result<Option<(K, V)>, BtreeError> {
+        if node.is_leaf() {
+            if node.total_entries() == 0 {
+                return Ok(None);
+            }
+            let k = node.get_nth_key::<K, V>(0, /* copy= */ true);
+            let v = node.get_nth_value::<K, V>(0, /* copy= */ true)
+                .resolve(self.storage.as_ref(), true).await?;
+            return Ok(Some((k, v)));
+        }
+
+        let child_id = node.get_nth_child_id::<K>(0);
+        let child = self.read_and_lock_node(child_id, LockType::Read).await?;
+        drop(node);
+        self.leftmost_entry(child).await
+    }
+
+    //================================================================================
     // QUERY Implementation (Sweep Query with Sibling Links)
     //================================================================================
 

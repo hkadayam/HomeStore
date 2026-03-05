@@ -99,6 +99,10 @@ impl<K: 'static + BtreeKey, V: 'static + BtreeValue> BtreeIndex<K, V> for Unshar
         self.btree.get_first(range).await
     }
 
+    async fn seek_gte(&self, key: &K) -> Result<Option<(K, V)>, BtreeError> {
+        self.btree.seek_gte(key).await
+    }
+
     async fn query(
         &self,
         range: BtreeKeyRange<K>,

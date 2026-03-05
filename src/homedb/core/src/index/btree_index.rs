@@ -62,6 +62,11 @@ pub trait BtreeIndex<K: 'static + BtreeKey, V: 'static + BtreeValue>: Send + Syn
         filter: Option<Arc<dyn GetFilter<K, V>>>,
     ) -> Result<Option<(K, V)>, BtreeError>;
 
+    /// Return the first entry with key >= `key`, or `None` if no such entry.
+    /// Uses single binary search (find) per node instead of double (match_range).
+    /// Ideal for MVCC point reads where we seek to `(user_key, !snapshot_ts)`.
+    async fn seek_gte(&self, key: &K) -> Result<Option<(K, V)>, BtreeError>;
+
     /// Fetch next batch for a previous query result handle.
     async fn query_next_batch(
         &self,

@@ -169,21 +169,26 @@ impl IndexOps for MvccOps {
     }
 
     async fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        // all_versions_for covers all seq_ids newest-first; batch_size=1 returns the newest.
-        let scan_range = MvccKey::all_versions_for(key, &self.key_spec);
-        let handle = self
+        // seek_gte with (user_key, seq_id=MAX) finds the newest version of user_key
+        // using single binary search per node — faster than get_first (double binary search).
+        let seek_key = MvccKey::new(DbKey::new(key.clone(), &self.key_spec), u64::MAX);
+        let result = self
             .btree
-            .query(scan_range, 1, None, false)
+            .seek_gte(&seek_key)
             .await
             .map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))?;
 
-        match handle.results().first() {
+        match result {
             None => Ok(None),
-            Some((_, mvcc_val)) => {
+            Some((found_key, mvcc_val)) => {
+                // Verify the result is for our user key (seek_gte may overshoot)
+                if found_key.inner.as_bytes() != key.as_slice() {
+                    return Ok(None);
+                }
                 if mvcc_val.is_tombstone() {
                     Ok(None)
                 } else {
-                    Ok(mvcc_val.inner().map(|v| v.clone().into_vec()))
+                    Ok(mvcc_val.into_inner().map(|v| v.into_vec()))
                 }
             }
         }
@@ -275,23 +280,25 @@ impl IndexOps for MvccOps {
 
     async fn snapshot_get(&self, key: Vec<u8>, ts: u64) -> Result<Option<Vec<u8>>> {
         // A snapshot at ts sees versions with seq_id < ts (exclusive).
-        // Seeking to inv_seq = !(ts-1) finds the newest version with seq_id ≤ ts-1.
+        // Seeking to (user_key, ts-1) finds the newest version with seq_id ≤ ts-1.
         // ts=0 means nothing was committed before snapshot creation — return None immediately.
         if ts == 0 {
             return Ok(None);
         }
 
-        let range_start = MvccKey::newest_since(key.clone(), &self.key_spec, ts - 1);
-        let range_end = MvccKey::oldest(key, &self.key_spec);
-        let range = BtreeKeyRange::new(range_start, true, range_end, true);
+        let seek_key = MvccKey::newest_since(key.clone(), &self.key_spec, ts - 1);
 
-        match self.btree.get_first(range, None).await.map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))? {
+        match self.btree.seek_gte(&seek_key).await.map_err(|e| HomeDbError::BtreeError(format!("{:?}", e)))? {
             None => Ok(None),
-            Some((_, mvcc_val)) => {
+            Some((found_key, mvcc_val)) => {
+                // Verify the result is for our user key (seek_gte may overshoot)
+                if found_key.inner.as_bytes() != key.as_slice() {
+                    return Ok(None);
+                }
                 if mvcc_val.is_tombstone() {
                     Ok(None)
                 } else {
-                    Ok(mvcc_val.inner().map(|v| v.clone().into_vec()))
+                    Ok(mvcc_val.into_inner().map(|v| v.into_vec()))
                 }
             }
         }

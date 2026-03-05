@@ -19,7 +19,7 @@
 //! no MVCC branching.
 
 use std::sync::Arc;
-use homestore::index::btree::BtreeConfig;
+use homestore::index::btree::{BtreeConfig, MergePolicy};
 use homedb_core::{IndexOps, MvccGc, MvccOps, NonTxnOps, RangeIterator, Snapshot, SnapshotOps};
 use crate::{HomeDbError, KeySpec, KeyType, PrefixType, Result, TableSpec, ValueSpec};
 
@@ -73,6 +73,13 @@ impl TableIndex {
         let mut config = BtreeConfig::new(spec.node_size, name.clone());
         config.leaf_node_variant = node_variant;
         config.int_node_variant = node_variant;
+
+        // MVCC tables with inline/background GC: disable node merges to prevent
+        // NodeNotFound errors when concurrent GC removes trigger node merges
+        // while foreground puts are traversing the tree.
+        if spec.mvcc_enabled {
+            config.merge_policy = MergePolicy::Never;
+        }
 
         // Prefix compression is only meaningful for plain tables.
         if !spec.mvcc_enabled {

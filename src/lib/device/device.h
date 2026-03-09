@@ -19,7 +19,7 @@
 
 #include <homestore/crc.h>
 #include <iomgr/iomgr.hpp>
-#include <sisl/fds/sparse_vector.hpp>
+#include <sisl/fds/SparseVector.h>
 #include <homestore/homestore_decl.hpp>
 #include "device/hs_super_blk.h"
 
@@ -77,7 +77,7 @@ struct vdev_info {
     void set_dev_type(HSDevType dtype) { hs_dev_type = enum_value(dtype); }
     void set_pdev_choice(vdev_multi_pdev_opts_t opts) { multi_pdev_choice = enum_value(opts); }
 
-    void set_user_private(const sisl::blob& data) {
+    void set_user_private(const sisl::Blob& data) {
         std::memcpy(&user_private, data.cbytes(), std::min(data.size(), uint32_cast(user_private_size)));
     }
     uint8_t* get_user_private_mutable() { return &(user_private[0]); }
@@ -112,7 +112,7 @@ struct vdev_parameters {
     blk_allocator_type_t alloc_type;        // which allocator type this vdev wants to be with;
     chunk_selector_type_t chunk_sel_type;   // which chunk selector type this vdev wants to be with;
     vdev_multi_pdev_opts_t multi_pdev_opts; // How data to be placed on multiple vdevs
-    sisl::blob context_data;                // Context data about this vdev
+    sisl::Blob context_data;                // Context data about this vdev
     bool use_slab_allocator{false};         // Use slab allocator for this vdev
 };
 
@@ -131,7 +131,7 @@ private:
     bool m_first_time_boot{false};
     bool m_boot_in_degraded_mode{false};
 
-    sisl::sparse_vector< std::unique_ptr< PhysicalDev > > m_all_pdevs;
+    sisl::SparseVector< std::unique_ptr< PhysicalDev > > m_all_pdevs;
     std::map< HSDevType, std::vector< PhysicalDev* > > m_pdevs_by_type;
     uint32_t m_cur_pdev_id{0};
 
@@ -139,7 +139,7 @@ private:
     sisl::Bitset m_chunk_id_bm{hs_super_blk::MAX_CHUNKS_IN_SYSTEM}; // Bitmap to keep track of chunk ids available
 
     std::mutex m_vdev_mutex;                                      // Create/Remove operation of vdev synchronization
-    sisl::sparse_vector< shared< VirtualDev > > m_vdevs;          // VDevs organized in array for quick lookup
+    sisl::SparseVector< shared< VirtualDev > > m_vdevs;          // VDevs organized in array for quick lookup
     sisl::Bitset m_vdev_id_bm{hs_super_blk::MAX_VDEVS_IN_SYSTEM}; // Bitmap to keep track of vdev ids available
     vdev_create_cb_t m_vdev_create_cb;
     // std::unique_ptr< ChunkManager > m_chunk_mgr;
@@ -186,7 +186,7 @@ public:
     uint64_t total_capacity() const;
     uint64_t total_capacity(HSDevType dtype) const;
 
-    shared< Chunk > create_chunk(HSDevType dev_type, uint32_t vdev_id, uint64_t chunk_size, const sisl::blob& data);
+    shared< Chunk > create_chunk(HSDevType dev_type, uint32_t vdev_id, uint64_t chunk_size, const sisl::Blob& data);
     void remove_chunk(shared< Chunk > chunk);
     void remove_chunk_locked(shared< Chunk > chunk);
 
@@ -209,7 +209,7 @@ public:
     struct Params {
         uint64_t pool_capacity;
         // Private data used when creating chunks.
-        std::function< sisl::blob() > init_private_data_cb;
+        std::function< sisl::Blob() > init_private_data_cb;
         uint8_t hs_dev_type;
         uint32_t vdev_id;
         uint64_t chunk_size;

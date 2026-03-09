@@ -22,7 +22,6 @@
 #include <gtest/gtest.h>
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
-#include <sisl/utility/thread_buffer.hpp>
 
 #include <homestore/homestore_decl.hpp>
 #include "blkalloc/varsize_blk_allocator.h"
@@ -277,10 +276,9 @@ TEST_F(BlkCacheQueueTest, join_from_multiple_levels) {
     validate_alloc(1 /* count */, 0 /* slab */, last_blk_num_at_slab(0), 1);
 }
 
-SISL_OPTIONS_ENABLE(logging)
 int main(int argc, char* argv[]) {
     ::testing::InitGoogleTest(&argc, argv);
-    SISL_OPTIONS_LOAD(argc, argv, logging)
+    SISL_OPTIONS_LOAD(argc, argv);
     sisl::logging::SetLogger("test_blkalloc");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
 

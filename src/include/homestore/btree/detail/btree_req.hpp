@@ -14,7 +14,7 @@
  *
  *********************************************************************************/
 #pragma once
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/buffer.h>
 #include <homestore/btree/btree_kv.hpp>
 #include <homestore/btree/btree_base.hpp>
 

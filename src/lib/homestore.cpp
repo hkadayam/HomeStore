@@ -18,10 +18,10 @@
 #include <stdexcept>
 #include <boost/intrusive_ptr.hpp>
 
-#include <sisl/fds/malloc_helper.hpp>
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/malloc_helper.h>
+#include <sisl/fds/buffer.h>
 #include <sisl/logging/logging.h>
-#include <sisl/version.hpp>
+#include <sisl/version.h>
 #include <sisl/cache/lru_evictor.hpp>
 
 #include <homestore/blkdata_service.hpp>
@@ -68,8 +68,6 @@ HomeStore* HomeStore::instance() {
 }
 
 HomeStore::HomeStore() {
-    REGISTER_LOG_MODS(btree, device, blkalloc, cp, logstore, replication, journalvdev);
-
     // Always start the meta service
     for (uint32_t i{0}; i < enum_count< ServiceType >(); ++i) {
         m_services.emplace_back(std::vector< ServiceSubType >{});

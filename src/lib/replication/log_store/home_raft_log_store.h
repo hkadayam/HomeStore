@@ -238,7 +238,7 @@ private:
 };
 
 // helper methods
-static nuraft::ptr< nuraft::log_entry > to_nuraft_log_entry(sisl::blob const& log_blob) {
+static nuraft::ptr< nuraft::log_entry > to_nuraft_log_entry(sisl::Blob const& log_blob) {
     uint8_t const* raw_ptr = log_blob.cbytes();
     uint64_t term = *r_cast< uint64_t const* >(raw_ptr);
     raw_ptr += sizeof(uint64_t);

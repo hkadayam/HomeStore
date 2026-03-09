@@ -36,7 +36,7 @@
 #include <type_traits>
 #include <vector>
 
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/buffer.h>
 #include <folly/Synchronized.h>
 #include <iomgr/io_environment.hpp>
 #include <iomgr/http_server.hpp>
@@ -151,7 +151,7 @@ public:
                 bool io_memory{false};
                 auto* d = prepare_data(lsn, io_memory);
                 m_log_store->write_async(lsn, {uintptr_cast(d), d->total_size(), false}, nullptr,
-                                         [io_memory, d, this](logstore_seq_num_t seq_num, const sisl::io_blob& b,
+                                         [io_memory, d, this](logstore_seq_num_t seq_num, const sisl::IoBlob& b,
                                                               logdev_key ld_key, void* ctx) {
                                              assert(ld_key);
                                              if (io_memory) {
@@ -838,7 +838,7 @@ protected:
 
     void set_store_workload_freq(const std::vector< std::pair< size_t, int > >& inp_freqs) {
         int cum_freqs{0};
-        sisl::sparse_vector< std::optional< int > > store_freqs;
+        sisl::SparseVector< std::optional< int > > store_freqs;
 
         for (auto& f : inp_freqs) {
             // No duplication
@@ -1258,7 +1258,6 @@ TEST_F(LogStoreTest, WriteSyncThenRead) {
     }
 }
 
-SISL_OPTIONS_ENABLE(logging, test_log_store, iomgr, test_common_setup)
 SISL_OPTION_GROUP(test_log_store,
                   (num_logdevs, "", "num_logdevs", "number of log devs",
                    ::cxxopts::value< uint32_t >()->default_value("4"), "number"),
@@ -1273,7 +1272,7 @@ SISL_OPTION_GROUP(test_log_store,
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_log_store, iomgr, test_common_setup);
+    SISL_OPTIONS_LOAD(parsed_argc, argv);
     sisl::logging::SetLogger("test_log_store");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
     return RUN_ALL_TESTS();

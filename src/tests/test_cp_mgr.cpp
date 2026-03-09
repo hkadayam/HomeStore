@@ -29,7 +29,6 @@ using namespace homestore;
 
  
 
-SISL_OPTIONS_ENABLE(logging, test_cp_mgr, iomgr, test_common_setup)
 
 SISL_OPTION_GROUP(test_cp_mgr,
                   (num_records, "", "num_records", "number of record to test",
@@ -178,7 +177,7 @@ TEST_F(TestCPMgr, cp_start_and_flush) {
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_cp_mgr, iomgr, test_common_setup);
+    SISL_OPTIONS_LOAD(parsed_argc, argv);
     sisl::logging::SetLogger("test_home_local_journal");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
 

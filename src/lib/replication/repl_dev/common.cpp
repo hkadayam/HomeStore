@@ -11,7 +11,7 @@
 namespace homestore {
 
 ReplServiceError repl_req_ctx::init(repl_key rkey, journal_type_t op_code, bool is_proposer,
-                                    sisl::blob const& user_header, sisl::blob const& key, uint32_t data_size,
+                                    sisl::Blob const& user_header, sisl::Blob const& key, uint32_t data_size,
                                     cshared< ReplDevListener >& listener) {
     m_rkey = std::move(rkey);
 #ifndef NDEBUG
@@ -121,9 +121,9 @@ void repl_req_ctx::change_raft_journal_buf(raft_buf_ptr_t new_buf, bool adjust_h
 
     if (adjust_hdr_key) {
         m_header =
-            sisl::blob{uintptr_cast(m_journal_entry) + sizeof(repl_journal_entry), m_journal_entry->user_header_size};
+            sisl::Blob{uintptr_cast(m_journal_entry) + sizeof(repl_journal_entry), m_journal_entry->user_header_size};
         m_key =
-            sisl::blob{uintptr_cast(m_journal_entry) + sizeof(repl_journal_entry) + m_journal_entry->user_header_size,
+            sisl::Blob{uintptr_cast(m_journal_entry) + sizeof(repl_journal_entry) + m_journal_entry->user_header_size,
                        m_journal_entry->key_size};
     }
     m_is_jentry_localize_pending = false;
@@ -183,7 +183,7 @@ bool repl_req_ctx::save_pushed_data(intrusive< sisl::GenericRpcData > const& pus
 
     if (((uintptr_t)data % data_service().get_align_size()) != 0) {
         // Unaligned buffer, create a new buffer and copy the entire buf
-        m_buf_for_unaligned_data = std::move(sisl::io_blob_safe(data_size, data_service().get_align_size()));
+        m_buf_for_unaligned_data = std::move(sisl::IoBlobSafe(data_size, data_service().get_align_size()));
         std::memcpy(m_buf_for_unaligned_data.bytes(), data, data_size);
         data = m_buf_for_unaligned_data.cbytes();
     }
@@ -200,7 +200,7 @@ bool repl_req_ctx::save_fetched_data(sisl::GenericClientResponse const& fetched_
 
     if (((uintptr_t)data % data_service().get_align_size()) != 0) {
         // Unaligned buffer, create a new buffer and copy the entire buf
-        m_buf_for_unaligned_data = std::move(sisl::io_blob_safe(data_size, data_service().get_align_size()));
+        m_buf_for_unaligned_data = std::move(sisl::IoBlobSafe(data_size, data_service().get_align_size()));
         std::memcpy(m_buf_for_unaligned_data.bytes(), data, data_size);
         data = m_buf_for_unaligned_data.cbytes();
     }
@@ -227,8 +227,8 @@ bool repl_req_ctx::add_state_if_not_already(repl_req_state_t s) {
 }
 
 void repl_req_ctx::clear() {
-    m_header = sisl::blob{};
-    m_key = sisl::blob{};
+    m_header = sisl::Blob{};
+    m_key = sisl::Blob{};
     m_pkts.clear();
 }
 
@@ -236,7 +236,7 @@ void repl_req_ctx::clear() {
 void repl_req_ctx::release_data() {
     m_data = nullptr;
     // explicitly clear m_buf_for_unaligned_data as unaligned pushdata/fetchdata will be saved here
-    m_buf_for_unaligned_data = sisl::io_blob_safe{};
+    m_buf_for_unaligned_data = sisl::IoBlobSafe{};
     if (m_pushed_data) {
         LOGTRACEMOD(replication, "[traceID={}] m_pushed_data addr={}, m_rkey={}, m_lsn={}", rkey().traceID,
                     static_cast< void* >(m_pushed_data.get()), m_rkey.to_string(), m_lsn);

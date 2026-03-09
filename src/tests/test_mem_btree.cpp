@@ -19,7 +19,7 @@
 #include <iomgr/io_environment.hpp>
 #include <sisl/options/options.h>
 #include <sisl/logging/logging.h>
-#include <sisl/utility/enum.hpp>
+#include <sisl/fds/enum.h>
 #include <boost/algorithm/string.hpp>
 
 #include "test_common/range_scheduler.hpp"
@@ -32,7 +32,6 @@
 using namespace homestore;
  
 
-SISL_OPTIONS_ENABLE(logging, test_mem_btree)
 SISL_OPTION_GROUP(
     test_mem_btree,
     (num_iters, "", "num_iters", "number of iterations for rand ops",
@@ -324,7 +323,7 @@ TYPED_TEST(BtreeConcurrentTest, ConcurrentAllOps) {
 
 int main(int argc, char* argv[]) {
     ::testing::InitGoogleTest(&argc, argv);
-    SISL_OPTIONS_LOAD(argc, argv, logging, test_mem_btree)
+    SISL_OPTIONS_LOAD(argc, argv);
     sisl::logging::SetLogger("test_mem_btree");
     spdlog::set_pattern("[%D %T%z] [%^%L%$] [%t] %v");
 

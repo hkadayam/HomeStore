@@ -2,7 +2,7 @@
 
 #ifdef _PRERELEASE
 #include <functional>
-#include <sisl/utility/urcu_helper.hpp>
+#include <sisl/fds/urcu_helper.h>
 #include <iomgr/iomgr_flip.hpp>
 
 namespace homestore {

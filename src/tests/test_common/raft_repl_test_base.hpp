@@ -23,7 +23,7 @@
 #include <iomgr/io_environment.hpp>
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/buffer.h>
 #include <folly/init/Init.h>
 #include <folly/executors/GlobalExecutor.h>
 #include <boost/uuid/nil_generator.hpp>
@@ -47,9 +47,6 @@
 
 using namespace homestore;
 
-SISL_LOGGING_DEF(test_raft_repl_dev)
-SISL_LOGGING_INIT(HOMESTORE_LOG_MODS, nuraft_mesg, nuraft)
-
 SISL_OPTION_GROUP(test_raft_repl_dev,
                   (block_size, "", "block_size", "block size to io",
                    ::cxxopts::value< uint32_t >()->default_value("4096"), "number"),
@@ -64,7 +61,6 @@ SISL_OPTION_GROUP(test_raft_repl_dev,
                   (res_mgr_audit_timer_ms, "", "res_mgr_audit_timer_ms", "resource manager audit timer",
                    ::cxxopts::value< uint32_t >()->default_value("0"), "number"));
 
-SISL_OPTIONS_ENABLE(logging, test_raft_repl_dev, iomgr, config, test_common_setup, test_repl_common_setup)
 
 static std::unique_ptr< test_common::HSReplTestHelper > g_helper;
 static std::random_device g_rd{};
@@ -98,11 +94,11 @@ public:
         };
         journal_header jheader;
         uint64_t key_id;
-        sisl::sg_list write_sgs;
-        sisl::sg_list read_sgs;
+        sisl::SgList write_sgs;
+        sisl::SgList read_sgs;
 
-        sisl::blob header_blob() { return sisl::blob(uintptr_cast(&jheader), sizeof(journal_header)); }
-        sisl::blob key_blob() { return sisl::blob{uintptr_cast(&key_id), sizeof(uint64_t)}; }
+        sisl::Blob header_blob() { return sisl::Blob(uintptr_cast(&jheader), sizeof(journal_header)); }
+        sisl::Blob key_blob() { return sisl::Blob{uintptr_cast(&key_id), sizeof(uint64_t)}; }
 
         test_req() {
             write_sgs.size = 0;
@@ -125,7 +121,7 @@ public:
     TestReplicatedDB() = default;
     virtual ~TestReplicatedDB() = default;
 
-    void on_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
+    void on_commit(int64_t lsn, sisl::Blob const& header, sisl::Blob const& key,
                    std::vector< MultiBlkId > const& blkids, cintrusive< repl_req_ctx >& ctx) override {
         ASSERT_EQ(header.size(), sizeof(test_req::journal_header));
         ASSERT_EQ(blkids.size(), 1);
@@ -152,14 +148,14 @@ public:
         if (ctx->is_proposer()) { g_helper->runner().next_task(); }
     }
 
-    bool on_pre_commit(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
+    bool on_pre_commit(int64_t lsn, const sisl::Blob& header, const sisl::Blob& key,
                        cintrusive< repl_req_ctx >& ctx) override {
         LOGINFOMOD(replication, "[Replica={}] Received pre-commit on lsn={} dsn={}", g_helper->replica_num(), lsn,
                    ctx->dsn());
         return true;
     }
 
-    void on_rollback(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
+    void on_rollback(int64_t lsn, const sisl::Blob& header, const sisl::Blob& key,
                      cintrusive< repl_req_ctx >& ctx) override {
         LOGINFOMOD(replication, "[Replica={}] Received rollback on lsn={}", g_helper->replica_num(), lsn);
     }
@@ -169,7 +165,7 @@ public:
                    boost::uuids::to_string(repl_dev()->group_id()));
     }
 
-    void on_error(ReplServiceError error, const sisl::blob& header, const sisl::blob& key,
+    void on_error(ReplServiceError error, const sisl::Blob& header, const sisl::Blob& key,
                   cintrusive< repl_req_ctx >& ctx) override {
         LOGINFOMOD(replication, "[Replica={}] Received error={} on key={}", g_helper->replica_num(), enum_name(error),
                    *(r_cast< uint64_t const* >(key.cbytes())));
@@ -214,7 +210,7 @@ public:
         int64_t next_lsn = get_next_lsn(snp_data->offset);
         if (next_lsn == 0) {
             snp_data->is_last_obj = false;
-            snp_data->blob = sisl::io_blob_safe(sizeof(ulong));
+            snp_data->blob = sisl::IoBlobSafe(sizeof(ulong));
             LOGINFOMOD(replication,
                        "[Replica={}] Read logical snapshot callback first message obj_id={} term={} idx={}",
                        g_helper->replica_num(), snp_data->offset, s->get_last_log_term(), s->get_last_log_idx());
@@ -240,7 +236,7 @@ public:
         }
 
         int64_t kv_snapshot_obj_size = sizeof(KeyValuePair) * kv_snapshot_obj.size();
-        sisl::io_blob_safe blob{static_cast< uint32_t >(kv_snapshot_obj_size)};
+        sisl::IoBlobSafe blob{static_cast< uint32_t >(kv_snapshot_obj_size)};
         std::memcpy(blob.bytes(), kv_snapshot_obj.data(), kv_snapshot_obj_size);
         snp_data->blob = std::move(blob);
         snp_data->is_last_obj = false;
@@ -331,7 +327,7 @@ public:
 
     void free_user_snp_ctx(void*& user_snp_ctx) override {}
 
-    ReplResult< blk_alloc_hints > get_blk_alloc_hints(sisl::blob const& header, uint32_t data_size,
+    ReplResult< blk_alloc_hints > get_blk_alloc_hints(sisl::Blob const& header, uint32_t data_size,
                                                       cintrusive< homestore::repl_req_ctx >& hs_ctx) override {
         auto jheader = r_cast< test_req::journal_header const* >(header.cbytes());
         Key k{.id_ = jheader->key_id};

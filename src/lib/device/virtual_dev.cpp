@@ -28,10 +28,10 @@
 #include <type_traits>
 #include <vector>
 
-#include <sisl/fds/buffer.hpp>
-#include <sisl/metrics/metrics.hpp>
+#include <sisl/fds/buffer.h>
+#include <sisl/metrics/metrics.h>
 #include <sisl/logging/logging.h>
-#include <sisl/utility/atomic_counter.hpp>
+#include <sisl/fds/atomic_counter.h>
 #include <iomgr/iomgr_flip.hpp>
 #include <homestore/homestore_decl.hpp>
 #include <homestore/checkpoint/cp_mgr.hpp>
@@ -542,8 +542,8 @@ std::error_code VirtualDev::sync_read(char* buf, uint32_t size, BlkId const& bid
     return chunk->physical_dev_mutable()->sync_read(buf, size, dev_offset);
 }
 
-std::pair< std::error_code, sisl::io_blob_safe > VirtualDev::sync_read(BlkId const& bid) {
-    auto buf = sisl::io_blob_safe(bid.blk_count() * block_size(), align_size(), sisl::buftag::common);
+std::pair< std::error_code, sisl::IoBlobSafe > VirtualDev::sync_read(BlkId const& bid) {
+    auto buf = sisl::IoBlobSafe(bid.blk_count() * block_size(), align_size(), sisl::Buftag::common);
     auto ec = sync_read(charptr_cast(buf.bytes()), buf.size(), bid);
     return std::pair(ec, std::move(buf));
 }
@@ -674,12 +674,12 @@ shared< Chunk > VirtualDev::get_next_chunk(cshared< Chunk >& chunk) {
     return m_all_chunks[(chunk->chunk_id() + 1) % m_all_chunks.size()];
 }
 
-void VirtualDev::update_vdev_private(const sisl::blob& private_data) {
+void VirtualDev::update_vdev_private(const sisl::Blob& private_data) {
     std::unique_lock lg{m_mgmt_mutex};
     m_vdev_info.set_user_private(private_data);
     m_vdev_info.compute_checksum();
 
-    auto buf = hs_utils::iobuf_alloc(vdev_info::size, sisl::buftag::superblk, align_size());
+    auto buf = hs_utils::iobuf_alloc(vdev_info::size, sisl::Buftag::superblk, align_size());
     auto vinfo = new (buf) vdev_info();
     *vinfo = m_vdev_info;
 
@@ -690,7 +690,7 @@ void VirtualDev::update_vdev_private(const sisl::blob& private_data) {
     }
 
     vinfo->~vdev_info();
-    hs_utils::iobuf_free(buf, sisl::buftag::superblk);
+    hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
 }
 
 ///////////////////////// VirtualDev Checkpoint methods /////////////////////////////

@@ -24,7 +24,7 @@ int COWBtreeCPCallbacks::cp_progress_percent() { return 100; }
 COWBtreeCPContext::COWBtreeCPContext(CP* cp, COWBtreeStore* bt_store) :
         CPContext(cp),
         m_parallel_flushers_count{bt_store->parallel_map_flushers_count()},
-        m_merged_journal_buf{4096u, bt_store->align_size(), sisl::buftag::btree_journal} {
+        m_merged_journal_buf{4096u, bt_store->align_size(), sisl::Buftag::btree_journal} {
     // NOTE: We calculate this on every CP is because we are making this resource limit of max dirty as hot swappable.
     // However, instead of doing this calculation on every dirty buf increment, it is reasonable to calculate the dirty
     // size per CP
@@ -66,7 +66,7 @@ void COWBtreeCPContext::prepare_to_flush(bool full_map_flush) {
         hdr_sb.cp_id = id();
         hdr_sb.index_store_type = IndexStore::Type::COPY_ON_WRITE_BTREE;
 
-        m_merged_journal_buf.append(sisl::blob{uintptr_cast(&hdr_sb), uint32_cast(sizeof(COWBtreeStore::Journal))});
+        m_merged_journal_buf.append(sisl::Blob{uintptr_cast(&hdr_sb), uint32_cast(sizeof(COWBtreeStore::Journal))});
         m_journal_header = r_cast< COWBtreeStore::Journal* >(m_merged_journal_buf.bytes());
     }
 
@@ -108,13 +108,13 @@ void COWBtreeCPContext::actual_destroy_btrees() {
                     m_destroyed_btrees.size());
 }
 
-void COWBtreeCPContext::append_btree_journal(sisl::io_blob_safe const& btree_journal_buf) {
+void COWBtreeCPContext::append_btree_journal(sisl::IoBlobSafe const& btree_journal_buf) {
     HS_DBG_ASSERT_EQ(m_is_full_map_flush, false, "Btree journal update on full map flush");
     ++m_journal_header->num_btrees;
     m_journal_header->size += btree_journal_buf.size();
     m_merged_journal_buf.append(btree_journal_buf);
 }
 
-sisl::byte_view COWBtreeCPContext::store_journal() const { return m_merged_journal_buf.view(); }
+sisl::ByteView COWBtreeCPContext::store_journal() const { return m_merged_journal_buf.view(); }
 
 } // namespace homestore

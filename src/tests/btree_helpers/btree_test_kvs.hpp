@@ -83,7 +83,7 @@ public:
     TestFixedKey(uint64_t k) : m_key{k} {}
     TestFixedKey(const TestFixedKey& other) : TestFixedKey(other.serialize(), true) {}
     TestFixedKey(const BtreeKey& other) : TestFixedKey(other.serialize(), true) {}
-    TestFixedKey(const sisl::blob& b, bool copy) : BtreeKey(), m_key{*(r_cast< const uint64_t* >(b.cbytes()))} {}
+    TestFixedKey(const sisl::Blob& b, bool copy) : BtreeKey(), m_key{*(r_cast< const uint64_t* >(b.cbytes()))} {}
     TestFixedKey& operator=(const TestFixedKey& other) = default;
     TestFixedKey& operator=(BtreeKey const& other) {
         m_key = s_cast< TestFixedKey const& >(other).m_key;
@@ -117,15 +117,15 @@ public:
         }
     }*/
 
-    sisl::blob serialize() const override {
-        return sisl::blob{uintptr_cast(const_cast< uint64_t* >(&m_key)), uint32_cast(sizeof(uint64_t))};
+    sisl::Blob serialize() const override {
+        return sisl::Blob{uintptr_cast(const_cast< uint64_t* >(&m_key)), uint32_cast(sizeof(uint64_t))};
     }
     uint32_t serialized_size() const override { return get_fixed_size(); }
     static bool is_fixed_size() { return true; }
     static uint32_t get_fixed_size() { return (sizeof(uint64_t)); }
     std::string to_string() const { return fmt::format("{}", m_key); }
 
-    void deserialize(const sisl::blob& b, bool copy) override { m_key = *(r_cast< const uint64_t* >(b.cbytes())); }
+    void deserialize(const sisl::Blob& b, bool copy) override { m_key = *(r_cast< const uint64_t* >(b.cbytes())); }
 
     static uint32_t get_max_size() { return get_fixed_size(); }
     friend std::ostream& operator<<(std::ostream& os, const TestFixedKey& k) {
@@ -184,12 +184,12 @@ public:
     TestVarLenKey& operator=(const TestVarLenKey& other) = default;
     TestVarLenKey& operator=(TestVarLenKey&& other) = default;
 
-    TestVarLenKey(const sisl::blob& b, bool copy) : BtreeKey() { deserialize(b, copy); }
+    TestVarLenKey(const sisl::Blob& b, bool copy) : BtreeKey() { deserialize(b, copy); }
     virtual ~TestVarLenKey() = default;
 
-    sisl::blob serialize() const override {
+    sisl::Blob serialize() const override {
         const auto& data = idx_to_key(m_key);
-        return sisl::blob{(uint8_t*)(data->c_str()), (uint32_t)data->size()};
+        return sisl::Blob{(uint8_t*)(data->c_str()), (uint32_t)data->size()};
     }
 
     uint32_t serialized_size() const override { return idx_to_key(m_key)->size(); }
@@ -199,7 +199,7 @@ public:
         return 0;
     }
 
-    void deserialize(const sisl::blob& b, bool copy) {
+    void deserialize(const sisl::Blob& b, bool copy) {
         std::string data{r_cast< const char* >(b.cbytes()), b.size()};
         std::stringstream ss;
         ss << std::hex << data.substr(0, 8);
@@ -279,7 +279,7 @@ public:
     TestIntervalKey(uint32_t b, uint32_t o) : m_base{b}, m_offset{o} {}
     TestIntervalKey(const TestIntervalKey& other) = default;
     TestIntervalKey(const BtreeKey& other) : TestIntervalKey(other.serialize(), true) {}
-    TestIntervalKey(const sisl::blob& b, bool copy) : BtreeIntervalKey() {
+    TestIntervalKey(const sisl::Blob& b, bool copy) : BtreeIntervalKey() {
         TestIntervalKey const* other = r_cast< TestIntervalKey const* >(b.cbytes());
         m_base = other->m_base;
         m_offset = other->m_offset;
@@ -308,13 +308,13 @@ public:
         }
     }
 
-    sisl::blob serialize() const override {
-        return sisl::blob{uintptr_cast(const_cast< TestIntervalKey* >(this)), uint32_cast(sizeof(TestIntervalKey))};
+    sisl::Blob serialize() const override {
+        return sisl::Blob{uintptr_cast(const_cast< TestIntervalKey* >(this)), uint32_cast(sizeof(TestIntervalKey))};
     }
 
     uint32_t serialized_size() const override { return sizeof(TestIntervalKey); }
 
-    void deserialize(sisl::blob const& b, bool copy) override {
+    void deserialize(sisl::Blob const& b, bool copy) override {
         assert(b.size() == sizeof(TestIntervalKey));
         TestIntervalKey const* other = r_cast< TestIntervalKey const* >(b.cbytes());
         m_base = other->m_base;
@@ -342,19 +342,19 @@ public:
 
     bool is_interval_key() const override { return true; }
 
-    sisl::blob serialize_prefix() const override {
-        return sisl::blob{uintptr_cast(const_cast< uint32_t* >(&m_base)), uint32_cast(sizeof(uint32_t))};
+    sisl::Blob serialize_prefix() const override {
+        return sisl::Blob{uintptr_cast(const_cast< uint32_t* >(&m_base)), uint32_cast(sizeof(uint32_t))};
     }
 
-    sisl::blob serialize_suffix() const override {
-        return sisl::blob{uintptr_cast(const_cast< uint32_t* >(&m_offset)), uint32_cast(sizeof(uint32_t))};
+    sisl::Blob serialize_suffix() const override {
+        return sisl::Blob{uintptr_cast(const_cast< uint32_t* >(&m_offset)), uint32_cast(sizeof(uint32_t))};
     }
 
     uint32_t serialized_prefix_size() const override { return uint32_cast(sizeof(uint32_t)); }
 
     uint32_t serialized_suffix_size() const override { return uint32_cast(sizeof(uint32_t)); };
 
-    void deserialize(sisl::blob const& prefix, sisl::blob const& suffix, bool) {
+    void deserialize(sisl::Blob const& prefix, sisl::Blob const& suffix, bool) {
         DEBUG_ASSERT_EQ(prefix.size(), sizeof(uint32_t), "Invalid prefix size on deserialize");
         DEBUG_ASSERT_EQ(suffix.size(), sizeof(uint32_t), "Invalid suffix size on deserialize");
         uint32_t const* other_p = r_cast< uint32_t const* >(prefix.cbytes());
@@ -399,7 +399,7 @@ public:
     TestFixedValue(uint32_t val) : BtreeValue() { m_val = val; }
     TestFixedValue() : TestFixedValue((uint32_t)-1) {}
     TestFixedValue(const TestFixedValue& other) : BtreeValue() { m_val = other.m_val; };
-    TestFixedValue(const sisl::blob& b, bool copy) : BtreeValue() { m_val = *(r_cast< uint32_t const* >(b.cbytes())); }
+    TestFixedValue(const sisl::Blob& b, bool copy) : BtreeValue() { m_val = *(r_cast< uint32_t const* >(b.cbytes())); }
     virtual ~TestFixedValue() = default;
 
     static TestFixedValue generate_rand() { return TestFixedValue{g_randval_generator(g_re)}; }
@@ -409,14 +409,14 @@ public:
         return *this;
     }
 
-    sisl::blob serialize() const override {
-        sisl::blob b{r_cast< uint8_t const* >(&m_val), uint32_cast(sizeof(m_val))};
+    sisl::Blob serialize() const override {
+        sisl::Blob b{r_cast< uint8_t const* >(&m_val), uint32_cast(sizeof(m_val))};
         return b;
     }
 
     uint32_t serialized_size() const override { return sizeof(m_val); }
     static uint32_t get_fixed_size() { return sizeof(m_val); }
-    void deserialize(const sisl::blob& b, bool copy) { m_val = *(r_cast< uint32_t const* >(b.cbytes())); }
+    void deserialize(const sisl::Blob& b, bool copy) { m_val = *(r_cast< uint32_t const* >(b.cbytes())); }
 
     std::string to_string() const override { return fmt::format("{}", m_val); }
 
@@ -452,7 +452,7 @@ public:
     TestVarLenValue(const std::string& val) : BtreeValue(), m_val{val} {}
     TestVarLenValue() = default;
     TestVarLenValue(const TestVarLenValue& other) : BtreeValue() { m_val = other.m_val; };
-    TestVarLenValue(const sisl::blob& b, bool copy) :
+    TestVarLenValue(const sisl::Blob& b, bool copy) :
             BtreeValue(), m_val{std::string((const char*)b.cbytes(), b.size())} {}
     virtual ~TestVarLenValue() = default;
 
@@ -463,15 +463,15 @@ public:
 
     static TestVarLenValue generate_rand() { return TestVarLenValue{gen_random_string(rand_val_size())}; }
 
-    sisl::blob serialize() const override {
-        sisl::blob b{r_cast< const uint8_t* >(m_val.c_str()), uint32_cast(m_val.size())};
+    sisl::Blob serialize() const override {
+        sisl::Blob b{r_cast< const uint8_t* >(m_val.c_str()), uint32_cast(m_val.size())};
         return b;
     }
 
     uint32_t serialized_size() const override { return (uint32_t)m_val.size(); }
     static uint32_t get_fixed_size() { return 0; }
 
-    void deserialize(const sisl::blob& b, bool copy) { m_val = std::string((const char*)b.cbytes(), b.size()); }
+    void deserialize(const sisl::Blob& b, bool copy) { m_val = std::string((const char*)b.cbytes(), b.size()); }
 
     std::string to_string() const override { return fmt::format("{}", m_val); }
 
@@ -509,7 +509,7 @@ public:
     TestIntervalValue() = default;
     TestIntervalValue(const TestIntervalValue& other) :
             BtreeIntervalValue(), m_base_val{other.m_base_val}, m_offset{other.m_offset} {}
-    TestIntervalValue(const sisl::blob& b, bool copy) : BtreeIntervalValue() { this->deserialize(b, copy); }
+    TestIntervalValue(const sisl::Blob& b, bool copy) : BtreeIntervalValue() { this->deserialize(b, copy); }
     virtual ~TestIntervalValue() = default;
 
     static TestIntervalValue generate_rand() {
@@ -518,14 +518,14 @@ public:
 
     ///////////////////////////// Overriding methods of BtreeValue //////////////////////////
     TestIntervalValue& operator=(const TestIntervalValue& other) = default;
-    sisl::blob serialize() const override {
-        sisl::blob b{r_cast< uint8_t const* >(this), sizeof(TestIntervalValue)};
+    sisl::Blob serialize() const override {
+        sisl::Blob b{r_cast< uint8_t const* >(this), sizeof(TestIntervalValue)};
         return b;
     }
 
     uint32_t serialized_size() const override { return sizeof(TestIntervalValue); }
     static uint32_t get_fixed_size() { return sizeof(TestIntervalValue); }
-    void deserialize(const sisl::blob& b, bool) {
+    void deserialize(const sisl::Blob& b, bool) {
         TestIntervalValue const* other = r_cast< TestIntervalValue const* >(b.cbytes());
         m_base_val = other->m_base_val;
         m_offset = other->m_offset;
@@ -551,16 +551,16 @@ public:
     ///////////////////////////// Overriding methods of BtreeIntervalValue //////////////////////////
     void shift(int n) override { m_offset += n; }
 
-    sisl::blob serialize_prefix() const override {
-        return sisl::blob{uintptr_cast(const_cast< uint32_t* >(&m_base_val)), uint32_cast(sizeof(uint32_t))};
+    sisl::Blob serialize_prefix() const override {
+        return sisl::Blob{uintptr_cast(const_cast< uint32_t* >(&m_base_val)), uint32_cast(sizeof(uint32_t))};
     }
-    sisl::blob serialize_suffix() const override {
-        return sisl::blob{uintptr_cast(const_cast< uint16_t* >(&m_offset)), uint32_cast(sizeof(uint16_t))};
+    sisl::Blob serialize_suffix() const override {
+        return sisl::Blob{uintptr_cast(const_cast< uint16_t* >(&m_offset)), uint32_cast(sizeof(uint16_t))};
     }
     uint32_t serialized_prefix_size() const override { return uint32_cast(sizeof(uint32_t)); }
     uint32_t serialized_suffix_size() const override { return uint32_cast(sizeof(uint16_t)); }
 
-    void deserialize(sisl::blob const& prefix, sisl::blob const& suffix, bool) override {
+    void deserialize(sisl::Blob const& prefix, sisl::Blob const& suffix, bool) override {
         DEBUG_ASSERT_EQ(prefix.size(), sizeof(uint32_t), "Invalid prefix size on deserialize");
         DEBUG_ASSERT_EQ(suffix.size(), sizeof(uint16_t), "Invalid suffix size on deserialize");
         m_base_val = *(r_cast< uint32_t const* >(prefix.cbytes()));

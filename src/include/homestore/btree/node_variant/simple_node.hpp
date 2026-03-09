@@ -233,7 +233,7 @@ public:
 
     void get_nth_key_internal(uint32_t ind, BtreeKey& out_key, bool copy) const override {
         DEBUG_ASSERT_LT(ind, this->total_entries(), "node={}", to_string());
-        sisl::blob b{this->node_data_area_const() + (get_nth_obj_size(ind) * ind), get_nth_key_size(ind)};
+        sisl::Blob b{this->node_data_area_const() + (get_nth_obj_size(ind) * ind), get_nth_key_size(ind)};
         out_key.deserialize(b, copy);
     }
 
@@ -243,7 +243,7 @@ public:
             DEBUG_ASSERT_EQ(this->has_valid_edge(), true, "node={}", to_string());
             *(BtreeLinkInfo*)out_val = this->get_edge_value();
         } else {
-            sisl::blob b{const_cast< uint8_t* >(this->node_data_area_const() + (get_nth_obj_size(ind) * ind) +
+            sisl::Blob b{const_cast< uint8_t* >(this->node_data_area_const() + (get_nth_obj_size(ind) * ind) +
                                                 get_nth_key_size(ind)),
                          dummy_value< V >.serialized_size()};
             out_val->deserialize(b, copy);
@@ -400,10 +400,10 @@ public:
             set_nth_value(ind, v);
         } else {
             uint8_t* entry = this->node_data_area() + (get_nth_obj_size(ind) * ind);
-            sisl::blob const key_blob = k.serialize();
+            sisl::Blob const key_blob = k.serialize();
             memcpy((void*)entry, key_blob.cbytes(), key_blob.size());
 
-            sisl::blob const val_blob = v.serialize();
+            sisl::Blob const val_blob = v.serialize();
             memcpy((void*)(entry + key_blob.size()), val_blob.cbytes(), val_blob.size());
         }
     }
@@ -421,12 +421,12 @@ public:
 
     void set_nth_key(uint32_t ind, BtreeKey* key) {
         uint8_t* entry = this->node_data_area() + (get_nth_obj_size(ind) * ind);
-        sisl::blob const b = key->serialize();
+        sisl::Blob const b = key->serialize();
         memcpy(entry, b.cbytes(), b.size());
     }
 
     void set_nth_value(uint32_t ind, const BtreeValue& v) {
-        sisl::blob b = v.serialize();
+        sisl::Blob b = v.serialize();
         if (ind >= this->total_entries()) {
             RELEASE_ASSERT_EQ(this->is_leaf(), false, "setting value outside bounds on leaf node");
             DEBUG_ASSERT_EQ(b.size(), sizeof(BtreeLinkInfo::bnode_link_info),

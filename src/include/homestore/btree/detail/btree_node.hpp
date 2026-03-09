@@ -19,9 +19,9 @@
 #include <functional>
 #include <iomgr/fiber_lib.hpp>
 
-#include <sisl/utility/atomic_counter.hpp>
-#include <sisl/utility/enum.hpp>
-#include <sisl/utility/obj_life_counter.hpp>
+#include <sisl/fds/atomic_counter.h>
+#include <sisl/fds/enum.h>
+#include <sisl/fds/obj_life_counter.h>
 #include <homestore/btree/detail/btree_internal.hpp>
 #include <homestore/btree/btree_kv.hpp>
 #include <homestore/crc.h>
@@ -142,7 +142,7 @@ public:
     };
 
     uint8_t* m_phys_node_buf;                      // Pointer to the physical node buffer
-    sisl::atomic_counter< int32_t > m_refcount{0}; // Refcount of the node
+    sisl::AtomicCounter< int32_t > m_refcount{0}; // Refcount of the node
 
     Allocator::Token m_token;
     std::atomic< uint8_t > m_phys_buf_share_count{0};
@@ -178,7 +178,7 @@ public:
         return (r_cast< PersistentHeader* >(buf))->edge_info;
     }
 
-    static bool is_valid_node(sisl::blob const& buf) {
+    static bool is_valid_node(sisl::Blob const& buf) {
         auto phdr = r_cast< PersistentHeader const* >(buf.cbytes());
         if ((phdr->magic != BTREE_NODE_MAGIC) || (phdr->version != BTREE_NODE_VERSION)) { return false; }
         if ((uint32_cast(phdr->node_size) + 1) != buf.size()) { return false; }

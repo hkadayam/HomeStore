@@ -45,7 +45,6 @@
 
 RCU_REGISTER_INIT
  
-SISL_OPTIONS_ENABLE(logging, test_append_blkalloc, iomgr, test_common_setup)
 
 constexpr uint64_t Ki{1024};
 constexpr uint64_t Mi{Ki * Ki};
@@ -83,13 +82,13 @@ public:
         this->m_cv.notify_one();
     }
 
-    void free(sisl::sg_list& sg) { test_common::HSTestHelper::free(sg); }
+    void free(sisl::SgList& sg) { test_common::HSTestHelper::free(sg); }
 
     //
     // this api is for caller who is not interested with the write buffer and blkids;
     //
     void write_io(uint64_t io_size, uint32_t num_iovs = 1) {
-        auto sg = std::make_shared< sisl::sg_list >();
+        auto sg = std::make_shared< sisl::SgList >();
         write_sgs(io_size, sg, num_iovs).thenValue([this, sg](auto) {
             free(*sg);
             finish_and_notify();
@@ -102,8 +101,8 @@ public:
     }
 
     void write_io_verify(const uint64_t io_size) {
-        auto sg_write_ptr = std::make_shared< sisl::sg_list >();
-        auto sg_read_ptr = std::make_shared< sisl::sg_list >();
+        auto sg_write_ptr = std::make_shared< sisl::SgList >();
+        auto sg_read_ptr = std::make_shared< sisl::SgList >();
 
         write_sgs(io_size, sg_write_ptr, 1 /* num_iovs */)
             .thenValue([sg_write_ptr, sg_read_ptr, this](auto&& written_bid_ptr) mutable {
@@ -133,7 +132,7 @@ public:
     }
 
     void write_io_free_blk(const uint64_t io_size) {
-        std::shared_ptr< sisl::sg_list > sg_write_ptr = std::make_shared< sisl::sg_list >();
+        std::shared_ptr< sisl::SgList > sg_write_ptr = std::make_shared< sisl::SgList >();
 
         write_sgs(io_size, sg_write_ptr, 1 /* num_iovs */)
             .thenValue([sg_write_ptr, this](auto&& written_bid_ptr) {
@@ -158,7 +157,7 @@ private:
     // caller should be responsible to call free(sg) to free the iobuf allocated in iovs,
     // normally it should be freed in after_write_cb;
     //
-    folly::Future< shared< BlkId > > write_sgs(uint64_t io_size, cshared< sisl::sg_list >& sg, uint32_t num_iovs) {
+    folly::Future< shared< BlkId > > write_sgs(uint64_t io_size, cshared< sisl::SgList >& sg, uint32_t num_iovs) {
         // TODO: What if iov_len is not multiple of 4Ki?
         HS_DBG_ASSERT_EQ(io_size % (4 * Ki * num_iovs), 0, "Expecting iov_len : {} to be multiple of {}.",
                          io_size / num_iovs, 4 * Ki);
@@ -279,7 +278,7 @@ SISL_OPTION_GROUP(test_append_blkalloc,
 int main(int argc, char* argv[]) {
     int parsed_argc{argc};
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_append_blkalloc, iomgr, test_common_setup);
+    SISL_OPTIONS_LOAD(parsed_argc, argv);
     sisl::logging::SetLogger("test_append_blkalloc");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
 

@@ -51,7 +51,6 @@ using namespace homestore;
 RCU_REGISTER_INIT
  
 
-SISL_OPTIONS_ENABLE(logging, test_meta_blk_mgr, iomgr, test_common_setup)
 
 struct Param {
     uint64_t num_io;
@@ -593,7 +592,7 @@ public:
         m_mbm->deregister_handler(mtype);
         m_mbm->register_handler(
             mtype,
-            [this](meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            [this](meta_blk* mblk, sisl::ByteView buf, size_t size) {
                 if (mblk) {
                     std::unique_lock< std::mutex > lg{m_mtx};
                     m_cb_blks[mblk->hdr.h.bid.to_integer()] =
@@ -628,7 +627,7 @@ public:
         // register with dependencies
         m_mbm->register_handler(
             "A",
-            [this](meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            [this](meta_blk* mblk, sisl::ByteView buf, size_t size) {
                 meta_sub_type subType(mblk->hdr.h.type);
                 actual_cb_order.push_back(subType);
             },
@@ -637,7 +636,7 @@ public:
 
         m_mbm->register_handler(
             "B",
-            [this](meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            [this](meta_blk* mblk, sisl::ByteView buf, size_t size) {
                 meta_sub_type subType(mblk->hdr.h.type);
                 actual_cb_order.push_back(subType);
             },
@@ -646,7 +645,7 @@ public:
 
         m_mbm->register_handler(
             "C",
-            [this](meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            [this](meta_blk* mblk, sisl::ByteView buf, size_t size) {
                 meta_sub_type subType(mblk->hdr.h.type);
                 actual_cb_order.push_back(subType);
             },
@@ -655,21 +654,21 @@ public:
 
         m_mbm->register_handler(
             "D",
-            [this](meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            [this](meta_blk* mblk, sisl::ByteView buf, size_t size) {
                 meta_sub_type subType(mblk->hdr.h.type);
                 actual_cb_order.push_back(subType);
             },
             [this](bool success) { actual_on_complete_cb_order.push_back("D"); }, false);
         m_mbm->register_handler(
             "E",
-            [this](meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            [this](meta_blk* mblk, sisl::ByteView buf, size_t size) {
                 meta_sub_type subType(mblk->hdr.h.type);
                 actual_cb_order.push_back(subType);
             },
             [this](bool success) { actual_on_complete_cb_order.push_back("E"); }, false);
         m_mbm->register_handler(
             "F",
-            [this](meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            [this](meta_blk* mblk, sisl::ByteView buf, size_t size) {
                 meta_sub_type subType(mblk->hdr.h.type);
                 actual_cb_order.push_back(subType);
             },
@@ -687,7 +686,7 @@ public:
         m_mbm->deregister_handler("F");
         m_mbm->register_handler(
             mtype,
-            [this](meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            [this](meta_blk* mblk, sisl::ByteView buf, size_t size) {
                 if (mblk) {
                     std::unique_lock< std::mutex > lg{m_mtx};
                     m_cb_blks[mblk->hdr.h.bid.to_integer()] =
@@ -961,7 +960,7 @@ SISL_OPTION_GROUP(
 int main(int argc, char* argv[]) {
     ::testing::GTEST_FLAG(filter) = "*random*:VMetaBlkMgrTest.recovery_test";
     ::testing::InitGoogleTest(&argc, argv);
-    SISL_OPTIONS_LOAD(argc, argv, logging, test_meta_blk_mgr, iomgr, test_common_setup);
+    SISL_OPTIONS_LOAD(argc, argv);
     sisl::logging::SetLogger("test_meta_blk_mgr");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
 

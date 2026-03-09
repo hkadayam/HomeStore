@@ -1,4 +1,4 @@
-#include <sisl/fds/vector_pool.hpp>
+#include <sisl/fds/vector_pool.h>
 #include "replication/log_store/repl_log_store.h"
 #include "replication/repl_dev/raft_state_machine.h"
 #include "replication/repl_dev/raft_repl_dev.h"

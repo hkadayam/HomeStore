@@ -4,7 +4,7 @@
 #include <string>
 #include <variant>
 
-#include <sisl/utility/enum.hpp>
+#include <sisl/fds/enum.h>
 #include <homestore/replication/repl_decls.h>
 #include <homestore/meta_service.hpp>
 

@@ -74,7 +74,7 @@ RaftReplService::RaftReplService(cshared< ReplApplication >& repl_app) : Generic
     m_config_sb_bufs.reserve(100);
     meta_service().register_handler(
         get_meta_blk_name() + "_raft_config",
-        [this](meta_blk* mblk, sisl::byte_view buf, size_t) {
+        [this](meta_blk* mblk, sisl::ByteView buf, size_t) {
             m_config_sb_bufs.emplace_back(std::pair(std::move(buf), voidptr_cast(mblk)));
         },
         nullptr, false, std::optional< meta_subtype_vec_t >({get_meta_blk_name()}));
@@ -266,7 +266,7 @@ bool RaftReplService::wait_for_cert(const std::string& filepath) {
     return false;
 }
 
-RaftReplDev* RaftReplService::raft_group_config_found(sisl::byte_view const& buf, void* meta_cookie) {
+RaftReplDev* RaftReplService::raft_group_config_found(sisl::ByteView const& buf, void* meta_cookie) {
     json_superblk group_config;
     auto& js = group_config.load(buf, meta_cookie);
 
@@ -415,7 +415,7 @@ folly::SemiFuture< ReplServiceError > RaftReplService::remove_repl_dev(group_id_
     return ret;
 }
 
-void RaftReplService::load_repl_dev(sisl::byte_view const& buf, void* meta_cookie) {
+void RaftReplService::load_repl_dev(sisl::ByteView const& buf, void* meta_cookie) {
     // Load the superblk
     superblk< raft_repl_dev_superblk > rd_sb{get_meta_blk_name()};
     rd_sb.load(buf, meta_cookie);

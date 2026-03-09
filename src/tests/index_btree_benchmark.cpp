@@ -40,7 +40,6 @@ using namespace homestore;
 // this is used to splite the setup and teardown from the benchmark to get a more accurate result
 void* g_btree_helper{nullptr};
 
-SISL_OPTIONS_ENABLE(logging, index_btree_benchmark, iomgr, test_common_setup)
 
 SISL_OPTION_GROUP(index_btree_benchmark,
                   (num_iters, "", "num_iters", "number of iterations for rand ops",
@@ -134,7 +133,7 @@ INDEX_BTREE_BENCHMARK(VarObjSizeBtree)
 // INDEX_BTREE_BENCHMARK(PrefixIntervalBtree)
 
 int main(int argc, char** argv) {
-    SISL_OPTIONS_LOAD(argc, argv, logging, index_btree_benchmark, iomgr, test_common_setup);
+    SISL_OPTIONS_LOAD(argc, argv);
     ::benchmark::Initialize(&argc, argv);
     ::benchmark::RunSpecifiedBenchmarks();
 }

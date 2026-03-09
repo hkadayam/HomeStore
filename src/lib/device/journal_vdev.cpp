@@ -47,7 +47,7 @@ JournalVirtualDev::JournalVirtualDev(DeviceManager& dmgr, const vdev_info& vinfo
             [this]() {
                 m_init_private_data->created_at = get_time_since_epoch_ms();
                 m_init_private_data->end_of_chunk = m_vdev_info.chunk_size;
-                sisl::blob private_blob{r_cast< uint8_t* >(m_init_private_data.get()), sizeof(JournalChunkPrivate)};
+                sisl::Blob private_blob{r_cast< uint8_t* >(m_init_private_data.get()), sizeof(JournalChunkPrivate)};
                 return private_blob;
             },
             m_vdev_info.hs_dev_type, m_vdev_info.vdev_id, m_vdev_info.chunk_size});
@@ -163,7 +163,7 @@ void JournalVirtualDev::release_chunk_to_pool(shared< Chunk > chunk) {
 }
 
 void JournalVirtualDev::update_chunk_private(shared< Chunk >& chunk, JournalChunkPrivate* private_data) {
-    sisl::blob private_blob{r_cast< uint8_t* >(private_data), sizeof(JournalChunkPrivate)};
+    sisl::Blob private_blob{r_cast< uint8_t* >(private_data), sizeof(JournalChunkPrivate)};
     chunk->set_user_private(private_blob);
 }
 

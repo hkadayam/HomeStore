@@ -26,7 +26,7 @@
 #include <boost/icl/split_interval_set.hpp>
 #include <nlohmann/json.hpp>
 #include <homestore/crc.h>
-#include <sisl/metrics/metrics.hpp>
+#include <sisl/metrics/metrics.h>
 #include <sisl/logging/logging.h>
 #include <homestore/homestore_decl.hpp>
 
@@ -94,10 +94,10 @@ struct chunk_info {
     void set_allocated() { chunk_allocated = 0x01; }
     void set_free() { chunk_allocated = 0x00; }
 
-    void set_selector_private(const sisl::blob& data) {
+    void set_selector_private(const sisl::Blob& data) {
         std::memcpy(&chunk_selector_private, data.cbytes(), std::min(data.size(), uint32_cast(selector_private_size)));
     }
-    void set_user_private(const sisl::blob& data) {
+    void set_user_private(const sisl::Blob& data) {
         if (data.size() != 0) {
             std::memcpy(&user_private, data.cbytes(), std::min(data.size(), uint32_cast(user_private_size)));
         }
@@ -176,7 +176,7 @@ public:
     /// @param private_data: data to be stored in chunk private space.
     /// @return Shared instance of chunk class created
     shared< Chunk > create_chunk(uint32_t chunk_id, uint32_t vdev_id, uint64_t size, uint32_t ordinal,
-                                 const sisl::blob& private_data = {});
+                                 const sisl::Blob& private_data = {});
 
     void load_chunks(std::function< bool(cshared< Chunk >&) >&& chunk_found_cb);
     void remove_chunks(std::vector< shared< Chunk > >& chunks);
@@ -232,7 +232,7 @@ public:
 private:
     void do_remove_chunk(cshared< Chunk >& chunk);
     void populate_chunk_info(chunk_info* cinfo, uint32_t vdev_id, uint64_t size, uint32_t chunk_id, uint32_t ordinal,
-                             const sisl::blob& private_data);
+                             const sisl::Blob& private_data);
     void free_chunk_info(chunk_info* cinfo);
     ChunkInterval find_next_chunk_area(uint64_t size) const;
 };

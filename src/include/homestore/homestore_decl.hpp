@@ -22,8 +22,8 @@
 #include <boost/uuid/uuid_io.hpp>
 #include <boost/uuid/uuid_hash.hpp>
 #include <boost/intrusive_ptr.hpp>
-#include <sisl/utility/enum.hpp>
-#include <sisl/fds/utils.hpp>
+#include <sisl/fds/enum.h>
+#include <sisl/fds/utils.h>
 
 #ifdef _PRERELEASE
 #include <sisl/flip/flip.hpp>

@@ -3,11 +3,18 @@ cmake_minimum_required(VERSION 3.13)
 set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
 
 find_package(Threads)
-find_library(LIB_AIO aio QUIET REQUIRED)
 find_package(isa-l QUIET)
-find_package(iomgr QUIET REQUIRED)
 find_package(farmhash QUIET REQUIRED)
 find_package(GTest QUIET REQUIRED)
+find_package(folly QUIET REQUIRED)
+find_package(spdlog QUIET REQUIRED)
+find_package(fmt QUIET REQUIRED)
+find_package(Boost QUIET REQUIRED)
+find_package(nlohmann_json QUIET REQUIRED)
+find_package(userspace-rcu QUIET REQUIRED)
+find_package(Snappy QUIET REQUIRED)
+find_package(flatbuffers QUIET REQUIRED)
+find_package(cxxopts QUIET REQUIRED)
 if (DEFINED REPLICATION)
   if (${REPLICATION} STREQUAL "ON")
     find_package(NuraftMesg QUIET REQUIRED)
@@ -15,9 +22,16 @@ if (DEFINED REPLICATION)
 endif()
 
 list(APPEND COMMON_DEPS
-    iomgr::iomgr
     farmhash::farmhash
-    sisl::sisl
+    folly::folly
+    spdlog::spdlog
+    fmt::fmt
+    Boost::boost
+    nlohmann_json::nlohmann_json
+    userspace-rcu::userspace-rcu
+    Snappy::snappy
+    flatbuffers::flatbuffers
+    cxxopts::cxxopts
 )
 
 if (DEFINED REPLICATION)
@@ -42,10 +56,13 @@ list(APPEND COMMON_TEST_DEPS
     GTest::gmock
 )
 
+include_directories (BEFORE ${CMAKE_CURRENT_SOURCE_DIR})  # enables <sisl/...> and <iomanager/...>
 include_directories (BEFORE lib/)
 include_directories (BEFORE include/)
 include_directories (BEFORE ${CMAKE_CURRENT_BINARY_DIR}/lib)
 
+add_subdirectory(sisl)
+add_subdirectory(iomanager)
 add_subdirectory(lib/blkalloc)
 add_subdirectory(lib/device)
 add_subdirectory(lib/checkpoint)

@@ -1,11 +1,11 @@
 /////////////////////// IndexBuffer methods //////////////////////////
 IndexBuffer::IndexBuffer(BlkId blkid, uint32_t buf_size, uint32_t align_size) :
-        m_blkid{blkid}, m_bytes{hs_utils::iobuf_alloc(buf_size, sisl::buftag::btree_node, align_size)} {}
+        m_blkid{blkid}, m_bytes{hs_utils::iobuf_alloc(buf_size, sisl::Buftag::btree_node, align_size)} {}
 
 IndexBuffer::IndexBuffer(uint8_t* raw_bytes, BlkId blkid) : m_blkid(blkid), m_bytes{raw_bytes} {}
 
 IndexBuffer::~IndexBuffer() {
-    if (m_bytes) { hs_utils::iobuf_free(m_bytes, sisl::buftag::btree_node); }
+    if (m_bytes) { hs_utils::iobuf_free(m_bytes, sisl::Buftag::btree_node); }
 }
 
 std::string IndexBuffer::to_string() const {
@@ -52,13 +52,13 @@ MetaIndexBuffer::MetaIndexBuffer(superblk< index_table_sb >& sb) : IndexBuffer{n
 MetaIndexBuffer::MetaIndexBuffer(shared< MetaIndexBuffer > const& other) :
         IndexBuffer{nullptr, BlkId{}}, m_sb{other->m_sb} {
     m_is_meta_buf = true;
-    m_bytes = hs_utils::iobuf_alloc(m_sb.size(), sisl::buftag::metablk, meta_service().align_size());
+    m_bytes = hs_utils::iobuf_alloc(m_sb.size(), sisl::Buftag::metablk, meta_service().align_size());
     copy_sb_to_buf();
 }
 
 MetaIndexBuffer::~MetaIndexBuffer() {
     if (m_bytes) {
-        hs_utils::iobuf_free(m_bytes, sisl::buftag::metablk);
+        hs_utils::iobuf_free(m_bytes, sisl::Buftag::metablk);
         m_bytes = nullptr;
     }
 }

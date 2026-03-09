@@ -17,7 +17,7 @@
 
 #include <sisl/options/options.h>
 #include <sisl/logging/logging.h>
-#include <sisl/utility/enum.hpp>
+#include <sisl/fds/enum.h>
 #include <homestore/btree/node_variant/simple_node.hpp>
 #include <homestore/btree/node_variant/varlen_node.hpp>
 #include <homestore/btree/node_variant/prefix_node.hpp>
@@ -517,14 +517,13 @@ TYPED_TEST(NodeTest, Move) {
     ASSERT_EQ(this->m_node2->total_entries(), list.size()) << "Move out to right has failed";
 }
 
-SISL_OPTIONS_ENABLE(logging, test_btree_node)
 SISL_OPTION_GROUP(test_btree_node,
                   (num_iters, "", "num_iters", "number of iterations for rand ops",
                    ::cxxopts::value< uint32_t >()->default_value("65536"), "number"))
 
 int main(int argc, char* argv[]) {
     ::testing::InitGoogleTest(&argc, argv);
-    SISL_OPTIONS_LOAD(argc, argv, logging, test_btree_node)
+    SISL_OPTIONS_LOAD(argc, argv);
     sisl::logging::SetLogger("test_btree_node");
     spdlog::set_pattern("[%D %T%z] [%^%L%$] [%t] %v");
 

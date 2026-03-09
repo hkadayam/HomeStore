@@ -25,7 +25,7 @@ BitmapBlkAllocator::BitmapBlkAllocator(BlkAllocConfig const& cfg, bool is_fresh,
     if (is_persistent()) {
         meta_service().register_handler(
             get_name(),
-            [this](meta_blk* mblk, sisl::byte_view buf, size_t size) {
+            [this](meta_blk* mblk, sisl::ByteView buf, size_t size) {
                 on_meta_blk_found(voidptr_cast(mblk), std::move(buf), size);
             },
             nullptr);
@@ -44,7 +44,7 @@ BitmapBlkAllocator::BitmapBlkAllocator(BlkAllocConfig const& cfg, bool is_fresh,
     }
 }
 
-void BitmapBlkAllocator::on_meta_blk_found(void* mblk_cookie, sisl::byte_view const& buf, size_t size) {
+void BitmapBlkAllocator::on_meta_blk_found(void* mblk_cookie, sisl::ByteView const& buf, size_t size) {
     m_meta_blk_cookie = mblk_cookie;
 
     m_disk_bm = std::unique_ptr< sisl::Bitset >{new sisl::Bitset{
@@ -58,7 +58,7 @@ void BitmapBlkAllocator::cp_flush(CP*) {
     if (!is_persistent()) { return; }
 
     if (m_is_disk_bm_dirty.load()) {
-        sisl::byte_array bitmap_buf = acquire_underlying_buffer();
+        sisl::ByteArray bitmap_buf = acquire_underlying_buffer();
         if (m_meta_blk_cookie) {
             meta_service().update_sub_sb(bitmap_buf->cbytes(), bitmap_buf->size(), m_meta_blk_cookie);
         } else {
@@ -149,7 +149,7 @@ void BitmapBlkAllocator::free_on_disk(BlkId const& bid) {
     }
 }
 
-sisl::byte_array BitmapBlkAllocator::acquire_underlying_buffer() {
+sisl::ByteArray BitmapBlkAllocator::acquire_underlying_buffer() {
     // prepare and temporary alloc list, where blkalloc is accumulated till underlying buffer is released.
     // RCU will wait for all I/Os that are still in critical section (allocating on disk bm) to complete and exit;
     auto alloc_list_ptr = new sisl::ThreadVector< MultiBlkId >();

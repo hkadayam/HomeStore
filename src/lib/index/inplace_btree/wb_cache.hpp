@@ -43,7 +43,7 @@ private:
     bool m_in_recovery{false};
 
 public:
-    IndexWBCache(const std::shared_ptr< VirtualDev >& vdev, std::pair< meta_blk*, sisl::byte_view > sb,
+    IndexWBCache(const std::shared_ptr< VirtualDev >& vdev, std::pair< meta_blk*, sisl::ByteView > sb,
                  const std::shared_ptr< sisl::Evictor >& evictor, uint32_t node_size);
 
     BtreeNodePtr alloc_buf(node_initializer_t&& node_initializer) override;
@@ -60,11 +60,11 @@ public:
     //////////////////// CP Related API section /////////////////////////////////
     folly::Future< bool > async_cp_flush(IndexCPContext* context);
     IndexBufferPtr copy_buffer(const IndexBufferPtr& cur_buf, const CPContext* cp_ctx) const;
-    void recover(sisl::byte_view sb) override;
+    void recover(sisl::ByteView sb) override;
 
 private:
     void start_flush_threads();
-    void recover_new_nodes(sisl::byte_view sb);
+    void recover_new_nodes(sisl::ByteView sb);
     void process_write_completion(IndexCPContext* cp_ctx, IndexBufferPtr const& pbuf);
     void do_flush_one_buf(IndexCPContext* cp_ctx, IndexBufferPtr const& buf, bool part_of_batch);
     void link_buf(IndexBufferPtr const& up, IndexBufferPtr const& down, bool is_sibling_link, CPContext* cp_ctx);

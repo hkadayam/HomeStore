@@ -25,8 +25,8 @@
 #include <sstream>
 
 #include <boost/icl/interval_map.hpp>
-#include <sisl/utility/enum.hpp>
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/enum.h>
+#include <sisl/fds/buffer.h>
 #include <homestore/homestore_decl.hpp>
 
 namespace homestore {
@@ -79,8 +79,8 @@ public:
 
     void invalidate();
     uint64_t to_integer() const;
-    sisl::blob serialize() const;
-    void deserialize(sisl::blob const& b, bool copy);
+    sisl::Blob serialize() const;
+    void deserialize(sisl::Blob const& b, bool copy);
     uint32_t serialized_size() const;
     std::string to_string() const;
     bool is_valid() const;
@@ -127,9 +127,9 @@ public:
     bool operator>(MultiBlkId const& other) const { return (compare(*this, other) > 0); }
     bool operator<(MultiBlkId const& other) const { return (compare(*this, other) < 0); }
 
-    sisl::blob serialize() const;
+    sisl::Blob serialize() const;
     uint32_t serialized_size() const;
-    void deserialize(sisl::blob const& b, bool copy);
+    void deserialize(sisl::Blob const& b, bool copy);
 
     bool has_room() const;
     BlkId to_single_blkid() const;

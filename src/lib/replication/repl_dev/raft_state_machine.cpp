@@ -1,8 +1,8 @@
 #include <iomgr/iomgr_timer.hpp>
 #include <iomgr/iomgr_flip.hpp>
 #include <sisl/logging/logging.h>
-#include <sisl/fds/utils.hpp>
-#include <sisl/fds/vector_pool.hpp>
+#include <sisl/fds/utils.h>
+#include <sisl/fds/vector_pool.h>
 #include <libnuraft/nuraft.hxx>
 
 #include "service/raft_repl_service.h"
@@ -19,14 +19,14 @@ RaftStateMachine::RaftStateMachine(RaftReplDev& rd) : m_rd{rd} {
     m_success_ptr->put(0);
 }
 
-static std::pair< sisl::blob, sisl::blob > header_only_extract(nuraft::buffer& buf) {
+static std::pair< sisl::Blob, sisl::Blob > header_only_extract(nuraft::buffer& buf) {
     repl_journal_entry* jentry = r_cast< repl_journal_entry* >(buf.data_begin());
     RELEASE_ASSERT_EQ(jentry->major_version, repl_journal_entry::JOURNAL_ENTRY_MAJOR,
                       "Mismatched version of journal entry received from RAFT peer");
     RELEASE_ASSERT_EQ(jentry->code, journal_type_t::HS_DATA_INLINED,
                       "Trying to extract header on non-header only entry");
-    sisl::blob const header = sisl::blob{uintptr_cast(jentry) + sizeof(repl_journal_entry), jentry->user_header_size};
-    sisl::blob const key = sisl::blob{header.cbytes() + header.size(), jentry->key_size};
+    sisl::Blob const header = sisl::Blob{uintptr_cast(jentry) + sizeof(repl_journal_entry), jentry->user_header_size};
+    sisl::Blob const key = sisl::Blob{header.cbytes() + header.size(), jentry->key_size};
     return {header, key};
 }
 
@@ -58,16 +58,16 @@ repl_req_ptr_t RaftStateMachine::localize_journal_entry_prepare(nuraft::log_entr
             jentry->server_id, lentry.get_term(), jentry->to_string());
 
     auto entry_to_hdr = [](repl_journal_entry* jentry) {
-        return sisl::blob{uintptr_cast(jentry) + sizeof(repl_journal_entry), jentry->user_header_size};
+        return sisl::Blob{uintptr_cast(jentry) + sizeof(repl_journal_entry), jentry->user_header_size};
     };
 
     auto entry_to_key = [](repl_journal_entry* jentry) {
-        return sisl::blob{uintptr_cast(jentry) + sizeof(repl_journal_entry) + jentry->user_header_size,
+        return sisl::Blob{uintptr_cast(jentry) + sizeof(repl_journal_entry) + jentry->user_header_size,
                           jentry->key_size};
     };
 
     auto entry_to_val = [](repl_journal_entry* jentry) {
-        return sisl::blob{uintptr_cast(jentry) + sizeof(repl_journal_entry) + jentry->user_header_size +
+        return sisl::Blob{uintptr_cast(jentry) + sizeof(repl_journal_entry) + jentry->user_header_size +
                               jentry->key_size,
                           jentry->value_size};
     };
@@ -389,7 +389,7 @@ void RaftStateMachine::save_logical_snp_obj(nuraft::snapshot& s, ulong& obj_id, 
     snp_data->is_last_obj = is_last_obj;
 
     // We are doing a copy here.
-    sisl::io_blob_safe blob{static_cast< uint32_t >(data.size())};
+    sisl::IoBlobSafe blob{static_cast< uint32_t >(data.size())};
     std::memcpy(blob.bytes(), data.data_begin(), data.size());
     snp_data->blob = std::move(blob);
 

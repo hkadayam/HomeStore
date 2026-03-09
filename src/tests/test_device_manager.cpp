@@ -36,7 +36,6 @@
 
 using namespace homestore;
  
-SISL_OPTIONS_ENABLE(logging, test_device_manager, iomgr)
 
 SISL_OPTION_GROUP(test_device_manager,
                   (num_data_devs, "", "num_data_devs", "number of data devices to create",
@@ -168,7 +167,7 @@ TEST_F(DeviceMgrTest, StripedVDevCreation) {
                                                            .alloc_type = blk_allocator_type_t::none,
                                                            .chunk_sel_type = chunk_selector_type_t::NONE,
                                                            .multi_pdev_opts = vdev_multi_pdev_opts_t::ALL_PDEV_STRIPED,
-                                                           .context_data = sisl::blob{}});
+                                                           .context_data = sisl::Blob{}});
         m_vdevs.push_back(std::move(vdev));
     }
 
@@ -199,7 +198,7 @@ TEST_F(DeviceMgrTest, SmallStripedVDevCreation) {
                                                        .alloc_type = blk_allocator_type_t::none,
                                                        .chunk_sel_type = chunk_selector_type_t::NONE,
                                                        .multi_pdev_opts = vdev_multi_pdev_opts_t::ALL_PDEV_STRIPED,
-                                                       .context_data = sisl::blob{}});
+                                                       .context_data = sisl::Blob{}});
 
     ASSERT_EQ(vdev->get_chunks().size(), m_pdevs.size()) << "Expected vdev to be created with 1 chunk per pdev";
 }
@@ -223,7 +222,7 @@ TEST_F(DeviceMgrTest, CreateChunk) {
                                                        .alloc_type = blk_allocator_type_t::none,
                                                        .chunk_sel_type = chunk_selector_type_t::NONE,
                                                        .multi_pdev_opts = vdev_multi_pdev_opts_t::ALL_PDEV_STRIPED,
-                                                       .context_data = sisl::blob{}});
+                                                       .context_data = sisl::Blob{}});
 
     auto num_chunks = 10;
     LOGINFO("Step 2: Creating {} chunks", num_chunks);
@@ -261,7 +260,7 @@ TEST_F(DeviceMgrTest, CreateChunk) {
 }
 
 int main(int argc, char* argv[]) {
-    SISL_OPTIONS_LOAD(argc, argv, logging, test_device_manager, iomgr);
+    SISL_OPTIONS_LOAD(argc, argv);
     ::testing::InitGoogleTest(&argc, argv);
     sisl::logging::SetLogger("test_device_manager");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");

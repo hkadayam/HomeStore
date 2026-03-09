@@ -42,7 +42,7 @@ private:
     void* m_meta_blk;
 
 public:
-    SeqStoreBtreeCache(const std::shared_ptr< VirtualDev >& vdev, std::pair< meta_blk*, sisl::byte_view > sb,
+    SeqStoreBtreeCache(const std::shared_ptr< VirtualDev >& vdev, std::pair< meta_blk*, sisl::ByteView > sb,
                        const std::shared_ptr< sisl::Evictor >& evictor, uint32_t node_size);
 
     BtreeNodePtr alloc_buf(node_initializer_t&& node_initializer) override;
@@ -58,7 +58,7 @@ public:
 
     //////////////////// CP Related API section /////////////////////////////////
     folly::Future< bool > async_cp_flush(IndexCPContext* context);
-    void recover(sisl::byte_view sb) override;
+    void recover(sisl::ByteView sb) override;
 
 private:
     void start_flush_threads();

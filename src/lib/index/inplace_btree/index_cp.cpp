@@ -33,7 +33,7 @@ void IndexCPContext::add_to_txn_journal(uint32_t index_ordinal, const IndexBuffe
     std::unique_lock< iomgr::FiberManagerLib::mutex > lg{m_txn_journal_mtx};
     if (m_txn_journal_buf.bytes() == nullptr) {
         m_txn_journal_buf =
-            std::move(sisl::io_blob_safe{std::max(sizeof(txn_journal), 512ul), 512, sisl::buftag::metablk});
+            std::move(sisl::IoBlobSafe{std::max(sizeof(txn_journal), 512ul), 512, sisl::Buftag::metablk});
         txn_journal* tj = new (m_txn_journal_buf.bytes()) txn_journal();
         tj->cp_id = id();
     }
@@ -41,7 +41,7 @@ void IndexCPContext::add_to_txn_journal(uint32_t index_ordinal, const IndexBuffe
     txn_journal* tj = r_cast< txn_journal* >(m_txn_journal_buf.bytes());
     if (m_txn_journal_buf.size() < tj->size + record_size) {
         m_txn_journal_buf.buf_realloc(m_txn_journal_buf.size() + std::max(tj->size + record_size, 512u), 512,
-                                      sisl::buftag::metablk);
+                                      sisl::Buftag::metablk);
         tj = r_cast< txn_journal* >(m_txn_journal_buf.bytes());
     }
 
@@ -200,7 +200,7 @@ void IndexCPContext::log_dags() {
     sisl::logging::GetLogger()->flush();
 }
 
-std::map< BlkId, IndexBufferPtr > IndexCPContext::recover(sisl::byte_view sb) {
+std::map< BlkId, IndexBufferPtr > IndexCPContext::recover(sisl::ByteView sb) {
     txn_journal const* tj = r_cast< txn_journal const* >(sb.bytes());
     if (tj->cp_id != id()) {
         // On clean shutdown, cp_id would be lesser than the current cp_id, in that case ignore this sb

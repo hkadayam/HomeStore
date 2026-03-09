@@ -1,0 +1,640 @@
+/*********************************************************************************
+ * Modifications Copyright 2017-2019 eBay Inc.
+ *
+ * Author/Developer(s): Harihara Kadayam
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *    https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software distributed
+ * under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+ * CONDITIONS OF ANY KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations under the License.
+ *
+ *********************************************************************************/
+#pragma once
+
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <mutex>
+#include <optional>
+#include <regex>
+#include <shared_mutex>
+#include <string>
+#include <tuple>
+#include <unordered_map>
+#include <variant>
+#include <vector>
+
+#include <grpc/grpc.h>
+#include <grpcpp/server.h>
+#include <grpcpp/server_builder.h>
+#include <grpcpp/server_context.h>
+#include <grpcpp/security/server_credentials.h>
+
+#include <boost/asio.hpp>
+#include <boost/date_time/posix_time/posix_time.hpp>
+
+#include <folly/io/async/EventBase.h>
+
+#include "proto/flip_spec.pb.h"
+#include "flip_rpc_server.h"
+#include <sisl/logging/logging.h>
+
+namespace flip {
+
+// ── Tuple iteration helper ────────────────────────────────────────────────────
+
+template < size_t Index = 0,
+           typename TTuple,
+           size_t Size = std::tuple_size_v< std::remove_reference_t< TTuple > >,
+           typename TCallable,
+           typename... TArgs >
+void for_each(TTuple&& tuple, TCallable&& callable, TArgs&&... args) {
+    if constexpr (Index < Size) {
+        std::invoke(callable, args..., std::get< Index >(tuple));
+        if constexpr (Index + 1 < Size) {
+            for_each< Index + 1 >(std::forward< TTuple >(tuple),
+                                  std::forward< TCallable >(callable),
+                                  std::forward< TArgs >(args)...);
+        }
+    }
+}
+
+// ── flip_instance ─────────────────────────────────────────────────────────────
+
+struct flip_instance {
+    explicit flip_instance(const FlipSpec& fspec)
+        : fspec_(fspec), hit_count_(0), remain_exec_count_(fspec.flip_frequency().count()) {}
+
+    flip_instance(const flip_instance& other) {
+        fspec_ = other.fspec_;
+        hit_count_.store(other.hit_count_.load());
+        remain_exec_count_.store(other.remain_exec_count_.load());
+    }
+
+    std::string to_string() const {
+        std::stringstream ss;
+        ss << "\n---------------------------" << fspec_.flip_name() << "-----------------------\n";
+        ss << "Hitcount: " << hit_count_ << "\n";
+        ss << "Remaining count: " << remain_exec_count_ << "\n";
+        ss << fspec_.flip_frequency().DebugString();
+        ss << fspec_.flip_action().DebugString();
+        ss << "Conditions: [\n";
+        int i = 1;
+        for (const auto& cond : fspec_.conditions()) {
+            ss << std::to_string(i++) << ") " << Operator_Name(cond.oper())
+               << " => " << cond.value().DebugString();
+        }
+        ss << "]\n-------------------------------------------------------------------\n";
+        return ss.str();
+    }
+
+    FlipSpec              fspec_;
+    std::atomic<uint32_t> hit_count_;
+    std::atomic<int32_t>  remain_exec_count_;
+};
+
+// ── Proto ↔ value converters ──────────────────────────────────────────────────
+
+template < typename T >
+struct val_converter {
+    T operator()(const ParamValue&) { return T{}; }
+};
+
+template <> struct val_converter< int > {
+    int operator()(const ParamValue& v) {
+        return v.kind_case() == ParamValue::kIntValue ? v.int_value() : 0;
+    }
+};
+
+template <> struct val_converter< long > {
+    long operator()(const ParamValue& v) {
+        return v.kind_case() == ParamValue::kLongValue ? v.long_value() : 0;
+    }
+};
+
+template <> struct val_converter< double > {
+    double operator()(const ParamValue& v) {
+        return v.kind_case() == ParamValue::kDoubleValue ? v.double_value() : 0;
+    }
+};
+
+template <> struct val_converter< std::string > {
+    std::string operator()(const ParamValue& v) {
+        return v.kind_case() == ParamValue::kStringValue ? v.string_value() : "";
+    }
+};
+
+template <> struct val_converter< const std::string > {
+    std::string operator()(const ParamValue& v) {
+        return v.kind_case() == ParamValue::kStringValue ? v.string_value() : "";
+    }
+};
+
+template <> struct val_converter< const char* > {
+    const char* operator()(const ParamValue& v) {
+        return v.kind_case() == ParamValue::kStringValue ? v.string_value().c_str() : nullptr;
+    }
+};
+
+template <> struct val_converter< bool > {
+    bool operator()(const ParamValue& v) {
+        return v.kind_case() == ParamValue::kBoolValue ? v.bool_value() : false;
+    }
+};
+
+template < typename T >
+struct delayed_return_param {
+    uint64_t delay_usec{0};
+    T        val{};
+};
+
+template < typename T >
+struct val_converter< delayed_return_param< T > > {
+    delayed_return_param< T > operator()(const ParamValue&) { return {}; }
+};
+
+// ── Value → proto converters ──────────────────────────────────────────────────
+
+template < typename T >
+struct to_proto_converter {
+    void operator()(const T&, ParamValue*) {}
+};
+
+template <> struct to_proto_converter< int > {
+    void operator()(const int& v, ParamValue* pv) { pv->set_int_value(v); }
+};
+template <> struct to_proto_converter< long > {
+    void operator()(const long& v, ParamValue* pv) { pv->set_long_value(v); }
+};
+template <> struct to_proto_converter< double > {
+    void operator()(const double& v, ParamValue* pv) { pv->set_double_value(v); }
+};
+template <> struct to_proto_converter< std::string > {
+    void operator()(const std::string& v, ParamValue* pv) { pv->set_string_value(v); }
+};
+template <> struct to_proto_converter< const std::string > {
+    void operator()(const std::string& v, ParamValue* pv) { pv->set_string_value(v); }
+};
+template <> struct to_proto_converter< const char* > {
+    void operator()(const char* v, ParamValue* pv) { pv->set_string_value(v); }
+};
+template <> struct to_proto_converter< bool > {
+    void operator()(const bool& v, ParamValue* pv) { pv->set_bool_value(v); }
+};
+
+// ── Comparators ───────────────────────────────────────────────────────────────
+
+template < typename T >
+struct compare_val {
+    bool operator()(const T& lhs, const T& rhs, Operator oper) {
+        switch (oper) {
+        case Operator::DONT_CARE:             return true;
+        case Operator::EQUAL:                 return lhs == rhs;
+        case Operator::NOT_EQUAL:             return lhs != rhs;
+        case Operator::GREATER_THAN:          return lhs > rhs;
+        case Operator::LESS_THAN:             return lhs < rhs;
+        case Operator::GREATER_THAN_OR_EQUAL: return lhs >= rhs;
+        case Operator::LESS_THAN_OR_EQUAL:    return lhs <= rhs;
+        default:                              return false;
+        }
+    }
+};
+
+template <>
+struct compare_val< std::string > {
+    bool operator()(const std::string& lhs, const std::string& rhs, Operator oper) {
+        switch (oper) {
+        case Operator::DONT_CARE:             return true;
+        case Operator::EQUAL:                 return lhs == rhs;
+        case Operator::NOT_EQUAL:             return lhs != rhs;
+        case Operator::GREATER_THAN:          return lhs > rhs;
+        case Operator::LESS_THAN:             return lhs < rhs;
+        case Operator::GREATER_THAN_OR_EQUAL: return lhs >= rhs;
+        case Operator::LESS_THAN_OR_EQUAL:    return lhs <= rhs;
+        case Operator::REG_EX: {
+            const std::regex re(rhs);
+            return std::sregex_iterator(lhs.begin(), lhs.end(), re) != std::sregex_iterator();
+        }
+        default: return false;
+        }
+    }
+};
+
+template <>
+struct compare_val< const char* > {
+    bool operator()(const char* lhs, const char* rhs, Operator oper) {
+        switch (oper) {
+        case Operator::DONT_CARE:             return true;
+        case Operator::EQUAL:
+            return (lhs && rhs && strcmp(lhs, rhs) == 0) || (!lhs && !rhs);
+        case Operator::NOT_EQUAL:
+            return !((lhs && rhs && strcmp(lhs, rhs) == 0) || (!lhs && !rhs));
+        case Operator::GREATER_THAN:
+            return lhs && rhs ? strcmp(lhs, rhs) > 0 : (lhs && !rhs);
+        case Operator::LESS_THAN:
+            return lhs && rhs ? strcmp(lhs, rhs) < 0 : (!lhs && rhs);
+        case Operator::GREATER_THAN_OR_EQUAL:
+            return lhs && rhs ? strcmp(lhs, rhs) >= 0 : !rhs;
+        case Operator::LESS_THAN_OR_EQUAL:
+            return lhs && rhs ? strcmp(lhs, rhs) <= 0 : !lhs;
+        case Operator::REG_EX: {
+            if (!lhs || !rhs) return false;
+            const std::regex re(rhs);
+            const std::string s(lhs);
+            return std::sregex_iterator(s.begin(), s.end(), re) != std::sregex_iterator();
+        }
+        default: return false;
+        }
+    }
+};
+
+// ── FlipTimerBase — interface ─────────────────────────────────────────────────
+//
+// Implement this interface to plug any timer backend into Flip.
+// Delay is passed as std::chrono::microseconds (no boost dependency in API).
+
+class FlipTimerBase {
+public:
+    virtual ~FlipTimerBase() = default;
+
+    virtual void schedule(const std::string& timer_name,
+                          std::chrono::microseconds delay,
+                          std::function< void() > closure) = 0;
+
+    virtual void cancel(const std::string& timer_name) = 0;
+};
+
+// ── FlipTimerAsio — boost::asio based (legacy, no external deps for callers) ──
+
+class FlipTimerAsio : public FlipTimerBase {
+public:
+    FlipTimerAsio() = default;
+
+    ~FlipTimerAsio() override {
+        if (timer_thread_) {
+            work_.reset();
+            timer_thread_->join();
+        }
+    }
+
+    void schedule(const std::string& timer_name,
+                  std::chrono::microseconds delay,
+                  std::function< void() > closure) override {
+        std::unique_lock lock(thr_mutex_);
+        if (!work_) {
+            work_        = std::make_unique< boost::asio::io_service::work >(svc_);
+            timer_thread_ = std::make_unique< std::thread >([this] { svc_.run(); });
+        }
+
+        auto t = std::make_shared< boost::asio::deadline_timer >(
+            svc_, boost::posix_time::microseconds(static_cast<long>(delay.count())));
+
+        t->async_wait([this, closure = std::move(closure), t, timer_name]
+                      (const boost::system::error_code& e) {
+            if (e) {
+                LOGERRORMOD(flip, "Timer error: {}", e.message());
+            } else {
+                closure();
+            }
+            remove_timer(timer_name, t);
+        });
+
+        timer_instances_.emplace(timer_name, std::move(t));
+    }
+
+    void cancel(const std::string& timer_name) override {
+        remove_timer(timer_name, nullptr);
+    }
+
+private:
+    using deadline_timer = boost::asio::deadline_timer;
+
+    void remove_timer(const std::string& name,
+                      const std::shared_ptr< deadline_timer >& t) {
+        std::unique_lock lock(thr_mutex_);
+        auto [first, last] = timer_instances_.equal_range(name);
+        for (auto it = first; it != last;) {
+            if (!t || it->second == t) {
+                it = timer_instances_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    boost::asio::io_service                                           svc_;
+    std::unique_ptr< boost::asio::io_service::work >                  work_;
+    std::mutex                                                         thr_mutex_;
+    std::unique_ptr< std::thread >                                     timer_thread_;
+    std::multimap< std::string, std::shared_ptr< deadline_timer > >   timer_instances_;
+};
+
+// ── FlipTimerFolly — folly EventBase based (folly-coro friendly) ───────────────
+//
+// Uses the EventBase's HHWheelTimer via runAfterDelay.  The closure fires on
+// the EventBase thread, so it is safe to schedule folly coroutine continuations
+// from within it.  "cancel" is implemented via a shared cancellation flag so
+// that in-flight timers are silently discarded.
+
+class FlipTimerFolly : public FlipTimerBase {
+public:
+    explicit FlipTimerFolly(folly::EventBase* eb) : eb_(eb) {}
+
+    void schedule(const std::string& timer_name,
+                  std::chrono::microseconds delay,
+                  std::function< void() > closure) override {
+        auto flag = std::make_shared< std::atomic< bool > >(false);
+        {
+            std::lock_guard lock(mutex_);
+            cancel_flags_[timer_name].push_back(flag);
+        }
+
+        auto delay_ms = std::chrono::duration_cast< std::chrono::milliseconds >(delay).count();
+        eb_->runAfterDelay(
+            [this, closure = std::move(closure), flag, timer_name] {
+                if (!flag->load(std::memory_order_acquire)) {
+                    closure();
+                }
+                // Clean up the flag entry (best-effort; may already be gone if cancelled).
+                std::lock_guard lock(mutex_);
+                if (auto it = cancel_flags_.find(timer_name); it != cancel_flags_.end()) {
+                    auto& vec = it->second;
+                    vec.erase(std::remove(vec.begin(), vec.end(), flag), vec.end());
+                    if (vec.empty()) cancel_flags_.erase(it);
+                }
+            },
+            static_cast< uint32_t >(delay_ms));
+    }
+
+    void cancel(const std::string& timer_name) override {
+        std::lock_guard lock(mutex_);
+        if (auto it = cancel_flags_.find(timer_name); it != cancel_flags_.end()) {
+            for (auto& f : it->second) f->store(true, std::memory_order_release);
+            cancel_flags_.erase(it);
+        }
+    }
+
+private:
+    folly::EventBase* eb_;
+    std::mutex        mutex_;
+    std::unordered_map< std::string,
+                        std::vector< std::shared_ptr< std::atomic< bool > > > > cancel_flags_;
+};
+
+// ── Flip action type tags ──────────────────────────────────────────────────────
+
+static constexpr int TEST_ONLY    = 0;
+static constexpr int RETURN_VAL   = 1;
+static constexpr int SET_DELAY    = 2;
+static constexpr int DELAYED_RETURN = 3;
+
+// ── Flip ──────────────────────────────────────────────────────────────────────
+
+class Flip {
+public:
+    Flip() : flip_enabled_(false) {}
+
+    // Construct with an explicit timer (e.g. FlipTimerFolly for folly reactors).
+    explicit Flip(std::unique_ptr< FlipTimerBase > timer)
+        : flip_enabled_(false), timer_(std::move(timer)) {}
+
+    ~Flip() {
+        if (flip_server_) stop_rpc_server();
+    }
+
+    static Flip& instance() {
+        static Flip s_instance;
+        return s_instance;
+    }
+
+    // Replace the timer implementation at any point.
+    // Call e.g. Flip::instance().set_timer(std::make_unique<FlipTimerFolly>(eb))
+    // from IOManager::start() on each reactor EventBase before any delay flips fire.
+    void set_timer(std::unique_ptr< FlipTimerBase > t) {
+        std::unique_lock lock(mutex_);
+        timer_ = std::move(t);
+    }
+
+    void start_rpc_server() {
+        if (flip_server_) stop_rpc_server();
+
+        flip_server_ = std::make_unique< FlipRPCServer >();
+        std::string addr("0.0.0.0:50051");
+        grpc::ServerBuilder builder;
+        builder.AddListeningPort(addr, grpc::InsecureServerCredentials());
+        builder.RegisterService(static_cast< FlipRPCServer::Service* >(flip_server_.get()));
+        grpc_server_ = builder.BuildAndStart();
+        LOGINFOMOD(flip, "Flip GRPC Server listening on {}", addr);
+        flip_server_thread_ = std::make_unique< std::thread >(
+            [s = grpc_server_.get()] { s->Wait(); });
+    }
+
+    void stop_rpc_server() {
+        if (grpc_server_) grpc_server_->Shutdown();
+        flip_server_thread_->join();
+        flip_server_thread_.reset();
+        flip_server_.reset();
+    }
+
+    bool add(const FlipSpec& fspec) {
+        flip_enabled_ = true;
+        flip_instance inst{fspec};
+
+        std::unique_lock lock(mutex_);
+
+        auto action_type = fspec.flip_action().action_case();
+        if ((action_type == FlipAction::kDelays || action_type == FlipAction::kDelayReturns)
+            && !timer_) {
+            timer_ = std::make_unique< FlipTimerAsio >();
+        }
+
+        flip_specs_.emplace(fspec.flip_name(), std::move(inst));
+        LOGDEBUGMOD(flip, "Added fault flip {}", fspec.flip_name());
+        return true;
+    }
+
+    std::vector< std::string > get(const std::string& flip_name) {
+        std::shared_lock lock(mutex_);
+        std::vector< std::string > res;
+        auto [first, last] = flip_specs_.equal_range(flip_name);
+        for (auto it = first; it != last; ++it) res.emplace_back(it->second.to_string());
+        return res;
+    }
+
+    std::vector< std::string > get_all() {
+        std::shared_lock lock(mutex_);
+        std::vector< std::string > res;
+        for (const auto& [name, inst] : flip_specs_) res.emplace_back(inst.to_string());
+        return res;
+    }
+
+    uint32_t remove(const std::string& flip_name) {
+        std::unique_lock lock(mutex_);
+        auto n = flip_specs_.erase(flip_name);
+        if (timer_) timer_->cancel(flip_name);
+        return static_cast< uint32_t >(n);
+    }
+
+    // ── Public test APIs ──────────────────────────────────────────────────────
+
+    template < class... Args >
+    bool test_flip(const std::string& flip_name, Args&&... args) {
+        if (!flip_enabled_) return false;
+        return __test_flip< bool, TEST_ONLY >(flip_name, std::forward< Args >(args)...).has_value();
+    }
+
+    template < typename T, class... Args >
+    std::optional< T > get_test_flip(const std::string& flip_name, Args&&... args) {
+        if (!flip_enabled_) return std::nullopt;
+        auto ret = __test_flip< T, RETURN_VAL >(flip_name, std::forward< Args >(args)...);
+        if (!ret) return std::nullopt;
+        return std::optional< T >(std::get< T >(*ret));
+    }
+
+    template < class... Args >
+    bool delay_flip(const std::string& flip_name,
+                    std::function< void() > closure,
+                    Args&&... args) {
+        if (!flip_enabled_) return false;
+        auto ret = __test_flip< bool, SET_DELAY >(flip_name, std::forward< Args >(args)...);
+        if (!ret) return false;
+        get_timer().schedule(flip_name,
+                             std::chrono::microseconds(std::get< uint64_t >(*ret)),
+                             std::move(closure));
+        return true;
+    }
+
+    template < typename T, class... Args >
+    bool get_delay_flip(const std::string& flip_name,
+                        std::function< void(T) > closure,
+                        Args&&... args) {
+        if (!flip_enabled_) return false;
+        auto ret = __test_flip< T, DELAYED_RETURN >(flip_name, std::forward< Args >(args)...);
+        if (!ret) return false;
+        auto param = std::get< delayed_return_param< T > >(*ret);
+        LOGDEBUGMOD(flip, "delay_flip {} delay={}us", flip_name, param.delay_usec);
+        get_timer().schedule(flip_name,
+                             std::chrono::microseconds(param.delay_usec),
+                             [closure = std::move(closure), param] { closure(param.val); });
+        return true;
+    }
+
+private:
+    // Internal return type for __test_flip.
+    template < typename T >
+    using FlipResult = std::optional< std::variant< T, bool, uint64_t, delayed_return_param< T > > >;
+
+    template < typename T, int ActionType, class... Args >
+    FlipResult< T > __test_flip(const std::string& flip_name, Args&&... args) {
+        bool exec_completed = false;
+        flip_instance* inst = nullptr;
+
+        {
+            std::shared_lock lock(mutex_);
+            inst = match_flip(flip_name, std::forward< Args >(args)...);
+            if (!inst) return std::nullopt;
+
+            if (!handle_hits(inst->fspec_.flip_frequency(), inst)) {
+                LOGDEBUGMOD(flip, "Flip {} rate-limited", flip_name);
+                return std::nullopt;
+            }
+
+            auto remain = inst->remain_exec_count_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+            if (remain == 0) {
+                exec_completed = true;
+            } else if (remain < 0) {
+                LOGDEBUGMOD(flip, "Flip {} reached max count", flip_name);
+                return std::nullopt;
+            }
+            LOGDEBUGMOD(flip, "Flip {} hit", flip_name);
+        }
+
+        std::variant< T, bool, uint64_t, delayed_return_param< T > > val;
+
+        switch (inst->fspec_.flip_action().action_case()) {
+        case FlipAction::kReturns:
+            if constexpr (ActionType == RETURN_VAL) {
+                val = val_converter< T >()(inst->fspec_.flip_action().returns().retval());
+            } else {
+                val = true;
+            }
+            break;
+
+        case FlipAction::kNoAction:
+            val = true;
+            break;
+
+        case FlipAction::kDelays:
+            val = static_cast< uint64_t >(inst->fspec_.flip_action().delays().delay_in_usec());
+            break;
+
+        case FlipAction::kDelayReturns:
+            if constexpr (ActionType == DELAYED_RETURN) {
+                const auto& dr = inst->fspec_.flip_action().delay_returns();
+                delayed_return_param< T > p;
+                p.delay_usec = dr.delay_in_usec();
+                p.val        = val_converter< T >()(dr.retval());
+                val = std::move(p);
+            } else {
+                val = true;
+            }
+            break;
+
+        default:
+            val = true;
+        }
+
+        if (exec_completed) {
+            std::unique_lock lock(mutex_);
+            if (inst->remain_exec_count_.load(std::memory_order_relaxed) == 0) {
+                flip_specs_.erase(flip_name);
+            }
+        }
+        return val;
+    }
+
+    template < class... Args >
+    flip_instance* match_flip(const std::string& flip_name, Args&&... args) {
+        auto [first, last] = flip_specs_.equal_range(flip_name);
+        for (auto it = first; it != last; ++it) {
+            auto* inst = &it->second;
+            std::tuple< Args... > arglist(std::forward< Args >(args)...);
+            bool matched = true;
+            auto i = 0U;
+            for_each(arglist, [&](auto& v) {
+                if (!condition_matches(v, inst->fspec_.conditions()[i++])) matched = false;
+            });
+            if (matched) return inst;
+        }
+        return nullptr;
+    }
+
+    template < typename T >
+    bool condition_matches(T& comp_val, const FlipCondition& cond) {
+        auto val = val_converter< T >()(cond.value());
+        return compare_val< T >()(comp_val, val, cond.oper());
+    }
+
+    bool handle_hits(const FlipFrequency& freq, flip_instance* inst) {
+        auto hit = inst->hit_count_.fetch_add(1, std::memory_order_release);
+        if (freq.every_nth() != 0) return (hit % freq.every_nth()) == 0;
+        return (static_cast< uint32_t >(rand() % 100) < freq.percent());
+    }
+
+    FlipTimerBase& get_timer() { return *timer_; }
+
+    std::multimap< std::string, flip_instance >  flip_specs_;
+    std::shared_mutex                            mutex_;
+    bool                                         flip_enabled_;
+    std::unique_ptr< FlipTimerBase >             timer_;
+    std::unique_ptr< std::thread >               flip_server_thread_;
+    std::unique_ptr< FlipRPCServer >             flip_server_;
+    std::unique_ptr< grpc::Server >              grpc_server_;
+};
+
+} // namespace flip

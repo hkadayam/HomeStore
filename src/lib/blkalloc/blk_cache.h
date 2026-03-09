@@ -21,10 +21,10 @@
 #include <string>
 #include <vector>
 
-#include <sisl/fds/bitword.hpp>
+#include <sisl/fds/bitword.h>
 #include <fmt/format.h>
 #include <fmt/ostream.h>
-#include <sisl/utility/enum.hpp>
+#include <sisl/fds/enum.h>
 
 #include <homestore/blk.h>
 #include "common/homestore_assert.hpp"

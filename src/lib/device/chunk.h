@@ -71,7 +71,7 @@ public:
     float get_blk_usage() const;
 
     ////////////// Setters /////////////////////
-    void set_user_private(const sisl::blob& data);
+    void set_user_private(const sisl::Blob& data);
     void set_block_allocator(cshared< BlkAllocator >& blkalloc) { m_blk_allocator = blkalloc; }
     void set_vdev_ordinal(uint32_t vdev_ordinal) { m_vdev_ordinal = vdev_ordinal; }
 

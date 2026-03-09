@@ -32,7 +32,7 @@
 #include <nlohmann/json.hpp>
 #include <sisl/options/options.h>
 #include <sisl/settings/settings.hpp>
-#include <sisl/utility/enum.hpp>
+#include <sisl/fds/enum.h>
 
 #include <homestore/homestore_decl.hpp>
 #include "error.h"

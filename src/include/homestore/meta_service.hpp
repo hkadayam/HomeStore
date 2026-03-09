@@ -27,8 +27,8 @@
 #include <queue>
 #include <optional>
 
-#include <sisl/fds/buffer.hpp>
-#include <sisl/metrics/metrics.hpp>
+#include <sisl/fds/buffer.h>
+#include <sisl/metrics/metrics.h>
 #include <iomgr/fiber_lib.hpp>
 #include <nlohmann/json.hpp>
 #include <homestore/homestore_decl.hpp>
@@ -48,7 +48,7 @@ struct vdev_info;
 // each subsystem could receive callbacks multiple times
 // NOTE: look at this prototype some other time for const correctness and efficiency
 // new blk found subsystem callback
-typedef std::function< void(meta_blk* mblk, sisl::byte_view buf, size_t size) > meta_blk_found_cb_t;
+typedef std::function< void(meta_blk* mblk, sisl::ByteView buf, size_t size) > meta_blk_found_cb_t;
 typedef std::string meta_sub_type;
 typedef std::vector< meta_sub_type > meta_subtype_vec_t;
 typedef std::function< void(bool success) > meta_blk_recover_comp_cb_t; // recover complete subsystem callbacks;
@@ -89,7 +89,7 @@ private:
     client_info_map_t m_sub_info;            // map of callbacks
     std::unique_ptr< BlkId > m_last_mblk_id; // last meta blk;
     meta_blk_sb* m_ssb{nullptr};             // meta super super blk;
-    sisl::blob m_compress_info;
+    sisl::Blob m_compress_info;
     MetablkMetrics m_metrics;
     bool m_inited{false};
     std::unique_ptr< meta_vdev_context > m_meta_vdev_context;
@@ -168,7 +168,7 @@ public:
      */
     void update_sub_sb(const uint8_t* context_data, uint64_t sz, void* cookie);
 
-    // size_t read_sub_sb(const meta_sub_type type, sisl::byte_view& buf);
+    // size_t read_sub_sb(const meta_sub_type type, sisl::ByteView& buf);
     void read_sub_sb(meta_sub_type type);
 
     /**
@@ -218,7 +218,7 @@ public:
     /*********************** static public function **********************/
     uint64_t ovf_blk_max_num_data_blk() const;
 
-    sisl::byte_array to_meta_buf(sisl::byte_view buf, size_t size) const;
+    sisl::ByteArray to_meta_buf(sisl::ByteView buf, size_t size) const;
 
 public:
     /*********************** static public function **********************/
@@ -330,7 +330,7 @@ private:
      * @param mblk
      * @param buf
      */
-    sisl::byte_array read_sub_sb_internal(const meta_blk* mblk) const;
+    sisl::ByteArray read_sub_sb_internal(const meta_blk* mblk) const;
 
     void free_compress_buf();
     void alloc_compress_buf(size_t size);

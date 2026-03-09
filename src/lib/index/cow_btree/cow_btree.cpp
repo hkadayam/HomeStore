@@ -29,7 +29,7 @@ static BlkId alloc_blks_or_fail(VirtualDev* vdev, uint32_t size, blk_alloc_hints
     return out_blkid;
 }
 
-static void write_or_fail(VirtualDev* vdev, sisl::io_blob const& blob, BlkId location) {
+static void write_or_fail(VirtualDev* vdev, sisl::IoBlob const& blob, BlkId location) {
     auto err = vdev->sync_write(r_cast< const char* >(blob.cbytes()), blob.size(), location);
     HS_REL_ASSERT(!err, "Flush of full map failed with err={}. best is to crash the system and replay", err.message());
 }
@@ -268,7 +268,7 @@ struct NodeFlushUnit {
     BlkId m_nodes_location;
     uint32_t m_nodes_count{0};
 
-    NodeFlushUnit(COWBtreeCPContext* cp_ctx, BlkId location, sisl::blob& journal_area) :
+    NodeFlushUnit(COWBtreeCPContext* cp_ctx, BlkId location, sisl::Blob& journal_area) :
             m_cp_ctx{cp_ctx}, m_nodes_location{location} {
         if (journal_area.bytes() != nullptr) {
             m_jentry = new (journal_area.bytes()) JournalEntry();
@@ -323,7 +323,7 @@ struct BNodeMapWriteUnit {
 #pragma pack()
 
     VirtualDev* m_vdev;
-    sisl::io_blob_safe m_buf;
+    sisl::IoBlobSafe m_buf;
     uint32_t m_available_space{0};
     BlkId m_location;
     MapEntry* m_cur_entry{nullptr};
@@ -351,7 +351,7 @@ public:
         m_available_space = m_location.blk_count() * m_vdev->block_size();
 
         // Allocate buffer to hold up that much disk space we allocated.
-        m_buf = sisl::io_blob_safe(m_available_space, vdev->align_size(), sisl::buftag::metablk);
+        m_buf = sisl::IoBlobSafe(m_available_space, vdev->align_size(), sisl::Buftag::metablk);
         memset(m_buf.bytes(), 0, m_available_space);
 
         // Initialize the in-memory pointers
@@ -361,7 +361,7 @@ public:
     }
 
     // Recovery constructor
-    BNodeMapWriteUnit(VirtualDev* vdev, sisl::io_blob_safe buf, BlkId location) :
+    BNodeMapWriteUnit(VirtualDev* vdev, sisl::IoBlobSafe buf, BlkId location) :
             m_vdev{vdev}, m_buf{std::move(buf)}, m_location{location} {
         HS_DBG_ASSERT_GE(m_buf.size(), header()->size, "Read buf is less than MapWriteUnit size on-disk");
         HS_REL_ASSERT_EQ(header()->checksum, compute_crc(), "CRC Mismatch on MapWriteUnit");
@@ -400,7 +400,7 @@ public:
 
     void link(BNodeMapWriteUnit& next) { header()->next_unit_location = COWBtree::CompactBlkId{next.m_location}; }
 
-    sisl::io_blob finalize() {
+    sisl::IoBlob finalize() {
         ++(header()->n_entries); // We increment as the last entry would be open until we finalize
 
         // Trim down the alloc size and actual blks (if we alloced them)
@@ -413,7 +413,7 @@ public:
         // Write the checksum
         header()->checksum = compute_crc();
 
-        return sisl::io_blob{m_buf.cbytes(), valid.blk_count() * m_vdev->block_size(), true /* is_aligned */};
+        return sisl::IoBlob{m_buf.cbytes(), valid.blk_count() * m_vdev->block_size(), true /* is_aligned */};
     }
 
     Header* header() { return r_cast< Header* >(m_buf.bytes()); }
@@ -739,7 +739,7 @@ FlushNodeInfo COWBtree::get_flush_version_buf(BtreeNodePtr node, cp_id_t cur_cp_
         HS_DBG_ASSERT_EQ(node->get_modified_cp_id(), cur_cp_id - 1,
                          "We have shared buffer of node with cp, but its cp modified id is more than 1, we only "
                          "support 2 concurrent cp sessions");
-        auto new_buf = hs_utils::iobuf_alloc(node->node_size(), sisl::buftag::btree_node, align_size());
+        auto new_buf = hs_utils::iobuf_alloc(node->node_size(), sisl::Buftag::btree_node, align_size());
         std::memcpy(new_buf, ret_buf, node->node_size());
         ret_buf = new_buf;
         node->set_phys_node_buf(new_buf);
@@ -807,13 +807,13 @@ bool COWBtree::CPSession::prepare_to_flush_nodes(COWBtreeCPContext* cp_ctx) {
     return true;
 }
 
-std::tuple< BlkId, COWBtree::DirtyNodeList::iterator, sisl::blob > COWBtree::CPSession::next_dirty() {
+std::tuple< BlkId, COWBtree::DirtyNodeList::iterator, sisl::Blob > COWBtree::CPSession::next_dirty() {
     std::lock_guard lg{m_flush_mtx};
     HS_DBG_ASSERT_EQ(m_state, FlushState::NODES_FLUSHING,
                      "Unexpected state while pulling a dirty nodes, we expect all fibers have drained the iterator "
                      "before moving to flushed or collecting state");
 
-    sisl::blob ret_blob;
+    sisl::Blob ret_blob;
     if (m_next_location_idx == m_node_locations.size()) {
         // We have reached the end of all nodes location's, which means there should be no more dirty
         HS_DBG_ASSERT(m_modified_it == m_modified_nodes.end(),
@@ -831,12 +831,12 @@ std::tuple< BlkId, COWBtree::DirtyNodeList::iterator, sisl::blob > COWBtree::CPS
 
     if (m_journal) {
         auto junit_size = NodeFlushUnit::JournalEntry::size(ret_loc.blk_count());
-        ret_blob = sisl::blob{m_journal->allocate(junit_size), junit_size};
+        ret_blob = sisl::Blob{m_journal->allocate(junit_size), junit_size};
     }
     return std::make_tuple(ret_loc, ret_it, ret_blob);
 }
 
-std::tuple< COWBtree::DeletedNodeList::iterator, COWBtree::DeletedNodeList::iterator, sisl::blob >
+std::tuple< COWBtree::DeletedNodeList::iterator, COWBtree::DeletedNodeList::iterator, sisl::Blob >
 COWBtree::CPSession::next_deleted() {
     std::lock_guard lg{m_flush_mtx};
     HS_DBG_ASSERT_EQ(m_state, FlushState::NODES_FLUSHED,
@@ -845,10 +845,10 @@ COWBtree::CPSession::next_deleted() {
     auto ret_it = m_deleted_it;
     m_deleted_it = m_deleted_nodes.end(); // Set to end, so that any subsequent requests will get ret_it as end iterator
 
-    sisl::blob ret_blob;
+    sisl::Blob ret_blob;
     if (m_journal) {
         uint32_t const jdel_size = m_deleted_count * sizeof(CompactNodeId);
-        ret_blob = sisl::blob{m_journal->allocate(jdel_size), jdel_size};
+        ret_blob = sisl::Blob{m_journal->allocate(jdel_size), jdel_size};
     }
     return std::make_tuple(std::move(ret_it), m_deleted_nodes.end(), std::move(ret_blob));
 }

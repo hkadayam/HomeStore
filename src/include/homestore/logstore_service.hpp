@@ -24,7 +24,7 @@
 #include <mutex>
 
 #include <iomgr/iomgr.hpp>
-#include <sisl/metrics/metrics.hpp>
+#include <sisl/metrics/metrics.h>
 #include <nlohmann/json.hpp>
 
 #include <homestore/homestore_decl.hpp>
@@ -178,10 +178,10 @@ public:
 
 private:
     std::shared_ptr< LogDev > create_new_logdev_internal(logdev_id_t logdev_id, flush_mode_t flush_mode);
-    void on_meta_blk_found(const sisl::byte_view& buf, void* meta_cookie);
+    void on_meta_blk_found(const sisl::ByteView& buf, void* meta_cookie);
     logdev_id_t get_next_logdev_id();
-    void logdev_super_blk_found(const sisl::byte_view& buf, void* meta_cookie);
-    void rollback_super_blk_found(const sisl::byte_view& buf, void* meta_cookie);
+    void logdev_super_blk_found(const sisl::ByteView& buf, void* meta_cookie);
+    void rollback_super_blk_found(const sisl::ByteView& buf, void* meta_cookie);
     void start_threads();
     void flush();
 

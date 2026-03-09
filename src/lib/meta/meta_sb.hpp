@@ -227,7 +227,7 @@ struct meta_blk_ovf_hdr {
 struct meta_vdev_context : public hs_vdev_context {
     BlkId first_blkid;
 
-    sisl::blob to_blob() { return sisl::blob{uintptr_cast(this), sizeof(*this)}; }
+    sisl::Blob to_blob() { return sisl::Blob{uintptr_cast(this), sizeof(*this)}; }
 };
 #pragma pack()
 

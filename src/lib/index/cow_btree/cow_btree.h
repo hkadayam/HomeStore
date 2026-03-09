@@ -1,7 +1,7 @@
 #pragma once
 
 #include <vector>
-#include <sisl/fds/concurrent_insert_vector.hpp>
+#include <sisl/fds/concurrent_insert_vector.h>
 #include <sisl/cache/simple_cache.hpp>
 #include <homestore/blk.h>
 #include <homestore/btree/btree_base.hpp>
@@ -142,15 +142,15 @@ public:
         };
 #pragma pack()
 
-        sisl::io_blob_safe m_base_buf;
-        sisl::byte_view m_loaded_journal_buf; // In case the journal was loaded, we use this
+        sisl::IoBlobSafe m_base_buf;
+        sisl::ByteView m_loaded_journal_buf; // In case the journal was loaded, we use this
         Header* m_header{nullptr};
         uint8_t* m_cur_ptr;
         cp_id_t m_cp_id; // CP Id this journal is for (mainly useful while loading)
 
         Journal(uint32_t ordinal, uint32_t initial_size, cp_id_t cp_id) :
                 m_base_buf{std::max(initial_size, uint32_cast(sizeof(Header))), meta_service().align_size(),
-                           sisl::buftag::metablk} {
+                           sisl::Buftag::metablk} {
             m_header = new (m_base_buf.bytes()) Header();
             m_header->size = initial_size;
             m_header->ordinal = ordinal;
@@ -158,7 +158,7 @@ public:
             m_cp_id = cp_id;
         }
 
-        Journal(sisl::byte_view journal_buf, cp_id_t cp_id) :
+        Journal(sisl::ByteView journal_buf, cp_id_t cp_id) :
                 m_loaded_journal_buf{journal_buf},
                 m_header{const_cast< Header* >(r_cast< Header const* >(m_loaded_journal_buf.bytes()))},
                 m_cur_ptr{const_cast< uint8_t* >(m_loaded_journal_buf.bytes()) + sizeof(Header)},
@@ -171,7 +171,7 @@ public:
                 auto const cur_size = occupied_size();
                 m_base_buf.buf_realloc(
                     std::max(num_bytes - available_space(), m_base_buf.size() + m_base_buf.size() / 2),
-                    meta_service().align_size(), sisl::buftag::metablk);
+                    meta_service().align_size(), sisl::Buftag::metablk);
                 m_cur_ptr = m_base_buf.bytes() + cur_size;
                 header()->size += num_bytes;
             }
@@ -187,13 +187,13 @@ public:
                 // doubling).
                 m_base_buf.buf_realloc(
                     std::max(num_bytes - available_space(), m_base_buf.size() + m_base_buf.size() / 2),
-                    meta_service().align_size(), sisl::buftag::metablk);
+                    meta_service().align_size(), sisl::Buftag::metablk);
                 m_cur_ptr = m_base_buf.bytes() + occupied_size();
             }
             return m_cur_ptr;
         }
 
-        sisl::io_blob& raw_buf() { return m_base_buf; }
+        sisl::IoBlob& raw_buf() { return m_base_buf; }
         Header* header() { return m_header; }
         uint32_t occupied_size() const { return m_cur_ptr - m_base_buf.cbytes(); }
         uint32_t available_space() const { return (m_base_buf.size() - occupied_size()); }
@@ -264,8 +264,8 @@ public:
     public:
         CPSession(COWBtree& bt) : m_bt{bt} {}
         bool prepare_to_flush_nodes(COWBtreeCPContext* cp_ctx);
-        std::tuple< BlkId, DirtyNodeList::iterator, sisl::blob > next_dirty();
-        std::tuple< DeletedNodeList::iterator, DeletedNodeList::iterator, sisl::blob > next_deleted();
+        std::tuple< BlkId, DirtyNodeList::iterator, sisl::Blob > next_dirty();
+        std::tuple< DeletedNodeList::iterator, DeletedNodeList::iterator, sisl::Blob > next_deleted();
         bnodeid_t new_root_id();
         bool done_flushing_nodes();
 

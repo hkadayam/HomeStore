@@ -21,7 +21,7 @@
 #include <folly/Exception.h>
 #include <iomgr/iomgr.hpp>
 #include <iomgr/iomgr_flip.hpp>
-#include <sisl/fds/utils.hpp>
+#include <sisl/fds/utils.h>
 
 #include <homestore/homestore_decl.hpp>
 #include "device/chunk.h"
@@ -65,12 +65,12 @@ first_block PhysicalDev::read_first_block(const std::string& devname, int oflags
     auto iodev = open_and_cache_dev(devname, oflags);
 
     first_block ret;
-    auto buf = hs_utils::iobuf_alloc(first_block::s_io_fb_size, sisl::buftag::superblk, 512);
+    auto buf = hs_utils::iobuf_alloc(first_block::s_io_fb_size, sisl::Buftag::superblk, 512);
     iodev->drive_interface()->sync_read(iodev.get(), r_cast< char* >(buf), first_block::s_io_fb_size,
                                         hs_super_blk::first_block_offset());
 
     ret = *(r_cast< first_block* >(buf));
-    hs_utils::iobuf_free(buf, sisl::buftag::superblk);
+    hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
 
     return ret;
 }
@@ -271,7 +271,7 @@ std::vector< shared< Chunk > > PhysicalDev::create_chunks(const std::vector< uin
             auto b = m_chunk_info_slots->get_next_contiguous_n_reset_bits(0u, std::nullopt, 1u, chunks_remaining);
             if (b.nbits == 0) { throw std::out_of_range("System has no room for additional chunk"); }
 
-            buf = hs_utils::iobuf_alloc(chunk_info::size * b.nbits, sisl::buftag::superblk,
+            buf = hs_utils::iobuf_alloc(chunk_info::size * b.nbits, sisl::Buftag::superblk,
                                         m_pdev_info.dev_attr.align_size);
             auto ptr = buf;
             for (auto cslot = b.start_bit; cslot < b.start_bit + b.nbits; ++cslot, ++cit, ptr += chunk_info::size) {
@@ -288,7 +288,7 @@ std::vector< shared< Chunk > > PhysicalDev::create_chunks(const std::vector< uin
             m_chunk_info_slots->set_bits(b.start_bit, b.nbits);
             write_super_block(buf, chunk_info::size * b.nbits, chunk_info_offset_nth(b.start_bit));
 
-            hs_utils::iobuf_free(buf, sisl::buftag::superblk);
+            hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
             buf = nullptr;
             chunks_remaining -= b.nbits;
         }
@@ -299,7 +299,7 @@ std::vector< shared< Chunk > > PhysicalDev::create_chunks(const std::vector< uin
     } catch (const std::out_of_range& e) {
         LOGERROR("Creation of chunks failed because of space, removing {} partially created chunks", ret_chunks.size());
         // exception is thrown out by populate_chunk_info
-        if (buf) hs_utils::iobuf_free(buf, sisl::buftag::superblk);
+        if (buf) hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
         for (auto& chunk : ret_chunks) {
             do_remove_chunk(chunk);
         }
@@ -309,7 +309,7 @@ std::vector< shared< Chunk > > PhysicalDev::create_chunks(const std::vector< uin
 }
 
 shared< Chunk > PhysicalDev::create_chunk(uint32_t chunk_id, uint32_t vdev_id, uint64_t size, uint32_t ordinal,
-                                          const sisl::blob& user_private) {
+                                          const sisl::Blob& user_private) {
     std::unique_lock lg{m_chunk_op_mtx};
 
     // We need to alloc a slot to store the chunk_info in the super blk
@@ -318,7 +318,7 @@ shared< Chunk > PhysicalDev::create_chunk(uint32_t chunk_id, uint32_t vdev_id, u
     m_chunk_info_slots->set_bit(cslot);
 
     // Populate the chunk info
-    auto buf = hs_utils::iobuf_alloc(chunk_info::size, sisl::buftag::superblk, m_pdev_info.dev_attr.align_size);
+    auto buf = hs_utils::iobuf_alloc(chunk_info::size, sisl::Buftag::superblk, m_pdev_info.dev_attr.align_size);
     chunk_info* cinfo = new (buf) chunk_info();
     shared< Chunk > chunk;
 
@@ -336,10 +336,10 @@ shared< Chunk > PhysicalDev::create_chunk(uint32_t chunk_id, uint32_t vdev_id, u
         HS_LOG(INFO, device, "Created chunk {}", chunk->to_string());
 
         cinfo->~chunk_info();
-        hs_utils::iobuf_free(buf, sisl::buftag::superblk);
+        hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
     } catch (std::out_of_range const& e) {
         cinfo->~chunk_info();
-        hs_utils::iobuf_free(buf, sisl::buftag::superblk);
+        hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
         throw e;
     }
     return chunk;
@@ -367,7 +367,7 @@ void PhysicalDev::load_chunks(std::function< bool(cshared< Chunk >&) >&& chunk_f
 
     // Read the chunk info bitmap area from super block and load them into in-memory bitmap of chunk slots
     auto buf_arr = make_byte_array(hs_super_blk::chunk_info_bitmap_size(m_dev_info), m_pdev_info.dev_attr.align_size,
-                                   sisl::buftag::superblk);
+                                   sisl::Buftag::superblk);
     read_super_block(buf_arr->bytes(), buf_arr->size(), hs_super_blk::chunk_sb_offset());
     m_chunk_info_slots = std::make_unique< sisl::Bitset >(buf_arr);
 
@@ -380,7 +380,7 @@ void PhysicalDev::load_chunks(std::function< bool(cshared< Chunk >&) >&& chunk_f
         prev_bit = b + nbits;
 
         auto buf =
-            hs_utils::iobuf_alloc(nbits * chunk_info::size, sisl::buftag::superblk, m_pdev_info.dev_attr.align_size);
+            hs_utils::iobuf_alloc(nbits * chunk_info::size, sisl::Buftag::superblk, m_pdev_info.dev_attr.align_size);
         read_super_block(buf, nbits * chunk_info::size, chunk_info_offset_nth(b));
         auto ptr = buf;
 
@@ -402,7 +402,7 @@ void PhysicalDev::load_chunks(std::function< bool(cshared< Chunk >&) >&& chunk_f
                 ChunkInterval::right_open(cinfo->chunk_start_offset, cinfo->chunk_start_offset + cinfo->chunk_size));
             if (chunk_found_cb(chunk)) { get_stream(chunk).m_chunks_map.insert(std::pair{cinfo->chunk_id, chunk}); }
         }
-        hs_utils::iobuf_free(buf, sisl::buftag::superblk);
+        hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
     } while (true);
 }
 
@@ -419,7 +419,7 @@ void PhysicalDev::remove_chunk(cshared< Chunk >& chunk) {
 }
 
 void PhysicalDev::do_remove_chunk(cshared< Chunk >& chunk) {
-    auto buf = hs_utils::iobuf_alloc(chunk_info::size, sisl::buftag::superblk, m_pdev_info.dev_attr.align_size);
+    auto buf = hs_utils::iobuf_alloc(chunk_info::size, sisl::Buftag::superblk, m_pdev_info.dev_attr.align_size);
     chunk_info* cinfo = new (buf) chunk_info();
     *cinfo = chunk->info();
     free_chunk_info(cinfo);
@@ -434,7 +434,7 @@ void PhysicalDev::do_remove_chunk(cshared< Chunk >& chunk) {
 
     get_stream(chunk).m_chunks_map.erase(chunk->chunk_id());
     cinfo->~chunk_info();
-    hs_utils::iobuf_free(buf, sisl::buftag::superblk);
+    hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
     HS_LOG(DEBUG, device, "Removed chunk {}", chunk->to_string());
 }
 
@@ -444,7 +444,7 @@ uint64_t PhysicalDev::chunk_info_offset_nth(uint32_t slot) const {
 }
 
 void PhysicalDev::populate_chunk_info(chunk_info* cinfo, uint32_t vdev_id, uint64_t size, uint32_t chunk_id,
-                                      uint32_t ordinal, const sisl::blob& private_data) {
+                                      uint32_t ordinal, const sisl::Blob& private_data) {
     // Find the free area for chunk data within between data_start_offset() and data_end_offset()
     auto ival = find_next_chunk_area(size);
     m_chunk_data_area.insert(ival);

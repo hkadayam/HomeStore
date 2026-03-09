@@ -61,9 +61,9 @@ COWBtreeStore::COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< I
             delete[] uintptr_cast(node);
         },                                       // free_btree_node
         [this](uint32_t node_size) -> uint8_t* { // alloc_node_buf
-            return hs_utils::iobuf_alloc(node_size, sisl::buftag::btree_node, m_vdev->align_size());
+            return hs_utils::iobuf_alloc(node_size, sisl::Buftag::btree_node, m_vdev->align_size());
         },
-        [](uint8_t* buf) { hs_utils::iobuf_free(buf, sisl::buftag::btree_node); }});
+        [](uint8_t* buf) { hs_utils::iobuf_free(buf, sisl::Buftag::btree_node); }});
 
     if (store_sbs.size()) {
         // There can be multiple sbs, each sb containing a journal for a particular cp. We need to sort based on
@@ -312,7 +312,7 @@ void COWBtreeStore::load_journal(superblk< IndexStoreSuperBlock >& sb) {
             HS_DBG_ASSERT(happened, "Insertion journal to journals list has failed for ordinal={}", cur_bj->ordinal);
         }
         it->second.emplace_back(std::make_unique< COWBtree::Journal >(
-            sisl::byte_view{sb.raw_buf(), cur_offset, cur_bj->size}, store_journal->cp_id));
+            sisl::ByteView{sb.raw_buf(), cur_offset, cur_bj->size}, store_journal->cp_id));
         cur_offset += cur_bj->size;
     }
 }

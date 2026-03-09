@@ -29,7 +29,7 @@
 #include <vector>
 
 #include <sisl/flip/flip.hpp>
-#include <sisl/metrics/metrics.hpp>
+#include <sisl/metrics/metrics.h>
 #include <sisl/logging/logging.h>
 
 #include <homestore/blk.h>

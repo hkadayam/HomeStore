@@ -28,7 +28,6 @@
 using namespace homestore;
 
  
-SISL_OPTIONS_ENABLE(logging, test_index_btree, iomgr, test_common_setup)
 
 
 // TODO Add tests to do write,remove after recovery.

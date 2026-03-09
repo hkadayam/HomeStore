@@ -14,7 +14,7 @@
  *********************************************************************************/
 #pragma once
 
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/buffer.h>
 #include <homestore/blk.h>
 #include <homestore/homestore_decl.hpp>
 
@@ -27,7 +27,7 @@ public:
 
     ~VChunk() = default;
 
-    void set_user_private(const sisl::blob& data);
+    void set_user_private(const sisl::Blob& data);
     const uint8_t* get_user_private() const;
     blk_num_t get_total_blks() const;
     blk_num_t available_blks() const;

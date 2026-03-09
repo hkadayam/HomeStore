@@ -18,7 +18,7 @@
 #include <string>
 #include <shared_mutex>
 
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/buffer.h>
 #include <sisl/logging/logging.h>
 
 #include <folly/Expected.h>
@@ -41,7 +41,7 @@ protected:
     std::shared_mutex m_rd_map_mtx;
     std::map< group_id_t, shared< ReplDev > > m_rd_map;
     replica_id_t m_my_uuid;
-    std::vector< std::pair< sisl::byte_view, void* > > m_sb_bufs;
+    std::vector< std::pair< sisl::ByteView, void* > > m_sb_bufs;
 
 public:
     static std::shared_ptr< GenericReplService > create(cshared< ReplApplication >& repl_app);
@@ -60,7 +60,7 @@ public:
 
 protected:
     virtual void add_repl_dev(group_id_t group_id, shared< ReplDev > rdev);
-    virtual void load_repl_dev(sisl::byte_view const& buf, void* meta_cookie) = 0;
+    virtual void load_repl_dev(sisl::ByteView const& buf, void* meta_cookie) = 0;
 };
 
 class SoloReplService : public GenericReplService {
@@ -72,7 +72,7 @@ public:
     AsyncReplResult< shared< ReplDev > > create_repl_dev(group_id_t group_id,
                                                          std::set< replica_id_t > const& members) override;
     folly::SemiFuture< ReplServiceError > remove_repl_dev(group_id_t group_id) override;
-    void load_repl_dev(sisl::byte_view const& buf, void* meta_cookie) override;
+    void load_repl_dev(sisl::ByteView const& buf, void* meta_cookie) override;
     AsyncReplResult<> replace_member(group_id_t group_id, const replica_member_info& member_out,
                                            const replica_member_info& member_in, uint32_t commit_quorum = 0,
                                            uint64_t trace_id = 0) const override;

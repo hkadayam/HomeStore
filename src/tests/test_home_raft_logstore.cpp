@@ -164,7 +164,7 @@ private:
     homestore::logdev_id_t m_logdev_id{UINT32_MAX};
     homestore::logstore_id_t m_store_id{UINT32_MAX};
     std::unique_ptr< HomeRaftLogStore > m_rls;
-    sisl::sparse_vector< std::string > m_shadow_log;
+    sisl::SparseVector< std::string > m_shadow_log;
     uint64_t m_cur_term{1};
     int64_t m_next_lsn{1};
     int64_t m_start_lsn{1};
@@ -258,7 +258,6 @@ TEST_F(TestRaftLogStore, lifecycle_test) {
     this->m_follower_store.append_read_test(nrecords); // total_records in follower = 4000
 }
 
-SISL_OPTIONS_ENABLE(logging, test_home_raft_log_store, iomgr, test_common_setup)
 SISL_OPTION_GROUP(test_home_raft_log_store,
                   (num_records, "", "num_records", "number of record to test",
                    ::cxxopts::value< uint32_t >()->default_value("1000"), "number"),
@@ -268,7 +267,7 @@ SISL_OPTION_GROUP(test_home_raft_log_store,
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_home_raft_log_store, iomgr, test_common_setup);
+    SISL_OPTIONS_LOAD(parsed_argc, argv);
     sisl::logging::SetLogger("test_home_raft_log_store");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
 

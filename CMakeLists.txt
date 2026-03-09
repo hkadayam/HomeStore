@@ -7,6 +7,7 @@ option(DEBUG_CMAKE "Debug CMake messages option" OFF)
 set_property(GLOBAL PROPERTY USE_FOLDERS ON) # turn on folder hierarchies
 
 include (cmake/Flags.cmake)
+include (cmake/settings_gen.cmake)
 
 set(CMAKE_CXX_STANDARD 20)
 enable_testing()
@@ -45,11 +46,6 @@ if (${CMAKE_BUILD_TYPE} STREQUAL "Debug")
         message(STATUS "'ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:disable_coredump=0::unmap_shadow_on_exit=1'")
     endif()
 endif()
-
-find_package(sisl REQUIRED)
-
-list(GET sisl_INCLUDE_DIRS 0 SISL_TOP_INCLUDE)
-include ("${SISL_TOP_INCLUDE}/../cmake/settings_gen.cmake")
 
 find_program(CCACHE_FOUND ccache)
 if(CCACHE_FOUND)
@@ -99,8 +95,9 @@ else()
   message(STATUS "Building with REPLICATION disabled")
 endif()
 
-if(UNIX)
-    # enable proper pread/pwrite and large file
+if(UNIX AND NOT APPLE)
+    # enable proper pread/pwrite and large file (Linux only; macOS is natively 64-bit and
+    # setting _POSIX_C_SOURCE suppresses BSD types like u_short needed by system headers)
     add_flags("-D_POSIX_C_SOURCE=200809L -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE")
 endif()
 

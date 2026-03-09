@@ -33,7 +33,7 @@ float Chunk::get_blk_usage() const {
     return s_cast<float>(m_blk_allocator->get_used_blks()) / s_cast<float>(m_blk_allocator->get_total_blks());
 }
 
-void Chunk::set_user_private(const sisl::blob& data) {
+void Chunk::set_user_private(const sisl::Blob& data) {
     std::unique_lock lg{m_mgmt_mutex};
     m_chunk_info.set_user_private(data);
     m_chunk_info.compute_checksum();
@@ -41,13 +41,13 @@ void Chunk::set_user_private(const sisl::blob& data) {
 }
 
 void Chunk::write_chunk_info() {
-    auto buf = hs_utils::iobuf_alloc(chunk_info::size, sisl::buftag::superblk, physical_dev()->align_size());
+    auto buf = hs_utils::iobuf_alloc(chunk_info::size, sisl::Buftag::superblk, physical_dev()->align_size());
     auto cinfo = new (buf) chunk_info();
     *cinfo = m_chunk_info;
     physical_dev_mutable()->write_super_block(buf, chunk_info::size,
                                               physical_dev()->chunk_info_offset_nth(slot_number()));
     cinfo->~chunk_info();
-    hs_utils::iobuf_free(buf, sisl::buftag::superblk);
+    hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
 }
 
 nlohmann::json Chunk::get_status([[maybe_unused]] int log_level) const {

@@ -19,8 +19,8 @@
 
 #include <folly/small_vector.h>
 #include <folly/futures/Future.h>
-#include <sisl/fds/buffer.hpp>
-#include <sisl/utility/atomic_counter.hpp>
+#include <sisl/fds/buffer.h>
+#include <sisl/fds/atomic_counter.h>
 
 #include <homestore/homestore_decl.hpp>
 #include <homestore/blk.h>
@@ -88,7 +88,7 @@ public:
      * @param part_of_batch Whether this operation is part of a batch of operations.
      * @return A Future that will contain an error code indicating the success or failure of the operation.
      */
-    folly::Future< std::error_code > async_alloc_write(sisl::sg_list const& sgs, blk_alloc_hints const& hints,
+    folly::Future< std::error_code > async_alloc_write(sisl::SgList const& sgs, blk_alloc_hints const& hints,
                                                        MultiBlkId& out_blkids, bool part_of_batch = false);
 
     /**
@@ -111,7 +111,7 @@ public:
      * @param cb : callback that will be triggered after write completes
      * @param part_of_batch : is this write part of a batch;
      */
-    folly::Future< std::error_code > async_write(sisl::sg_list const& sgs, MultiBlkId const& in_blkids,
+    folly::Future< std::error_code > async_write(sisl::SgList const& sgs, MultiBlkId const& in_blkids,
                                                  bool part_of_batch = false);
 
     /**
@@ -123,7 +123,7 @@ public:
      * @param cb : callback that will be triggered after write completes
      * @param part_of_batch : is this write part of a batch;
      */
-    folly::Future< std::error_code > async_write(sisl::sg_list const& sgs, std::vector< MultiBlkId > const& in_blkids,
+    folly::Future< std::error_code > async_write(sisl::SgList const& sgs, std::vector< MultiBlkId > const& in_blkids,
                                                  bool part_of_batch = false);
 
     /**
@@ -148,7 +148,7 @@ public:
      *
      * @return A `folly::Future` that will contain the error code of the read operation.
      */
-    folly::Future< std::error_code > async_read(MultiBlkId const& bid, sisl::sg_list& sgs, uint32_t size,
+    folly::Future< std::error_code > async_read(MultiBlkId const& bid, sisl::SgList& sgs, uint32_t size,
                                                 bool part_of_batch = false);
 
     /**

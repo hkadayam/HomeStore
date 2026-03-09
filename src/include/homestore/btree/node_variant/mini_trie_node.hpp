@@ -64,7 +64,7 @@ private:
 
         static uint16_t size(uint16_t key_size) { return key_size + sizeof(PrefixInfo) - 1; }
 
-        PrefixInfo(sisl::blob const& k) { std::memcpy(&key[0], k.cbytes(), k.size()); }
+        PrefixInfo(sisl::Blob const& k) { std::memcpy(&key[0], k.cbytes(), k.size()); }
         std::string to_string() const { return fmt::format("refcount={} key={}", refcount, key); }
     };
 #pragma pack()
@@ -350,8 +350,8 @@ private:
         if (cur_obj_size >= new_obj_size) {
             uint8_t* key_ptr = (uint8_t*)get_nth_obj(ind);
             uint8_t* val_ptr = key_ptr + key.serialized_size();
-            sisl::blob kblob = key.serialize();
-            sisl::blob vblob = val.serialize();
+            sisl::Blob kblob = key.serialize();
+            sisl::Blob vblob = val.serialize();
 
             DEBUG_ASSERT_EQ(kblob.size(), key.serialized_size(),
                             "Key Serialized size returned different after serialization");
@@ -441,8 +441,8 @@ private:
         bool full_move{false};
         while (ind >= end_ind) {
             // Get the ith key and value blob and then remove the entry from here and insert to the other node
-            sisl::blob const kb{get_nth_obj(ind), get_nth_key_size(ind)};
-            sisl::blob const vb{kb.cbytes() + kb.size(), get_nth_value_size(ind)};
+            sisl::Blob const kb{get_nth_obj(ind), get_nth_key_size(ind)};
+            sisl::Blob const vb{kb.cbytes() + kb.size(), get_nth_value_size(ind)};
 
             auto sz = other.insert(0, kb, vb);
             if (!sz) { break; }
@@ -477,8 +477,8 @@ private:
 
         uint32_t ind = this->total_entries() - 1;
         while (ind > 0) {
-            sisl::blob const kb{get_nth_obj(ind), get_nth_key_size(ind)};
-            sisl::blob const vb{kb.cbytes() + kb.size(), get_nth_value_size(ind)};
+            sisl::Blob const kb{get_nth_obj(ind), get_nth_key_size(ind)};
+            sisl::Blob const vb{kb.cbytes() + kb.size(), get_nth_value_size(ind)};
 
             if ((kb.size() + vb.size() + this->get_record_size()) > size_to_move) {
                 // We reached threshold of how much we could move
@@ -529,8 +529,8 @@ private:
         auto idx = start_idx;
         uint32_t n = 0;
         while (idx < other.total_entries()) {
-            sisl::blob const kb{(uint8_t*)other.get_nth_obj(idx), other.get_nth_key_size(idx)};
-            sisl::blob const vb{kb.cbytes() + kb.size(), other.get_nth_value_size(idx)};
+            sisl::Blob const kb{(uint8_t*)other.get_nth_obj(idx), other.get_nth_key_size(idx)};
+            sisl::Blob const vb{kb.cbytes() + kb.size(), other.get_nth_value_size(idx)};
 
             // We reached threshold of how much we could move
             if ((kb.size() + vb.size() + other.get_record_size()) > copy_size) { break; }
@@ -559,8 +559,8 @@ private:
         auto idx = start_idx;
         uint32_t n = 0;
         while (n < nentries) {
-            sisl::blob const kb{other.get_nth_obj(idx), other.get_nth_key_size(idx)};
-            sisl::blob const vb{kb.cbytes() + kb.size(), other.get_nth_value_size(idx)};
+            sisl::Blob const kb{other.get_nth_obj(idx), other.get_nth_key_size(idx)};
+            sisl::Blob const vb{kb.cbytes() + kb.size(), other.get_nth_value_size(idx)};
 
             auto sz = insert(this->total_entries(), kb, vb);
             if (sz == 0) { break; }
@@ -586,11 +586,11 @@ private:
         uint32_t other_ind = 0;
         while (nentries) {
             // Get the ith key and value blob and then remove the entry from here and insert to the other node
-            sisl::blob kb;
+            sisl::Blob kb;
             kb.bytes = (uint8_t*)other.get_nth_obj(other_ind);
             kb.size = other.get_nth_key_size(other_ind);
 
-            sisl::blob vb;
+            sisl::Blob vb;
             vb.bytes = kb.bytes + kb.size;
             vb.size = other.get_nth_value_size(other_ind);
 
@@ -627,11 +627,11 @@ private:
 
         uint32_t ind = 0;
         while (ind < this->total_entries()) {
-            sisl::blob kb;
+            sisl::Blob kb;
             kb.bytes = (uint8_t*)other.get_nth_obj(ind);
             kb.size = other.get_nth_key_size(ind);
 
-            sisl::blob vb;
+            sisl::Blob vb;
             vb.bytes = kb.bytes + kb.size;
             vb.size = other.get_nth_value_size(ind);
 
@@ -686,7 +686,7 @@ private:
 
     void get_nth_key_internal(uint32_t ind, BtreeKey& out_key, bool copy) const override {
         assert(ind < this->total_entries());
-        sisl::blob b{const_cast< uint8_t* >(get_nth_obj(ind)), get_nth_key_size(ind)};
+        sisl::Blob b{const_cast< uint8_t* >(get_nth_obj(ind)), get_nth_key_size(ind)};
         out_key.deserialize(b, copy);
     }
 
@@ -696,7 +696,7 @@ private:
             DEBUG_ASSERT_EQ(this->has_valid_edge(), true, "get_nth_value out-of-bound");
             *(BtreeLinkInfo*)out_val = this->get_edge_value();
         } else {
-            sisl::blob b{const_cast< uint8_t* >(get_nth_obj(ind)) + get_nth_key_size(ind), get_nth_value_size(ind)};
+            sisl::Blob b{const_cast< uint8_t* >(get_nth_obj(ind)) + get_nth_key_size(ind), get_nth_value_size(ind)};
             out_val->deserialize(b, copy);
         }
     }
@@ -728,7 +728,7 @@ private:
     }*/
 
 protected:
-    uint32_t insert(uint32_t ind, const sisl::blob& key_blob, const sisl::blob& val_blob) {
+    uint32_t insert(uint32_t ind, const sisl::Blob& key_blob, const sisl::Blob& val_blob) {
         assert(ind <= this->total_entries());
         LOGTRACEMOD(btree, "{}:{}:{}:{}", ind, get_var_node_header()->tail_offset(), get_arena_free_space(),
                     get_var_node_header()->available_space());

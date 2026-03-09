@@ -40,7 +40,7 @@ GenericReplService::GenericReplService(cshared< ReplApplication >& repl_app) : m
     m_sb_bufs.reserve(100);
     meta_service().register_handler(
         get_meta_blk_name(),
-        [this](meta_blk* mblk, sisl::byte_view buf, size_t) {
+        [this](meta_blk* mblk, sisl::ByteView buf, size_t) {
             m_sb_bufs.emplace_back(std::pair(std::move(buf), voidptr_cast(mblk)));
         },
         nullptr);
@@ -174,7 +174,7 @@ folly::SemiFuture< ReplServiceError > SoloReplService::remove_repl_dev(group_id_
     return folly::makeSemiFuture(ReplServiceError::OK);
 }
 
-void SoloReplService::load_repl_dev(sisl::byte_view const& buf, void* meta_cookie) {
+void SoloReplService::load_repl_dev(sisl::ByteView const& buf, void* meta_cookie) {
     superblk< repl_dev_superblk > rd_sb{get_meta_blk_name()};
     rd_sb.load(buf, meta_cookie);
     HS_DBG_ASSERT_EQ(rd_sb->get_magic(), repl_dev_superblk::REPL_DEV_SB_MAGIC, "Invalid rdev metablk, magic mismatch");

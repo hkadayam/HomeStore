@@ -18,7 +18,7 @@
 #include <string>
 
 #include <nlohmann/json.hpp>
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/buffer.h>
 #include <homestore/meta_service.hpp>
 
 namespace homestore {
@@ -65,7 +65,7 @@ public:
         }
     }
 
-    T* load(const sisl::byte_view& buf, void* meta_blk) {
+    T* load(const sisl::ByteView& buf, void* meta_blk) {
         m_meta_blk = voidptr_cast(meta_blk);
         m_raw_buf = meta_service().is_aligned_buf_needed(buf.size()) ? buf.extract(meta_service().align_size())
                                                                      : buf.extract(0);
@@ -76,9 +76,9 @@ public:
     T* create(uint32_t size = sizeof(T)) {
         if (meta_service().is_aligned_buf_needed(size)) {
             auto al_sz = meta_service().align_size();
-            m_raw_buf = sisl::make_byte_array(uint32_cast(sisl::round_up(size, al_sz)), al_sz, sisl::buftag::metablk);
+            m_raw_buf = sisl::make_byte_array(uint32_cast(sisl::round_up(size, al_sz)), al_sz, sisl::Buftag::metablk);
         } else {
-            m_raw_buf = sisl::make_byte_array(size, 0, sisl::buftag::metablk);
+            m_raw_buf = sisl::make_byte_array(size, 0, sisl::Buftag::metablk);
         }
         m_sb = new (m_raw_buf->bytes()) T();
         return m_sb;
@@ -87,9 +87,9 @@ public:
     T* resize(uint32_t size) {
         if (meta_service().is_aligned_buf_needed(size)) {
             auto al_sz = meta_service().align_size();
-            m_raw_buf->buf_realloc(uint32_cast(sisl::round_up(size, al_sz)), al_sz, sisl::buftag::metablk);
+            m_raw_buf->buf_realloc(uint32_cast(sisl::round_up(size, al_sz)), al_sz, sisl::Buftag::metablk);
         } else {
-            m_raw_buf->buf_realloc(size, 0, sisl::buftag::metablk);
+            m_raw_buf->buf_realloc(size, 0, sisl::Buftag::metablk);
         }
         m_sb = new (m_raw_buf->bytes()) T();
         return m_sb;
@@ -105,7 +105,7 @@ public:
     }
 
     uint32_t size() const { return m_raw_buf->size(); }
-    sisl::byte_array raw_buf() { return m_raw_buf; }
+    sisl::ByteArray raw_buf() { return m_raw_buf; }
 
     void write() {
         if (m_meta_blk) {
@@ -126,7 +126,7 @@ public:
 
 private:
     void* m_meta_blk{nullptr};
-    sisl::byte_array m_raw_buf;
+    sisl::ByteArray m_raw_buf;
     T* m_sb{nullptr};
     std::string m_meta_sub_name;
 };
@@ -153,7 +153,7 @@ public:
         }
     }
 
-    nlohmann::json& load(const sisl::byte_view& buf, void* meta_blk) {
+    nlohmann::json& load(const sisl::ByteView& buf, void* meta_blk) {
         m_meta_blk = voidptr_cast(meta_blk);
         std::string_view const b{c_charptr_cast(buf.bytes()), buf.size()};
 
@@ -179,7 +179,7 @@ public:
     uint32_t size() const { return m_json_sb.size(); }
 
     void write() {
-        auto do_write = [this](sisl::blob const& b) {
+        auto do_write = [this](sisl::Blob const& b) {
             if (m_meta_blk) {
                 meta_service().update_sub_sb(b.cbytes(), b.size(), m_meta_blk);
             } else {
@@ -190,11 +190,11 @@ public:
         auto const packed_data = nlohmann::json::to_msgpack(m_json_sb);
         auto const size = packed_data.size();
         if (meta_service().is_aligned_buf_needed(size)) {
-            sisl::io_blob_safe buffer(size, meta_service().align_size());
+            sisl::IoBlobSafe buffer(size, meta_service().align_size());
             std::memcpy(buffer.bytes(), packed_data.data(), size);
             do_write(buffer);
         } else {
-            do_write(sisl::blob{r_cast< uint8_t const* >(packed_data.data()), uint32_cast(size)});
+            do_write(sisl::Blob{r_cast< uint8_t const* >(packed_data.data()), uint32_cast(size)});
         }
     }
 

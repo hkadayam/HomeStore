@@ -22,7 +22,7 @@
 #include <iomgr/io_environment.hpp>
 #include <sisl/options/options.h>
 #include <sisl/logging/logging.h>
-#include <sisl/utility/enum.hpp>
+#include <sisl/fds/enum.h>
 #include <iomgr/iomgr_flip.hpp>
 #include <boost/algorithm/string.hpp>
 #include <homestore/btree/btree.ipp>

@@ -15,20 +15,20 @@
  *********************************************************************************/
 #pragma once
 #include <atomic>
-#include <sisl/metrics/metrics.hpp>
+#include <sisl/metrics/metrics.h>
 #include "homestore_config.hpp"
 
 namespace homestore {
 class RsrcMgrMetrics : public sisl::MetricsGroup {
 public:
     explicit RsrcMgrMetrics() : sisl::MetricsGroup("resource_mgr", "resource_mgr") {
-        REGISTER_COUNTER(index_dirty_size, "Total Index cache dirty buffer size", sisl::_publish_as::publish_as_gauge);
+        REGISTER_COUNTER(index_dirty_size, "Total Index cache dirty buffer size", sisl::PublishAs::Gauge);
         REGISTER_COUNTER(free_blk_size_in_cp, "Total free blks size accumulated in a cp",
-                         sisl::_publish_as::publish_as_gauge);
+                         sisl::PublishAs::Gauge);
         REGISTER_COUNTER(free_blk_cnt_in_cp, "Total free blks cnt accumulated in a cp",
-                         sisl::_publish_as::publish_as_gauge);
+                         sisl::PublishAs::Gauge);
         REGISTER_COUNTER(alloc_blk_cnt_in_cp, "Total alloc blks cnt accumulated in a cp",
-                         sisl::_publish_as::publish_as_gauge);
+                         sisl::PublishAs::Gauge);
         register_me_to_farm();
     }
 

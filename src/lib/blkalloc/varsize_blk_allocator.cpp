@@ -20,8 +20,7 @@
 
 #include <fmt/format.h>
 #include <sisl/logging/logging.h>
-#include <sisl/utility/thread_factory.hpp>
-#include <sisl/utility/thread_buffer.hpp>
+#include <sisl/fds/thread_factory.h>
 #include <iomgr/iomgr_flip.hpp>
 
 #include "blk_cache_queue.h"

@@ -18,7 +18,7 @@
 
 #include <fmt/format.h>
 #include <iomgr/iomgr.hpp>
-#include <sisl/utility/thread_factory.hpp>
+#include <sisl/fds/thread_factory.h>
 
 #include <homestore/meta_service.hpp>
 #include <homestore/logstore_service.hpp>
@@ -39,25 +39,25 @@ LogStoreService& logstore_service() { return hs()->logstore_service(); }
 LogStoreService::LogStoreService() : m_sb{"LogStoreServiceSB"} {
     meta_service().register_handler(
         logdev_sb_meta_name,
-        [this](meta_blk* mblk, sisl::byte_view buf, size_t size) {
+        [this](meta_blk* mblk, sisl::ByteView buf, size_t size) {
             logdev_super_blk_found(std::move(buf), voidptr_cast(mblk));
         },
         nullptr);
 
     meta_service().register_handler(
         logdev_rollback_sb_meta_name,
-        [this](meta_blk* mblk, sisl::byte_view buf, size_t size) {
+        [this](meta_blk* mblk, sisl::ByteView buf, size_t size) {
             rollback_super_blk_found(std::move(buf), voidptr_cast(mblk));
         },
         nullptr, true, std::optional< meta_subtype_vec_t >({logdev_sb_meta_name}));
 
     meta_service().register_handler(
         "LogStoreServiceSB",
-        [this](meta_blk* mblk, sisl::byte_view buf, size_t size) { on_meta_blk_found(std::move(buf), (void*)mblk); },
+        [this](meta_blk* mblk, sisl::ByteView buf, size_t size) { on_meta_blk_found(std::move(buf), (void*)mblk); },
         nullptr);
 }
 
-void LogStoreService::on_meta_blk_found(const sisl::byte_view& buf, void* meta_cookie) {
+void LogStoreService::on_meta_blk_found(const sisl::ByteView& buf, void* meta_cookie) {
     m_sb.load(buf, meta_cookie);
     HS_REL_ASSERT_EQ(m_sb->magic, logstore_service_sb_magic, "Invalid log service metablk, magic mismatch");
     HS_REL_ASSERT_EQ(m_sb->version, logstore_service_sb_version, "Invalid version of log service metablk");
@@ -218,7 +218,7 @@ std::shared_ptr< LogDev > LogStoreService::get_logdev(logdev_id_t id) {
     return it->second;
 }
 
-void LogStoreService::logdev_super_blk_found(const sisl::byte_view& buf, void* meta_cookie) {
+void LogStoreService::logdev_super_blk_found(const sisl::ByteView& buf, void* meta_cookie) {
     superblk< logdev_superblk > sb;
     sb.load(buf, meta_cookie);
     HS_REL_ASSERT_EQ(sb->get_magic(), logdev_superblk::LOGDEV_SB_MAGIC, "Invalid logdev metablk, magic mismatch");
@@ -248,7 +248,7 @@ void LogStoreService::logdev_super_blk_found(const sisl::byte_view& buf, void* m
     }
 }
 
-void LogStoreService::rollback_super_blk_found(const sisl::byte_view& buf, void* meta_cookie) {
+void LogStoreService::rollback_super_blk_found(const sisl::ByteView& buf, void* meta_cookie) {
     superblk< rollback_superblk > rollback_sb;
     rollback_sb.load(buf, meta_cookie);
     HS_REL_ASSERT_EQ(rollback_sb->get_magic(), rollback_superblk::ROLLBACK_SB_MAGIC, "Rollback sb magic mismatch");
@@ -367,8 +367,8 @@ uint32_t LogStoreService::used_size() const { return m_logdev_vdev->used_size();
 uint32_t LogStoreService::total_size() const { return m_logdev_vdev->size(); }
 
 LogStoreServiceMetrics::LogStoreServiceMetrics() : sisl::MetricsGroup("LogStores", "AllLogStores") {
-    REGISTER_COUNTER(logdevs_count, "Total number of log devs", sisl::_publish_as::publish_as_gauge);
-    REGISTER_COUNTER(logstores_count, "Total number of log stores", sisl::_publish_as::publish_as_gauge);
+    REGISTER_COUNTER(logdevs_count, "Total number of log devs", sisl::PublishAs::Gauge);
+    REGISTER_COUNTER(logstores_count, "Total number of log stores", sisl::PublishAs::Gauge);
     REGISTER_COUNTER(logstore_append_count, "Total number of append requests to log stores", "logstore_op_count",
                      {"op", "write"});
     REGISTER_COUNTER(logstore_read_count, "Total number of read requests to log stores", "logstore_op_count",

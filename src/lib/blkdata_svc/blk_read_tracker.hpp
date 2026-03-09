@@ -17,8 +17,8 @@
 
 #include <folly/small_vector.h>
 #include <sisl/cache/simple_hashmap.hpp>
-#include <sisl/fds/utils.hpp>
-#include <sisl/metrics/metrics.hpp>
+#include <sisl/fds/utils.h>
+#include <sisl/metrics/metrics.h>
 #include <folly/Function.h>
 #include <homestore/blk.h>
 
@@ -93,7 +93,7 @@ class BlkReadTrackerMetrics : public sisl::MetricsGroup {
 public:
     explicit BlkReadTrackerMetrics() : sisl::MetricsGroupWrapper("BlkReadTracker", "DataSvc") {
 #ifdef _PRERELEASE
-        REGISTER_COUNTER(blktrack_pending_blk_read_map_sz, "Size of pending blk read map", sisl::_publish_as::publish_as_gauge);
+        REGISTER_COUNTER(blktrack_pending_blk_read_map_sz, "Size of pending blk read map", sisl::PublishAs::Gauge);
         REGISTER_COUNTER(blktrack_erase_blk_rescheduled, "Erase blk rescheduled due to concurrent rw");
         REGISTER_HISTOGRAM(blktrack_erase_blk_rescheduled_latency, "Erase blk rescheduled latency");
 #endif

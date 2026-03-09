@@ -23,7 +23,7 @@
 #include <iomgr/io_environment.hpp>
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/buffer.h>
 #include <gtest/gtest.h>
 
 #include <homestore/blk.h>
@@ -48,7 +48,6 @@ using namespace homestore;
 using namespace test_common;
 
  
-SISL_OPTIONS_ENABLE(logging, test_solo_repl_dev, iomgr, test_common_setup)
 
 static thread_local std::random_device g_rd{};
 static thread_local std::default_random_engine g_re{g_rd()};
@@ -59,9 +58,9 @@ static constexpr uint64_t Mi{Ki * Ki};
 static constexpr uint64_t Gi{Ki * Mi};
 
 struct test_repl_req : public repl_req_ctx {
-    sisl::byte_array header;
-    sisl::byte_array key;
-    sisl::sg_list write_sgs;
+    sisl::ByteArray header;
+    sisl::ByteArray key;
+    sisl::SgList write_sgs;
     std::vector< MultiBlkId > written_blkids;
 
     test_repl_req() { write_sgs.size = 0; }
@@ -89,7 +88,7 @@ public:
         Listener(SoloReplDevTest& test) : m_test{test} {}
         virtual ~Listener() = default;
 
-        void on_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
+        void on_commit(int64_t lsn, sisl::Blob const& header, sisl::Blob const& key,
                        std::vector< MultiBlkId > const& blkids, cintrusive< repl_req_ctx >& ctx) override {
             LOGINFO("Received on_commit lsn={}", lsn);
             if (ctx == nullptr) {
@@ -111,22 +110,22 @@ public:
         bool apply_snapshot(shared< snapshot_context > context) override { return true; }
         shared< snapshot_context > last_snapshot() override { return nullptr; }
         void free_user_snp_ctx(void*& user_snp_ctx) override {}
-        bool on_pre_commit(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
+        bool on_pre_commit(int64_t lsn, const sisl::Blob& header, const sisl::Blob& key,
                            cintrusive< repl_req_ctx >& ctx) override {
             return true;
         }
 
-        void on_rollback(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
+        void on_rollback(int64_t lsn, const sisl::Blob& header, const sisl::Blob& key,
                          cintrusive< repl_req_ctx >& ctx) override {}
 
-        ReplResult< blk_alloc_hints > get_blk_alloc_hints(sisl::blob const& header, uint32_t data_size,
+        ReplResult< blk_alloc_hints > get_blk_alloc_hints(sisl::Blob const& header, uint32_t data_size,
                                                           cintrusive< homestore::repl_req_ctx >& hs_ctx) override {
             return blk_alloc_hints{};
         }
 
         void on_restart() override { LOGINFO("ReplDev restarted"); }
 
-        void on_error(ReplServiceError error, const sisl::blob& header, const sisl::blob& key,
+        void on_error(ReplServiceError error, const sisl::Blob& header, const sisl::Blob& key,
                       cintrusive< repl_req_ctx >& ctx) override {
             LOGINFO("Received error={} on repl_dev", enum_name(error));
         }
@@ -220,7 +219,7 @@ public:
         auto const cap = hs()->repl_service().get_cap_stats();
         LOGDEBUG("Before write, cap stats: used={} total={}", cap.used_capacity, cap.total_capacity);
 
-        rdev->async_alloc_write(*req->header, req->key ? *req->key : sisl::blob{}, req->write_sgs, req);
+        rdev->async_alloc_write(*req->header, req->key ? *req->key : sisl::Blob{}, req->write_sgs, req);
     }
 
     void async_write_data_and_journal(uint32_t key_size, uint64_t data_size, uint32_t max_size_per_iov) {
@@ -253,11 +252,11 @@ public:
 
         rdev->async_write(blkids, req->write_sgs).thenValue([this, rdev, blkids, data_size, req](auto&& err) {
             RELEASE_ASSERT(!err, "Error during async_write");
-            rdev->async_write_journal(blkids, *req->header, req->key ? *req->key : sisl::blob{}, data_size, req);
+            rdev->async_write_journal(blkids, *req->header, req->key ? *req->key : sisl::Blob{}, data_size, req);
         });
     }
 
-    void validate_replay(ReplDev& rdev, int64_t lsn, sisl::blob const& header, sisl::blob const& key,
+    void validate_replay(ReplDev& rdev, int64_t lsn, sisl::Blob const& header, sisl::Blob const& key,
                          std::vector< MultiBlkId > const& blkids) {
         if (blkids.empty()) {
             m_task_waiter.one_complete();
@@ -387,7 +386,7 @@ SISL_OPTION_GROUP(test_solo_repl_dev,
 int main(int argc, char* argv[]) {
     int parsed_argc{argc};
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_solo_repl_dev, iomgr, test_common_setup);
+    SISL_OPTIONS_LOAD(parsed_argc, argv);
     sisl::logging::SetLogger("test_solo_repl_dev");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
 

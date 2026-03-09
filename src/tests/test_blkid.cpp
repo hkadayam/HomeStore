@@ -7,7 +7,6 @@
 
 #include <homestore/blk.h>
 
-SISL_OPTIONS_ENABLE(logging, test_blkid)
 
 SISL_OPTION_GROUP(test_blkid,
                   (num_iterations, "", "num_iterations", "number of iterations",
@@ -27,7 +26,7 @@ TEST(BlkIdTest, SingleBlkIdBasic) {
     ASSERT_EQ(b2.chunk_num(), 1);
     ASSERT_EQ(b2.is_multi(), false);
 
-    sisl::blob buf = b2.serialize();
+    sisl::Blob buf = b2.serialize();
     ASSERT_EQ(buf.size(), sizeof(uint64_t));
 
     BlkId b3;
@@ -169,7 +168,7 @@ TEST(BlkIdTest, MultiBlkIdInMap) {
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_blkid);
+    SISL_OPTIONS_LOAD(parsed_argc, argv);
     sisl::logging::SetLogger("test_blkid");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
 

@@ -25,7 +25,6 @@
 
 using namespace homestore;
 
-SISL_OPTIONS_ENABLE(logging, test_blk_read_tracker)
 
 VENUM(op_type_t, uint8_t, insert = 0, remove = 1, wait_on = 2, max_op = 3);
 class BlkReadTrackerTest : public testing::Test {
@@ -556,7 +555,7 @@ SISL_OPTION_GROUP(test_blk_read_tracker,
 int main(int argc, char* argv[]) {
     int parsed_argc{argc};
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_blk_read_tracker);
+    SISL_OPTIONS_LOAD(parsed_argc, argv);
     sisl::logging::SetLogger("test_blk_read_tracker");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
 

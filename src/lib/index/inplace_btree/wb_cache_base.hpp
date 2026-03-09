@@ -17,7 +17,7 @@
 
 #include <memory>
 #include <boost/intrusive_ptr.hpp>
-#include <sisl/utility/atomic_counter.hpp>
+#include <sisl/fds/atomic_counter.h>
 #include <homestore/blk.h>
 #include <homestore/index/index_internal.hpp>
 
@@ -64,7 +64,7 @@ public:
     /// @param cur_buf
     /// @return
     // virtual IndexBufferPtr copy_buffer(const IndexBufferPtr& cur_buf, const CPContext* context) const = 0;
-    virtual void recover(sisl::byte_view sb) = 0;
+    virtual void recover(sisl::ByteView sb) = 0;
 };
 
 } // namespace homestore

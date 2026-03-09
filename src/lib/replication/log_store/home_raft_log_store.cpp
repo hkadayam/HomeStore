@@ -15,7 +15,7 @@
 
 #include "home_raft_log_store.h"
 #include "storage_engine_buffer.h"
-#include <sisl/fds/utils.hpp>
+#include <sisl/fds/utils.h>
 #include "common/homestore_assert.hpp"
 #include <homestore/homestore.hpp>
 #include <iomgr/iomgr_flip.hpp>
@@ -164,8 +164,8 @@ ulong HomeRaftLogStore::append(nuraft::ptr< nuraft::log_entry >& entry) {
                    static_cast< uint32_t >(entry->get_val_type()), entry->get_buf().size());
     auto buf = entry->serialize();
     auto const next_seq =
-        m_log_store->append_async(sisl::io_blob{buf->data_begin(), uint32_cast(buf->size()), false /* is_aligned */},
-                                  nullptr /* cookie */, [buf](int64_t, sisl::io_blob&, logdev_key, void*) {});
+        m_log_store->append_async(sisl::IoBlob{buf->data_begin(), uint32_cast(buf->size()), false /* is_aligned */},
+                                  nullptr /* cookie */, [buf](int64_t, sisl::IoBlob&, logdev_key, void*) {});
     ulong lsn = to_repl_lsn(next_seq);
 
     auto position_in_cache = lsn % m_log_entry_cache.size();
@@ -185,8 +185,8 @@ void HomeRaftLogStore::write_at(ulong index, nuraft::ptr< nuraft::log_entry >& e
     // calls, but it is dangerous to set higher number.
     m_last_durable_lsn = -1;
 
-    m_log_store->append_async(sisl::io_blob{buf->data_begin(), uint32_cast(buf->size()), false /* is_aligned */},
-                              nullptr /* cookie */, [buf](int64_t, sisl::io_blob&, logdev_key, void*) {});
+    m_log_store->append_async(sisl::IoBlob{buf->data_begin(), uint32_cast(buf->size()), false /* is_aligned */},
+                              nullptr /* cookie */, [buf](int64_t, sisl::IoBlob&, logdev_key, void*) {});
 
     auto position_in_cache = index % m_log_entry_cache.size();
     {
@@ -344,7 +344,7 @@ void HomeRaftLogStore::apply_pack(ulong index, nuraft::buffer& pack) {
     for (int i{0}; i < num_entries; ++i) {
         size_t entry_len;
         auto* entry = pack.get_bytes(entry_len);
-        sisl::blob b{entry, uint32_cast(entry_len)};
+        sisl::Blob b{entry, uint32_cast(entry_len)};
 
         auto nle = to_nuraft_log_entry(b);
         this->append(nle);

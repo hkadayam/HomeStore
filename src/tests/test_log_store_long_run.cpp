@@ -36,7 +36,7 @@
 #include <type_traits>
 #include <vector>
 
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/buffer.h>
 #include <folly/Synchronized.h>
 #include <iomgr/io_environment.hpp>
 #include <iomgr/http_server.hpp>
@@ -125,7 +125,7 @@ public:
             auto* d = prepare_data(lsn, io_memory);
             m_log_store->write_async(
                 lsn, {uintptr_cast(d), d->total_size(), false}, nullptr,
-                [io_memory, d, this](logstore_seq_num_t seq_num, const sisl::io_blob& b, logdev_key ld_key, void* ctx) {
+                [io_memory, d, this](logstore_seq_num_t seq_num, const sisl::IoBlob& b, logdev_key ld_key, void* ctx) {
                     assert(ld_key);
                     if (io_memory) {
                         iomanager.iobuf_free(uintptr_cast(d));
@@ -571,7 +571,6 @@ TEST_F(LogStoreLongRun, LongRunning) {
     }
 }
 
-SISL_OPTIONS_ENABLE(logging, test_log_store_long_run, iomgr, test_common_setup)
 SISL_OPTION_GROUP(test_log_store_long_run,
                   (num_logstores, "", "num_logstores", "number of log stores",
                    ::cxxopts::value< uint32_t >()->default_value("100"), "number"),
@@ -587,7 +586,7 @@ SISL_OPTION_GROUP(test_log_store_long_run,
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_log_store_long_run, iomgr, test_common_setup);
+    SISL_OPTIONS_LOAD(parsed_argc, argv);
     sisl::logging::SetLogger("test_log_store_long_run");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
 

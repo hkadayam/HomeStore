@@ -23,11 +23,11 @@
 #include <thread>
 #include <vector>
 
-#include <sisl/fds/bitset.hpp>
+#include <sisl/fds/bitset.h>
 #include <folly/MPMCQueue.h>
-#include <sisl/utility/enum.hpp>
-#include <sisl/utility/urcu_helper.hpp>
-#include <sisl/fds/thread_vector.hpp>
+#include <sisl/fds/enum.h>
+#include <urcu.h>
+#include <sisl/fds/thread_vector.h>
 
 #include <homestore/homestore_decl.hpp>
 #include <homestore/blk.h>
@@ -107,13 +107,13 @@ protected:
 private:
     void do_init();
     sisl::ThreadVector< MultiBlkId >* get_alloc_blk_list();
-    void on_meta_blk_found(void* mblk_cookie, sisl::byte_view const& buf, size_t size);
+    void on_meta_blk_found(void* mblk_cookie, sisl::ByteView const& buf, size_t size);
 
     // Acquire the underlying bitmap buffer and while the caller has acquired, all the new allocations
     // will be captured in a separate list and then pushes into buffer once released.
     // NOTE: THIS IS NON-THREAD SAFE METHOD. Caller is expected to ensure synchronization between multiple
     // acquires/releases
-    sisl::byte_array acquire_underlying_buffer();
+    sisl::ByteArray acquire_underlying_buffer();
     void release_underlying_buffer();
 
 protected:

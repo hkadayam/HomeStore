@@ -8,7 +8,7 @@
 #include <sisl/logging/logging.h>
 #include <homestore/homestore_decl.hpp>
 #include <homestore/blk.h>
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/buffer.h>
 
 namespace homestore {
 // clang-format off

@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <sisl/fds/compact_bitset.hpp>
+#include <sisl/fds/compact_bitset.h>
 #include <sisl/logging/logging.h>
 #include <homestore/btree/detail/btree_node.hpp>
 #include <homestore/btree/btree_kv.hpp>
@@ -75,8 +75,8 @@ private:
 
         void write_kv(BtreeKey const& key, BtreeValue const& val) {
             if constexpr (std::is_base_of_v< BtreeIntervalKey, K > && std::is_base_of_v< BtreeIntervalValue, V >) {
-                sisl::blob const kblob = s_cast< K const& >(key).serialize_prefix();
-                sisl::blob const vblob = s_cast< V const& >(val).serialize_prefix();
+                sisl::Blob const kblob = s_cast< K const& >(key).serialize_prefix();
+                sisl::Blob const vblob = s_cast< V const& >(val).serialize_prefix();
 
                 DEBUG_ASSERT_EQ(kblob.size(), key_size(), "Prefix key size mismatch with serialized prefix size");
                 DEBUG_ASSERT_EQ(vblob.size(), value_size(), "Prefix value size mismatch with serialized prefix size");
@@ -88,10 +88,10 @@ private:
             }
         }
 
-        sisl::blob key_buf() const {
-            return sisl::blob{r_cast< uint8_t const* >(this) + sizeof(prefix_entry), key_size()};
+        sisl::Blob key_buf() const {
+            return sisl::Blob{r_cast< uint8_t const* >(this) + sizeof(prefix_entry), key_size()};
         }
-        sisl::blob val_buf() const { return sisl::blob{key_buf().cbytes() + key_buf().size(), value_size()}; }
+        sisl::Blob val_buf() const { return sisl::Blob{key_buf().cbytes() + key_buf().size(), value_size()}; }
     };
 
     struct suffix_entry {
@@ -118,8 +118,8 @@ private:
         }
 
         void write_kv(BtreeKey const& key, BtreeValue const& val) {
-            sisl::blob kblob;
-            sisl::blob vblob;
+            sisl::Blob kblob;
+            sisl::Blob vblob;
 
             uint8_t* cur_ptr = uintptr_cast(this) + sizeof(suffix_entry);
             if constexpr (std::is_base_of_v< BtreeIntervalKey, K > && std::is_base_of_v< BtreeIntervalValue, V >) {
@@ -137,11 +137,11 @@ private:
             std::memcpy(cur_ptr, vblob.cbytes(), vblob.size());
         }
 
-        sisl::blob key_buf() const {
-            return sisl::blob{const_cast< uint8_t* >(r_cast< uint8_t const* >(this) + sizeof(suffix_entry)),
+        sisl::Blob key_buf() const {
+            return sisl::Blob{const_cast< uint8_t* >(r_cast< uint8_t const* >(this) + sizeof(suffix_entry)),
                               key_size()};
         }
-        sisl::blob val_buf() const { return sisl::blob{key_buf().bytes() + key_buf().size(), value_size()}; }
+        sisl::Blob val_buf() const { return sisl::Blob{key_buf().bytes() + key_buf().size(), value_size()}; }
     };
 #pragma pack()
 
@@ -150,7 +150,7 @@ private:
 public:
     FixedPrefixNode(bnodeid_t id, bool is_leaf, uint32_t node_size, BtreeNode::Allocator::Token token) :
             VariantNode< K, V >(id, is_leaf, node_size, token),
-            prefix_bitset_{sisl::blob{bitset_area(), reqd_bitset_size(this->node_data_size())}, /*init=*/true} {
+            prefix_bitset_{sisl::Blob{bitset_area(), reqd_bitset_size(this->node_data_size())}, /*init=*/true} {
         this->set_node_type(btree_node_type::FIXED_PREFIX);
         this->m_variant_private_data = reqd_bitset_size(this->node_data_size());
         new (this->node_data_area()) prefix_node_header();
@@ -158,7 +158,7 @@ public:
 
     FixedPrefixNode(uint8_t* node_buf, bnodeid_t id, BtreeNode::Allocator::Token token) :
             VariantNode< K, V >(node_buf, id, token),
-            prefix_bitset_{sisl::blob{bitset_area(), reqd_bitset_size(this->node_data_size())}, /*init=*/false} {
+            prefix_bitset_{sisl::Blob{bitset_area(), reqd_bitset_size(this->node_data_size())}, /*init=*/false} {
         DEBUG_ASSERT_EQ(this->get_node_type(), btree_node_type::FIXED_PREFIX);
         this->m_variant_private_data = reqd_bitset_size(this->node_data_size());
     }
@@ -708,7 +708,7 @@ private:
             DEBUG_ASSERT(false, "Unable to alloc slot, shouldn't be mutating in this node without splitting");
             return std::numeric_limits< uint16_t >::max();
         }
-        prefix_bitset_.set_bit(sisl::blob{bitset_area(), uint32_cast(bitset_size())}, slot_num);
+        prefix_bitset_.set_bit(sisl::Blob{bitset_area(), uint32_cast(bitset_size())}, slot_num);
 
         auto phdr = prefix_header();
         ++phdr->used_slots;
@@ -729,7 +729,7 @@ private:
 
         if (--pentry->ref_count == 0) {
             --phdr->used_slots;
-            prefix_bitset_.reset_bit(sisl::blob{bitset_area(), uint32_cast(bitset_size())}, slot_num);
+            prefix_bitset_.reset_bit(sisl::Blob{bitset_area(), uint32_cast(bitset_size())}, slot_num);
             if ((slot_num == phdr->tail_slot - 1)) {
                 uint16_t prev_slot = prefix_bitset_.get_prev_set_bit(cbitset_blob(), slot_num);
                 phdr->tail_slot = prev_slot + 1u;
@@ -802,8 +802,8 @@ private:
 
             std::memcpy(uintptr_cast(get_prefix_entry(to_slot)), (void*)get_prefix_entry(from_slot),
                         prefix_entry::size());
-            prefix_bitset_.reset_bit(sisl::blob{bitset_area(), uint32_cast(bitset_size())}, from_slot);
-            prefix_bitset_.set_bit(sisl::blob{bitset_area(), uint32_cast(bitset_size())}, to_slot);
+            prefix_bitset_.reset_bit(sisl::Blob{bitset_area(), uint32_cast(bitset_size())}, from_slot);
+            prefix_bitset_.set_bit(sisl::Blob{bitset_area(), uint32_cast(bitset_size())}, to_slot);
 
             // Move all the suffixes that are referencing this prefix to the new location
             auto range = prefix_to_suffix.equal_range(from_slot);
@@ -852,8 +852,8 @@ private:
     uint8_t* bitset_area() { return this->node_data_area() + sizeof(prefix_node_header); }
     uint8_t const* cbitset_area() const { return this->node_data_area_const() + sizeof(prefix_node_header); }
     uint16_t bitset_size() const { return this->m_variant_private_data; }
-    sisl::blob bitset_blob() { return sisl::blob{bitset_area(), uint32_cast(bitset_size())}; }
-    sisl::blob cbitset_blob() const { return sisl::blob{cbitset_area(), uint32_cast(bitset_size())}; }
+    sisl::Blob bitset_blob() { return sisl::Blob{bitset_area(), uint32_cast(bitset_size())}; }
+    sisl::Blob cbitset_blob() const { return sisl::Blob{cbitset_area(), uint32_cast(bitset_size())}; }
 
     uint8_t* suffix_kv_area() { return bitset_area() + bitset_size(); }
     uint8_t const* csuffix_kv_area() const { return cbitset_area() + bitset_size(); }

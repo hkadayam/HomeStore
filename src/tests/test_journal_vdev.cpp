@@ -43,7 +43,6 @@ using namespace homestore;
 RCU_REGISTER_INIT
  
 
-SISL_OPTIONS_ENABLE(logging, test_journal_vdev, iomgr, test_common_setup)
 
 struct Param {
     uint64_t num_io;
@@ -619,7 +618,7 @@ SISL_OPTION_GROUP(test_journal_vdev,
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_journal_vdev, iomgr, test_common_setup);
+    SISL_OPTIONS_LOAD(parsed_argc, argv);
     sisl::logging::SetLogger("test_journal_vdev");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
 

@@ -6,8 +6,8 @@
 #include <boost/smart_ptr/intrusive_ref_counter.hpp>
 #include <flatbuffers/flatbuffers.h>
 #include <folly/futures/Future.h>
-#include <sisl/fds/buffer.hpp>
-#include <sisl/fds/utils.hpp>
+#include <sisl/fds/buffer.h>
+#include <sisl/fds/utils.h>
 #include <sisl/grpc/generic_service.hpp>
 #include <sisl/grpc/rpc_client.hpp>
 #include <homestore/replication/repl_decls.h>
@@ -83,7 +83,7 @@ class snapshot_context {
 public:
     snapshot_context(int64_t lsn) : lsn_(lsn) {}
     virtual ~snapshot_context() = default;
-    virtual sisl::io_blob_safe serialize() = 0;
+    virtual sisl::IoBlobSafe serialize() = 0;
     int64_t get_lsn() { return lsn_; }
 
 protected:
@@ -93,7 +93,7 @@ protected:
 struct snapshot_obj {
     void* user_ctx{nullptr};
     uint64_t offset{0};
-    sisl::io_blob_safe blob;
+    sisl::IoBlobSafe blob;
     bool is_first_obj{false};
     bool is_last_obj{false};
 };
@@ -116,8 +116,8 @@ struct repl_req_ctx : public boost::intrusive_ref_counter< repl_req_ctx, boost::
 public:
     repl_req_ctx() { m_start_time = Clock::now(); }
     virtual ~repl_req_ctx();
-    ReplServiceError init(repl_key rkey, journal_type_t op_code, bool is_proposer, sisl::blob const& user_header,
-              sisl::blob const& key, uint32_t data_size, cshared< ReplDevListener >& listener);
+    ReplServiceError init(repl_key rkey, journal_type_t op_code, bool is_proposer, sisl::Blob const& user_header,
+              sisl::Blob const& key, uint32_t data_size, cshared< ReplDevListener >& listener);
 
     /////////////////////// All getters ///////////////////////
     repl_key const& rkey() const { return m_rkey; }
@@ -129,8 +129,8 @@ public:
     journal_type_t op_code() const { return m_op_code; }
     bool is_volatile() const { return m_is_volatile.load(); }
 
-    sisl::blob const& header() const { return m_header; }
-    sisl::blob const& key() const { return m_key; }
+    sisl::Blob const& header() const { return m_header; }
+    sisl::Blob const& key() const { return m_key; }
     MultiBlkId const& local_blkid() const {
         // Currently used by raft repl dev only where a single blob is expected.
         // Code checks if its a valid blkid so return a dummy blkid.
@@ -224,13 +224,13 @@ public:
     // methods.
     folly::Promise< folly::Unit > m_data_received_promise; // Promise to be fulfilled when data is received
     folly::Promise< folly::Unit > m_data_written_promise;  // Promise to be fulfilled when data is written
-    sisl::io_blob_list_t m_pkts;                           // Pkts used for sending data
+    sisl::IoBlobList m_pkts;                           // Pkts used for sending data
     std::mutex m_state_mtx;
 
 private:
     repl_key m_rkey;                                           // Unique key for the request
-    sisl::blob m_header;                                       // User header
-    sisl::blob m_key;                                          // User supplied key for this req
+    sisl::Blob m_header;                                       // User header
+    sisl::Blob m_key;                                          // User supplied key for this req
     int64_t m_lsn{-1};                                         // Lsn for this replication req
     bool m_is_proposer{false};                                 // Is the repl_req proposed by this node
     Clock::time_point m_start_time;                            // Start time of the request
@@ -254,7 +254,7 @@ private:
 
     /////////////// Communication packet/builder section /////////////////
     flatbuffers::FlatBufferBuilder m_fb_builder;
-    sisl::io_blob_safe m_buf_for_unaligned_data;
+    sisl::IoBlobSafe m_buf_for_unaligned_data;
     intrusive< sisl::GenericRpcData > m_pushed_data;
     sisl::GenericClientResponse m_fetched_data;
 };
@@ -280,7 +280,7 @@ public:
     /// @param blkids - List of independent blkids where data is written to the storage engine.
     /// @param ctx - Context passed as part of the replica_set::write() api
     ///
-    virtual void on_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
+    virtual void on_commit(int64_t lsn, sisl::Blob const& header, sisl::Blob const& key,
                            std::vector< MultiBlkId > const& blkids, cintrusive< repl_req_ctx >& ctx) = 0;
 
     /// @brief periodically called to notify the lastest committed lsn to the listener.
@@ -309,7 +309,7 @@ public:
     /// @param header - Header originally passed with repl_dev::write() api
     /// @param key - Key originally passed with repl_dev::write() api
     /// @param ctx - Context passed as part of the replica_set::write() api
-    virtual bool on_pre_commit(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
+    virtual bool on_pre_commit(int64_t lsn, const sisl::Blob& header, const sisl::Blob& key,
                                cintrusive< repl_req_ctx >& ctx) = 0;
 
     /// @brief Called when the log entry has been rolled back by the replica set.
@@ -325,7 +325,7 @@ public:
     /// @param header - Header originally passed with ReplDev::async_alloc_write() api
     /// @param key - Key originally passed with ReplDev::async_alloc_write() api
     /// @param ctx - Context passed as part of the ReplDev::async_alloc_write() api
-    virtual void on_rollback(int64_t lsn, const sisl::blob& header, const sisl::blob& key,
+    virtual void on_rollback(int64_t lsn, const sisl::Blob& header, const sisl::Blob& key,
                              cintrusive< repl_req_ctx >& ctx) = 0;
 
     /// @brief Called when the config log entry has been rolled back.
@@ -346,7 +346,7 @@ public:
     /// @param header - Header originally passed with ReplDev::async_alloc_write() api
     /// @param key - Key originally passed with ReplDev::async_alloc_write() api
     /// @param ctx - Context passed as part of the ReplDev::async_alloc_write() api
-    virtual void on_error(ReplServiceError error, const sisl::blob& header, const sisl::blob& key,
+    virtual void on_error(ReplServiceError error, const sisl::Blob& header, const sisl::Blob& key,
                           cintrusive< repl_req_ctx >& ctx) = 0;
 
     /// @brief Called when replication module is trying to allocate a block to write the value
@@ -360,7 +360,7 @@ public:
     /// @return Expected to return blk_alloc_hints for this write. If the hints are not available, then return the
     /// error. It is to be noted this method should return error only in very abnornal cases as in some code flow, an
     /// error would result in a crash or stall of the entire commit thread.
-    virtual ReplResult< blk_alloc_hints > get_blk_alloc_hints(sisl::blob const& header, uint32_t data_size,
+    virtual ReplResult< blk_alloc_hints > get_blk_alloc_hints(sisl::Blob const& header, uint32_t data_size,
                                                               cintrusive< homestore::repl_req_ctx >& hs_ctx) = 0;
 
     /// @brief Called when the repl_dev is being destroyed. The consumer is expected to clean up any related resources.
@@ -406,8 +406,8 @@ public:
     // @param blkid - original blkid of the log entry
     // @param sgs - sgs to be filled with data
     // @param lsn - lsn of the log entry
-    virtual folly::Future< std::error_code > on_fetch_data(const int64_t lsn, const sisl::blob& header,
-                                                           const MultiBlkId& blkid, sisl::sg_list& sgs) {
+    virtual folly::Future< std::error_code > on_fetch_data(const int64_t lsn, const sisl::Blob& header,
+                                                           const MultiBlkId& blkid, sisl::SgList& sgs) {
         // default implementation is reading by blkid directly
         return data_service().async_read(blkid, sgs, sgs.size);
     }
@@ -447,7 +447,7 @@ public:
     /// @return A Future with std::error_code to notify if it has successfully write the data or any error code in case
     /// of failure
     virtual folly::Future< std::error_code > async_write(const std::vector< MultiBlkId >& blkids,
-                                                         sisl::sg_list const& value, bool part_of_batch = false,
+                                                         sisl::SgList const& value, bool part_of_batch = false,
                                                          trace_id_t tid = 0) = 0;
 
     /// @brief Creates a log/journal entry with <header, key, blkid> and calls the on_commit listener callback.
@@ -458,8 +458,8 @@ public:
     /// the journal entry).
     /// @param data_size - Size of the data.
     /// @param ctx - User supplied context which will be passed to listener callbacks
-    virtual void async_write_journal(const std::vector< MultiBlkId >& blkids, sisl::blob const& header,
-                                     sisl::blob const& key, uint32_t data_size, repl_req_ptr_t ctx,
+    virtual void async_write_journal(const std::vector< MultiBlkId >& blkids, sisl::Blob const& header,
+                                     sisl::Blob const& key, uint32_t data_size, repl_req_ptr_t ctx,
                                      trace_id_t tid = 0) = 0;
 
     /// @brief Replicate the data to the replica set. This method goes through the
@@ -482,7 +482,7 @@ public:
     /// @param ctx - User supplied context which will be passed to listener callbacks
     /// @param part_of_batch Is write is part of a batch. If part of the batch, then submit_batch needs to be called at
     /// the end
-    virtual void async_alloc_write(sisl::blob const& header, sisl::blob const& key, sisl::sg_list const& value,
+    virtual void async_alloc_write(sisl::Blob const& header, sisl::Blob const& key, sisl::SgList const& value,
                                    repl_req_ptr_t ctx, bool part_of_batch = false, trace_id_t tid = 0) = 0;
 
     /// @brief Reads the data and returns a future to continue on
@@ -493,7 +493,7 @@ public:
     /// the end
     /// @return A Future with std::error_code to notify if it has successfully read the data or any error code in case
     /// of failure
-    virtual folly::Future< std::error_code > async_read(MultiBlkId const& blkid, sisl::sg_list& sgs, uint32_t size,
+    virtual folly::Future< std::error_code > async_read(MultiBlkId const& blkid, sisl::SgList& sgs, uint32_t size,
                                                         bool part_of_batch = false, trace_id_t tid = 0) = 0;
 
     /// @brief After data is replicated and on_commit to the listener is called. the blkids can be freed.
@@ -544,7 +544,7 @@ public:
     /// @brief Clean up resources on this repl dev.
     virtual void purge() = 0;
 
-    virtual std::shared_ptr< snapshot_context > deserialize_snapshot_context(sisl::io_blob_safe& snp_ctx) = 0;
+    virtual std::shared_ptr< snapshot_context > deserialize_snapshot_context(sisl::IoBlobSafe& snp_ctx) = 0;
 
     virtual void attach_listener(shared< ReplDevListener > listener) { m_listener = std::move(listener); }
 

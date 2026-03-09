@@ -28,7 +28,7 @@
 
 #include <gtest/gtest.h>
 #include <boost/dynamic_bitset.hpp>
-#include <sisl/fds/bitword.hpp>
+#include <sisl/fds/bitword.h>
 #include <folly/ConcurrentSkipList.h>
 #include <folly/concurrency/ConcurrentHashMap.h>
 #include <sisl/logging/logging.h>
@@ -891,7 +891,6 @@ std::shared_ptr< cxxopts::Value > opt_default(const char* val) {
 }
 
 #define ENABLED_OPTIONS logging, test_blkalloc
-SISL_OPTIONS_ENABLE(ENABLED_OPTIONS)
 
 SISL_OPTION_GROUP(test_blkalloc,
                   (num_blks, "", "num_blks", "number of blks", opt_default< uint32_t >("1000000"), "number"),
@@ -900,7 +899,7 @@ SISL_OPTION_GROUP(test_blkalloc,
 
 int main(int argc, char* argv[]) {
     ::testing::InitGoogleTest(&argc, argv);
-    SISL_OPTIONS_LOAD(argc, argv, ENABLED_OPTIONS)
+    SISL_OPTIONS_LOAD(argc, argv);
     sisl::logging::SetLogger("test_blkalloc");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
     const int result{RUN_ALL_TESTS()};

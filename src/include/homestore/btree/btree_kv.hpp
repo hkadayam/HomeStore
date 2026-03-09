@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 #include <fmt/format.h>
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/buffer.h>
 #include <homestore/btree/detail/btree_internal.hpp>
 
 namespace homestore {
@@ -43,15 +43,15 @@ public:
 
     // Deleting copy constructor forces the derived class to define its own copy constructor
     // BtreeKey(const BtreeKey& other) = delete;
-    // BtreeKey(const sisl::blob& b) = delete;
+    // BtreeKey(const sisl::Blob& b) = delete;
     BtreeKey(BtreeKey const& other) = default;
     virtual ~BtreeKey() = default;
 
     virtual int compare(BtreeKey const& other) const = 0;
 
-    virtual sisl::blob serialize() const = 0;
+    virtual sisl::Blob serialize() const = 0;
     virtual uint32_t serialized_size() const = 0;
-    virtual void deserialize(sisl::blob const& b, bool copy) = 0;
+    virtual void deserialize(sisl::Blob const& b, bool copy) = 0;
 
     virtual std::string to_string() const = 0;
     virtual bool is_interval_key() const { return false; }
@@ -65,12 +65,12 @@ public:
     virtual int distance(BtreeKey const& from) const = 0;
     bool is_interval_key() const override { return true; }
 
-    virtual sisl::blob serialize_prefix() const = 0;
-    virtual sisl::blob serialize_suffix() const = 0;
+    virtual sisl::Blob serialize_prefix() const = 0;
+    virtual sisl::Blob serialize_suffix() const = 0;
 
     virtual uint32_t serialized_prefix_size() const = 0;
     virtual uint32_t serialized_suffix_size() const = 0;
-    virtual void deserialize(sisl::blob const& prefix, sisl::blob const& suffix, bool copy) = 0;
+    virtual void deserialize(sisl::Blob const& prefix, sisl::Blob const& suffix, bool copy) = 0;
 };
 
 template < typename K >
@@ -133,9 +133,9 @@ public:
     BtreeValue() = default;
     virtual ~BtreeValue() = default;
 
-    virtual sisl::blob serialize() const = 0;
+    virtual sisl::Blob serialize() const = 0;
     virtual uint32_t serialized_size() const = 0;
-    virtual void deserialize(const sisl::blob& b, bool copy) = 0;
+    virtual void deserialize(const sisl::Blob& b, bool copy) = 0;
 
     virtual std::string to_string() const { return ""; }
 };
@@ -144,12 +144,12 @@ class BtreeIntervalValue : public BtreeValue {
 public:
     virtual void shift(int n) = 0;
 
-    virtual sisl::blob serialize_prefix() const = 0;
-    virtual sisl::blob serialize_suffix() const = 0;
+    virtual sisl::Blob serialize_prefix() const = 0;
+    virtual sisl::Blob serialize_suffix() const = 0;
 
     virtual uint32_t serialized_prefix_size() const = 0;
     virtual uint32_t serialized_suffix_size() const = 0;
-    virtual void deserialize(sisl::blob const& prefix, sisl::blob const& suffix, bool copy) = 0;
+    virtual void deserialize(sisl::Blob const& prefix, sisl::Blob const& suffix, bool copy) = 0;
 };
 
 struct BtreeLockTracker;
@@ -159,7 +159,7 @@ struct BtreeQueryCursor {
     std::unique_ptr< BtreeLockTracker > m_locked_nodes;
     BtreeQueryCursor() = default;
 
-    const sisl::blob serialize() const { return m_last_key ? m_last_key->serialize() : sisl::blob{}; };
+    const sisl::Blob serialize() const { return m_last_key ? m_last_key->serialize() : sisl::Blob{}; };
     virtual std::string to_string() const { return (m_last_key) ? m_last_key->to_string() : "null"; }
 };
 
@@ -254,8 +254,8 @@ public:
     void set_link_version(uint64_t v) { info.m_link_version = v; }
     bool has_valid_bnode_id() const { return (info.m_bnodeid != empty_bnodeid); }
 
-    sisl::blob serialize() const override {
-        sisl::blob b;
+    sisl::Blob serialize() const override {
+        sisl::Blob b;
         b.set_size(sizeof(bnode_link_info));
         b.set_bytes(r_cast< const uint8_t* >(&info));
         return b;
@@ -264,7 +264,7 @@ public:
     static uint32_t get_fixed_size() { return sizeof(bnode_link_info); }
     std::string to_string() const override { return fmt::format("{}.{}", info.m_bnodeid, info.m_link_version); }
 
-    void deserialize(const sisl::blob& b, bool copy) override {
+    void deserialize(const sisl::Blob& b, bool copy) override {
         DEBUG_ASSERT_EQ(b.size(), sizeof(bnode_link_info), "BtreeLinkInfo deserialize received invalid blob");
         auto other = r_cast< bnode_link_info const* >(b.cbytes());
         set_bnode_id(other->m_bnodeid);

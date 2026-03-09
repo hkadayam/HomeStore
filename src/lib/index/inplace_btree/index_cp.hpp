@@ -15,7 +15,7 @@
  *********************************************************************************/
 #pragma once
 #include <atomic>
-#include <sisl/fds/concurrent_insert_vector.hpp>
+#include <sisl/fds/concurrent_insert_vector.h>
 #include <homestore/blk.h>
 #include <homestore/index/index_internal.hpp>
 #include <homestore/index_service.hpp>
@@ -135,12 +135,12 @@ public:
     std::atomic< uint64_t > m_num_nodes_added{0};
     std::atomic< uint64_t > m_num_nodes_removed{0};
     sisl::ConcurrentInsertVector< IndexBufferPtr > m_dirty_buf_list;
-    sisl::atomic_counter< int64_t > m_dirty_buf_count{0};
+    sisl::AtomicCounter< int64_t > m_dirty_buf_count{0};
     std::mutex m_flush_buffer_mtx;
     sisl::ConcurrentInsertVector< IndexBufferPtr >::iterator m_dirty_buf_it;
 
     iomgr::FiberManagerLib::mutex m_txn_journal_mtx;
-    sisl::io_blob_safe m_txn_journal_buf;
+    sisl::IoBlobSafe m_txn_journal_buf;
 
 public:
     IndexCPContext(CP* cp);
@@ -150,9 +150,9 @@ public:
     void add_to_txn_journal(uint32_t index_ordinal, const IndexBufferPtr& parent_buf,
                             const IndexBufferPtr& left_child_buf, const IndexBufferPtrList& created_bufs,
                             const IndexBufferPtrList& freed_buf);
-    std::map< BlkId, IndexBufferPtr > recover(sisl::byte_view sb);
+    std::map< BlkId, IndexBufferPtr > recover(sisl::ByteView sb);
 
-    sisl::io_blob_safe const& journal_buf() const { return m_txn_journal_buf; }
+    sisl::IoBlobSafe const& journal_buf() const { return m_txn_journal_buf; }
 
     void add_to_dirty_list(const IndexBufferPtr& buf);
     bool any_dirty_buffers() const;

@@ -408,8 +408,7 @@ int main(int argc, char* argv[]) {
 
     ::testing::InitGoogleTest(&parsed_argc, argv);
 
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, config, test_raft_repl_dev, iomgr, test_common_setup,
-                      test_repl_common_setup);
+    SISL_OPTIONS_LOAD(parsed_argc, argv);
 
     //
     // Entire test suite assumes that once a replica takes over as leader, it stays until it is explicitly yielded.

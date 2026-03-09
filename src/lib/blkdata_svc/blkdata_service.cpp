@@ -106,12 +106,12 @@ folly::Future< std::error_code > BlkDataService::async_read(MultiBlkId const& bl
     }
 }
 
-folly::Future< std::error_code > BlkDataService::async_read(MultiBlkId const& blkid, sisl::sg_list& sgs, uint32_t size,
+folly::Future< std::error_code > BlkDataService::async_read(MultiBlkId const& blkid, sisl::SgList& sgs, uint32_t size,
                                                             bool part_of_batch) {
     // TODO: sg_iovs_t should not be passed by value. We need it pass it as const&, but that is failing because
     // iovs.data() will then return "const iovec*", but unfortunately all the way down to iomgr, we take iovec*
     // instead it can easily take "const iovec*". Until we change this is made as copy by value
-    auto do_read = [this](BlkId const& bid, sisl::sg_iovs_t iovs, uint32_t size, bool part_of_batch) {
+    auto do_read = [this](BlkId const& bid, sisl::SgIovs iovs, uint32_t size, bool part_of_batch) {
         m_blk_read_tracker->insert(bid);
 
         return m_vdev->async_readv(iovs.data(), iovs.size(), size, bid, part_of_batch)
@@ -127,7 +127,7 @@ folly::Future< std::error_code > BlkDataService::async_read(MultiBlkId const& bl
         static thread_local std::vector< folly::Future< std::error_code > > s_futs;
         s_futs.clear();
 
-        sisl::sg_iterator sg_it{sgs.iovs};
+        sisl::SgIterator sg_it{sgs.iovs};
         auto blkid_it = blkid.iterate();
         while (auto const bid = blkid_it.next()) {
             uint32_t const sz = bid->blk_count() * m_blk_size;
@@ -138,7 +138,7 @@ folly::Future< std::error_code > BlkDataService::async_read(MultiBlkId const& bl
     }
 }
 
-folly::Future< std::error_code > BlkDataService::async_alloc_write(const sisl::sg_list& sgs,
+folly::Future< std::error_code > BlkDataService::async_alloc_write(const sisl::SgList& sgs,
                                                                    const blk_alloc_hints& hints, MultiBlkId& out_blkids,
                                                                    bool part_of_batch) {
     const auto status = alloc_blks(sgs.size, hints, out_blkids);
@@ -168,7 +168,7 @@ folly::Future< std::error_code > BlkDataService::async_write(const char* buf, ui
     }
 }
 
-folly::Future< std::error_code > BlkDataService::async_write(sisl::sg_list const& sgs, MultiBlkId const& blkid,
+folly::Future< std::error_code > BlkDataService::async_write(sisl::SgList const& sgs, MultiBlkId const& blkid,
                                                              bool part_of_batch) {
     // TODO: Async write should pass this by value the sgs.size parameter as well, currently vdev write routine
     // walks through again all the iovs and then getting the len to pass it down to iomgr. This defeats the purpose of
@@ -179,7 +179,7 @@ folly::Future< std::error_code > BlkDataService::async_write(sisl::sg_list const
     } else {
         static thread_local std::vector< folly::Future< std::error_code > > s_futs;
         s_futs.clear();
-        sisl::sg_iterator sg_it{sgs.iovs};
+        sisl::SgIterator sg_it{sgs.iovs};
 
         auto blkid_it = blkid.iterate();
         while (auto const bid = blkid_it.next()) {
@@ -191,7 +191,7 @@ folly::Future< std::error_code > BlkDataService::async_write(sisl::sg_list const
 }
 
 folly::Future< std::error_code >
-BlkDataService::async_write(sisl::sg_list const& sgs, std::vector< MultiBlkId > const& blkids, bool part_of_batch) {
+BlkDataService::async_write(sisl::SgList const& sgs, std::vector< MultiBlkId > const& blkids, bool part_of_batch) {
     static thread_local std::vector< folly::Future< std::error_code > > s_futs;
     s_futs.clear();
     for (const auto& blkid : blkids) {

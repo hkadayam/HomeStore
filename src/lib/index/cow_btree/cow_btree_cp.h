@@ -19,8 +19,8 @@
 #include <vector>
 
 #include <folly/futures/Future.h>
-#include <sisl/fds/concurrent_insert_vector.hpp>
-#include <sisl/utility/atomic_counter.hpp>
+#include <sisl/fds/concurrent_insert_vector.h>
+#include <sisl/fds/atomic_counter.h>
 #include <homestore/checkpoint/cp_mgr.hpp>
 #include <homestore/checkpoint/cp.hpp>
 #include <iomgr/fiber_lib.hpp>
@@ -49,9 +49,9 @@ private:
 
 struct COWBtreeCPContext : public CPContext {
 public:
-    sisl::atomic_counter< int64_t > m_dirty_size{0};
-    sisl::atomic_counter< int64_t > m_pending_free_size{0};
-    sisl::atomic_counter< int64_t > m_flushing_fibers_count{0};
+    sisl::AtomicCounter< int64_t > m_dirty_size{0};
+    sisl::AtomicCounter< int64_t > m_pending_free_size{0};
+    sisl::AtomicCounter< int64_t > m_flushing_fibers_count{0};
     uint32_t const m_parallel_flushers_count;
 
     bool m_is_full_map_flush{false};
@@ -60,7 +60,7 @@ public:
     uint32_t m_flushed_btrees_count{0};
     std::vector< std::pair< shared< Index >, folly::Promise< folly::Unit > > > m_destroyed_btrees;
     std::vector< COWBtree* > m_active_btree_list;
-    sisl::buf_builder m_merged_journal_buf;
+    sisl::BufBuilder m_merged_journal_buf;
     COWBtreeStore::Journal* m_journal_header;
     uint64_t m_max_dirty_size;
     uint64_t m_max_pending_free_size;
@@ -77,8 +77,8 @@ public:
     folly::Future< folly::Unit > add_to_destroyed_list(shared< Index > btree);
     void actual_destroy_btrees();
     bool any_dirty_nodes() const { return (!m_dirty_size.testz() || !m_pending_free_size.testz()); }
-    void append_btree_journal(sisl::io_blob_safe const& btree_journal_buf);
-    sisl::byte_view store_journal() const;
+    void append_btree_journal(sisl::IoBlobSafe const& btree_journal_buf);
+    sisl::ByteView store_journal() const;
     std::string to_string() const;
 };
 } // namespace homestore

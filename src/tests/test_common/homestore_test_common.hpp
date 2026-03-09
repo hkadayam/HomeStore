@@ -277,7 +277,7 @@ public:
         }
     }
 
-    static sisl::sg_list create_sgs(uint64_t io_size, uint32_t max_size_per_iov,
+    static sisl::SgList create_sgs(uint64_t io_size, uint32_t max_size_per_iov,
                                     std::optional< uint64_t > fill_data_pattern = std::nullopt) {
         auto blk_size = SISL_OPTIONS["block_size"].as< uint32_t >();
         HS_REL_ASSERT_EQ(io_size % blk_size, 0, "io_size should be a multiple of blk_size");
@@ -290,7 +290,7 @@ public:
         static std::default_random_engine s_re{s_rd()};
         static std::uniform_int_distribution< uint32_t > iov_nblks_generator{1u, max_iov_nblks};
 
-        sisl::sg_list sgs;
+        sisl::SgList sgs;
         sgs.size = 0;
         uint32_t remain_nblks = nblks;
         while (remain_nblks != 0) {
@@ -308,7 +308,7 @@ public:
         return sgs;
     }
 
-    static bool compare(const sisl::sg_list& sg1, const sisl::sg_list& sg2) {
+    static bool compare(const sisl::SgList& sg1, const sisl::SgList& sg2) {
         if ((sg2.size != sg1.size)) {
             LOGINFO("sg_list of sg1 size: {} mismatch with sg2 size: {}, ", sg1.size, sg2.size);
             return false;
@@ -335,7 +335,7 @@ public:
         return true;
     }
 
-    static void free(sisl::sg_list& sg) {
+    static void free(sisl::SgList& sg) {
         for (auto x : sg.iovs) {
             iomanager.iobuf_free(s_cast< uint8_t* >(x.iov_base));
             x.iov_base = nullptr;

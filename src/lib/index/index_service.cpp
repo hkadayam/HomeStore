@@ -37,7 +37,7 @@ IndexService::IndexService(std::unique_ptr< IndexServiceCallbacks > cbs,
     m_ordinal_reserver = std::make_unique< sisl::IDReserver >();
     meta_service().register_handler(
         "index_table",
-        [this](meta_blk* mblk, sisl::byte_view buf, size_t size) {
+        [this](meta_blk* mblk, sisl::ByteView buf, size_t size) {
             superblk< IndexSuperBlock > sb("index_table");
             sb.load(buf, mblk);
             m_index_sbs.emplace_back(std::move(sb));
@@ -46,7 +46,7 @@ IndexService::IndexService(std::unique_ptr< IndexServiceCallbacks > cbs,
 
     meta_service().register_handler(
         "index_store",
-        [this](meta_blk* mblk, sisl::byte_view buf, size_t size) {
+        [this](meta_blk* mblk, sisl::ByteView buf, size_t size) {
             superblk< IndexStoreSuperBlock > sb("index_store");
             sb.load(buf, mblk);
             m_store_sbs.emplace_back(std::move(sb));

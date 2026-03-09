@@ -31,7 +31,7 @@ SoloReplDev::SoloReplDev(superblk< repl_dev_superblk >&& rd_sb, bool load_existi
     }
 }
 
-void SoloReplDev::async_alloc_write(sisl::blob const& header, sisl::blob const& key, sisl::sg_list const& value,
+void SoloReplDev::async_alloc_write(sisl::Blob const& header, sisl::Blob const& key, sisl::SgList const& value,
                                     repl_req_ptr_t rreq, bool part_of_batch, trace_id_t tid) {
     if (!rreq) { auto rreq = repl_req_ptr_t(new repl_req_ctx{}); }
 
@@ -67,8 +67,8 @@ void SoloReplDev::write_journal(repl_req_ptr_t rreq) {
     rreq->create_journal_entry(false /* raft_buf */, 1);
 
     m_data_journal->append_async(
-        sisl::io_blob{rreq->raw_journal_buf(), rreq->journal_entry_size(), false /* is_aligned */},
-        nullptr /* cookie */, [this, rreq](int64_t lsn, sisl::io_blob&, homestore::logdev_key, void*) mutable {
+        sisl::IoBlob{rreq->raw_journal_buf(), rreq->journal_entry_size(), false /* is_aligned */},
+        nullptr /* cookie */, [this, rreq](int64_t lsn, sisl::IoBlob&, homestore::logdev_key, void*) mutable {
             rreq->set_lsn(lsn);
             m_listener->on_pre_commit(rreq->lsn(), rreq->header(), rreq->key(), rreq);
 
@@ -104,7 +104,7 @@ std::error_code SoloReplDev::alloc_blks(uint32_t data_size, const blk_alloc_hint
 }
 
 folly::Future< std::error_code > SoloReplDev::async_write(const std::vector< MultiBlkId >& blkids,
-                                                          sisl::sg_list const& value, bool part_of_batch,
+                                                          sisl::SgList const& value, bool part_of_batch,
                                                           trace_id_t tid) {
     /*if (is_stopping()) {
         return folly::makeFuture< std::error_code >(std::make_error_code(std::errc::operation_canceled));
@@ -114,7 +114,7 @@ folly::Future< std::error_code > SoloReplDev::async_write(const std::vector< Mul
     HS_REL_ASSERT_GT(blkids.size(), 0, "Empty blkid vec");
     std::vector< folly::Future< std::error_code > > futs;
     futs.reserve(blkids.size());
-    sisl::sg_iterator sg_it{value.iovs};
+    sisl::SgIterator sg_it{value.iovs};
 
     for (const auto& blkid : blkids) {
         auto sgs_size = blkid.blk_count() * data_service().get_blk_size();
@@ -127,7 +127,7 @@ folly::Future< std::error_code > SoloReplDev::async_write(const std::vector< Mul
             LOGINFO("Block size mismatch total_size={} sgs_size={}", total_size, sgs_size);
             return folly::makeFuture< std::error_code >(std::make_error_code(std::errc::invalid_argument));
         }
-        sisl::sg_list sgs{sgs_size, iovs};
+        sisl::SgList sgs{sgs_size, iovs};
         futs.emplace_back(data_service().async_write(sgs, blkid, part_of_batch));
     }
 
@@ -143,8 +143,8 @@ folly::Future< std::error_code > SoloReplDev::async_write(const std::vector< Mul
     });
 }
 
-void SoloReplDev::async_write_journal(const std::vector< MultiBlkId >& blkids, sisl::blob const& header,
-                                      sisl::blob const& key, uint32_t data_size, repl_req_ptr_t rreq, trace_id_t tid) {
+void SoloReplDev::async_write_journal(const std::vector< MultiBlkId >& blkids, sisl::Blob const& header,
+                                      sisl::Blob const& key, uint32_t data_size, repl_req_ptr_t rreq, trace_id_t tid) {
     // if (is_stopping()) { return; }
     // incr_pending_request_num();
 
@@ -168,12 +168,12 @@ void SoloReplDev::on_log_found(logstore_seq_num_t lsn, log_buffer buf, void* ctx
                      "Mismatched version of journal entry found");
 
     uint8_t const* raw_ptr = r_cast< uint8_t const* >(entry) + sizeof(repl_journal_entry);
-    sisl::blob header{raw_ptr, entry->user_header_size};
+    sisl::Blob header{raw_ptr, entry->user_header_size};
     HS_REL_ASSERT_GE(remain_size, entry->user_header_size, "Invalid journal entry, header_size mismatch");
     raw_ptr += entry->user_header_size;
     remain_size -= entry->user_header_size;
 
-    sisl::blob key{raw_ptr, entry->key_size};
+    sisl::Blob key{raw_ptr, entry->key_size};
     HS_REL_ASSERT_GE(remain_size, entry->key_size, "Invalid journal entry, key_size mismatch");
     raw_ptr += entry->key_size;
     remain_size -= entry->key_size;
@@ -181,7 +181,7 @@ void SoloReplDev::on_log_found(logstore_seq_num_t lsn, log_buffer buf, void* ctx
     std::vector< MultiBlkId > blkids;
     while (remain_size > 0) {
         MultiBlkId blkid;
-        sisl::blob value_blob{raw_ptr, sizeof(BlkId)};
+        sisl::Blob value_blob{raw_ptr, sizeof(BlkId)};
         blkid.deserialize(value_blob, true /* copy */);
         raw_ptr += sizeof(BlkId);
         remain_size -= sizeof(BlkId);
@@ -196,7 +196,7 @@ void SoloReplDev::on_log_found(logstore_seq_num_t lsn, log_buffer buf, void* ctx
     m_listener->on_commit(lsn, header, key, blkids, nullptr);
 }
 
-folly::Future< std::error_code > SoloReplDev::async_read(MultiBlkId const& bid, sisl::sg_list& sgs, uint32_t size,
+folly::Future< std::error_code > SoloReplDev::async_read(MultiBlkId const& bid, sisl::SgList& sgs, uint32_t size,
                                                          bool part_of_batch, trace_id_t tid) {
     /*if (is_stopping()) {
         return folly::makeFuture< std::error_code >(std::make_error_code(std::errc::operation_canceled));

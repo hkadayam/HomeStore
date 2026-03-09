@@ -44,16 +44,16 @@ public:
     virtual std::error_code alloc_blks(uint32_t data_size, const blk_alloc_hints& hints,
                                        std::vector< MultiBlkId >& out_blkids) override;
     virtual folly::Future< std::error_code > async_write(const std::vector< MultiBlkId >& blkids,
-                                                         sisl::sg_list const& value, bool part_of_batch = false,
+                                                         sisl::SgList const& value, bool part_of_batch = false,
                                                          trace_id_t tid = 0) override;
-    virtual void async_write_journal(const std::vector< MultiBlkId >& blkids, sisl::blob const& header,
-                                     sisl::blob const& key, uint32_t data_size, repl_req_ptr_t ctx,
+    virtual void async_write_journal(const std::vector< MultiBlkId >& blkids, sisl::Blob const& header,
+                                     sisl::Blob const& key, uint32_t data_size, repl_req_ptr_t ctx,
                                      trace_id_t tid = 0) override;
 
-    void async_alloc_write(sisl::blob const& header, sisl::blob const& key, sisl::sg_list const& value,
+    void async_alloc_write(sisl::Blob const& header, sisl::Blob const& key, sisl::SgList const& value,
                            repl_req_ptr_t ctx, bool part_of_batch = false, trace_id_t tid = 0) override;
 
-    folly::Future< std::error_code > async_read(MultiBlkId const& bid, sisl::sg_list& sgs, uint32_t size,
+    folly::Future< std::error_code > async_read(MultiBlkId const& bid, sisl::SgList& sgs, uint32_t size,
                                                 bool part_of_batch = false, trace_id_t tid = 0) override;
 
     folly::Future< std::error_code > async_free_blks(int64_t lsn, MultiBlkId const& blkid, trace_id_t tid = 0) override;
@@ -68,7 +68,7 @@ public:
     bool is_ready_for_traffic() const override { return true; }
     void purge() override {}
 
-    std::shared_ptr< snapshot_context > deserialize_snapshot_context(sisl::io_blob_safe& snp_ctx) override {
+    std::shared_ptr< snapshot_context > deserialize_snapshot_context(sisl::IoBlobSafe& snp_ctx) override {
         return nullptr;
     }
 

@@ -21,8 +21,8 @@
 #include <folly/small_vector.h>
 #include <boost/intrusive_ptr.hpp>
 #include <boost/vmd/is_empty.hpp>
-#include <sisl/fds/utils.hpp>
-#include <sisl/metrics/metrics.hpp>
+#include <sisl/fds/utils.h>
+#include <sisl/metrics/metrics.h>
 #include <homestore/index/index_common.h>
 
 namespace homestore {
@@ -268,14 +268,14 @@ public:
 class BtreeMetrics : public sisl::MetricsGroup {
 public:
     explicit BtreeMetrics(const char* inst_name) : sisl::MetricsGroup("Btree", inst_name) {
-        REGISTER_COUNTER(btree_obj_count, "Btree object count", _publish_as::publish_as_gauge);
+        REGISTER_COUNTER(btree_obj_count, "Btree object count", PublishAs::Gauge);
         REGISTER_COUNTER(btree_leaf_node_count, "Btree Leaf node count", "btree_node_count", {"node_type", "leaf"},
-                         _publish_as::publish_as_gauge);
+                         PublishAs::Gauge);
         REGISTER_COUNTER(btree_int_node_count, "Btree Interior node count", "btree_node_count",
-                         {"node_type", "interior"}, _publish_as::publish_as_gauge);
+                         {"node_type", "interior"}, PublishAs::Gauge);
         REGISTER_COUNTER(btree_split_count, "Total number of btree node splits");
         REGISTER_COUNTER(btree_merge_count, "Total number of btree node merges");
-        REGISTER_COUNTER(btree_depth, "Depth of btree", _publish_as::publish_as_gauge);
+        REGISTER_COUNTER(btree_depth, "Depth of btree", PublishAs::Gauge);
 
         REGISTER_COUNTER(btree_int_node_writes, "Total number of btree interior node writes", "btree_node_writes",
                          {"node_type", "interior"});

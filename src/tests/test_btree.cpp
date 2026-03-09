@@ -16,7 +16,7 @@
 #include <gtest/gtest.h>
 #include <boost/uuid/random_generator.hpp>
 
-#include <sisl/utility/enum.hpp>
+#include <sisl/fds/enum.h>
 #include "common/homestore_config.hpp"
 #include "common/resource_mgr.hpp"
 #include "test_common/homestore_test_common.hpp"
@@ -27,7 +27,6 @@
 
 using namespace homestore;
 
-SISL_OPTIONS_ENABLE(logging, test_btree, iomgr, test_common_setup)
 
 // TODO Add tests to do write,remove after recovery.
 // TODO Test with var len key with io mgr page size is 512.
@@ -522,7 +521,7 @@ TYPED_TEST(BtreeTest, ConcurrentMultiOps) {
 int main(int argc, char* argv[]) {
     int parsed_argc{argc};
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_btree, iomgr, test_common_setup);
+    SISL_OPTIONS_LOAD(parsed_argc, argv);
     sisl::logging::SetLogger("test_btree");
     spdlog::set_pattern("[%D %T%z] [%^%L%$] [%t] %v");
 

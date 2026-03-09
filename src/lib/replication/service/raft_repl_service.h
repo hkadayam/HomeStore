@@ -22,7 +22,7 @@
 #include <folly/Expected.h>
 #include <folly/futures/Future.h>
 #include <nuraft_mesg/nuraft_mesg.hpp>
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/buffer.h>
 #include <sisl/logging/logging.h>
 
 #include <homestore/homestore.hpp>
@@ -46,7 +46,7 @@ class RaftReplService : public GenericReplService,
 private:
     shared< nuraft_mesg::Manager > m_msg_mgr;
     json_superblk m_config_sb;
-    std::vector< std::pair< sisl::byte_view, void* > > m_config_sb_bufs;
+    std::vector< std::pair< sisl::ByteView, void* > > m_config_sb_bufs;
     std::mutex m_pending_fetch_mtx;
     std::queue< std::pair< shared< RaftReplDev >, std::vector< repl_req_ptr_t > > > m_pending_fetch_batches;
     iomgr::timer_handle_t m_rdev_fetch_timer_hdl;
@@ -77,7 +77,7 @@ protected:
     AsyncReplResult< shared< ReplDev > > create_repl_dev(group_id_t group_id,
                                                          std::set< replica_id_t > const& members) override;
     folly::SemiFuture< ReplServiceError > remove_repl_dev(group_id_t group_id) override;
-    void load_repl_dev(sisl::byte_view const& buf, void* meta_cookie) override;
+    void load_repl_dev(sisl::ByteView const& buf, void* meta_cookie) override;
     AsyncReplResult<> replace_member(group_id_t group_id, const replica_member_info& member_out,
                                            const replica_member_info& member_in, uint32_t commit_quorum = 0,
                                            uint64_t trace_id = 0) const override;
@@ -87,7 +87,7 @@ protected:
                                         uint64_t trace_id = 0) const override;
 
 private:
-    RaftReplDev* raft_group_config_found(sisl::byte_view const& buf, void* meta_cookie);
+    RaftReplDev* raft_group_config_found(sisl::ByteView const& buf, void* meta_cookie);
     void start_reaper_thread();
     void stop_reaper_thread();
     void fetch_pending_data();

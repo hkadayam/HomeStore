@@ -1,6 +1,6 @@
 #pragma once
 #include <string>
-#include <sisl/utility/enum.hpp>
+#include <sisl/fds/enum.h>
 
 namespace homestore {
 class IndexStore {

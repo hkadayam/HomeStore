@@ -35,7 +35,6 @@
 
 using namespace homestore;
  
-SISL_OPTIONS_ENABLE(logging, test_pdev, iomgr)
 
 SISL_OPTION_GROUP(test_pdev,
                   (num_data_devs, "", "num_data_devs", "number of data devices to create",
@@ -263,7 +262,7 @@ TEST_F(PDevTest, RandomChunkOpsWithRestart) {
 }
 
 int main(int argc, char* argv[]) {
-    SISL_OPTIONS_LOAD(argc, argv, logging, test_pdev, iomgr);
+    SISL_OPTIONS_LOAD(argc, argv);
     ::testing::InitGoogleTest(&argc, argv);
     sisl::logging::SetLogger("test_pdev");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");

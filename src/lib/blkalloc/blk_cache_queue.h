@@ -21,7 +21,7 @@
 #include <optional>
 #include <vector>
 
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/buffer.h>
 #include <folly/MPMCQueue.h>
 
 #include "blk_cache.h"

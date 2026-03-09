@@ -20,7 +20,7 @@
 #include <mutex>
 
 #include <sisl/logging/logging.h>
-#include <sisl/utility/atomic_counter.hpp>
+#include <sisl/fds/atomic_counter.h>
 #include <iomgr/iomgr.hpp>
 #include <folly/futures/SharedPromise.h>
 
@@ -78,7 +78,7 @@ VENUM(cp_consumer_t, uint8_t,
 
 struct CP {
     std::atomic< cp_status_t > m_cp_status{cp_status_t::cp_unknown};
-    sisl::atomic_counter< int64_t > m_enter_cnt;
+    sisl::AtomicCounter< int64_t > m_enter_cnt;
     CPManager* m_cp_mgr;
     cp_id_t m_cp_id;
     std::array< std::unique_ptr< CPContext >, (size_t)cp_consumer_t::SENTINEL > m_contexts;

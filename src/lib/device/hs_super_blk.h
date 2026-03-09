@@ -19,7 +19,7 @@
 
 #include <iomgr/iomgr_flip.hpp>
 #include <iomgr/iomgr.hpp>
-#include <sisl/fds/sparse_vector.hpp>
+#include <sisl/fds/SparseVector.h>
 #include <homestore/homestore_decl.hpp>
 
 // Super blk format

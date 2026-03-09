@@ -13,7 +13,7 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
-#include <sisl/fds/thread_vector.hpp>
+#include <sisl/fds/thread_vector.h>
 #include <homestore/btree/detail/btree_node.hpp>
 #include <homestore/index_service.hpp>
 #include <homestore/homestore.hpp>
@@ -40,7 +40,7 @@ IndexWBCacheBase& wb_cache() {
     }
 }
 
-IndexWBCache::IndexWBCache(const std::shared_ptr< VirtualDev >& vdev, std::pair< meta_blk*, sisl::byte_view > sb,
+IndexWBCache::IndexWBCache(const std::shared_ptr< VirtualDev >& vdev, std::pair< meta_blk*, sisl::ByteView > sb,
                            const std::shared_ptr< sisl::Evictor >& evictor, uint32_t node_size) :
         m_vdev{vdev},
         m_cache{evictor, HS_DYNAMIC_CONFIG(generic.cache_hashmap_nbuckets), node_size,
@@ -440,7 +440,7 @@ void IndexWBCache::free_buf(const IndexBufferPtr& buf, CPContext* cp_ctx) {
 //////////////////// Recovery Related section /////////////////////////////////
 void IndexWBCache::load_buf(IndexBufferPtr const& buf) {
     if (buf->m_bytes == nullptr) {
-        buf->m_bytes = hs_utils::iobuf_alloc(m_node_size, sisl::buftag::btree_node, m_vdev->align_size());
+        buf->m_bytes = hs_utils::iobuf_alloc(m_node_size, sisl::Buftag::btree_node, m_vdev->align_size());
         m_vdev->sync_read(r_cast< char* >(buf->m_bytes), m_node_size, buf->blkid());
         buf->m_dirtied_cp_id = BtreeNode::get_modified_cp_id(buf->m_bytes);
     }
@@ -518,7 +518,7 @@ static std::string to_string_dag_bufs(DagMap& dags, cp_id_t cp_id = 0) {
     return str;
 }
 
-void IndexWBCache::recover(sisl::byte_view sb) {
+void IndexWBCache::recover(sisl::ByteView sb) {
     // If sb is empty, its possible a first time boot.
     if ((sb.bytes() == nullptr) || (sb.size() == 0)) {
         m_vdev->recovery_completed();
@@ -744,7 +744,7 @@ bool IndexWBCache::was_node_committed(IndexBufferPtr const& buf) {
 
     // All down_buf has indicated that they have seen this up buffer, now its time to repair them.
     load_buf(buf);
-    if (!BtreeNode::is_valid_node(sisl::blob{buf->m_bytes, m_node_size})) { return false; }
+    if (!BtreeNode::is_valid_node(sisl::Blob{buf->m_bytes, m_node_size})) { return false; }
     return (buf->m_dirtied_cp_id == cp_mgr().cp_guard()->id());
 }
 

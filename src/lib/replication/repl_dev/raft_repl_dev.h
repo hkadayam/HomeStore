@@ -5,8 +5,8 @@
 #include <libnuraft/ptr.hxx>
 #include <nuraft_mesg/nuraft_mesg.hpp>
 #include <nuraft_mesg/mesg_state_mgr.hpp>
-#include <sisl/fds/buffer.hpp>
-#include <sisl/fds/utils.hpp>
+#include <sisl/fds/buffer.h>
+#include <sisl/fds/utils.h>
 #include <homestore/replication/repl_dev.h>
 #include <homestore/superblk_handler.hpp>
 #include <homestore/logstore/log_store.hpp>
@@ -62,11 +62,11 @@ public:
         REGISTER_COUNTER(total_read_cnt, "total write count", "total_write_cnt", {"op", "read"}); // placeholder
         REGISTER_COUNTER(total_write_cnt, "total read count", "total_read_cnt", {"op", "write"});
         REGISTER_COUNTER(outstanding_data_read_cnt, "Total data outstanding read cnt",
-                         sisl::_publish_as::publish_as_gauge); // placeholder
+                         sisl::PublishAs::Gauge); // placeholder
         REGISTER_COUNTER(outstanding_data_write_cnt, "Total data outstanding write cnt",
-                         sisl::_publish_as::publish_as_gauge);
+                         sisl::PublishAs::Gauge);
         REGISTER_COUNTER(outstanding_data_fetch_cnt, "Total data outstanding fetch cnt",
-                         sisl::_publish_as::publish_as_gauge);
+                         sisl::PublishAs::Gauge);
 
         // leader: data write latency;
         // follower: from rreq push data received to data write completion;
@@ -133,17 +133,17 @@ public:
         snapshot_ = nuraft::snapshot::deserialize(*snp_buf);
     }
 
-    nuraft_snapshot_context(sisl::io_blob_safe const& snp_ctx) : snapshot_context(0) { deserialize(snp_ctx); }
+    nuraft_snapshot_context(sisl::IoBlobSafe const& snp_ctx) : snapshot_context(0) { deserialize(snp_ctx); }
 
-    sisl::io_blob_safe serialize() override {
+    sisl::IoBlobSafe serialize() override {
         // Dump the context from nuraft buffer to the io blob.
         auto snp_buf = snapshot_->serialize();
-        sisl::io_blob_safe blob{s_cast< size_t >(snp_buf->size())};
+        sisl::IoBlobSafe blob{s_cast< size_t >(snp_buf->size())};
         std::memcpy(blob.bytes(), snp_buf->data_begin(), snp_buf->size());
         return blob;
     }
 
-    void deserialize(const sisl::io_blob_safe& snp_ctx) {
+    void deserialize(const sisl::IoBlobSafe& snp_ctx) {
         // Load the context from the io blob to nuraft buffer.
         auto snp_buf = nuraft::buffer::alloc(snp_ctx.size());
         snp_buf->put_raw(snp_ctx.cbytes(), snp_ctx.size());
@@ -254,21 +254,21 @@ public:
         return std::make_error_code(std::errc::operation_not_supported);
     }
     virtual folly::Future< std::error_code > async_write(const std::vector< MultiBlkId >& blkids,
-                                                         sisl::sg_list const& value, bool part_of_batch = false,
+                                                         sisl::SgList const& value, bool part_of_batch = false,
                                                          trace_id_t tid = 0) override {
         RD_REL_ASSERT(false, "NOT SUPPORTED");
         return folly::makeFuture< std::error_code >(std::make_error_code(std::errc::operation_not_supported));
     }
 
-    virtual void async_write_journal(const std::vector< MultiBlkId >& blkids, sisl::blob const& header,
-                                     sisl::blob const& key, uint32_t data_size, repl_req_ptr_t ctx,
+    virtual void async_write_journal(const std::vector< MultiBlkId >& blkids, sisl::Blob const& header,
+                                     sisl::Blob const& key, uint32_t data_size, repl_req_ptr_t ctx,
                                      trace_id_t tid = 0) override {
         RD_REL_ASSERT(false, "NOT SUPPORTED");
     }
 
-    void async_alloc_write(sisl::blob const& header, sisl::blob const& key, sisl::sg_list const& value,
+    void async_alloc_write(sisl::Blob const& header, sisl::Blob const& key, sisl::SgList const& value,
                            repl_req_ptr_t ctx, bool part_of_batch = false, trace_id_t tid = 0) override;
-    folly::Future< std::error_code > async_read(MultiBlkId const& blkid, sisl::sg_list& sgs, uint32_t size,
+    folly::Future< std::error_code > async_read(MultiBlkId const& blkid, sisl::SgList& sgs, uint32_t size,
                                                 bool part_of_batch = false, trace_id_t tid = 0) override;
     folly::Future< std::error_code > async_free_blks(int64_t lsn, MultiBlkId const& blkid, trace_id_t tid = 0) override;
     AsyncReplResult<> become_leader() override;
@@ -299,7 +299,7 @@ public:
     // purge all resources (e.g., logs in logstore) is a very dangerous operation, it is not supported yet.
     void purge() override { RD_REL_ASSERT(false, "NOT SUPPORTED YET"); }
 
-    std::shared_ptr< snapshot_context > deserialize_snapshot_context(sisl::io_blob_safe& snp_ctx) override {
+    std::shared_ptr< snapshot_context > deserialize_snapshot_context(sisl::IoBlobSafe& snp_ctx) override {
         return std::make_shared< nuraft_snapshot_context >(snp_ctx);
     }
 
@@ -316,8 +316,8 @@ public:
     void handle_rollback(repl_req_ptr_t rreq);
     void handle_config_rollback(const repl_lsn_t lsn, raft_cluster_config_ptr_t& old_conf);
     repl_req_ptr_t repl_key_to_req(repl_key const& rkey) const;
-    repl_req_ptr_t applier_create_req(repl_key const& rkey, journal_type_t code, sisl::blob const& user_header,
-                                      sisl::blob const& key, uint32_t data_size, bool is_data_channel,
+    repl_req_ptr_t applier_create_req(repl_key const& rkey, journal_type_t code, sisl::Blob const& user_header,
+                                      sisl::Blob const& key, uint32_t data_size, bool is_data_channel,
                                       int64_t lsn = -1 /*init lsn*/);
     folly::Future< folly::Unit > notify_after_data_written(std::vector< repl_req_ptr_t >* rreqs);
     void check_and_fetch_remote_data(std::vector< repl_req_ptr_t > rreqs);
@@ -425,7 +425,7 @@ protected:
 
 private:
     shared< nuraft::log_store > data_journal() { return m_data_journal; }
-    void push_data_to_all_followers(repl_req_ptr_t rreq, sisl::sg_list const& data);
+    void push_data_to_all_followers(repl_req_ptr_t rreq, sisl::SgList const& data);
     void on_push_data_received(intrusive< sisl::GenericRpcData >& rpc_data);
     void on_fetch_data_received(intrusive< sisl::GenericRpcData >& rpc_data);
     void fetch_data_from_remote(std::vector< repl_req_ptr_t > rreqs);
@@ -451,7 +451,7 @@ private:
 
     void report_blk_metrics_if_needed(repl_req_ptr_t rreq);
     ReplServiceError init_req_ctx(repl_req_ptr_t rreq, repl_key rkey, journal_type_t op_code, bool is_proposer,
-                                  sisl::blob const& user_header, sisl::blob const& key, uint32_t data_size,
+                                  sisl::Blob const& user_header, sisl::Blob const& key, uint32_t data_size,
                                   cshared< ReplDevListener >& listener);
 
     bool is_in_quience() { return m_in_quience.load(std::memory_order_acquire); }

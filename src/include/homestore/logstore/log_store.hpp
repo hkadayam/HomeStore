@@ -27,8 +27,8 @@
 #include <vector>
 #include <tuple>
 
-#include <sisl/fds/buffer.hpp>
-#include <sisl/fds/stream_tracker.hpp>
+#include <sisl/fds/buffer.h>
+#include <sisl/fds/stream_tracker.h>
 #include <folly/Synchronized.h>
 #include <nlohmann/json.hpp>
 
@@ -99,7 +99,7 @@ public:
      * @param cookie : Any cookie or context which will passed back in the callback
      * @param cb Callback upon completion which is called with the status, seq_num and cookie that was passed.
      */
-    void write_async(logstore_seq_num_t seq_num, const sisl::io_blob& b, void* cookie, const log_write_comp_cb_t& cb);
+    void write_async(logstore_seq_num_t seq_num, const sisl::IoBlob& b, void* cookie, const log_write_comp_cb_t& cb);
 
     /**
      * @brief This method appends the blob into the log and makes a callback at the end of the append.
@@ -117,7 +117,7 @@ public:
      *
      * @return internally generated sequence number
      */
-    logstore_seq_num_t append_async(const sisl::io_blob& b, void* cookie, const log_write_comp_cb_t& completion_cb);
+    logstore_seq_num_t append_async(const sisl::IoBlob& b, void* cookie, const log_write_comp_cb_t& completion_cb);
 
     /**
      * @brief Write the blob at the user specified seq number and flush, just like write_sync
@@ -125,7 +125,7 @@ public:
      * @param seq_num: Seq number to write to
      * @param b : Blob of data
      */
-    void write_and_flush(logstore_seq_num_t seq_num, const sisl::io_blob& b);
+    void write_and_flush(logstore_seq_num_t seq_num, const sisl::IoBlob& b);
 
     /**
      * @brief Read the log provided the sequence number synchronously. This is not the most efficient way to read

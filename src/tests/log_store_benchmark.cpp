@@ -37,7 +37,6 @@
 using namespace homestore;
  
 
-SISL_OPTIONS_ENABLE(logging, log_store_benchmark, iomgr, test_common_setup)
 SISL_OPTION_GROUP(log_store_benchmark,
                   (num_logstores, "", "num_logstores", "number of log stores",
                    ::cxxopts::value< uint32_t >()->default_value("1"), "number"),
@@ -113,8 +112,8 @@ private:
 
         DLOGDEBUG("Appending log entry for iteration_ind={} ind={}", iter_ind, ind);
         m_log_store->append_async(
-            sisl::io_blob(uintptr_cast(m_data[iter_ind].data()), uint32_cast(m_data[iter_ind].size()), false), nullptr,
-            [this](logstore_seq_num_t, sisl::io_blob&, bool, void*) {
+            sisl::IoBlob(uintptr_cast(m_data[iter_ind].data()), uint32_cast(m_data[iter_ind].size()), false), nullptr,
+            [this](logstore_seq_num_t, sisl::IoBlob&, bool, void*) {
                 if (m_outstanding.fetch_sub(1, std::memory_order_acq_rel) < int_cast(m_q_depth)) { issue_io(); };
             });
         return true;
@@ -178,7 +177,7 @@ static void teardown() { s_helper.shutdown_homestore(); }
 BENCHMARK(test_append)->Iterations(1);
 
 int main(int argc, char** argv) {
-    SISL_OPTIONS_LOAD(argc, argv, logging, log_store_benchmark, iomgr, test_common_setup)
+    SISL_OPTIONS_LOAD(argc, argv);
     sisl::logging::SetLogger("log_store_benchmark");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
 

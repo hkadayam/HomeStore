@@ -119,7 +119,6 @@ static void setup() {
     LogDev::instance()->register_logfound_cb(on_log_found);
 }
 
-SISL_OPTIONS_ENABLE(logging, log_dev_benchmark)
 SISL_OPTION_GROUP(log_dev_benchmark,
                   (num_threads, "", "num_threads", "number of threads",
                    ::cxxopts::value< uint32_t >()->default_value("2"), "number"),
@@ -130,9 +129,8 @@ SISL_OPTION_GROUP(log_dev_benchmark,
 
 BENCHMARK(test_append)->Iterations(ITERATIONS)->Threads(THREADS);
 
-SISL_OPTIONS_ENABLE(logging)
 int main(int argc, char** argv) {
-    SISL_OPTIONS_LOAD(argc, argv, logging, log_dev_benchmark)
+    SISL_OPTIONS_LOAD(argc, argv);
     sisl::logging::SetLogger("log_dev_benchmark");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
 

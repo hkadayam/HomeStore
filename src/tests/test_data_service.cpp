@@ -24,7 +24,7 @@
 #include <iomgr/io_environment.hpp>
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/buffer.h>
 #include <gtest/gtest.h>
 #include <iomgr/iomgr_flip.hpp>
 #include <folly/concurrency/ConcurrentHashMap.h>
@@ -54,7 +54,6 @@ using namespace homestore;
 
 RCU_REGISTER_INIT
  
-SISL_OPTIONS_ENABLE(logging, test_data_service, iomgr, test_common_setup)
 
 constexpr uint64_t Ki{1024};
 constexpr uint64_t Mi{Ki * Ki};
@@ -94,12 +93,12 @@ public:
 
     virtual void TearDown() override { m_helper.shutdown_homestore(); }
 
-    void free(sisl::sg_list& sg) { test_common::HSTestHelper::free(sg); }
+    void free(sisl::SgList& sg) { test_common::HSTestHelper::free(sg); }
 
     // free_blk after read completes
     void write_read_free_blk(uint64_t io_size) {
-        auto sg_write_ptr = std::make_shared< sisl::sg_list >();
-        auto sg_read_ptr = std::make_shared< sisl::sg_list >();
+        auto sg_write_ptr = std::make_shared< sisl::SgList >();
+        auto sg_read_ptr = std::make_shared< sisl::SgList >();
         auto test_blkid_ptr = std::make_shared< MultiBlkId >();
 
         write_sgs(io_size, sg_write_ptr, 1 /* num_iovs */, *test_blkid_ptr)
@@ -136,8 +135,8 @@ public:
 
     // free_blk before read completes
     void write_free_blk_before_read_comp(const uint64_t io_size) {
-        auto sg_write_ptr = std::make_shared< sisl::sg_list >();
-        auto sg_read_ptr = std::make_shared< sisl::sg_list >();
+        auto sg_write_ptr = std::make_shared< sisl::SgList >();
+        auto sg_read_ptr = std::make_shared< sisl::SgList >();
         auto test_blkid_ptr = std::make_shared< MultiBlkId >();
 
         write_sgs(io_size, sg_write_ptr, 1 /* num_iovs */, *test_blkid_ptr)
@@ -184,7 +183,7 @@ public:
     }
 
     void write_io_free_blk(const uint64_t io_size) {
-        std::shared_ptr< sisl::sg_list > sg_write_ptr = std::make_shared< sisl::sg_list >();
+        std::shared_ptr< sisl::SgList > sg_write_ptr = std::make_shared< sisl::SgList >();
         auto test_blkid_ptr = std::make_shared< MultiBlkId >();
 
         write_sgs(io_size, sg_write_ptr, 1 /* num_iovs */, *test_blkid_ptr)
@@ -203,8 +202,8 @@ public:
     }
 
     void write_io_verify(const uint64_t io_size) {
-        auto sg_write_ptr = std::make_shared< sisl::sg_list >();
-        auto sg_read_ptr = std::make_shared< sisl::sg_list >();
+        auto sg_write_ptr = std::make_shared< sisl::SgList >();
+        auto sg_read_ptr = std::make_shared< sisl::SgList >();
         auto test_blkid_ptr = std::make_shared< MultiBlkId >();
 
         write_sgs(io_size, sg_write_ptr, 1 /* num_iovs */, *test_blkid_ptr)
@@ -285,7 +284,7 @@ public:
 
         blk_alloc_hints hints;
 
-        auto sg_write_ptr1 = std::make_shared< sisl::sg_list >();
+        auto sg_write_ptr1 = std::make_shared< sisl::SgList >();
         hints.chunk_id_hint = chunk_in_living_pdev->chunk_id();
         ++m_outstanding_io_cnt;
         write_sgs(io_size, sg_write_ptr1, 4, living_drive_blk, hints).thenValue([this](auto&& err) {
@@ -296,7 +295,7 @@ public:
         });
 
         hints.chunk_id_hint = chunk_in_missing_pdev->chunk_id();
-        auto sg_write_ptr2 = std::make_shared< sisl::sg_list >();
+        auto sg_write_ptr2 = std::make_shared< sisl::SgList >();
         ++m_outstanding_io_cnt;
         write_sgs(io_size, sg_write_ptr2, 4, missing_drive_blk, hints).thenValue([this](auto&& err) {
             RELEASE_ASSERT(!err, "Write error");
@@ -329,7 +328,7 @@ public:
         m_helper.restart_homestore();
 
         LOGINFO("Step 4: read the blk from missing data drive");
-        auto sg = std::make_shared< sisl::sg_list >();
+        auto sg = std::make_shared< sisl::SgList >();
         sg->size = io_size;
         struct iovec iov;
         iov.iov_len = io_size;
@@ -402,7 +401,7 @@ public:
     // this api is for caller who is not interested with the write buffer and blkids;
     //
     void write_io(uint64_t io_size, uint32_t num_iovs = 1) {
-        auto sg = std::make_shared< sisl::sg_list >();
+        auto sg = std::make_shared< sisl::SgList >();
         MultiBlkId blkid;
         write_sgs(io_size, sg, num_iovs, blkid).thenValue([this, sg](auto) {
             free(*sg);
@@ -427,7 +426,7 @@ public:
 
     ////////////////////////// Load Test APIS ////////////////////////////////
     void write_io_load(uint64_t io_size, uint32_t num_iovs = 1) {
-        auto sg = std::make_shared< sisl::sg_list >();
+        auto sg = std::make_shared< sisl::SgList >();
         auto out_bids = std::make_shared< MultiBlkId >();
         ++m_outstanding_io_cnt;
         // out_bids are returned syncronously;
@@ -640,7 +639,7 @@ private:
     // caller should be responsible to call free(sg) to free the iobuf allocated in iovs,
     // normally it should be freed in after_write_cb;
     //
-    folly::Future< std::error_code > write_sgs(uint64_t io_size, cshared< sisl::sg_list > sg, uint32_t num_iovs,
+    folly::Future< std::error_code > write_sgs(uint64_t io_size, cshared< sisl::SgList > sg, uint32_t num_iovs,
                                                MultiBlkId& out_bids,
                                                std::optional< blk_alloc_hints > hints = std::nullopt) {
         // TODO: What if iov_len is not multiple of 4Ki?
@@ -661,7 +660,7 @@ private:
         return fut;
     }
 
-    void verify_read_blk_crc(sisl::sg_list& sg, std::vector< uint64_t > read_crc_vec) {
+    void verify_read_blk_crc(sisl::SgList& sg, std::vector< uint64_t > read_crc_vec) {
         auto const blk_size = inst().get_blk_size();
         auto const blk_count = sg.iovs[0].iov_len / blk_size;
         auto const blk_base = r_cast< uint8_t* >(sg.iovs[0].iov_base);
@@ -680,7 +679,7 @@ private:
     }
 
 #if 0
-    void verify_read_blk_crc(sisl::sg_list& sg, MultiBlkId bid) {
+    void verify_read_blk_crc(sisl::SgList& sg, MultiBlkId bid) {
         auto const blk_size = inst().get_blk_size();
         auto const blk_count = sg.iovs[0].iov_len / blk_size;
         auto const blk_base = r_cast< uint8_t* >(sg.iovs[0].iov_base);
@@ -723,7 +722,7 @@ private:
     }
 
     void do_read_io(MultiBlkId bid, uint32_t io_size, cshared< std::vector< uint64_t > > read_crc_vec) {
-        auto sg = std::make_shared< sisl::sg_list >();
+        auto sg = std::make_shared< sisl::SgList >();
         sg->size = io_size;
         struct iovec iov;
         iov.iov_len = io_size;
@@ -754,7 +753,7 @@ private:
      * @param sg The scatter-gather list to calculate the CRC for.
      * @param bid The ID of the block to calculate the CRC for.
      */
-    void cal_write_blk_crc(sisl::sg_list& sg, MultiBlkId bid) {
+    void cal_write_blk_crc(sisl::SgList& sg, MultiBlkId bid) {
         RELEASE_ASSERT_EQ(sg.iovs.size(), 1, "Only expect one iov.");
 
         // calculate crc blk by blk and save them to m_blk_crc_map;
@@ -1007,7 +1006,7 @@ SISL_OPTION_GROUP(test_data_service,
 int main(int argc, char* argv[]) {
     int parsed_argc{argc};
     ::testing::InitGoogleTest(&parsed_argc, argv);
-    SISL_OPTIONS_LOAD(parsed_argc, argv, logging, test_data_service, iomgr, test_common_setup);
+    SISL_OPTIONS_LOAD(parsed_argc, argv);
     sisl::logging::SetLogger("test_data_service");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
     gp.run_time = SISL_OPTIONS["run_time"].as< uint64_t >();

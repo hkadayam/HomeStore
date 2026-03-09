@@ -25,12 +25,12 @@
 #include <type_traits>
 #include <vector>
 
-#include <sisl/metrics/metrics.hpp>
+#include <sisl/metrics/metrics.h>
 #include <sisl/logging/logging.h>
-#include <sisl/utility/obj_life_counter.hpp>
-#include <sisl/utility/atomic_counter.hpp>
-#include <sisl/utility/enum.hpp>
-#include <sisl/fds/concurrent_insert_vector.hpp>
+#include <sisl/fds/obj_life_counter.h>
+#include <sisl/fds/atomic_counter.h>
+#include <sisl/fds/enum.h>
+#include <sisl/fds/concurrent_insert_vector.h>
 
 #include <homestore/checkpoint/cp_mgr.hpp>
 #include <homestore/homestore_decl.hpp>
@@ -245,7 +245,7 @@ public:
     // TODO: This needs to be removed once Journal starting to use AppendBlkAllocator
     std::error_code sync_read(char* buf, uint32_t size, cshared< Chunk >& chunk, uint64_t offset_in_chunk);
 
-    std::pair< std::error_code, sisl::io_blob_safe > sync_read(BlkId const& bid);
+    std::pair< std::error_code, sisl::IoBlobSafe > sync_read(BlkId const& bid);
 
     /// @brief Synchronously read the data for a given BlkId to vector of buffers
     /// @param iov : Vector of buffer to write read to
@@ -304,7 +304,7 @@ public:
     bool is_blk_exist(MultiBlkId const& b) const;
 
     ///////////////////////// Meta operations on vdev ////////////////////////
-    void update_vdev_private(const sisl::blob& data);
+    void update_vdev_private(const sisl::Blob& data);
 
 private:
     uint64_t to_dev_offset(BlkId const& b, Chunk** chunk) const;

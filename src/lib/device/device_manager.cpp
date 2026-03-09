@@ -111,7 +111,7 @@ void DeviceManager::format_devices() {
         auto attr = iomgr::DriveInterface::get_attributes(dinfo.dev_name);
         if (dinfo.dev_size == 0) { dinfo.dev_size = PhysicalDev::get_dev_size(dinfo.dev_name); }
         auto sb_size = hs_super_blk::total_used_size(dinfo);
-        auto buf = hs_utils::iobuf_alloc(sb_size, sisl::buftag::superblk, attr.align_size);
+        auto buf = hs_utils::iobuf_alloc(sb_size, sisl::Buftag::superblk, attr.align_size);
         std::memset(buf, 0, sb_size);
 
         first_block* fblk = r_cast< first_block* >(buf);
@@ -138,7 +138,7 @@ void DeviceManager::format_devices() {
         pdev->format_chunks();
         m_all_pdevs[pdev_id] = std::move(pdev);
 
-        hs_utils::iobuf_free(buf, sisl::buftag::superblk);
+        hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
     }
 }
 
@@ -179,7 +179,7 @@ void DeviceManager::load_devices() {
 }
 
 void DeviceManager::commit_formatting() {
-    auto buf = hs_utils::iobuf_alloc(hs_super_blk::first_block_size(), sisl::buftag::superblk, 512);
+    auto buf = hs_utils::iobuf_alloc(hs_super_blk::first_block_size(), sisl::Buftag::superblk, 512);
     for (auto& pdev : m_all_pdevs) {
         if (!pdev) { continue; }
 
@@ -195,7 +195,7 @@ void DeviceManager::commit_formatting() {
 
         pdev->write_super_block(buf, hs_super_blk::first_block_size(), hs_super_blk::first_block_offset());
     }
-    hs_utils::iobuf_free(buf, sisl::buftag::superblk);
+    hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
     LOGINFO("HomeStore formatting is committed on all physical devices");
 }
 
@@ -319,7 +319,7 @@ shared< VirtualDev > DeviceManager::create_vdev(vdev_parameters&& vparam) {
         pdevs.size(), vparam.num_chunks, in_bytes(vparam.chunk_size));
 
     // Convert the vparameters to the vdev_info
-    auto buf = hs_utils::iobuf_alloc(vdev_info::size, sisl::buftag::superblk, pdevs[0]->align_size());
+    auto buf = hs_utils::iobuf_alloc(vdev_info::size, sisl::Buftag::superblk, pdevs[0]->align_size());
     auto vinfo = new (buf) vdev_info();
     populate_vdev_info(vparam, vdev_id, pdevs, vinfo);
 
@@ -382,7 +382,7 @@ shared< VirtualDev > DeviceManager::create_vdev(vdev_parameters&& vparam) {
     }
 
     vinfo->~vdev_info();
-    hs_utils::iobuf_free(buf, sisl::buftag::superblk);
+    hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
     LOGINFO("Virtal Dev={} of size={} successfully created", vparam.vdev_name, in_bytes(vparam.vdev_size));
     return vdev;
 }
@@ -402,7 +402,7 @@ void DeviceManager::load_vdevs() {
     // There are some vdevs load their chunks in each of pdev
     if (m_vdevs.size()) {
         for (auto& pdev : m_all_pdevs) {
-            // we might have some missing pdevs in the sparse_vector m_all_pdevs, so skip them
+            // we might have some missing pdevs in the SparseVector m_all_pdevs, so skip them
             if (!pdev) continue;
             pdev->load_chunks([this](cshared< Chunk >& chunk) -> bool {
                 // Found a chunk for which vdev information is missing
@@ -429,7 +429,7 @@ void DeviceManager::load_vdevs() {
 }
 
 shared< Chunk > DeviceManager::create_chunk(HSDevType dev_type, uint32_t vdev_id, uint64_t chunk_size,
-                                            const sisl::blob& data) {
+                                            const sisl::Blob& data) {
     std::unique_lock lg{m_vdev_mutex};
     auto pdevs = pdevs_by_type_internal(dev_type);
     auto chunk_id = m_chunk_id_bm.get_next_reset_bit(0u);
@@ -460,7 +460,7 @@ shared< Chunk > DeviceManager::create_chunk(HSDevType dev_type, uint32_t vdev_id
     vdev->add_chunk(chunk, true /* fresh_chunk */);
     m_chunks[chunk->chunk_id()] = chunk;
 
-    auto buf = hs_utils::iobuf_alloc(vdev_info::size, sisl::buftag::superblk, pdev->align_size());
+    auto buf = hs_utils::iobuf_alloc(vdev_info::size, sisl::Buftag::superblk, pdev->align_size());
     auto vdev_info = vdev->info();
     vdev_info.vdev_size += chunk_size;
     vdev_info.num_primary_chunks++;
@@ -471,7 +471,7 @@ shared< Chunk > DeviceManager::create_chunk(HSDevType dev_type, uint32_t vdev_id
     std::memcpy(buf, &vdev_info, sizeof(vdev_info));
     uint64_t offset = hs_super_blk::vdev_sb_offset() + (vdev_id * vdev_info::size);
     pdev->write_super_block(buf, vdev_info::size, offset);
-    hs_utils::iobuf_free(buf, sisl::buftag::superblk);
+    hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
 
     HS_LOG(DEBUG, device, "Created chunk_id={} dev_type={} vdev_id={} size={}", chunk_id, (uint8_t)dev_type, vdev_id,
            chunk_size);
@@ -501,7 +501,7 @@ void DeviceManager::remove_chunk_locked(shared< Chunk > chunk) {
     m_chunks.erase(chunk_id);
 
     // Update the vdev info.
-    auto buf = hs_utils::iobuf_alloc(vdev_info::size, sisl::buftag::superblk, pdev->align_size());
+    auto buf = hs_utils::iobuf_alloc(vdev_info::size, sisl::Buftag::superblk, pdev->align_size());
     auto vdev_info = vdev->info();
     vdev_info.vdev_size -= vdev_info.chunk_size;
     vdev_info.num_primary_chunks--;
@@ -511,7 +511,7 @@ void DeviceManager::remove_chunk_locked(shared< Chunk > chunk) {
     std::memcpy(buf, &vdev_info, sizeof(vdev_info));
     uint64_t offset = hs_super_blk::vdev_sb_offset() + (vdev_id * vdev_info::size);
     pdev->write_super_block(buf, vdev_info::size, offset);
-    hs_utils::iobuf_free(buf, sisl::buftag::superblk);
+    hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
 
     HS_LOG(DEBUG, device, "Removed chunk_id={} vdev_id={}", chunk_id, vdev_id);
 }
@@ -575,7 +575,7 @@ static void populate_vdev_info(const vdev_parameters& vparam, uint32_t vdev_id,
 std::vector< vdev_info > DeviceManager::read_vdev_infos(const std::vector< PhysicalDev* >& pdevs) {
     std::vector< vdev_info > ret_vinfos;
     auto buf =
-        hs_utils::iobuf_alloc(hs_super_blk::vdev_super_block_size(), sisl::buftag::superblk, pdevs[0]->align_size());
+        hs_utils::iobuf_alloc(hs_super_blk::vdev_super_block_size(), sisl::Buftag::superblk, pdevs[0]->align_size());
 
     // TODO: Read from all pdevs and validate that they are correct
     pdevs[0]->read_super_block(buf, hs_super_blk::vdev_super_block_size(), hs_super_blk::vdev_sb_offset());
@@ -594,7 +594,7 @@ std::vector< vdev_info > DeviceManager::read_vdev_infos(const std::vector< Physi
         if (vinfo->slot_allocated) { ret_vinfos.push_back(*vinfo); }
     }
 
-    hs_utils::iobuf_free(buf, sisl::buftag::superblk);
+    hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
     return ret_vinfos;
 }
 

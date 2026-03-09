@@ -26,8 +26,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include <sisl/fds/buffer.hpp>
-#include <sisl/fds/obj_allocator.hpp>
+#include <sisl/fds/buffer.h>
+#include <sisl/fds/obj_allocator.h>
 #include <folly/Synchronized.h>
 #include <nlohmann/json.hpp>
 
@@ -40,12 +40,12 @@ struct logdev_key;
 typedef int64_t logid_t;
 typedef int64_t logstore_seq_num_t;
 typedef std::function< void(logstore_req*, logdev_key) > log_req_comp_cb_t;
-typedef sisl::byte_view log_buffer;
+typedef sisl::ByteView log_buffer;
 typedef uint32_t logstore_id_t;
 typedef uint32_t logdev_id_t;
 
 typedef std::function< void(logstore_req*, logdev_key) > log_req_comp_cb_t;
-typedef std::function< void(logstore_seq_num_t, sisl::io_blob&, logdev_key, void*) > log_write_comp_cb_t;
+typedef std::function< void(logstore_seq_num_t, sisl::IoBlob&, logdev_key, void*) > log_write_comp_cb_t;
 typedef std::function< void(logstore_seq_num_t, log_buffer, void*) > log_found_cb_t;
 typedef std::function< void(std::shared_ptr< HomeLogStore >) > log_store_opened_cb_t;
 typedef std::function< void(std::shared_ptr< HomeLogStore >, logstore_seq_num_t) > log_replay_done_cb_t;
@@ -125,7 +125,7 @@ struct logstore_req {
     HomeLogStore* log_store; // Backpointer to the log store. We are not storing shared_ptr as user should not destroy
                              // it until all ios are not completed.
     logstore_seq_num_t seq_num; // Log store specific seq_num (which could be monotonically increaseing with logstore)
-    sisl::io_blob data;         // Data blob containing data
+    sisl::IoBlob data;         // Data blob containing data
     void* cookie;               // User generated cookie (considered as opaque)
     bool is_internal_req;       // If the req is created internally by HomeLogStore itself
     log_req_comp_cb_t cb;       // Callback upon completion of write (overridden than default)
@@ -143,7 +143,7 @@ struct logstore_req {
         // TODO: Implement this method
         return 0;
     }
-    static logstore_req* make(HomeLogStore* store, logstore_seq_num_t seq_num, const sisl::io_blob& data) {
+    static logstore_req* make(HomeLogStore* store, logstore_seq_num_t seq_num, const sisl::IoBlob& data) {
         logstore_req* req = new logstore_req();
         req->log_store = store;
         req->seq_num = seq_num;

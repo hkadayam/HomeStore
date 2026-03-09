@@ -26,7 +26,7 @@ AppendBlkAllocator::AppendBlkAllocator(const BlkAllocConfig& cfg, bool need_form
     // TODO: try to make all append_blk_allocator instances use same client type to reduce metablk's cache footprint;
     meta_service().register_handler(
         get_name(),
-        [this](meta_blk* mblk, sisl::byte_view buf, size_t size) { on_meta_blk_found(std::move(buf), (void*)mblk); },
+        [this](meta_blk* mblk, sisl::ByteView buf, size_t size) { on_meta_blk_found(std::move(buf), (void*)mblk); },
         nullptr);
 
     if (need_format) {
@@ -45,7 +45,7 @@ AppendBlkAllocator::AppendBlkAllocator(const BlkAllocConfig& cfg, bool need_form
     // for recovery boot, fields will also be recovered from metablks;
 }
 
-void AppendBlkAllocator::on_meta_blk_found(const sisl::byte_view& buf, void* meta_cookie) {
+void AppendBlkAllocator::on_meta_blk_found(const sisl::ByteView& buf, void* meta_cookie) {
     m_sb.load(buf, meta_cookie);
 
     HS_REL_ASSERT_EQ(m_sb->magic, append_blkalloc_sb_magic, "Invalid AppendBlkAlloc metablk, magic mismatch");

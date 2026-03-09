@@ -28,11 +28,11 @@ void LogGroup::start(const uint64_t flush_multiple_size, const uint32_t align_si
 
     // TO DO: Might need to differentiate based on data or fast type
     m_cur_buf_len = sisl::round_up(inline_log_buf_size, flush_multiple_size);
-    m_log_buf = sisl::aligned_unique_ptr< uint8_t, sisl::buftag::logwrite >::make_sized(align_size, m_cur_buf_len);
+    m_log_buf = sisl::AlignedUniquePtr< uint8_t, sisl::Buftag::logwrite >::make_sized(align_size, m_cur_buf_len);
 
     m_footer_buf_len = sisl::round_up(sizeof(log_group_footer), flush_multiple_size);
     m_footer_buf =
-        sisl::aligned_unique_ptr< uint8_t, sisl::buftag::logwrite >::make_sized(align_size, m_footer_buf_len);
+        sisl::AlignedUniquePtr< uint8_t, sisl::Buftag::logwrite >::make_sized(align_size, m_footer_buf_len);
 }
 
 void LogGroup::stop() {
@@ -60,7 +60,7 @@ void LogGroup::reset(const uint32_t max_records) {
 void LogGroup::create_overflow_buf(const uint32_t min_needed) {
     auto const new_len = sisl::round_up(std::max(min_needed, m_cur_buf_len * 2), m_flush_multiple_size);
     auto new_buf =
-        sisl::aligned_unique_ptr< uint8_t, sisl::buftag::logwrite >::make_sized(m_flush_multiple_size, new_len);
+        sisl::AlignedUniquePtr< uint8_t, sisl::Buftag::logwrite >::make_sized(m_flush_multiple_size, new_len);
     std::memcpy(s_cast< void* >(new_buf.get()), s_cast< const void* >(m_cur_log_buf), m_cur_buf_len);
 
     m_overflow_log_buf = std::move(new_buf);

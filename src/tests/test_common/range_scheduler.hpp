@@ -20,7 +20,7 @@
 
 #pragma once
 
-#include <sisl/fds/bitset.hpp>
+#include <sisl/fds/bitset.h>
 #include <cassert>
 
 namespace homestore {

@@ -1,4 +1,4 @@
-#include <sisl/utility/enum.hpp>
+#include <sisl/fds/enum.h>
 #include "index/index_cp.h"
 
 namespace homestore {

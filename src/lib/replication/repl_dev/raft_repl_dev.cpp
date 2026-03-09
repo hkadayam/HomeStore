@@ -5,10 +5,10 @@
 #include <boost/lexical_cast.hpp>
 #include <boost/uuid/nil_generator.hpp>
 
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/buffer.h>
 #include <sisl/grpc/generic_service.hpp>
 #include <sisl/grpc/rpc_client.hpp>
-#include <sisl/fds/vector_pool.hpp>
+#include <sisl/fds/vector_pool.h>
 #include <homestore/blkdata_service.hpp>
 #include <homestore/logstore_service.hpp>
 #include <homestore/superblk_handler.hpp>
@@ -237,12 +237,12 @@ AsyncReplResult<> RaftReplDev::start_replace_member(const replica_member_info& m
     members.replica_out = member_out;
     members.replica_in = member_in;
 
-    sisl::blob header(r_cast< uint8_t* >(&members), sizeof(replace_member_ctx));
+    sisl::Blob header(r_cast< uint8_t* >(&members), sizeof(replace_member_ctx));
     rreq->init(repl_key{.server_id = server_id(),
                         .term = raft_server()->get_term(),
                         .dsn = m_next_dsn.fetch_add(1),
                         .traceID = trace_id},
-               journal_type_t::HS_CTRL_START_REPLACE, true, header, sisl::blob{}, 0, m_listener);
+               journal_type_t::HS_CTRL_START_REPLACE, true, header, sisl::Blob{}, 0, m_listener);
 
     auto err = m_state_machine->propose_to_raft(std::move(rreq));
     if (err != ReplServiceError::OK) {
@@ -339,12 +339,12 @@ AsyncReplResult<> RaftReplDev::complete_replace_member(const replica_member_info
     members.replica_out = member_out;
     members.replica_in = member_in;
 
-    sisl::blob header(r_cast< uint8_t* >(&members), sizeof(replace_member_ctx));
+    sisl::Blob header(r_cast< uint8_t* >(&members), sizeof(replace_member_ctx));
     rreq->init(repl_key{.server_id = server_id(),
                         .term = raft_server()->get_term(),
                         .dsn = m_next_dsn.fetch_add(1),
                         .traceID = trace_id},
-               journal_type_t::HS_CTRL_COMPLETE_REPLACE, true, header, sisl::blob{}, 0, m_listener);
+               journal_type_t::HS_CTRL_COMPLETE_REPLACE, true, header, sisl::Blob{}, 0, m_listener);
 
     auto err = m_state_machine->propose_to_raft(std::move(rreq));
     if (err != ReplServiceError::OK) {
@@ -587,7 +587,7 @@ folly::SemiFuture< ReplServiceError > RaftReplDev::destroy_group() {
                                      .term = raft_server()->get_term(),
                                      .dsn = m_next_dsn.fetch_add(1),
                                      .traceID = std::numeric_limits< uint64_t >::max()},
-                            journal_type_t::HS_CTRL_DESTROY, true, sisl::blob{}, sisl::blob{}, 0, m_listener);
+                            journal_type_t::HS_CTRL_DESTROY, true, sisl::Blob{}, sisl::Blob{}, 0, m_listener);
 
     if (err != ReplServiceError::OK) {
         // Failed to initialize the repl_req_ctx for replace member.
@@ -619,7 +619,7 @@ void RaftReplDev::on_create_snapshot(nuraft::snapshot& s, nuraft::async_result< 
     if (when_done) { when_done(ret_val, null_except); }
 }
 
-void RaftReplDev::async_alloc_write(sisl::blob const& header, sisl::blob const& key, sisl::sg_list const& data,
+void RaftReplDev::async_alloc_write(sisl::Blob const& header, sisl::Blob const& key, sisl::SgList const& data,
                                     repl_req_ptr_t rreq, bool part_of_batch, trace_id_t tid) {
     if (!rreq) { auto rreq = repl_req_ptr_t(new repl_req_ctx{}); }
 
@@ -707,7 +707,7 @@ void RaftReplDev::async_alloc_write(sisl::blob const& header, sisl::blob const& 
     }
 }
 
-void RaftReplDev::push_data_to_all_followers(repl_req_ptr_t rreq, sisl::sg_list const& data) {
+void RaftReplDev::push_data_to_all_followers(repl_req_ptr_t rreq, sisl::SgList const& data) {
     auto& builder = rreq->create_fb_builder();
 
     // Prepare the rpc request packet with all repl_reqs details
@@ -716,8 +716,8 @@ void RaftReplDev::push_data_to_all_followers(repl_req_ptr_t rreq, sisl::sg_list 
         builder.CreateVector(rreq->header().cbytes(), rreq->header().size()),
         builder.CreateVector(rreq->key().cbytes(), rreq->key().size()), data.size, get_time_since_epoch_ms()));
 
-    rreq->m_pkts = sisl::io_blob::sg_list_to_ioblob_list(data);
-    rreq->m_pkts.insert(rreq->m_pkts.begin(), sisl::io_blob{builder.GetBufferPointer(), builder.GetSize(), false});
+    rreq->m_pkts = sisl::IoBlob::sg_list_to_ioblob_list(data);
+    rreq->m_pkts.insert(rreq->m_pkts.begin(), sisl::IoBlob{builder.GetBufferPointer(), builder.GetSize(), false});
 
     /*RD_LOGI("Data Channel: Pushing data to all followers: rreq=[{}] data=[{}]", rreq->to_string(),
            flatbuffers::FlatBufferToString(builder.GetBufferPointer() + sizeof(flatbuffers::uoffset_t),
@@ -768,8 +768,8 @@ void RaftReplDev::on_push_data_received(intrusive< sisl::GenericRpcData >& rpc_d
         rpc_data->send_response();
         return;
     }
-    sisl::blob header = sisl::blob{push_req->user_header()->Data(), push_req->user_header()->size()};
-    sisl::blob key = sisl::blob{push_req->user_key()->Data(), push_req->user_key()->size()};
+    sisl::Blob header = sisl::Blob{push_req->user_header()->Data(), push_req->user_header()->size()};
+    sisl::Blob key = sisl::Blob{push_req->user_key()->Data(), push_req->user_key()->size()};
     repl_key rkey{.server_id = push_req->issuer_replica_id(),
                   .term = push_req->raft_term(),
                   .dsn = push_req->dsn(),
@@ -850,8 +850,8 @@ void RaftReplDev::on_push_data_received(intrusive< sisl::GenericRpcData >& rpc_d
         });
 }
 
-repl_req_ptr_t RaftReplDev::applier_create_req(repl_key const& rkey, journal_type_t code, sisl::blob const& user_header,
-                                               sisl::blob const& key, uint32_t data_size, bool is_data_channel,
+repl_req_ptr_t RaftReplDev::applier_create_req(repl_key const& rkey, journal_type_t code, sisl::Blob const& user_header,
+                                               sisl::Blob const& key, uint32_t data_size, bool is_data_channel,
                                                int64_t lsn) {
     if (is_data_channel) RD_DBG_ASSERT(-1 == lsn, "lsn from data channel should always be -1 , got lsn {}", lsn);
 
@@ -1084,8 +1084,8 @@ void RaftReplDev::fetch_data_from_remote(std::vector< repl_req_ptr_t > rreqs) {
     group_msg_service()
         ->data_service_request_bidirectional(
             originator, FETCH_DATA,
-            sisl::io_blob_list_t{
-                sisl::io_blob{builder->GetBufferPointer(), builder->GetSize(), false /* is_aligned */}})
+            sisl::IoBlobList{
+                sisl::IoBlob{builder->GetBufferPointer(), builder->GetSize(), false /* is_aligned */}})
         .via(&folly::InlineExecutor::instance())
         .thenValue([this, builder, rreqs = std::move(rreqs), fetch_start_time](auto response) {
             COUNTER_DECREMENT(m_metrics, outstanding_data_fetch_cnt, 1);
@@ -1137,7 +1137,7 @@ void RaftReplDev::on_fetch_data_received(intrusive< sisl::GenericRpcData >& rpc_
     RD_LOGT(NO_TRACE_ID, "Data Channel: FetchData received: fetch_req.size={}",
             fetch_req->request()->entries()->size());
 
-    std::vector< sisl::sg_list > sgs_vec;
+    std::vector< sisl::SgList > sgs_vec;
     std::vector< folly::Future< bool > > futs;
     sgs_vec.reserve(fetch_req->request()->entries()->size());
     futs.reserve(fetch_req->request()->entries()->size());
@@ -1147,10 +1147,10 @@ void RaftReplDev::on_fetch_data_received(intrusive< sisl::GenericRpcData >& rpc_
         auto const& originator = req->blkid_originator();
         auto const& remote_blkid = req->remote_blkid();
         MultiBlkId local_blkid;
-        local_blkid.deserialize(sisl::blob{remote_blkid->Data(), remote_blkid->size()}, true /* copy */);
+        local_blkid.deserialize(sisl::Blob{remote_blkid->Data(), remote_blkid->size()}, true /* copy */);
         // prepare the sgs data buffer to read into;
         auto const total_size = local_blkid.blk_count() * get_blk_size();
-        sisl::sg_list sgs;
+        sisl::SgList sgs;
         sgs.size = total_size;
         sgs.iovs.emplace_back(
             iovec{.iov_base = iomanager.iobuf_alloc(get_blk_size(), total_size), .iov_len = total_size});
@@ -1166,7 +1166,7 @@ void RaftReplDev::on_fetch_data_received(intrusive< sisl::GenericRpcData >& rpc_
         }
 
         auto const& header = req->user_header();
-        sisl::blob user_header = sisl::blob{header->Data(), header->size()};
+        sisl::Blob user_header = sisl::Blob{header->Data(), header->size()};
         RD_LOGT(NO_TRACE_ID, "Data Channel: FetchData handled, my_blkid={}", local_blkid.to_string());
         futs.emplace_back(std::move(m_listener->on_fetch_data(lsn, user_header, local_blkid, sgs)));
     }
@@ -1186,9 +1186,9 @@ void RaftReplDev::on_fetch_data_received(intrusive< sisl::GenericRpcData >& rpc_
             RD_LOGT(NO_TRACE_ID, "Data Channel: FetchData data read completed for {} buffers", sgs_vec.size());
 
             // now prepare the io_blob_list to response back to requester;
-            nuraft_mesg::io_blob_list_t pkts = sisl::io_blob_list_t{};
+            nuraft_mesg::io_blob_list_t pkts = sisl::IoBlobList{};
             for (auto const& sgs : sgs_vec) {
-                auto const ret = sisl::io_blob::sg_list_to_ioblob_list(sgs);
+                auto const ret = sisl::IoBlob::sg_list_to_ioblob_list(sgs);
                 pkts.insert(pkts.end(), ret.begin(), ret.end());
             }
 
@@ -1433,7 +1433,7 @@ void RaftReplDev::complete_replace_member(repl_req_ptr_t rreq) {
     RD_LOGI(rreq->traceID(), "Raft repl replace_member_ctx has been cleared.");
 }
 
-static bool blob_equals(sisl::blob const& a, sisl::blob const& b) {
+static bool blob_equals(sisl::Blob const& a, sisl::Blob const& b) {
     if (a.size() != b.size()) { return false; }
     return (std::memcmp(a.cbytes(), b.cbytes(), a.size()) == 0);
 }
@@ -1444,7 +1444,7 @@ repl_req_ptr_t RaftReplDev::repl_key_to_req(repl_key const& rkey) const {
     return it->second;
 }
 
-folly::Future< std::error_code > RaftReplDev::async_read(MultiBlkId const& bid, sisl::sg_list& sgs, uint32_t size,
+folly::Future< std::error_code > RaftReplDev::async_read(MultiBlkId const& bid, sisl::SgList& sgs, uint32_t size,
                                                          bool part_of_batch, trace_id_t tid) {
     if (is_stopping()) {
         LOGINFO("repl dev is being shutdown!");
@@ -2002,16 +2002,16 @@ void RaftReplDev::on_log_found(logstore_seq_num_t lsn, log_buffer buf, void* ctx
             jentry->server_id, lentry->get_term(), repl_lsn, jentry->to_string());
 
     auto entry_to_hdr = [](repl_journal_entry* jentry) {
-        return sisl::blob{uintptr_cast(jentry) + sizeof(repl_journal_entry), jentry->user_header_size};
+        return sisl::Blob{uintptr_cast(jentry) + sizeof(repl_journal_entry), jentry->user_header_size};
     };
 
     auto entry_to_key = [](repl_journal_entry* jentry) {
-        return sisl::blob{uintptr_cast(jentry) + sizeof(repl_journal_entry) + jentry->user_header_size,
+        return sisl::Blob{uintptr_cast(jentry) + sizeof(repl_journal_entry) + jentry->user_header_size,
                           jentry->key_size};
     };
 
     auto entry_to_val = [](repl_journal_entry* jentry) {
-        return sisl::blob{uintptr_cast(jentry) + sizeof(repl_journal_entry) + jentry->user_header_size +
+        return sisl::Blob{uintptr_cast(jentry) + sizeof(repl_journal_entry) + jentry->user_header_size +
                               jentry->key_size,
                           jentry->value_size};
     };
@@ -2199,7 +2199,7 @@ void RaftReplDev::clear_chunk_req(chunk_num_t chunk_id) {
 }
 
 ReplServiceError RaftReplDev::init_req_ctx(repl_req_ptr_t rreq, repl_key rkey, journal_type_t op_code, bool is_proposer,
-                                           sisl::blob const& user_header, sisl::blob const& key, uint32_t data_size,
+                                           sisl::Blob const& user_header, sisl::Blob const& key, uint32_t data_size,
                                            cshared< ReplDevListener >& listener) {
     if (!rreq) {
         RD_LOGD(rkey.traceID, "got nullptr for initing req, rkey=[{}]", rkey.to_string());

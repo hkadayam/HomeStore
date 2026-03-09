@@ -21,8 +21,8 @@
 
 #include <folly/futures/Future.h>
 #include <iomgr/iomgr.hpp>
-#include <sisl/fds/id_reserver.hpp>
-#include <sisl/utility/enum.hpp>
+#include <sisl/fds/id_reserver.h>
+#include <sisl/fds/enum.h>
 #include <homestore/homestore_decl.hpp>
 #include <homestore/superblk_handler.hpp>
 #include <homestore/index/index_common.h>
@@ -53,7 +53,7 @@ struct IndexSuperBlock {
     uint32_t user_sb_size;    // Size of the user superblk
     uint8_t user_sb_bytes[0]; // Raw bytes of the sb. Better to access with helper routine below
 
-    sisl::blob user_sb() { return sisl::blob{&user_sb_bytes[0], user_sb_size}; }
+    sisl::Blob user_sb() { return sisl::Blob{&user_sb_bytes[0], user_sb_size}; }
 };
 
 struct IndexStoreSuperBlock {

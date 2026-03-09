@@ -1,6 +1,6 @@
+import subprocess
 from conan import ConanFile
 from conan.errors import ConanInvalidConfiguration
-from conan.tools.build import check_min_cppstd
 from conan.tools.cmake import CMakeToolchain, CMakeDeps, CMake
 from conan.tools.files import copy
 from os.path import join
@@ -25,7 +25,6 @@ class HomestoreConan(ConanFile):
                 "coverage": ['True', 'False'],
                 "sanitize": ['True', 'False'],
                 "testing" : ['full', 'min', 'off', 'epoll_mode', 'spdk_mode'],
-                "replication" : ['off', 'on'],
             }
     default_options = {
                 'shared':       False,
@@ -33,7 +32,6 @@ class HomestoreConan(ConanFile):
                 'coverage':     False,
                 'sanitize':     False,
                 'testing':      'epoll_mode',
-                'replication':  'off',
             }
 
     exports_sources = "cmake/*", "src/*", "CMakeLists.txt", "test_wrap.sh", "LICENSE"
@@ -45,29 +43,37 @@ class HomestoreConan(ConanFile):
         if self.settings.build_type == "Debug":
             if self.options.coverage and self.options.sanitize:
                 raise ConanInvalidConfiguration("Sanitizer does not work with Code Coverage!")
-            #if self.conf.get("tools.build:skip_test", default=False):
-                #if self.options.coverage or self.options.sanitize:
-                #    raise ConanInvalidConfiguration("Coverage/Sanitizer requires Testing!")
 
     def build_requirements(self):
         self.test_requires("benchmark/1.8.2")
         self.test_requires("gtest/1.14.0")
 
     def requirements(self):
-        self.requires("iomgr/[^12.1]@oss/master", transitive_headers=True)
-        self.requires("sisl/[^13.3]@oss/master", transitive_headers=True)
-        if str(self.options.replication) == "on":
-            self.requires("nuraft_mesg/[^4.1]@oss/main", transitive_headers=True)
+        # Core async / coroutines
+        self.requires("folly/2024.08.12.00", transitive_headers=True)
 
-        self.requires("farmhash/cci.20190513@", transitive_headers=True)
+        # Logging
+        self.requires("spdlog/1.12.0", transitive_headers=True)
+        self.requires("fmt/10.0.0", transitive_headers=True, override=True)
+
+        # Data structures / utilities (formerly from sisl)
+        self.requires("boost/1.85.0", transitive_headers=True)
+        self.requires("nlohmann_json/3.11.2", transitive_headers=True)
+        self.requires("userspace-rcu/0.14.0", transitive_headers=True)
+        self.requires("snappy/1.2.1", transitive_headers=True)
+
+        # Settings (flatbuffers-based config)
+        self.requires("flatbuffers/23.5.26", transitive_headers=True)
+
+        # Options parsing
+        self.requires("cxxopts/3.1.1", transitive_headers=True)
+
+        self.requires("farmhash/cci.20190513", transitive_headers=True)
         if self.settings.arch in ['x86', 'x86_64']:
             self.requires("isa-l/2.30.0", transitive_headers=True)
 
         # Tests require OpenSSL 3.x
         self.requires("openssl/[^3.1]", override=True)
-
-    def imports(self):
-        self.copy(root_package="sisl", pattern="*", dst="bin/scripts/python/flip/", src="bindings/flip/python/", keep_path=False)
 
     def layout(self):
         self.folders.source = "."
@@ -80,18 +86,15 @@ class HomestoreConan(ConanFile):
         self.folders.generators = join(self.folders.build, "generators")
 
         self.cpp.source.includedirs = ["src/include"]
-
         self.cpp.build.libdirs = ["src"]
-
         self.cpp.package.libs = ["homestore"]
-        self.cpp.package.includedirs = ["include"] # includedirs is already set to 'include' by
+        self.cpp.package.includedirs = ["include"]
         self.cpp.package.libdirs = ["lib"]
 
         if not self.settings.arch in ['x86', 'x86_64']:
             self.cpp.package.defines.append("NO_ISAL")
 
     def generate(self):
-        # This generates "conan_toolchain.cmake" in self.generators_folder
         tc = CMakeToolchain(self)
         if self.options.testing != "off":
             tc.variables["TEST_TARGET"] = self.options.testing
@@ -107,13 +110,19 @@ class HomestoreConan(ConanFile):
                 tc.variables['MEMORY_SANITIZER_ON'] = 'ON'
         tc.variables["CONAN_PACKAGE_NAME"] = self.name
         tc.variables["CONAN_PACKAGE_VERSION"] = self.version
-        if str(self.options.replication) == "on":
-            tc.variables["REPLICATION"] = "ON"
-        else:
-            tc.variables["REPLICATION"] = "OFF"
+        # On macOS with Unix Makefiles generator, cmake passes CMAKE_OSX_SYSROOT
+        # literally to clang. Resolve the symbolic SDK name to a real path here so
+        # the toolchain file contains an absolute path that clang can use.
+        if self.settings.os == "Macos":
+            try:
+                sdk_path = subprocess.check_output(
+                    ["xcrun", "--show-sdk-path", "--sdk", "macosx"], text=True
+                ).strip()
+                tc.cache_variables["CMAKE_OSX_SYSROOT"] = sdk_path
+            except Exception:
+                pass
         tc.generate()
 
-        # This generates "boost-config.cmake" and "grpc-config.cmake" etc in self.generators_folder
         deps = CMakeDeps(self)
         deps.generate()
 

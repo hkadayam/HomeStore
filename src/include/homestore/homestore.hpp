@@ -92,7 +92,7 @@ struct hs_vdev_context {
     enum hs_vdev_type_t type;
     ServiceSubType sub_type{ServiceSubType::DEFAULT};
 
-    sisl::blob to_blob() { return sisl::blob{uintptr_cast(this), sizeof(*this)}; }
+    sisl::Blob to_blob() { return sisl::Blob{uintptr_cast(this), sizeof(*this)}; }
 };
 #pragma pack()
 

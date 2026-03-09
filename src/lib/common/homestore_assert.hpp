@@ -26,8 +26,8 @@
 #include <boost/preprocessor/facilities/empty.hpp>
 #include <boost/preprocessor/facilities/identity.hpp>
 #include <boost/vmd/is_empty.hpp>
-#include <sisl/fds/utils.hpp>
-#include <sisl/metrics/metrics.hpp>
+#include <sisl/fds/utils.h>
+#include <sisl/metrics/metrics.h>
 #include <sisl/logging/logging.h>
 #include <spdlog/fmt/fmt.h>
 

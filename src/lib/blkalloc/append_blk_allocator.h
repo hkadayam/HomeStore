@@ -119,7 +119,7 @@ public:
 
 private:
     std::string get_name() const;
-    void on_meta_blk_found(const sisl::byte_view& buf, void* meta_cookie);
+    void on_meta_blk_found(const sisl::ByteView& buf, void* meta_cookie);
 
 private:
     std::atomic< blk_num_t > m_last_append_offset{0}; // last appended offset in blocks in memory

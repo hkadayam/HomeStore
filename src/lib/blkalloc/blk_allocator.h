@@ -23,11 +23,11 @@
 #include <thread>
 #include <vector>
 
-#include <sisl/fds/bitset.hpp>
+#include <sisl/fds/bitset.h>
 #include <folly/MPMCQueue.h>
-#include <sisl/utility/enum.hpp>
-#include <sisl/utility/urcu_helper.hpp>
-#include <sisl/fds/thread_vector.hpp>
+#include <sisl/fds/enum.h>
+#include <urcu.h>
+#include <sisl/fds/thread_vector.h>
 
 #include <homestore/homestore_decl.hpp>
 #include <homestore/blk.h>

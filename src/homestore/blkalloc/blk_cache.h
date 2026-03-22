@@ -16,25 +16,21 @@
 #pragma once
 
 #include <array>
-#include <atomic>
 #include <cstdint>
-#include <string>
-#include <vector>
+#include <utility>
 
 #include <sisl/fds/bitword.h>
-#include <fmt/format.h>
-#include <fmt/ostream.h>
-#include <sisl/fds/enum.h>
 
 #include <homestore/blk.h>
 #include "common/homestore_assert.hpp"
 
 namespace homestore {
+
 using slab_idx_t = blk_count_t;
 
 static constexpr uint16_t slab_tbl_size{257};
 
-// Lookup table that converts number_of_blks to slab
+// Lookup table: number_of_blks → round-UP slab index (smallest slab that fits nblks)
 static constexpr std::array< slab_idx_t, slab_tbl_size > nblks_to_slab_tbl = {
     0, 0, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6,
     6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7,
@@ -44,7 +40,7 @@ static constexpr std::array< slab_idx_t, slab_tbl_size > nblks_to_slab_tbl = {
     8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
     8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8};
 
-// Lookup table that converts number_of_blks to the lower slab and the difference with the lower slab
+// Lookup table: number_of_blks → (round-DOWN slab index, remainder blks)
 static constexpr std::array< std::pair< slab_idx_t, uint8_t >, slab_tbl_size > nblks_to_round_down_slab_tbl = {
     {{0, 0},   {0, 0},   {1, 0},   {1, 1},   {2, 0},   {2, 1},   {2, 2},   {2, 3},   {3, 0},   {3, 1},   {3, 2},
      {3, 3},   {3, 4},   {3, 5},   {3, 6},   {3, 7},   {4, 0},   {4, 1},   {4, 2},   {4, 3},   {4, 4},   {4, 5},
@@ -71,248 +67,4 @@ static constexpr std::array< std::pair< slab_idx_t, uint8_t >, slab_tbl_size > n
      {7, 114}, {7, 115}, {7, 116}, {7, 117}, {7, 118}, {7, 119}, {7, 120}, {7, 121}, {7, 122}, {7, 123}, {7, 124},
      {7, 125}, {7, 126}, {7, 127}, {8, 0}}};
 
-#pragma pack(1)
-struct blk_cache_entry {
-public:
-    blk_cache_entry() : blk_cache_entry{0, 0, 0} {}
-    blk_cache_entry(const blk_num_t blk_num, const blk_count_t nblks, const blk_temp_t temp) {
-        set_blk_num(blk_num);
-        set_blk_count(nblks);
-        set_temperature(temp);
-    }
-
-    void set_blk_num(const blk_num_t blk_num) { m_blk_num = blk_num; }
-    [[nodiscard]] blk_num_t get_blk_num() const { return m_blk_num; }
-
-    void set_blk_count(const blk_count_t nblks) {
-        HS_DBG_ASSERT_LE(nblks, max_blks_per_blkid());
-        m_nblks = nblks;
-    }
-    [[nodiscard]] blk_count_t blk_count() const { return m_nblks; }
-
-    void set_temperature(const blk_temp_t temp) { m_temp = temp; }
-    [[nodiscard]] blk_temp_t get_temperature() const { return m_temp; }
-
-    [[nodiscard]] std::string to_string() const {
-        return fmt::format("BlkNum={} nblks={} temp={}", get_blk_num(), blk_count(), get_temperature());
-    }
-
-private:
-    blk_num_t m_blk_num; // Blk number within the chunk
-    blk_count_t m_nblks; // Total number of blocks
-    blk_temp_t m_temp;   // Temperature of each page
-};
-#pragma pack()
-
-struct blk_cache_alloc_req {
-    blk_cache_alloc_req(const blk_count_t n, const blk_temp_t l, const bool contiguous, const slab_idx_t mn = 0,
-                        const slab_idx_t mx = 8) :
-            nblks{n}, preferred_level{l}, is_contiguous(contiguous), min_slab_idx{mn}, max_slab_idx{mx} {}
-    const blk_count_t nblks;
-    const blk_temp_t preferred_level;
-    const bool is_contiguous;
-    const slab_idx_t min_slab_idx;
-    const slab_idx_t max_slab_idx;
-};
-
-struct blk_cache_alloc_resp {
-    blk_cache_alloc_resp() {
-        out_blks.reserve(256);
-        excess_blks.reserve(8);
-    }
-
-    void reset() {
-        nblks_alloced = 0;
-        nblks_zombied = 0;
-        out_blks.clear();
-        excess_blks.clear();
-    }
-
-    blk_count_t nblks_alloced{0};
-    blk_count_t nblks_zombied{0};
-    bool need_refill{false};
-    std::vector< blk_cache_entry > out_blks;
-    std::vector< blk_cache_entry > excess_blks;
-};
-
-struct blk_cache_fill_req {
-    blk_num_t start_blk_num{0};    // Start blk number available to fill
-    uint32_t nblks{0};             // Number of blks available to fill
-    blk_temp_t preferred_level{1}; // Preferred temperature level to fill this cache in
-    bool only_this_level{false};   // Is cache to be filled only in this level/temperature
-};
-
-struct blk_cache_refill_status {
-    blk_num_t slab_required_count{0};
-    blk_num_t slab_refilled_count{0};
-
-    [[nodiscard]] bool need_refill() const {
-        return (slab_required_count && (slab_refilled_count != slab_required_count));
-    }
-
-    [[nodiscard]] bool is_refill_done() const {
-        return (slab_required_count == 0) || (slab_refilled_count == slab_required_count);
-    }
-
-    void mark_refill_done() { slab_refilled_count = slab_required_count; }
-};
-} // namespace homestore
-
-namespace fmt {
-template <>
-struct formatter< homestore::blk_cache_refill_status > {
-    template < typename ParseContext >
-    constexpr auto parse(ParseContext& ctx) {
-        return ctx.begin();
-    }
-
-    template < typename FormatContext >
-    auto format(const homestore::blk_cache_refill_status& s, FormatContext& ctx) {
-        return format_to(ctx.out(), "{}/{}", s.slab_refilled_count, s.slab_required_count);
-    }
-};
-} // namespace fmt
-
-namespace homestore {
-struct blk_cache_fill_session {
-    uint64_t session_id;
-    std::vector< blk_cache_refill_status > slab_requirements; // A slot for each slab about count of required/refilled
-    blk_num_t overall_refilled_num_blks{0};
-    bool overall_refill_done{false};
-    std::atomic< blk_num_t > urgent_refill_blks_count{0}; // Send notification after approx this much blks refilled
-
-    [[nodiscard]] static uint64_t gen_session_id() {
-        static std::atomic< uint64_t > s_session_id{1};
-        auto id{s_session_id.fetch_add(1, std::memory_order_relaxed)};
-        if (id == 0) {
-            // NOTE: 0 is no session so id cannot be zero after rollover
-            std::atomic_thread_fence(std::memory_order_acquire);
-            id = s_session_id.fetch_add(1, std::memory_order_relaxed);
-        }
-        return id;
-    }
-
-    blk_cache_fill_session(const size_t num_slabs, const bool fill_entire_cache) : session_id{gen_session_id()} {
-        slab_requirements.reserve(num_slabs);
-    }
-
-    void urgent_need_atleast(const blk_num_t wait_count) {
-        urgent_refill_blks_count.store(overall_refilled_num_blks + wait_count, std::memory_order_release);
-    }
-
-    [[nodiscard]] bool need_notify() const {
-        const auto urgent_count{urgent_refill_blks_count.load(std::memory_order_acquire)};
-        return ((urgent_count > 0) && ((overall_refilled_num_blks >= urgent_count) || overall_refill_done));
-    }
-
-    void set_urgent_satisfied() { urgent_refill_blks_count.store(0, std::memory_order_release); }
-
-    [[nodiscard]] bool is_urgent_req_pending() const {
-        return urgent_refill_blks_count.load(std::memory_order_acquire);
-    }
-
-    void reset() {
-        session_id = gen_session_id();
-        slab_requirements.clear();
-        overall_refill_done = false;
-        overall_refilled_num_blks = 0;
-        urgent_refill_blks_count.store(0, std::memory_order_release);
-    }
-
-    [[nodiscard]] std::string to_string() const {
-        return fmt::format("session={} slab_reqs={} blks_refilled_so_far={} refill_done={}", session_id,
-                           fmt::join(slab_requirements, ","), overall_refilled_num_blks, overall_refill_done);
-    }
-};
-
-struct SlabCacheConfig {
-    struct _slab_config {
-        blk_count_t slab_size;      // Size of this slab (in terms of number of blks)
-        blk_num_t max_entries;      // Max entries allowed in this slab
-        float refill_threshold_pct; // At what percentage empty should we start refilling this slab cache
-        std::vector< float > m_level_distribution_pct; // How to distribute entries into multiple levels
-        std::string m_name;                            // Name of the base blk allocator
-    };
-
-    std::string m_name;
-    std::vector< _slab_config > m_per_slab_cfg;
-
-    std::string to_string() const {
-        std::string str;
-        for (const auto& s : m_per_slab_cfg) {
-            fmt::format_to(std::back_inserter(str),
-                           "[nblks={} max_entries={} refill_threshold={} level distribution=[{}]], ", s.slab_size,
-                           s.max_entries, s.refill_threshold_pct, fmt::join(s.m_level_distribution_pct, ","));
-        }
-        return str;
-    }
-    std::string get_name() const { return m_name; }
-};
-} // namespace homestore
-
-namespace fmt {
-template <>
-struct formatter< homestore::SlabCacheConfig > {
-    template < typename ParseContext >
-    constexpr auto parse(ParseContext& ctx) {
-        return ctx.begin();
-    }
-
-    template < typename FormatContext >
-    auto format(const homestore::SlabCacheConfig& s, FormatContext& ctx) {
-        return format_to(ctx.out(), "{}", s.to_string());
-    }
-};
-} // namespace fmt
-
-namespace homestore {
-class FreeBlkCache {
-public:
-    FreeBlkCache() = default;
-    FreeBlkCache(const FreeBlkCache&) = delete;
-    FreeBlkCache(FreeBlkCache&&) noexcept = delete;
-    FreeBlkCache& operator=(const FreeBlkCache&) = delete;
-    FreeBlkCache& operator=(FreeBlkCache&&) noexcept = delete;
-    virtual ~FreeBlkCache() = default;
-
-    /**
-     * @brief Try to allocate nblks on a preferred temperature level. Note the level is just a hint and if there is
-     * no available block in that level in cache, it automatically checks for other levels in the same slab and allocate
-     * based on that.
-     *
-     * @param req Request which comprises number_of_blks, preferred_temp_level to allocate, is_contiguous blocks are
-     * needed or vector of multiple blocks is ok.
-     * @param resp
-     * @return BlkAllocStatus
-     */
-    [[nodiscard]] virtual BlkAllocStatus try_alloc_blks(const blk_cache_alloc_req& req, blk_cache_alloc_resp& resp) = 0;
-
-    [[maybe_unused]] virtual blk_count_t try_free_blks(const blk_cache_entry& entry,
-                                                       std::vector< blk_cache_entry >& excess_blks) = 0;
-    [[maybe_unused]] virtual blk_count_t try_free_blks(const std::vector< blk_cache_entry >& blks,
-                                                       std::vector< blk_cache_entry >& excess_blks) = 0;
-    [[nodiscard]] virtual blk_num_t try_fill_cache(const blk_cache_fill_req& fill_req,
-                                                   blk_cache_fill_session& fill_session) = 0;
-
-    [[nodiscard]] virtual std::shared_ptr< blk_cache_fill_session >
-    create_cache_fill_session(const bool fill_entire_cache) = 0;
-    virtual void close_cache_fill_session(blk_cache_fill_session& fill_session) = 0;
-
-    [[nodiscard]] virtual blk_num_t total_free_blks() const = 0;
-
-    [[nodiscard]] static slab_idx_t find_slab(const blk_count_t nblks) {
-        if (sisl_unlikely(nblks >= slab_tbl_size)) {
-            return s_cast< slab_idx_t >((nblks > 1) ? sisl::logBase2(s_cast< blk_count_t >(nblks - 1)) + 1 : 0);
-        }
-        return nblks_to_slab_tbl[nblks];
-    }
-
-    [[nodiscard]] static std::pair< slab_idx_t, blk_count_t > find_round_down_slab(const blk_count_t nblks) {
-        if (sisl_unlikely(nblks >= slab_tbl_size)) {
-            const auto s{find_slab(nblks + 1) - 1};
-            return std::make_pair<>(s, nblks - (1 << s));
-        }
-        return nblks_to_round_down_slab_tbl[nblks];
-    }
-};
 } // namespace homestore

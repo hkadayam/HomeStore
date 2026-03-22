@@ -14,20 +14,11 @@
  *********************************************************************************/
 #pragma once
 
-#include <cassert>
 #include <cstdint>
-#include <memory>
-#include <mutex>
-#include <sstream>
 #include <string>
-#include <thread>
-#include <vector>
 
-#include <sisl/fds/bitset.h>
-#include <folly/MPMCQueue.h>
-#include <sisl/fds/enum.h>
-#include <urcu.h>
-#include <sisl/fds/thread_vector.h>
+#include <sisl/fds/buffer.h>
+#include <nlohmann/json.hpp>
 
 #include <homestore/homestore_decl.hpp>
 #include <homestore/blk.h>
@@ -50,28 +41,27 @@ namespace homestore {
 #define BLKALLOC_LOG_ASSERT_CMP(val1, cmp, val2, ...)                                                                  \
     HS_SUBMOD_ASSERT_CMP(LOGMSG_ASSERT_CMP, val1, cmp, val2, , "blkalloc", get_name(), ##__VA_ARGS__)
 
-struct blkalloc_cp;
-
 struct BlkAllocConfig {
     friend class BlkAllocator;
 
 public:
-    const uint32_t m_blk_size;
-    const uint32_t m_align_size;
-    const blk_num_t m_capacity;
-    const blk_num_t m_blks_per_portion;
-    const bool m_persistent{false};
-    const std::string m_unique_name;
+    uint32_t blk_size_{0};
+    uint32_t align_size_{0};
+    blk_num_t capacity_{0};
+    blk_num_t blks_per_portion_{0};
+    bool persistent_{false};
+    std::string unique_name_;
 
 public:
+    BlkAllocConfig() = default;
     BlkAllocConfig(uint32_t blk_size, uint32_t align_size, uint64_t size, bool persistent,
                    const std::string& name = "") :
-            m_blk_size{blk_size},
-            m_align_size{align_size},
-            m_capacity{static_cast< blk_num_t >(size / blk_size)},
-            m_blks_per_portion{std::min(HS_DYNAMIC_CONFIG(blkallocator.num_blks_per_portion), m_capacity)},
-            m_persistent{persistent},
-            m_unique_name{name} {}
+            blk_size_{blk_size},
+            align_size_{align_size},
+            capacity_{static_cast< blk_num_t >(size / blk_size)},
+            blks_per_portion_{std::min(HS_DYNAMIC_CONFIG(blkallocator.num_blks_per_portion), capacity_)},
+            persistent_{persistent},
+            unique_name_{name} {}
 
     BlkAllocConfig(BlkAllocConfig const&) = default;
     BlkAllocConfig(BlkAllocConfig&&) noexcept = delete;
@@ -80,65 +70,30 @@ public:
     virtual ~BlkAllocConfig() = default;
 
     virtual std::string to_string() const {
-        return fmt::format("BlkSize={} TotalBlks={} BlksPerPortion={} persistent={}", in_bytes(m_blk_size),
-                           in_bytes(m_capacity), m_blks_per_portion, m_persistent);
+        return fmt::format("BlkSize={} TotalBlks={} BlksPerPortion={} persistent={}", in_bytes(blk_size_),
+                           in_bytes(capacity_), blks_per_portion_, persistent_);
     }
 };
 
-VENUM(BlkOpStatus, uint8_t,
-      NONE = 0,            // Default no status
-      SUCCESS = 1u << 0,   // Success
-      FAILED = 1u << 1,    // Generic failure
-      SPACEFULL = 1u << 2, // Space full failure
-      PARTIAL_FAILED = 1u << 3);
-
-ENUM(BlkAllocatorState, uint8_t, INIT, WAITING, SWEEP_SCHEDULED, SWEEPING, EXITING, DONE);
-
-////////////////////////////////////// BlkAllocator Design //////////////////////////////////////////////
-//
-// BlkAllocator is a generic class to allocate and free blocks. It is a base class upon which different allocators are
-// derived from. This class provides generic framework for them to allocate, free and recover those blks.
-//
-// There are 3 levels where allocated/free blks for the blkallocator is maintained
-//   1. cache version
-//   2. on-disk version
-//   3. Actual persistent version in the devices.
-//
-// Allocation/Reservation:
-// All allocation happens from the cache version of the blkallocator. Based on different blkallocator, it searches and
-// picks available free blk and respond to that call. When the blks are ready to be committed, it calls commit_blk of
-// the vdev, which calls reserve_on_disk() of the blkallocator to reserve the blkids in the on-disk version.
-//
-// When the blkids are reserved in the on-disk version, it is not yet written to the actual devices. It is written
-// as part of the next CP.
-//
-// Upon restart, there are 2 types of mismatches possible between state of blks before restart and
-// after restart.
-//  a) Blks that are allocated in cache version prior to restart, but they are not committed yet.
-//  b) Blks that are marked reserved in on-disk version prior to restart, but they are not persisted yet.
-//
-// During recovery phase after restart the persistent version is loaded and updated into the on-disk version and also
-// copies that on-disk version to cache version. BlkAllocator requires consumer to maintain the allocated blkids in
-// journal and replay them during restart. When the consumer replays, it calls VirtualDev::commit_blk() calls
-// reserve_on_cache() and reserve_on_disk() (only during recovery, otherwise it calls only reserve_on_disk()).
-// reserve_on_cache() will mark the blkids in the cache as allocated and reserve_on_disk() marks the blkids in on-disk
-// version as allocated.
-//
-// Free:
-// Freeing the blocks is done in a slightly different way, where blkallocator free will free the blk from cache version.
-// and also on disk version and will be persisted on next cp. In other words, free blks are always committed entries.
-// Blkallocator free is idempotent.
-//
-class CP;
+///
+/// BlkAllocator — abstract interface for all block allocators.
+///
+/// alloc/free:        allocate and release blocks.
+/// commit:            mark a blkid as durably allocated in the persistent layer (no-op for inmem allocators).
+///                    CP-safe: calls arriving while acquire_buffer() is held are buffered and replayed on
+///                    release_buffer().
+/// acquire_buffer:    serialize the current persistent bitmap into a ByteArray for a CP flush.
+///                    New commits arriving while the buffer is held accumulate in an internal list.
+/// release_buffer:    drain the accumulated commit list back into the persistent bitmap.
+///
 class BlkAllocator {
 public:
     BlkAllocator(BlkAllocConfig const& cfg, chunk_num_t id = 0) :
-            m_name{cfg.m_unique_name},
-            m_blk_size{cfg.m_blk_size},
-            m_align_size{cfg.m_align_size},
-            m_num_blks{cfg.m_capacity},
-            m_chunk_id{id},
-            m_is_persistent{cfg.m_persistent} {}
+            name_{cfg.unique_name_},
+            blk_size_{cfg.blk_size_},
+            align_size_{cfg.align_size_},
+            num_blks_{cfg.capacity_},
+            chunk_id_{id} {}
     BlkAllocator(BlkAllocator const&) = delete;
     BlkAllocator(BlkAllocator&&) noexcept = delete;
     BlkAllocator& operator=(BlkAllocator const&) = delete;
@@ -147,38 +102,56 @@ public:
 
     virtual BlkAllocStatus alloc_contiguous(BlkId& bid) = 0;
     virtual BlkAllocStatus alloc(blk_count_t nblks, blk_alloc_hints const& hints, BlkId& out_blkid) = 0;
-    virtual BlkAllocStatus reserve_on_disk(BlkId const& bid) = 0;
-    virtual BlkAllocStatus reserve_on_cache(BlkId const& bid) = 0;
-
     virtual void free(BlkId const& id) = 0;
 
+    virtual BlkAllocStatus commit(BlkId const& bid) = 0;
+
     virtual blk_num_t available_blks() const = 0;
-    virtual blk_num_t get_defrag_nblks() const = 0;
     virtual blk_num_t get_used_blks() const = 0;
     virtual bool is_blk_alloced(BlkId const& b, bool use_lock = false) const = 0;
-    virtual bool is_blk_alloced_on_disk(BlkId const& b, bool use_lock = false) const = 0;
     virtual void recovery_completed() = 0;
     virtual void reset() = 0;
 
     virtual std::string to_string() const = 0;
-    virtual void cp_flush(CP* cp) = 0;
-
-    uint32_t get_align_size() const { return m_align_size; }
-    blk_num_t get_total_blks() const { return m_num_blks; }
-    const std::string& get_name() const { return m_name; }
-    bool is_persistent() const { return m_is_persistent; }
-    uint32_t get_blk_size() const { return m_blk_size; }
-
-    /* Get status */
     virtual nlohmann::json get_status(int log_level) const = 0;
 
+    /// RAII buffer handle returned by acquire_buffer().
+    /// Holds the serialized bitmap ByteArray for a CP flush. On destruction the allocator's
+    /// pending commit list is drained back into the bitmap.
+    class BufferGuard {
+    public:
+        ~BufferGuard() { if (release_fn_) release_fn_(); }
+        BufferGuard(BufferGuard&&) = default;            // std::function is empty after move → no-op dtor
+        BufferGuard& operator=(BufferGuard&&) = delete;
+        BufferGuard(BufferGuard const&) = delete;
+        BufferGuard& operator=(BufferGuard const&) = delete;
+        sisl::ByteArray const& buf() const { return buf_; }
+
+    private:
+        friend class BlkAllocator;
+        BufferGuard(sisl::ByteArray buf, std::function< void() > release_fn) :
+                buf_{std::move(buf)}, release_fn_{std::move(release_fn)} {}
+        sisl::ByteArray buf_;
+        std::function< void() > release_fn_;
+    };
+
+    virtual BufferGuard acquire_buffer() = 0;
+
+    uint32_t get_align_size() const { return align_size_; }
+    blk_num_t get_total_blks() const { return num_blks_; }
+    const std::string& get_name() const { return name_; }
+    uint32_t get_blk_size() const { return blk_size_; }
+
 protected:
-    const std::string m_name;
-    const uint32_t m_blk_size;
-    const uint32_t m_align_size;
-    const blk_num_t m_num_blks;
-    const chunk_num_t m_chunk_id;
-    const bool m_is_persistent;
+    static BufferGuard make_buffer_guard(sisl::ByteArray buf, std::function< void() > release_fn) {
+        return BufferGuard{std::move(buf), std::move(release_fn)};
+    }
+
+    const std::string name_;
+    const uint32_t blk_size_{0};
+    const uint32_t align_size_{0};
+    const blk_num_t num_blks_{0};
+    const chunk_num_t chunk_id_{0};
 };
 
 } // namespace homestore

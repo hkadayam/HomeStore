@@ -14,117 +14,121 @@
  *********************************************************************************/
 #pragma once
 
-#include <cassert>
+#include <atomic>
 #include <cstdint>
 #include <memory>
-#include <mutex>
-#include <sstream>
-#include <string>
-#include <thread>
-#include <vector>
+#include <optional>
 
 #include <sisl/fds/bitset.h>
-#include <folly/MPMCQueue.h>
-#include <sisl/fds/enum.h>
-#include <urcu.h>
 #include <sisl/fds/thread_vector.h>
+#include <urcu.h>
 
 #include <homestore/homestore_decl.hpp>
 #include <homestore/blk.h>
-#include "common/homestore_config.hpp"
-#include "common/homestore_assert.hpp"
-
 #include "blk_allocator.h"
+#include "segment_manager.h"
 
 namespace homestore {
 
-class BlkAllocPortion {
-private:
-    mutable std::mutex m_blk_lock;
-    blk_num_t m_portion_num;
-    blk_temp_t m_temperature;
-
-public:
-    BlkAllocPortion(blk_temp_t temp = default_temperature()) : m_temperature(temp) {}
-    ~BlkAllocPortion() = default;
-    BlkAllocPortion(BlkAllocPortion const&) = delete;
-    BlkAllocPortion(BlkAllocPortion&&) noexcept = delete;
-    BlkAllocPortion& operator=(BlkAllocPortion const&) = delete;
-    BlkAllocPortion& operator=(BlkAllocPortion&&) noexcept = delete;
-
-    auto portion_auto_lock() const { return std::scoped_lock< std::mutex >(m_blk_lock); }
-    blk_num_t get_portion_num() const { return m_portion_num; }
-    blk_temp_t temperature() const { return m_temperature; }
-
-    void set_portion_num(blk_num_t portion_num) { m_portion_num = portion_num; }
-    void set_temperature(const blk_temp_t temp) { m_temperature = temp; }
-    static constexpr blk_temp_t default_temperature() { return 1; }
-};
-
-class CP;
+///
+/// BitmapBlkAllocator — Holds a sisl::Bitset over num_blks bits and uses a non-owning SegmentManager& for the
+/// portion layout and per-portion mutexes.
+///
+/// alloc():           direct bitmap scan — finds free (reset) bits, sets them, returns BlkId.
+/// free():            resets bits; if inject_slab_on_free_ is true also injects the freed range
+///                    into the owning InmemPortion::slab_cache_.
+/// commit():          sets bits — CP-safe: if acquire_buffer() is active, the bid is pushed to the
+///                    pending commit list and applied by release_buffer().
+/// scan_free_blks():  acquires the portion lock, scans bm_ for reset bits in the portion's range,
+///                    sets them (marking as "in-cache"), and calls producer(bid) for each range found.
+///                    Used by SlabBlkAllocator::fill_cache_for_portion().
+/// copy_from():       bulk-copy a source bitmap into bm_; used to initialise inmem_bm_ from ondisk_bm_.
+///
+/// Thread-safety: each bitmap operation acquires the relevant InmemPortion::mtx_ via seg_mgr_.
+///
 class BitmapBlkAllocator : public BlkAllocator {
 public:
-    BitmapBlkAllocator(BlkAllocConfig const& cfg, bool is_fresh, chunk_num_t id = 0);
-    BitmapBlkAllocator(BlkAllocator const&) = delete;
+    // buf: nullopt allocates a fresh zeroed bitset; a ByteArray deserializes from persisted bytes.
+    BitmapBlkAllocator(BlkAllocConfig const& cfg, SegmentManager& seg_mgr, bool inject_slab_on_free,
+                       chunk_num_t id, std::optional< sisl::ByteArray > buf = std::nullopt);
+    BitmapBlkAllocator(BitmapBlkAllocator const&) = delete;
     BitmapBlkAllocator(BitmapBlkAllocator&&) noexcept = delete;
     BitmapBlkAllocator& operator=(BitmapBlkAllocator const&) = delete;
     BitmapBlkAllocator& operator=(BitmapBlkAllocator&&) noexcept = delete;
-    virtual ~BitmapBlkAllocator() = default;
+    ~BitmapBlkAllocator() override = default;
 
-    virtual void load() = 0;
-    BlkAllocStatus reserve_on_disk(BlkId const& in_bid) override;
-    bool is_blk_alloced_on_disk(BlkId const& b, bool use_lock = false) const override;
-    void cp_flush(CP* cp) override;
+    BlkAllocStatus alloc_contiguous(BlkId& bid) override;
+    BlkAllocStatus alloc(blk_count_t nblks, blk_alloc_hints const& hints, BlkId& out_blkid) override;
+    void free(BlkId const& bid) override;
 
+    // Sets bits in bm_. CP-safe via commit_list_ when a buffer is acquired.
+    BlkAllocStatus commit(BlkId const& bid) override;
+
+    // Serialize bm_; new commits accumulate in commit_list_ until the returned BufferGuard is destroyed.
+    BufferGuard acquire_buffer() override;
+
+    // Scan bm_ for free (reset) bits in portion's range, set them, call producer(bid) per range.
+    // Acquires portion.mtx_ internally. Producer returns false to stop early.
+    template < typename F >
+    void scan_free_blks(InmemPortion& portion, F&& producer);
+
+    // Copy all bits from src.bm_ into bm_ (used for load-time initialisation).
+    void copy_from(BitmapBlkAllocator const& src);
+
+    bool is_blk_alloced(BlkId const& b, bool use_lock = false) const override;
+    blk_num_t available_blks() const override;
+    blk_num_t get_used_blks() const override;
     void recovery_completed() override {}
     void reset() override {}
-    blk_num_t get_num_portions() const { return (m_num_blks - 1) / m_blks_per_portion + 1; }
-    blk_num_t get_blks_per_portion() const { return m_blks_per_portion; }
-
-    BlkAllocPortion& get_blk_portion(blk_num_t portion_num) {
-        HS_DBG_ASSERT_LT(portion_num, get_num_portions(), "Portion num is not in range");
-        return m_blk_portions[portion_num];
-    }
-
-    blk_num_t blknum_to_portion_num(const blk_num_t blknum) const { return blknum / m_blks_per_portion; }
-    BlkAllocPortion& blknum_to_portion(blk_num_t blknum) { return m_blk_portions[blknum_to_portion_num(blknum)]; }
-    BlkAllocPortion const& blknum_to_portion_const(blk_num_t blknum) const {
-        return m_blk_portions[blknum_to_portion_num(blknum)];
-    }
-
-    sisl::Bitset const* get_disk_bitmap() const { return is_persistent() ? m_disk_bm.get() : nullptr; }
-
-    /* Get status */
-    nlohmann::json get_status(int log_level) const override;
-
-    void incr_alloced_blk_count(blk_count_t nblks) { m_alloced_blk_count.fetch_add(nblks, std::memory_order_relaxed); }
-    void decr_alloced_blk_count(blk_count_t nblks) { m_alloced_blk_count.fetch_sub(nblks, std::memory_order_relaxed); }
-    int64_t get_alloced_blk_count() const { return m_alloced_blk_count.load(std::memory_order_acquire); }
-
-protected:
-    void free_on_disk(BlkId const& b);
+    std::string to_string() const override;
+    nlohmann::json get_status(int) const override { return {}; }
 
 private:
-    void do_init();
-    sisl::ThreadVector< MultiBlkId >* get_alloc_blk_list();
-    void on_meta_blk_found(void* mblk_cookie, sisl::ByteView const& buf, size_t size);
+    sisl::ThreadVector< MultiBlkId >* get_commit_list();
+    void do_set_bits(BlkId const& b);
+    void do_release_buffer();
 
-    // Acquire the underlying bitmap buffer and while the caller has acquired, all the new allocations
-    // will be captured in a separate list and then pushes into buffer once released.
-    // NOTE: THIS IS NON-THREAD SAFE METHOD. Caller is expected to ensure synchronization between multiple
-    // acquires/releases
-    sisl::ByteArray acquire_underlying_buffer();
-    void release_underlying_buffer();
-
-protected:
-    blk_num_t m_blks_per_portion;
-
-private:
-    sisl::ThreadVector< MultiBlkId >* m_alloc_blkid_list{nullptr};
-    std::unique_ptr< BlkAllocPortion[] > m_blk_portions;
-    std::unique_ptr< sisl::Bitset > m_disk_bm{nullptr};
-    std::atomic< bool > m_is_disk_bm_dirty{true}; // initially disk_bm treated as dirty
-    void* m_meta_blk_cookie{nullptr};
-    std::atomic< int64_t > m_alloced_blk_count{0};
+    unique< sisl::Bitset > bm_;
+    SegmentManager& seg_mgr_;
+    bool inject_slab_on_free_;
+    // Non-null while acquire_buffer() is active; new commits are appended here.
+    sisl::ThreadVector< MultiBlkId >* commit_list_{nullptr};
+    std::atomic< int64_t > alloced_blk_count_{0};
 };
+
+// ---- template implementation ----
+
+template < typename F >
+void BitmapBlkAllocator::scan_free_blks(InmemPortion& portion, F&& producer) {
+    auto lock = portion.portion_lock();
+
+    blk_num_t cursor = portion.sweep_cursor_;
+    bool wrapped = false;
+
+    while (true) {
+        const auto bb = bm_->get_next_contiguous_n_reset_bits(cursor, static_cast< uint64_t >(portion.end_blk_), 1u,
+                                                              static_cast< uint32_t >(portion.end_blk_ - cursor));
+        if (bb.nbits == 0) {
+            if (wrapped || cursor == portion.start_blk_) break;
+            // wrap around to the start of the portion for a second pass
+            cursor = portion.start_blk_;
+            wrapped = true;
+            continue;
+        }
+
+        const blk_num_t start = static_cast< blk_num_t >(bb.start_bit);
+        const blk_count_t count = static_cast< blk_count_t >(bb.nbits);
+
+        bm_->set_bits(start, count);
+        alloced_blk_count_.fetch_add(count, std::memory_order_relaxed);
+
+        const bool keep_going = producer(BlkId{start, count, chunk_id_});
+        cursor = start + count;
+
+        if (!keep_going || cursor >= portion.end_blk_) break;
+    }
+
+    portion.sweep_cursor_ = cursor;
+}
+
 } // namespace homestore

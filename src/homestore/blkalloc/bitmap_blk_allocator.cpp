@@ -12,176 +12,210 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
-#include <homestore/homestore.hpp>
-#include <homestore/meta_service.hpp>
-#include <homestore/checkpoint/cp_mgr.hpp>
+#include <optional>
+
 #include "bitmap_blk_allocator.h"
-#include "meta/meta_sb.hpp"
-#include "common/homestore_utils.hpp"
+#include "common/homestore_assert.hpp"
 
 namespace homestore {
-BitmapBlkAllocator::BitmapBlkAllocator(BlkAllocConfig const& cfg, bool is_fresh, chunk_num_t id) :
-        BlkAllocator(cfg, id), m_blks_per_portion{cfg.m_blks_per_portion} {
-    if (is_persistent()) {
-        meta_service().register_handler(
-            get_name(),
-            [this](meta_blk* mblk, sisl::ByteView buf, size_t size) {
-                on_meta_blk_found(voidptr_cast(mblk), std::move(buf), size);
-            },
-            nullptr);
-    }
 
-    if (is_fresh) {
-        if (is_persistent()) { m_disk_bm = std::make_unique< sisl::Bitset >(m_num_blks, m_chunk_id, m_align_size); }
-    }
-
-    // NOTE:  Blocks per portion must be modulo word size so locks do not fall on same word
-    m_blks_per_portion = sisl::round_up(m_blks_per_portion, m_disk_bm ? m_disk_bm->word_size() : 64u);
-
-    m_blk_portions = std::make_unique< BlkAllocPortion[] >(get_num_portions());
-    for (blk_num_t index{0}; index < get_num_portions(); ++index) {
-        m_blk_portions[index].set_portion_num(index);
-    }
-}
-
-void BitmapBlkAllocator::on_meta_blk_found(void* mblk_cookie, sisl::ByteView const& buf, size_t size) {
-    m_meta_blk_cookie = mblk_cookie;
-
-    m_disk_bm = std::unique_ptr< sisl::Bitset >{new sisl::Bitset{
-        hs_utils::extract_byte_array(buf, meta_service().is_aligned_buf_needed(size), meta_service().align_size())}};
-
-    m_alloced_blk_count.store(m_disk_bm->get_set_count(), std::memory_order_relaxed);
-    load();
-}
-
-void BitmapBlkAllocator::cp_flush(CP*) {
-    if (!is_persistent()) { return; }
-
-    if (m_is_disk_bm_dirty.load()) {
-        sisl::ByteArray bitmap_buf = acquire_underlying_buffer();
-        if (m_meta_blk_cookie) {
-            meta_service().update_sub_sb(bitmap_buf->cbytes(), bitmap_buf->size(), m_meta_blk_cookie);
-        } else {
-            meta_service().add_sub_sb(get_name(), bitmap_buf->cbytes(), bitmap_buf->size(), m_meta_blk_cookie);
-        }
-        m_is_disk_bm_dirty.store(false); // No longer dirty now, needs to be set before releasing the buffer
-        release_underlying_buffer();
-    }
-}
-
-bool BitmapBlkAllocator::is_blk_alloced_on_disk(const BlkId& b, bool use_lock) const {
-    // for non-persistent bitmap nothing to compare. So always return true
-    if (!is_persistent()) { return true; }
-
-    if (use_lock) {
-        const BlkAllocPortion& portion = blknum_to_portion_const(b.blk_num());
-        auto lock{portion.portion_auto_lock()};
-        return m_disk_bm->is_bits_set(b.blk_num(), b.blk_count());
+BitmapBlkAllocator::BitmapBlkAllocator(BlkAllocConfig const& cfg, SegmentManager& seg_mgr, bool inject_slab_on_free,
+                                       chunk_num_t id, std::optional< sisl::ByteArray > buf) :
+        BlkAllocator{cfg, id}, seg_mgr_{seg_mgr}, inject_slab_on_free_{inject_slab_on_free} {
+    if (buf.has_value()) {
+        bm_ = std::make_unique< sisl::Bitset >(std::move(*buf));
+        alloced_blk_count_.store(to_i64(bm_->get_set_count()), std::memory_order_relaxed);
     } else {
-        return m_disk_bm->is_bits_set(b.blk_num(), b.blk_count());
+        bm_ = std::make_unique< sisl::Bitset >(cfg.capacity_, id, cfg.align_size_);
     }
 }
 
-BlkAllocStatus BitmapBlkAllocator::reserve_on_disk(BlkId const& bid) {
-    if (!is_persistent()) {
-        // for non-persistent bitmap nothing is needed to do. So always return success
-        return BlkAllocStatus::SUCCESS;
-    }
+void BitmapBlkAllocator::copy_from(BitmapBlkAllocator const& src) {
+    bm_->copy(*(src.bm_));
+    alloced_blk_count_.store(static_cast< int64_t >(bm_->get_set_count()), std::memory_order_relaxed);
+}
 
-    rcu_read_lock();
-    auto list = get_alloc_blk_list();
-    if (list) {
-        // cp has started, accumulating to the list
-        list->push_back(bid);
-    } else {
-        auto set_on_disk_bm = [this](auto& b) {
-            BlkAllocPortion& portion = blknum_to_portion(b.blk_num());
-            {
-                auto lock{portion.portion_auto_lock()};
-                if (!hs()->is_initializing()) {
-                    // During recovery we might try to free the entry which is already freed while replaying the
-                    // journal, This assert is valid only post recovery.
-                    BLKALLOC_REL_ASSERT(m_disk_bm->is_bits_reset(b.blk_num(), b.blk_count()),
-                                        "Expected disk blks to reset");
-                }
-                m_disk_bm->set_bits(b.blk_num(), b.blk_count());
-                BLKALLOC_LOG(DEBUG, "blks allocated {} chunk number {}", b.to_string(), m_chunk_id);
-            }
-        };
+// ---- alloc ----
 
-        // cp is not started or already done, allocate on disk bm directly;
-        if (bid.is_multi()) {
-            MultiBlkId const& mbid = r_cast< MultiBlkId const& >(bid);
-            auto it = mbid.iterate();
-            while (auto b = it.next()) {
-                set_on_disk_bm(*b);
+BlkAllocStatus BitmapBlkAllocator::alloc_contiguous(BlkId& bid) {
+    blk_alloc_hints hints;
+    hints.is_contiguous = true;
+    return alloc(1, hints, bid);
+}
+
+BlkAllocStatus BitmapBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const& hints, BlkId& out_blkid) {
+    MultiBlkId& mout = r_cast< MultiBlkId& >(out_blkid);
+    mout = MultiBlkId{};
+    blk_count_t remain = nblks;
+
+    for (auto& seg : seg_mgr_.segments()) {
+        for (auto& portion_ptr : seg.portions_) {
+            if (remain == 0)
+                goto done;
+            InmemPortion& portion = *portion_ptr;
+            auto lock = portion.portion_lock();
+
+            blk_num_t cursor = portion.start_blk_;
+            while (cursor < portion.end_blk_ && remain > 0 && mout.has_room()) {
+                const blk_count_t want = hints.is_contiguous
+                    ? nblks
+                    : static_cast< blk_count_t >(std::min< uint32_t >(remain, hints.max_blks_per_piece));
+
+                const blk_count_t min_needed =
+                    hints.is_contiguous ? nblks : static_cast< blk_count_t >(hints.min_blks_per_piece);
+
+                const auto bb = bm_->get_next_contiguous_n_reset_bits(cursor, to_u64(portion.end_blk_),
+                                                                      min_needed, want);
+                if (bb.nbits == 0)
+                    break;
+
+                const blk_num_t start = static_cast< blk_num_t >(bb.start_bit);
+                const blk_count_t got = static_cast< blk_count_t >(bb.nbits);
+                bm_->set_bits(start, got);
+                alloced_blk_count_.fetch_add(got, std::memory_order_relaxed);
+                mout.add(start, got, chunk_id_);
+                remain -= got;
+
+                if (hints.is_contiguous)
+                    goto done;
+                cursor = start + got;
             }
-        } else {
-            set_on_disk_bm(bid);
         }
-        m_is_disk_bm_dirty.store(true);
     }
-    rcu_read_unlock();
 
+done:
+    if (remain == nblks)
+        return BlkAllocStatus::SPACE_FULL;
+    if (remain > 0) {
+        if (!hints.partial_alloc_ok) {
+            free(mout);
+            return BlkAllocStatus::SPACE_FULL;
+        }
+        return BlkAllocStatus::PARTIAL;
+    }
     return BlkAllocStatus::SUCCESS;
 }
 
-void BitmapBlkAllocator::free_on_disk(BlkId const& bid) {
-    // this api should be called only on persistent blk allocator
-    DEBUG_ASSERT_EQ(is_persistent(), true, "free_on_disk called for non-persistent blk allocator");
+// ---- free ----
 
-    auto unset_on_disk_bm = [this](auto& b) {
-        BlkAllocPortion& portion = blknum_to_portion(b.blk_num());
-        {
-            auto lock{portion.portion_auto_lock()};
-            m_disk_bm->reset_bits(b.blk_num(), b.blk_count());
+void BitmapBlkAllocator::free(BlkId const& bid) {
+    auto do_free = [this](BlkId const& b) {
+        InmemPortion& portion = seg_mgr_.blkid_to_portion(b.blk_num());
+
+        auto lock = portion.portion_lock();
+        bm_->reset_bits(b.blk_num(), b.blk_count());
+        alloced_blk_count_.fetch_sub(b.blk_count(), std::memory_order_relaxed);
+        if (inject_slab_on_free_) {
+            portion.slab_cache_.free_blk(b);
         }
     };
 
     if (bid.is_multi()) {
-        MultiBlkId const& mbid = r_cast< MultiBlkId const& >(bid);
+        auto const& mbid = r_cast< MultiBlkId const& >(bid);
         auto it = mbid.iterate();
         while (auto const b = it.next()) {
-            unset_on_disk_bm(*b);
+            do_free(*b);
         }
     } else {
-        unset_on_disk_bm(bid);
+        do_free(bid);
     }
 }
 
-sisl::ByteArray BitmapBlkAllocator::acquire_underlying_buffer() {
-    // prepare and temporary alloc list, where blkalloc is accumulated till underlying buffer is released.
-    // RCU will wait for all I/Os that are still in critical section (allocating on disk bm) to complete and exit;
-    auto alloc_list_ptr = new sisl::ThreadVector< MultiBlkId >();
-    auto old_alloc_list_ptr = rcu_xchg_pointer(&m_alloc_blkid_list, alloc_list_ptr);
-    synchronize_rcu();
+// ---- commit ----
 
-    BLKALLOC_REL_ASSERT(old_alloc_list_ptr == nullptr, "Multiple acquires concurrently?");
-    return (m_disk_bm->serialize(m_align_size));
+void BitmapBlkAllocator::do_set_bits(BlkId const& b) {
+    InmemPortion& portion = seg_mgr_.blkid_to_portion(b.blk_num());
+    auto lock = portion.portion_lock();
+    bm_->set_bits(b.blk_num(), b.blk_count());
+    alloced_blk_count_.fetch_add(b.blk_count(), std::memory_order_relaxed);
 }
 
-void BitmapBlkAllocator::release_underlying_buffer() {
-    // set to nullptr, so that alloc will go to disk bm directly
-    // wait for all I/Os in critical section (still accumulating bids) to complete and exit;
-    auto old_alloc_list_ptr = rcu_xchg_pointer(&m_alloc_blkid_list, nullptr);
-    synchronize_rcu();
+sisl::ThreadVector< MultiBlkId >* BitmapBlkAllocator::get_commit_list() {
+    return rcu_dereference(commit_list_);
+}
 
-    // at this point, no I/O will be pushing back to the list (old_alloc_list_ptr);
-    auto it = old_alloc_list_ptr->begin(true /* latest */);
-    const BlkId* bid{nullptr};
-    while ((bid = old_alloc_list_ptr->next(it)) != nullptr) {
-        reserve_on_disk(*bid);
+BlkAllocStatus BitmapBlkAllocator::commit(BlkId const& bid) {
+    rcu_read_lock();
+    auto* list = get_commit_list();
+    if (list) {
+        // Buffer is currently acquired — defer the commit; release_buffer() will apply it.
+        if (bid.is_multi()) {
+            list->push_back(r_cast< MultiBlkId const& >(bid));
+        } else {
+            MultiBlkId mbid;
+            mbid.add(bid.blk_num(), bid.blk_count(), bid.chunk_num());
+            list->push_back(mbid);
+        }
+        rcu_read_unlock();
+        return BlkAllocStatus::SUCCESS;
     }
-    old_alloc_list_ptr->clear();
-    delete (old_alloc_list_ptr);
+    rcu_read_unlock();
+
+    // No buffer held — set bits directly.
+    auto do_commit = [this](BlkId const& b) { do_set_bits(b); };
+    if (bid.is_multi()) {
+        auto const& mbid = r_cast< MultiBlkId const& >(bid);
+        auto it = mbid.iterate();
+        while (auto const b = it.next()) {
+            do_commit(*b);
+        }
+    } else {
+        do_commit(bid);
+    }
+    return BlkAllocStatus::SUCCESS;
 }
 
-/* Get status */
-nlohmann::json BitmapBlkAllocator::get_status(int) const { return nlohmann::json{}; }
+// ---- acquire / release buffer ----
 
-sisl::ThreadVector< MultiBlkId >* BitmapBlkAllocator::get_alloc_blk_list() {
-    auto p = rcu_dereference(m_alloc_blkid_list);
-    return p;
+BlkAllocator::BufferGuard BitmapBlkAllocator::acquire_buffer() {
+    auto* new_list = new sisl::ThreadVector< MultiBlkId >();
+    auto* old_list = rcu_xchg_pointer(&commit_list_, new_list);
+    synchronize_rcu();
+    HS_REL_ASSERT_EQ(old_list, nullptr, "acquire_buffer called while buffer already acquired");
+    return make_buffer_guard(bm_->serialize(align_size_), [this]() { do_release_buffer(); });
+}
+
+void BitmapBlkAllocator::do_release_buffer() {
+    auto* old_list = rcu_xchg_pointer(&commit_list_, nullptr);
+    synchronize_rcu();
+
+    auto it = old_list->begin(true /* latest */);
+    const MultiBlkId* mbid{nullptr};
+    while ((mbid = old_list->next(it)) != nullptr) {
+        auto jt = mbid->iterate();
+        while (auto const b = jt.next()) {
+            do_set_bits(*b);
+        }
+    }
+    old_list->clear();
+    delete old_list;
+}
+
+// ---- query ----
+
+bool BitmapBlkAllocator::is_blk_alloced(BlkId const& b, bool use_lock) const {
+    if (use_lock) {
+        InmemPortion const& portion = seg_mgr_.blkid_to_portion(b.blk_num());
+        auto lock = portion.portion_lock();
+        return bm_->is_bits_set(b.blk_num(), b.blk_count());
+    }
+    return bm_->is_bits_set(b.blk_num(), b.blk_count());
+}
+
+blk_num_t BitmapBlkAllocator::available_blks() const {
+    const auto used = alloced_blk_count_.load(std::memory_order_acquire);
+    return (used >= 0 && static_cast< blk_num_t >(used) <= num_blks_) ? (num_blks_ - static_cast< blk_num_t >(used))
+                                                                      : 0;
+}
+
+blk_num_t BitmapBlkAllocator::get_used_blks() const {
+    const auto used = alloced_blk_count_.load(std::memory_order_acquire);
+    return (used >= 0) ? static_cast< blk_num_t >(used) : 0;
+}
+
+std::string BitmapBlkAllocator::to_string() const {
+    return fmt::format("BitmapBlkAllocator name={} num_blks={} used={} available={}", name_, num_blks_, get_used_blks(),
+                       available_blks());
 }
 
 } // namespace homestore

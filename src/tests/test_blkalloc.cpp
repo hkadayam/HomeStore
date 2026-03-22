@@ -38,8 +38,7 @@
 #include "blkalloc/blk_cache.h"
 #include "common/homestore_assert.hpp"
 #include "common/homestore_config.hpp"
-#include "blkalloc/fixed_blk_allocator.h"
-#include "blkalloc/varsize_blk_allocator.h"
+#include "blkalloc/slab_blk_allocator.h"
 
  
 
@@ -364,31 +363,25 @@ struct BlkAllocatorTest {
     }
 };
 
-struct FixedBlkAllocatorTest : public ::testing::Test, BlkAllocatorTest {
-    std::unique_ptr< FixedBlkAllocator > m_allocator;
-    FixedBlkAllocatorTest() : BlkAllocatorTest() {
-        BlkAllocConfig fixed_cfg{4096, 4096, static_cast< uint64_t >(m_total_count) * 4096, false};
-        m_allocator = std::make_unique< FixedBlkAllocator >(fixed_cfg, true, 0);
+struct CompactBlkAllocatorTest : public ::testing::Test, BlkAllocatorTest {
+    std::unique_ptr< SlabBlkAllocator > m_allocator;
+    CompactBlkAllocatorTest() : BlkAllocatorTest() {
+        SlabBlkAllocConfig cfg{4096, 4096, 4096, static_cast< uint64_t >(m_total_count) * 4096, false,
+                                  "compact_test"};
+        cfg.alloc_mode = AllocMode::CompactAlloc;
+        m_allocator = std::make_unique< SlabBlkAllocator >(cfg, std::nullopt, 0);
     }
-    FixedBlkAllocatorTest(const FixedBlkAllocatorTest&) = delete;
-    FixedBlkAllocatorTest(FixedBlkAllocatorTest&&) noexcept = delete;
-    FixedBlkAllocatorTest& operator=(const FixedBlkAllocatorTest&) = delete;
-    FixedBlkAllocatorTest& operator=(FixedBlkAllocatorTest&&) noexcept = delete;
-    virtual ~FixedBlkAllocatorTest() override = default;
+    CompactBlkAllocatorTest(const CompactBlkAllocatorTest&) = delete;
+    CompactBlkAllocatorTest(CompactBlkAllocatorTest&&) noexcept = delete;
+    CompactBlkAllocatorTest& operator=(const CompactBlkAllocatorTest&) = delete;
+    CompactBlkAllocatorTest& operator=(CompactBlkAllocatorTest&&) noexcept = delete;
+    virtual ~CompactBlkAllocatorTest() override = default;
 
     virtual void SetUp() override {};
     virtual void TearDown() override {};
 
     bool alloc_blk(BlkAllocStatus exp_status, BlkId& bid, bool track_block_group) {
-        return do_alloc_blk(exp_status, bid, track_block_group, false /* specific_blk */);
-    }
-
-    bool reserve_on_cache(BlkAllocStatus exp_status, BlkId& bid, bool track_block_group) {
-        return do_alloc_blk(exp_status, bid, track_block_group, true /* specific_blk */);
-    }
-
-    bool do_alloc_blk(BlkAllocStatus exp_status, BlkId& bid, bool track_block_group, bool specific_blk = false) {
-        const auto ret = specific_blk ? m_allocator->reserve_on_cache(bid) : m_allocator->alloc_contiguous(bid);
+        const auto ret = m_allocator->alloc_contiguous(bid);
         if (ret != exp_status) {
             {
                 std::scoped_lock< std::mutex > lock{s_print_mutex};
@@ -419,24 +412,24 @@ struct FixedBlkAllocatorTest : public ::testing::Test, BlkAllocatorTest {
     }
 };
 
-struct VarsizeBlkAllocatorTest : public ::testing::Test, BlkAllocatorTest {
-    std::unique_ptr< VarsizeBlkAllocator > m_allocator;
+struct SlabBlkAllocatorTest : public ::testing::Test, BlkAllocatorTest {
+    std::unique_ptr< SlabBlkAllocator > m_allocator;
 
-    VarsizeBlkAllocatorTest() : BlkAllocatorTest() { HomeStoreDynamicConfig::init_settings_default(); }
-    VarsizeBlkAllocatorTest(const VarsizeBlkAllocatorTest&) = delete;
-    VarsizeBlkAllocatorTest(VarsizeBlkAllocatorTest&&) noexcept = delete;
-    VarsizeBlkAllocatorTest& operator=(const VarsizeBlkAllocatorTest&) = delete;
-    VarsizeBlkAllocatorTest& operator=(VarsizeBlkAllocatorTest&&) noexcept = delete;
-    virtual ~VarsizeBlkAllocatorTest() override = default;
+    SlabBlkAllocatorTest() : BlkAllocatorTest() { HomeStoreDynamicConfig::init_settings_default(); }
+    SlabBlkAllocatorTest(const SlabBlkAllocatorTest&) = delete;
+    SlabBlkAllocatorTest(SlabBlkAllocatorTest&&) noexcept = delete;
+    SlabBlkAllocatorTest& operator=(const SlabBlkAllocatorTest&) = delete;
+    SlabBlkAllocatorTest& operator=(SlabBlkAllocatorTest&&) noexcept = delete;
+    virtual ~SlabBlkAllocatorTest() override = default;
 
     virtual void SetUp() override {};
     virtual void TearDown() override {};
 
     void create_allocator(const bool use_slabs = true, uint64_t size = 0) {
         if (size == 0) { size = static_cast< uint64_t >(m_total_count); }
-        VarsizeBlkAllocConfig cfg{4096,  4096, 4096u,    size * 4096,
-                                  false, "",   use_slabs};
-        m_allocator = std::make_unique< VarsizeBlkAllocator >(cfg, true, 0);
+        SlabBlkAllocConfig cfg{4096, 4096, 4096u, size * 4096, false, ""};
+        cfg.use_slab_cache_ = use_slabs;
+        m_allocator = std::make_unique< SlabBlkAllocator >(cfg, std::nullopt, 0);
     }
 
     [[nodiscard]] bool alloc_rand_blk(const BlkAllocStatus exp_status, const bool is_contiguous,
@@ -444,10 +437,8 @@ struct VarsizeBlkAllocatorTest : public ::testing::Test, BlkAllocatorTest {
         blk_alloc_hints hints;
         hints.is_contiguous = is_contiguous;
 
-        static thread_local std::vector< BlkId > bids;
-        bids.clear();
-
-        const auto ret = m_allocator->alloc(reqd_size, hints, bids);
+        MultiBlkId bid;
+        const auto ret = m_allocator->alloc(reqd_size, hints, bid);
         if (ret != exp_status) {
             {
                 std::scoped_lock< std::mutex > lock{s_print_mutex};
@@ -456,21 +447,20 @@ struct VarsizeBlkAllocatorTest : public ::testing::Test, BlkAllocatorTest {
             return false;
         }
         if (ret == BlkAllocStatus::SUCCESS) {
-            if (is_contiguous) {
-                if (bids.size() != 1) {
-                    {
-                        std::scoped_lock< std::mutex > lock{s_print_mutex};
-                        std::cout << "Did not expect multiple bids for contiguous request.  Bids=" << bids.size()
-                                  << std::endl;
-                    }
-                    return false;
+            if (is_contiguous && bid.num_pieces() != 1) {
+                {
+                    std::scoped_lock< std::mutex > lock{s_print_mutex};
+                    std::cout << "Did not expect multiple bids for contiguous request.  Bids=" << bid.num_pieces()
+                              << std::endl;
                 }
+                return false;
             }
 
             blk_count_t sz{0};
-            for (auto& bid : bids) {
-                if (!alloced(bid, track_block_group)) { return false; }
-                sz += bid.blk_count();
+            auto it = bid.iterate();
+            while (auto const b = it.next()) {
+                if (!alloced(*b, track_block_group)) { return false; }
+                sz += b->blk_count();
             }
             if (sz != reqd_size) {
                 {
@@ -567,19 +557,10 @@ public:
     }
 };
 
-TEST_F(FixedBlkAllocatorTest, alloc_free_fixed_size) {
+TEST_F(CompactBlkAllocatorTest, alloc_free_compact) {
     const auto nthreads{
         std::clamp< uint32_t >(std::thread::hardware_concurrency(), 2, SISL_OPTIONS["num_threads"].as< uint32_t >())};
-
-    std::vector< BlkId > reserved_blkids;
-
-    LOGINFO("Step 0: Reserve {} blks to be not allocated", nthreads);
-    for (blk_num_t i = 0; i < nthreads; ++i) {
-        reserved_blkids.emplace_back(BlkId{i * i, 1, 0});
-        ASSERT_TRUE(reserve_on_cache(BlkAllocStatus::SUCCESS, reserved_blkids.back(), false /* track_blk_group */));
-    }
-
-    const auto count = m_total_count - nthreads;
+    const auto count = m_total_count;
 
     LOGINFO("Step 1: Pre allocate {} objects in {} threads", count / 2, nthreads);
     run_parallel(nthreads, count / 2, [&](const uint64_t count_per_thread, std::atomic< bool >& terminate_flag) {
@@ -590,7 +571,7 @@ TEST_F(FixedBlkAllocatorTest, alloc_free_fixed_size) {
     });
     validate_count();
 
-    LOGINFO("Step 2: Free {} blks randomly in {} threads ", count / 4, nthreads);
+    LOGINFO("Step 2: Free {} blks randomly in {} threads", count / 4, nthreads);
     run_parallel(nthreads, count / 4, [&](const uint64_t count_per_thread, std::atomic< bool >& terminate_flag) {
         for (uint64_t i{0}; (i < count_per_thread) && !terminate_flag; ++i) {
             [[maybe_unused]] const BlkId blkId{free_random_alloced_blk(false)};
@@ -611,38 +592,24 @@ TEST_F(FixedBlkAllocatorTest, alloc_free_fixed_size) {
     LOGINFO("Step 4: Validate if further allocation result in space full error");
     ASSERT_TRUE(alloc_blk(BlkAllocStatus::SPACE_FULL, bid, false));
 
-    LOGINFO("Step 5: Free up {} blocks ({} previously reserved and 2 new) and make sure 2 more alloc is successful and "
-            "do FIFO allocation",
-            nthreads + 2, nthreads);
-
-    for (blk_num_t i = 0; i < nthreads; ++i) {
-        ASSERT_TRUE(free_blk(reserved_blkids[i].blk_num()));
-    }
+    LOGINFO("Step 5: Free 2 blks and verify 2 more allocs succeed");
     BlkId const free_bid1 = free_random_alloced_blk(false);
     BlkId const free_bid2 = free_random_alloced_blk(false);
-
-    for (blk_num_t i = 0; i < nthreads; ++i) {
-        BlkId bid;
-        ASSERT_TRUE(alloc_blk(BlkAllocStatus::SUCCESS, bid, false));
-        ASSERT_EQ(BlkId::compare(bid, reserved_blkids[i]), 0) << "Order of block allocation not expected";
-    }
 
     BlkId bid1, bid2;
     ASSERT_TRUE(alloc_blk(BlkAllocStatus::SUCCESS, bid1, false));
     ASSERT_TRUE(alloc_blk(BlkAllocStatus::SUCCESS, bid2, false));
-    ASSERT_EQ(BlkId::compare(bid1, free_bid1), 0) << "Order of block allocation not expected";
-    ASSERT_EQ(BlkId::compare(bid2, free_bid2), 0) << "Order of block allocation not expected";
     validate_count();
 }
 
 namespace {
-void alloc_free_var_contiguous_unirandsize(VarsizeBlkAllocatorTest* const block_test_pointer, uint64_t capacity) {
+void alloc_free_var_contiguous_unirandsize(SlabBlkAllocatorTest* const block_test_pointer, uint64_t capacity) {
     const auto nthreads{
         std::clamp< uint32_t >(std::thread::hardware_concurrency(), 2, SISL_OPTIONS["num_threads"].as< uint32_t >())};
-    auto max_rand_size{std::max(capacity/4096, uint64_t(2))};
+    auto max_rand_size{std::max(capacity / 4096, uint64_t(2))};
     std::uniform_int_distribution< blk_count_t > s_rand_size_generator{1, static_cast< blk_count_t >(max_rand_size)};
 
-    auto rand_func =  [&s_rand_size_generator]() -> blk_count_t {
+    auto rand_func = [&s_rand_size_generator]() -> blk_count_t {
         return s_rand_size_generator(g_re);
     };
     const uint8_t prealloc_pct{5};
@@ -668,27 +635,27 @@ void alloc_free_var_contiguous_unirandsize(VarsizeBlkAllocatorTest* const block_
 }
 } // namespace
 
-TEST_F(VarsizeBlkAllocatorTest, alloc_free_var_contiguous_unirandsize_with_slabs) {
+TEST_F(SlabBlkAllocatorTest, alloc_free_var_contiguous_unirandsize_with_slabs) {
     // test with slabs
     create_allocator();
     alloc_free_var_contiguous_unirandsize(this, m_total_count);
 }
 
-TEST_F(VarsizeBlkAllocatorTest, small_allocator_with_slab) {
+TEST_F(SlabBlkAllocatorTest, small_allocator_with_slab) {
     // test with slabs
     auto size = 4224;
     create_allocator(true, size);
     alloc_free_var_contiguous_unirandsize(this, size);
 }
 
-TEST_F(VarsizeBlkAllocatorTest, alloc_free_var_contiguous_unirandsize_without_slabs) {
+TEST_F(SlabBlkAllocatorTest, alloc_free_var_contiguous_unirandsize_without_slabs) {
     // test without slabs
     create_allocator(false);
     alloc_free_var_contiguous_unirandsize(this, m_total_count);
 }
 
 namespace {
-void alloc_free_var_contiguous_roundrandsize(VarsizeBlkAllocatorTest* const block_test_pointer) {
+void alloc_free_var_contiguous_roundrandsize(SlabBlkAllocatorTest* const block_test_pointer) {
     const auto nthreads{
         std::clamp< uint32_t >(std::thread::hardware_concurrency(), 2, SISL_OPTIONS["num_threads"].as< uint32_t >())};
     const uint8_t prealloc_pct{5};
@@ -714,19 +681,19 @@ void alloc_free_var_contiguous_roundrandsize(VarsizeBlkAllocatorTest* const bloc
 }
 } // namespace
 
-TEST_F(VarsizeBlkAllocatorTest, alloc_free_var_contiguous_roundrandsize_with_slabs) {
+TEST_F(SlabBlkAllocatorTest, alloc_free_var_contiguous_roundrandsize_with_slabs) {
     // test with slabs
     create_allocator();
     alloc_free_var_contiguous_roundrandsize(this);
 }
 
-TEST_F(VarsizeBlkAllocatorTest, alloc_free_var_contiguous_roundrandsize_without_slabs) {
+TEST_F(SlabBlkAllocatorTest, alloc_free_var_contiguous_roundrandsize_without_slabs) {
     // test without slabs
     create_allocator(false);
     alloc_free_var_contiguous_roundrandsize(this);
 }
 
-TEST_F(VarsizeBlkAllocatorTest, alloc_free_var_contiguous_slabrandsize) {
+TEST_F(SlabBlkAllocatorTest, alloc_free_var_contiguous_slabrandsize) {
     create_allocator();
     start_track_slabs();
 
@@ -756,7 +723,7 @@ TEST_F(VarsizeBlkAllocatorTest, alloc_free_var_contiguous_slabrandsize) {
 }
 
 namespace {
-void alloc_free_var_contiguous_onesize(VarsizeBlkAllocatorTest* const block_test_pointer) {
+void alloc_free_var_contiguous_onesize(SlabBlkAllocatorTest* const block_test_pointer) {
     const auto nthreads{
         std::clamp< uint32_t >(std::thread::hardware_concurrency(), 2, SISL_OPTIONS["num_threads"].as< uint32_t >())};
 
@@ -783,20 +750,20 @@ void alloc_free_var_contiguous_onesize(VarsizeBlkAllocatorTest* const block_test
 }
 }; // namespace
 
-TEST_F(VarsizeBlkAllocatorTest, alloc_free_var_contiguous_onesize_with_slabs) {
+TEST_F(SlabBlkAllocatorTest, alloc_free_var_contiguous_onesize_with_slabs) {
     // test with slabs
     create_allocator();
     alloc_free_var_contiguous_onesize(this);
 }
 #if 0
-TEST_F(VarsizeBlkAllocatorTest, alloc_free_var_contiguous_onesize_without_slabs) {
+TEST_F(SlabBlkAllocatorTest, alloc_free_var_contiguous_onesize_without_slabs) {
     // test with slabs
     create_allocator(false);
     alloc_free_var_contiguous_onesize(this);
 }
 #endif
 namespace {
-void alloc_free_var_scatter_unirandsize(VarsizeBlkAllocatorTest* const block_test_pointer) {
+void alloc_free_var_scatter_unirandsize(SlabBlkAllocatorTest* const block_test_pointer) {
     const auto nthreads{
         std::clamp< uint32_t >(std::thread::hardware_concurrency(), 2, SISL_OPTIONS["num_threads"].as< uint32_t >())};
     const uint8_t prealloc_pct{50};
@@ -829,14 +796,14 @@ void alloc_free_var_scatter_unirandsize(VarsizeBlkAllocatorTest* const block_tes
 }
 } // namespace
 
-TEST_F(VarsizeBlkAllocatorTest, alloc_free_var_scatter_unirandsize_with_slabs) {
+TEST_F(SlabBlkAllocatorTest, alloc_free_var_scatter_unirandsize_with_slabs) {
     // test with slabs
     create_allocator();
     alloc_free_var_scatter_unirandsize(this);
 }
 
 #if 0
-TEST_F(VarsizeBlkAllocatorTest, alloc_free_var_scatter_unirandsize_without_slabs) {
+TEST_F(SlabBlkAllocatorTest, alloc_free_var_scatter_unirandsize_without_slabs) {
     // test without slabs
     create_allocator(false);
     alloc_free_var_scatter_unirandsize(this);
@@ -844,7 +811,7 @@ TEST_F(VarsizeBlkAllocatorTest, alloc_free_var_scatter_unirandsize_without_slabs
 #endif
 
 namespace {
-void alloc_var_scatter_direct_unirandsize(VarsizeBlkAllocatorTest* const block_test_pointer) {
+void alloc_var_scatter_direct_unirandsize(SlabBlkAllocatorTest* const block_test_pointer) {
     LOGINFO("Step 1: Set the flip to force directly bypassing freeblk cache");
 #ifdef _PRERELEASE
     flip::FlipClient* const fc{iomgr_flip::client_instance()};
@@ -873,13 +840,13 @@ void alloc_var_scatter_direct_unirandsize(VarsizeBlkAllocatorTest* const block_t
 } // namespace
 
 #if 0
-TEST_F(VarsizeBlkAllocatorTest, alloc_var_scatter_direct_unirandsize_with_slabs) {
+TEST_F(SlabBlkAllocatorTest, alloc_var_scatter_direct_unirandsize_with_slabs) {
     // test with slabs
     create_allocator();
     alloc_var_scatter_direct_unirandsize(this);
 }
 
-TEST_F(VarsizeBlkAllocatorTest, alloc_var_scatter_direct_unirandsize_without_slabs) {
+TEST_F(SlabBlkAllocatorTest, alloc_var_scatter_direct_unirandsize_without_slabs) {
     // test without slabs
     create_allocator(false);
     alloc_var_scatter_direct_unirandsize(this);

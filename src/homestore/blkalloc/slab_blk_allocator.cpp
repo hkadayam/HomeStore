@@ -1,7 +1,6 @@
 /*********************************************************************************
  * Modifications Copyright 2017-2019 eBay Inc.
  *
- *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
@@ -13,861 +12,321 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
-#include <iostream>
-#include <iterator>
-#include <random>
-#include <thread>
+#include <algorithm>
+#include <optional>
 
 #include <fmt/format.h>
 #include <sisl/logging/logging.h>
 #include <sisl/fds/thread_factory.h>
-#include <iomgr/iomgr_flip.hpp>
+#include <urcu.h>
 
-#include "blk_cache_queue.h"
-
-#include "varsize_blk_allocator.h"
-
-template <>
-struct fmt::formatter< std::thread::id > {
-    constexpr auto parse(format_parse_context& ctx) -> format_parse_context::iterator { return ctx.begin(); }
-    auto format(std::thread::id const& i, format_context& ctx) const -> format_context::iterator {
-        return fmt::format_to(ctx.out(), "{}", std::hash< std::thread::id >{}(i));
-    }
-};
+#include "slab_blk_allocator.h"
 
 namespace homestore {
 
-// initialize static variables
-std::atomic< size_t > VarsizeBlkAllocator::s_sweeper_thread_references{0};
-std::vector< std::thread > VarsizeBlkAllocator::s_sweeper_threads;
-std::mutex VarsizeBlkAllocator::s_sweeper_mutex;
-std::mutex VarsizeBlkAllocator::s_sweeper_create_delete_mutex;
-std::atomic< bool > VarsizeBlkAllocator::s_sweeper_threads_stop{false};
-std::condition_variable VarsizeBlkAllocator::s_sweeper_cv;
-std::queue< VarsizeBlkAllocator* > VarsizeBlkAllocator::s_sweeper_queue;
-std::unordered_set< VarsizeBlkAllocator* > VarsizeBlkAllocator::s_block_allocators;
-
-VarsizeBlkAllocator::VarsizeBlkAllocator(VarsizeBlkAllocConfig const& cfg, bool is_fresh, chunk_num_t chunk_id) :
-        BitmapBlkAllocator{cfg, is_fresh, chunk_id},
-        m_state{BlkAllocatorState::INIT},
-        m_cfg{cfg},
-        m_rand_portion_num_generator{0, s_cast< blk_count_t >(get_num_portions() - 1)},
-        m_metrics{get_name().c_str()} {
-    BLKALLOC_LOG(INFO, "Creating VarsizeBlkAllocator with config: {}", cfg.to_string());
-
-    HS_REL_ASSERT_LT(get_num_portions(), INVALID_PORTION_NUM);
-
-    // TODO: Raise exception when blk_size > page_size or total blks is less than some number etc...
-    m_cache_bm = std::make_unique< sisl::Bitset >(get_total_blks(), chunk_id, get_align_size());
-
-    // NOTE: Number of blocks must be modulo word size so locks do not fall on same word
-    HS_REL_ASSERT_EQ(get_blks_per_portion() % m_cache_bm->word_size(), 0,
-                     "Blocks per portion must be multiple of bitmap word size.")
-
-    // Create segments with as many blk groups as configured.
-    m_blks_per_seg = get_total_blks() / cfg.m_nsegments;
-    m_segments.reserve(cfg.m_nsegments);
-    m_portions_per_seg = get_num_portions() / cfg.m_nsegments;
-
-    for (seg_num_t i{0U}; i < m_cfg.m_nsegments; ++i) {
-        const std::string seg_name = fmt::format("{}_seg_{}", get_name(), i);
-        auto seg = std::make_unique< BlkAllocSegment >(i, m_portions_per_seg, seg_name);
-        m_segments.push_back(std::move(seg));
-    }
-
-    // Create free blk Cache of type Queue
-    if (m_cfg.m_use_slabs) {
-        m_fb_cache = std::make_unique< FreeBlkCacheQueue >(cfg.get_slab_config(), &m_metrics);
-        LOGINFO("m_fb_cache total free blks: {}", m_fb_cache->total_free_blks());
-    }
-
-    if (is_fresh || !is_persistent()) { do_start(); }
-}
-
-VarsizeBlkAllocator::~VarsizeBlkAllocator() {
-    // remove from queue of
-    if (m_cfg.m_use_slabs) {
-        bool in_sweep_list{false};
-        {
-            std::unique_lock< std::mutex > lock{s_sweeper_mutex};
-            // remove this block allocator from list
-            if (s_block_allocators.erase(this) == 1) { in_sweep_list = true; }
-        }
-
-        if (in_sweep_list) {
-            {
-                // mark state as exiting
-                std::unique_lock< std::mutex > lock{m_mutex};
-                if (m_state != BlkAllocatorState::EXITING) {
-                    BLKALLOC_LOG(DEBUG, "Allocator state change from {} to {}", m_state, BlkAllocatorState::EXITING);
-                    m_state = BlkAllocatorState::EXITING;
-                }
-            }
-
-            {
-                // signal exiting state
-                std::unique_lock< std::mutex > lock{s_sweeper_mutex};
-
-                // emplace this block allocator on the sweeper queue
-                s_sweeper_queue.emplace(this);
-                s_sweeper_cv.notify_one();
-            }
-
-            {
-                // wait for done state
-                std::unique_lock< std::mutex > lock{m_mutex};
-                BLKALLOC_LOG(DEBUG, "Allocator waiting for {} state", BlkAllocatorState::DONE);
-                m_cv.wait(lock, [this]() { return m_state == BlkAllocatorState::DONE; });
-            }
-
-            {
-                std::unique_lock< std::mutex > create_delete_lock{s_sweeper_create_delete_mutex};
-                assert(s_sweeper_thread_references > 0);
-                if (--s_sweeper_thread_references == 0) {
-                    {
-                        std::unique_lock< std::mutex > lock{s_sweeper_mutex};
-                        assert(s_sweeper_queue.empty());
-                        assert(s_block_allocators.empty());
-                    }
-                    s_sweeper_threads_stop = true;
-                    s_sweeper_cv.notify_all();
-                    for (auto& sweeper_thread : s_sweeper_threads) {
-                        BLKALLOC_LOG(INFO, "Destroying new blk sweep thread, thread num = {}", sweeper_thread.get_id());
-                        if (sweeper_thread.joinable()) sweeper_thread.join();
-                    }
-                    s_sweeper_threads.clear();
-                }
+SlabBlkAllocator::SlabBlkAllocator(SlabBlkAllocConfig const& cfg, std::optional< sisl::ByteArray > buf,
+                                         chunk_num_t chunk_id) :
+        BlkAllocator{cfg, chunk_id},
+        cfg_{cfg},
+        seg_mgr_{cfg_.capacity_, cfg_.num_segments_, cfg_.blks_per_portion_,
+                 (cfg_.alloc_mode == AllocMode::CompactAlloc) ? cfg_.blks_per_portion_
+                                                              : cfg_.max_cache_blks_per_portion(),
+                 chunk_id},
+        metrics_{cfg_.unique_name_.c_str()} {
+    if (cfg_.alloc_mode == AllocMode::CompactAlloc) {
+        if (cfg_.persistent_) {
+            const bool is_recovery = buf.has_value();
+            ondisk_bm_ = std::make_unique< BitmapBlkAllocator >(cfg_, seg_mgr_, /*inject_slab_on_free=*/false,
+                                                                chunk_id, std::move(buf));
+            if (is_recovery) {
+                alloced_blk_count_.store(to_i64(ondisk_bm_->get_used_blks()), std::memory_order_relaxed);
             }
         }
-    }
-}
-
-void VarsizeBlkAllocator::sweeper_thread(size_t thread_num) {
-    const size_t num_sweeper_threads = HS_DYNAMIC_CONFIG(blkallocator.num_slab_sweeper_threads);
-
-    while (!s_sweeper_threads_stop) {
-        VarsizeBlkAllocator* allocator_ptr{nullptr};
-        {
-            std::unique_lock< std::mutex > lock{s_sweeper_mutex};
-            auto const woken{s_sweeper_cv.wait_for(
-                lock, std::chrono::milliseconds(HS_DYNAMIC_CONFIG(blkallocator.free_blk_cache_refill_frequency_ms)),
-                [&]() { return !s_sweeper_queue.empty() || s_sweeper_threads_stop; })};
-            if (s_sweeper_threads_stop) continue;
-            if (woken) {
-                // pull allocator to process
-                allocator_ptr = s_sweeper_queue.front();
-                s_sweeper_queue.pop();
-            }
-        }
-
-        if (allocator_ptr) {
-            bool requeue{false};
-            {
-                std::unique_lock< std::mutex > alloc_lock{allocator_ptr->m_mutex};
-                switch (allocator_ptr->m_state) {
-                case BlkAllocatorState::INIT:
-                    // fill the cache
-                    allocator_ptr->request_more_blks(nullptr, true /* fill_entire_cache */);
-                    allocator_ptr->m_state = BlkAllocatorState::WAITING;
-                    break;
-                case BlkAllocatorState::EXITING:
-                    allocator_ptr->m_state = BlkAllocatorState::DONE;
-                    allocator_ptr->m_cv.notify_one();
-                    break;
-                default:
-                    // process normally
-                    requeue = allocator_ptr->allocator_state_machine();
-                    break;
-                }
-            }
-
-            if (requeue) {
-                {
-                    std::unique_lock< std::mutex > lock{s_sweeper_mutex};
-                    s_sweeper_queue.emplace(allocator_ptr);
-                }
-                s_sweeper_cv.notify_one();
-            }
-        } else {
-            {
-                // timed out, so process all block allocators
-                std::unique_lock< std::mutex > lock{s_sweeper_mutex};
-                size_t pos = thread_num;
-                for (auto itr{std::cbegin(s_block_allocators)}; itr != std::cend(s_block_allocators); ++itr, ++pos) {
-                    if ((pos % num_sweeper_threads) == 0) { s_sweeper_queue.emplace(*itr); }
-                }
-            }
-            s_sweeper_cv.notify_all();
-        }
-    }
-}
-
-// returns true if state change, and must be called under external lock
-bool VarsizeBlkAllocator::allocator_state_machine() {
-    bool active_state{false};
-
-    switch (m_state) {
-    case BlkAllocatorState::WAITING:
-        BLKALLOC_LOG(TRACE, "Allocator is going to Waiting State");
-        active_state = prepare_sweep(nullptr, false /* fill_entire_cache */);
-        break;
-    case BlkAllocatorState::SWEEP_SCHEDULED:
-        BLKALLOC_LOG(TRACE, "Allocator state change from {} to {}", m_state, BlkAllocatorState::SWEEPING);
-        m_state = BlkAllocatorState::SWEEPING;
-        BLKALLOC_LOG(DEBUG, "Starting to sweep based on requirement {}", m_cur_fill_session->to_string());
-        fill_cache(m_sweep_segment, *m_cur_fill_session);
-        BLKALLOC_LOG(TRACE, "Allocator is going to Waiting State");
-        m_state = BlkAllocatorState::WAITING;
-        m_cv.notify_all();
-        BLKALLOC_LOG(DEBUG, "Sweep session completed with fill details {}", m_cur_fill_session->to_string());
-        break;
-    default:
-        break;
-    }
-
-    return active_state;
-}
-
-void VarsizeBlkAllocator::load() {
-    BLKALLOC_DBG_ASSERT_CMP(is_persistent(), ==, true, "Load called on non-persistent blk allocator");
-    m_cache_bm->copy(*get_disk_bitmap());
-
-    BLKALLOC_LOG(INFO, "VarSizeBlkAllocator initialized loading bitmap of size={} used blks={} from persistent storage",
-                 in_bytes(m_cache_bm->size()), get_alloced_blk_count());
-    do_start();
-}
-
-void VarsizeBlkAllocator::do_start() {
-    // if use slabs then add to sweeper threads queue
-    if (m_cfg.m_use_slabs) {
-        {
-            std::unique_lock< std::mutex > create_delete_lock{s_sweeper_create_delete_mutex};
-            if (s_sweeper_thread_references++ == 0) {
-                s_sweeper_threads_stop = false;
-                {
-                    for (size_t thread_num{0}; thread_num < HS_DYNAMIC_CONFIG(blkallocator.num_slab_sweeper_threads);
-                         ++thread_num) {
-                        s_sweeper_threads.emplace_back(sisl::named_thread("blkalloc_sweep" + std::to_string(thread_num),
-                                                                          VarsizeBlkAllocator::sweeper_thread,
-                                                                          thread_num));
-                        BLKALLOC_LOG(INFO, "Starting new blk sweep thread, thread num = {}",
-                                     s_sweeper_threads.back().get_id());
-                    }
-                }
-            }
-        }
-
-        {
-            std::unique_lock< std::mutex > lock{s_sweeper_mutex};
-            // add this to the list of allocators to sweep
-            s_block_allocators.emplace(this);
-
-            // emplace this block allocator on the sweeper queue
-            s_sweeper_queue.emplace(this);
-        }
-        s_sweeper_cv.notify_one();
-    }
-}
-
-// This runs on per region thread and is at present single threaded.
-/* we are going through the segments which has maximum free blks so that we can ensure that all slabs are populated.
- * We might need to find a efficient way of doing it later. It stop processing the segment when any slab greater
- * then slab_indx is full.
- */
-void VarsizeBlkAllocator::fill_cache(BlkAllocSegment* in_seg, blk_cache_fill_session& fill_session) {
-#ifdef _PRERELEASE
-    if (iomgr_flip::instance()->test_flip("varsize_blkalloc_bypass_cache")) {
-        m_fb_cache->close_cache_fill_session(fill_session);
+        load();
         return;
     }
-#endif
 
-    // Pick a segment if scan if not provided
-    BlkAllocSegment* seg = in_seg;
-    if (seg == nullptr) {
-        // For now we are picking segment[0], we need to find a way to track allocation per segment
-        seg = m_segments[0].get();
-#if 0
-        uint64_t max_blks{0};
-        for (uint32_t i{0}; i < m_segments.size(); ++i) {
-            if (m_segments[i]->get_free_blks() > max_blks) {
-                seg = m_segments[i];
-                max_blks = m_segments[i]->get_free_blks();
+    // ExpandedAlloc path
+    inmem_bm_ = std::make_unique< BitmapBlkAllocator >(cfg_, seg_mgr_, cfg_.use_slab_cache_, chunk_id);
+    if (cfg_.persistent_) {
+        const bool is_recovery = buf.has_value();
+        ondisk_bm_ = std::make_unique< BitmapBlkAllocator >(cfg_, seg_mgr_, /*inject_slab_on_free=*/false, chunk_id,
+                                                            std::move(buf));
+        if (is_recovery) {
+            alloced_blk_count_.store(to_i64(ondisk_bm_->get_used_blks()), std::memory_order_relaxed);
+            inmem_bm_->copy_from(*ondisk_bm_);
+            BLKALLOC_LOG(INFO, "loaded bitmap total_blks={} used_blks={}", num_blks_, get_used_blks());
+            recovering_ = new bool(true);
+        }
+    }
+
+    sweep_thread_ = sisl::named_thread("blkalloc_sweep_" + name_, [this]() { sweep_worker(); });
+    request_sweep();
+}
+
+SlabBlkAllocator::~SlabBlkAllocator() {
+    if (sweep_thread_.joinable()) {
+        {
+            std::unique_lock< std::mutex > lk{sweep_mutex_};
+            sweep_stop_ = true;
+            sweep_cv_.notify_all();
+        }
+        sweep_thread_.join();
+    }
+    // Clean up in case recovery_completed() was never called (e.g. error path).
+    delete recovering_;
+}
+
+// ---- CompactAlloc load ----
+
+void SlabBlkAllocator::load() {
+    if (cfg_.alloc_mode != AllocMode::CompactAlloc) { return; }
+
+    if (cfg_.persistent_) {
+        // Scan ondisk_bm_ to find which blocks are free, push only those into slab caches.
+        for (auto& seg : seg_mgr_.segments()) {
+            for (auto& p_ptr : seg.portions_) {
+                InmemPortion& portion = *p_ptr;
+                ondisk_bm_->scan_free_blks(portion, [&portion](BlkId const& bid) -> bool {
+                    portion.slab_cache_.free_blk(bid);
+                    return true; // keep scanning — entire portion fits in slab
+                });
+            }
+        }
+    } else {
+        // All blocks are free: place each block in the highest slab; break_up() splits on demand.
+        const blk_count_t max_slab_size = static_cast< blk_count_t >(1) << (SlabCache::NUM_SLABS - 1);
+        for (auto& seg : seg_mgr_.segments()) {
+            for (auto& p_ptr : seg.portions_) {
+                InmemPortion& portion = *p_ptr;
+                for (blk_num_t b = portion.start_blk_; b < portion.end_blk_; b += max_slab_size) {
+                    const blk_count_t count =
+                        static_cast< blk_count_t >(std::min< blk_num_t >(max_slab_size, portion.end_blk_ - b));
+                    portion.slab_cache_.free_blk(BlkId{b, count, chunk_id_});
+                }
+            }
+        }
+    }
+}
+
+// ---- sweep ----
+
+void SlabBlkAllocator::sweep_worker() {
+    while (true) {
+        {
+            std::unique_lock< std::mutex > lk{sweep_mutex_};
+            sweep_cv_.wait_for(
+                lk, std::chrono::milliseconds(HS_DYNAMIC_CONFIG(blkallocator.free_blk_cache_refill_frequency_ms)),
+                [this]() { return sweep_requested_ || sweep_stop_; });
+            if (sweep_stop_)
+                break;
+            sweep_requested_ = false;
+        }
+
+        if (!cfg_.use_slab_cache_) {
+            continue;
+        }
+
+        blk_num_t blks_added{0};
+        for (auto& seg : seg_mgr_.segments()) {
+            for (auto& p_ptr : seg.portions_) {
+                InmemPortion& portion = *p_ptr;
+                if (portion.slab_cache_.needs_refill()) {
+                    fill_cache_for_portion(portion);
+                    blks_added += portion.slab_cache_.total_cached_blks();
+                }
             }
         }
 
-        if (seg == nullptr) {
-            BLKALLOC_LOG(ERROR, "There are no more free blocks in bitset, everything is swept");
-            return;
+        {
+            std::unique_lock< std::mutex > lk{sweep_mutex_};
+            sweep_blks_added_ = blks_added;
+            sweep_cv_.notify_all();
         }
-#endif
     }
-
-    const blk_num_t start_portion_num = seg->get_seg_num() * m_portions_per_seg + seg->get_clock_hand();
-    auto portion_num = start_portion_num;
-
-    do {
-        BLKALLOC_LOG_ASSERT_CMP(portion_num, <, get_num_portions());
-        fill_cache_in_portion(portion_num, fill_session);
-
-        // We have fully satisifed this session requirements
-        if (fill_session.overall_refill_done) { break; }
-
-        // Goto next group within the segment.
-        seg->inc_clock_hand();
-        portion_num = seg->get_clock_hand();
-    } while (portion_num != start_portion_num);
-
-    if (fill_session.overall_refilled_num_blks) {
-        BLKALLOC_LOG(DEBUG, "Allocator sweep session={} added {} blks to blk cache", fill_session.session_id,
-                     fill_session.overall_refilled_num_blks);
-    } else {
-        BLKALLOC_LOG(DEBUG, "Allocator sweep session={} failed to add any blocks to blk cache",
-                     fill_session.session_id);
-    }
-    m_fb_cache->close_cache_fill_session(fill_session);
 }
 
-void VarsizeBlkAllocator::fill_cache_in_portion(blk_num_t portion_num, blk_cache_fill_session& fill_session) {
-    auto cur_blk_id = portion_num * get_blks_per_portion();
-    auto const end_blk_id = cur_blk_id + get_blks_per_portion() - 1;
+// Uses BitmapBlkAllocator::scan_free_blks() which acquires the portion lock internally,
+// scans inmem_bm_ for free bits, marks them as in-cache, and calls the producer lambda
+// to inject each range into the slab cache.
+void SlabBlkAllocator::fill_cache_for_portion(InmemPortion& portion) {
+    inmem_bm_->scan_free_blks(portion, [&portion](BlkId const& bid) -> bool {
+        portion.slab_cache_.free_blk(bid);
+        return !portion.slab_cache_.is_full();
+    });
+}
 
-    blk_cache_fill_req fill_req;
-    fill_req.preferred_level = 1;
-
-    BLKALLOC_LOG(TRACE, "Allocator sweep session={} for portion_num={} sweep blk_id_range=[{}-{}]",
-                 fill_session.session_id, portion_num, cur_blk_id, end_blk_id);
-
-    BlkAllocPortion& portion = get_blk_portion(portion_num);
+void SlabBlkAllocator::request_sweep(blk_count_t wait_for_blks) {
     {
-        auto lock{portion.portion_auto_lock()};
-        while (!fill_session.overall_refill_done && (cur_blk_id <= end_blk_id)) {
-            // Get next reset bits and insert to cache and then reset those bits
-            auto const b{
-                m_cache_bm->get_next_contiguous_n_reset_bits(cur_blk_id, end_blk_id, 1, end_blk_id - cur_blk_id + 1)};
+        std::unique_lock< std::mutex > lk{sweep_mutex_};
+        sweep_requested_ = true;
+        sweep_cv_.notify_all();
+    }
+    if (wait_for_blks > 0) {
+        std::unique_lock< std::mutex > lk{sweep_mutex_};
+        sweep_cv_.wait(lk, [&]() { return sweep_blks_added_ >= wait_for_blks || !sweep_requested_ || sweep_stop_; });
+    }
+}
 
-            // If there are no free blocks within the assigned portion
-            if (b.nbits == 0) { break; }
+// ---- alloc ----
 
-            HS_DBG_ASSERT_GE(end_blk_id, b.start_bit, "Expected start bit to be smaller than portion end bit");
-            HS_DBG_ASSERT_GE(end_blk_id, (b.start_bit + b.nbits - 1),
-                             "Expected end bit to be smaller than portion end bit");
-            HISTOGRAM_OBSERVE(m_metrics, frag_pct_distribution, 100 / (static_cast< double >(b.nbits)));
+BlkAllocStatus SlabBlkAllocator::alloc_contiguous(BlkId& out_blkid) {
+    blk_alloc_hints hints;
+    hints.is_contiguous = true;
+    return alloc(1, hints, out_blkid);
+}
 
-            // Fill the blk cache and keep accounting of number of blks added
-            fill_req.start_blk_num = b.start_bit;
-            fill_req.nblks = b.nbits;
-            fill_req.preferred_level = portion.temperature();
-            auto const nblks_added = m_fb_cache->try_fill_cache(fill_req, fill_session);
+BlkAllocStatus SlabBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const& hints, BlkId& out_blkid) {
+    COUNTER_INCREMENT(metrics_, num_alloc, 1);
 
-            HS_DBG_ASSERT_LE(nblks_added, b.nbits);
+    MultiBlkId& mout = r_cast< MultiBlkId& >(out_blkid);
+    mout = MultiBlkId{};
 
-            BLKALLOC_LOG(DEBUG, "Sweep session={} portion_num={}, setting bit={} nblks={} set_bits_count={}",
-                         fill_session.session_id, portion_num, b.start_bit, nblks_added, get_alloced_blk_count());
-
-            // Set the bitmap indicating the blocks are allocated
-            if (nblks_added > 0) { m_cache_bm->set_bits(b.start_bit, nblks_added); }
-            cur_blk_id = b.start_bit + b.nbits;
+    // CompactAlloc: slab is the only allocator — no bitmap fallback.
+    if (cfg_.alloc_mode == AllocMode::CompactAlloc) {
+        SegmentManager::Segment& seg = seg_mgr_.select_segment(hints);
+        InmemPortion& portion = seg_mgr_.next_alloc_portion(seg);
+        const BlkAllocStatus status = portion.slab_cache_.try_alloc(nblks, hints.is_contiguous, mout);
+        if (status == BlkAllocStatus::SUCCESS) {
+            alloced_blk_count_.fetch_add(nblks, std::memory_order_relaxed);
+        } else {
+            COUNTER_INCREMENT(metrics_, num_alloc_failure, 1);
         }
-    }
-    if (fill_session.need_notify()) {
-        // If we have filled enough to satisfy notification, do so
-        fill_session.set_urgent_satisfied();
-        m_cv.notify_all();
+        return status;
     }
 
-    BLKALLOC_LOG(TRACE, "Allocator Portion num={} sweep session={} completed, so far added {} blks",
-                 fill_session.session_id, portion_num, fill_session.overall_refilled_num_blks);
-}
+    // ExpandedAlloc path
+    if (cfg_.use_slab_cache_) {
+        // Step 1: try the slab cache of the selected portion.
+        SegmentManager::Segment& seg = seg_mgr_.select_segment(hints);
+        InmemPortion& portion = seg_mgr_.next_alloc_portion(seg);
 
-BlkAllocStatus VarsizeBlkAllocator::alloc_contiguous(BlkId& out_blkid) {
-    return alloc_contiguous(1, blk_alloc_hints{}, out_blkid);
-}
+        BlkAllocStatus status = portion.slab_cache_.try_alloc(nblks, hints.is_contiguous, mout);
 
-BlkAllocStatus VarsizeBlkAllocator::alloc_contiguous(blk_count_t nblks, blk_alloc_hints const& hints,
-                                                     BlkId& out_blkid) {
-    MultiBlkId mbid;
-    auto const status = alloc(nblks, hints, mbid);
-    if (status == BlkAllocStatus::SUCCESS) { out_blkid = mbid; }
-    return status;
-}
-
-BlkAllocStatus VarsizeBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const& hints, BlkId& out_blkid) {
-    bool use_slabs = m_cfg.m_use_slabs;
-
-#ifdef _PRERELEASE
-    if (iomgr_flip::instance()->test_flip("varsize_blkalloc_no_blks", nblks)) { return BlkAllocStatus::SPACE_FULL; }
-    if (iomgr_flip::instance()->test_flip("varsize_blkalloc_bypass_cache")) { use_slabs = false; }
-#endif
-
-    if (!hints.is_contiguous && !out_blkid.is_multi()) {
-        HS_DBG_ASSERT(false, "Invalid Input: Non contiguous allocation needs MultiBlkId to store");
-        return BlkAllocStatus::INVALID_INPUT;
-    }
-
-    MultiBlkId tmp_blkid;
-    MultiBlkId& out_mbid = out_blkid.is_multi() ? r_cast< MultiBlkId& >(out_blkid) : tmp_blkid;
-    BlkAllocStatus status;
-    blk_count_t num_allocated{0};
-    blk_count_t nblks_remain;
-
-    if (use_slabs && (nblks <= m_cfg.highest_slab_blks_count())) {
-        num_allocated = alloc_blks_slab(nblks, hints, out_mbid);
-        if (num_allocated >= nblks) {
-            status = BlkAllocStatus::SUCCESS;
-            goto out;
-        }
-        // Fall through to alloc_blks_direct
-    }
-
-    nblks_remain = nblks - num_allocated;
-    num_allocated += alloc_blks_direct(nblks_remain, hints, out_mbid);
-    if (num_allocated == nblks) {
-        status = BlkAllocStatus::SUCCESS;
-        BLKALLOC_LOG(TRACE, "Alloced blks [{}] directly", out_mbid.to_string());
-    } else if ((num_allocated != 0) && hints.partial_alloc_ok) {
-        status = BlkAllocStatus::PARTIAL;
-    } else {
-        free_blks_direct(out_mbid);
-        status = hints.is_contiguous ? BlkAllocStatus::FAILED : BlkAllocStatus::SPACE_FULL;
-    }
-
-out:
-    if ((status == BlkAllocStatus::SUCCESS) || (status == BlkAllocStatus::PARTIAL)) {
-        incr_alloced_blk_count(num_allocated);
-
-#ifdef _PRERELEASE
-        alloc_sanity_check(num_allocated, hints, out_mbid);
-#endif
-    }
-
-    if (!out_blkid.is_multi()) { out_blkid = out_mbid.to_single_blkid(); }
-    return status;
-}
-
-BlkAllocStatus VarsizeBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const& hints,
-                                          std::vector< BlkId >& out_blkids) {
-    // Regular alloc blks will allocate in MultiBlkId, but there is an upper limit on how many it can accomodate in a
-    // single MultiBlkId, if caller is ok to generate multiple MultiBlkids, this method is called.
-    auto h = hints;
-    h.partial_alloc_ok = true;
-    blk_count_t nblks_remain = nblks;
-    BlkAllocStatus status;
-
-    do {
-        MultiBlkId mbid;
-        status = alloc(nblks_remain, h, mbid);
-        if ((status != BlkAllocStatus::SUCCESS) && (status != BlkAllocStatus::PARTIAL)) { break; }
-
-        blk_count_t nblks_this_iter{0};
-        auto it = mbid.iterate();
-        while (auto const bid = it.next()) {
-            out_blkids.push_back(*bid);
-            nblks_this_iter += bid->blk_count();
+        // Step 2: on cache miss, fill the cache inline and retry once.
+        if (status != BlkAllocStatus::SUCCESS) {
+            COUNTER_INCREMENT(metrics_, num_retries, 1);
+            fill_cache_for_portion(portion);
+            status = portion.slab_cache_.try_alloc(nblks, hints.is_contiguous, mout);
         }
 
         if (status == BlkAllocStatus::SUCCESS) {
-            HS_DBG_ASSERT_GE(nblks_this_iter, nblks_remain,
-                             "alloc_blks returned success, but return id doesn't have reqd blks");
-            break;
+            if (portion.slab_cache_.needs_refill()) {
+                request_sweep();
+            }
+            alloced_blk_count_.fetch_add(nblks, std::memory_order_relaxed);
+            return BlkAllocStatus::SUCCESS;
         }
+    }
 
-        if (nblks_this_iter >= nblks_remain) {
-            HS_DBG_ASSERT(false, "alloc_blks returns partial, while it has fully allocated reqd blks");
-            status = BlkAllocStatus::SUCCESS;
-            break;
+    // Direct bitmap scan across all portions via inmem_bm_->alloc().
+    COUNTER_INCREMENT(metrics_, num_blks_alloc_direct, 1);
+    const BlkAllocStatus status = inmem_bm_->alloc(nblks, hints, out_blkid);
+
+    if (status == BlkAllocStatus::SUCCESS || status == BlkAllocStatus::PARTIAL) {
+        blk_count_t got{0};
+        auto it = mout.iterate();
+        while (auto const b = it.next()) {
+            got += b->blk_count();
         }
-        nblks_remain -= nblks_this_iter;
-    } while (nblks_remain);
+        alloced_blk_count_.fetch_add(got, std::memory_order_relaxed);
+    } else {
+        COUNTER_INCREMENT(metrics_, num_alloc_failure, 1);
+    }
 
     return status;
 }
 
-blk_count_t VarsizeBlkAllocator::alloc_blks_slab(blk_count_t nblks, blk_alloc_hints const& hints,
-                                                 MultiBlkId& out_blkid) {
-    blk_count_t num_allocated{0};
+// ---- free ----
 
-    // Allocate from blk cache
-    static thread_local blk_cache_alloc_resp s_alloc_resp;
-    const blk_cache_alloc_req alloc_req{nblks, hints.desired_temp, hints.is_contiguous,
-                                        FreeBlkCache::find_slab(hints.min_blks_per_piece),
-                                        s_cast< slab_idx_t >(m_cfg.get_slab_cnt() - 1)};
-    COUNTER_INCREMENT(m_metrics, num_alloc, 1);
-
-    auto free_excess_blocks = [this]() {
-        // put excess blocks back on bitmap
-        for (auto const& e : s_alloc_resp.excess_blks) {
-            BLKALLOC_LOG(DEBUG, "Freeing in bitmap of entry={} - excess of alloc_blks size={}", e.to_string(),
-                         s_alloc_resp.excess_blks.size());
-            free_blks_direct(MultiBlkId{blk_cache_entry_to_blkid(e)});
-        }
-    };
-
-    auto discard_current_allocation = [this, &free_excess_blocks]() {
-        if (!s_alloc_resp.out_blks.empty()) {
-            s_alloc_resp.nblks_zombied = m_fb_cache->try_free_blks(s_alloc_resp.out_blks, s_alloc_resp.excess_blks);
-        }
-        free_excess_blocks();
-        s_alloc_resp.reset();
-    };
-
-    s_alloc_resp.reset();
-    // retries must be at least two to allow slab refill logic to run
-    const uint32_t max_retries = std::max< uint32_t >(HS_DYNAMIC_CONFIG(blkallocator.max_varsize_blk_alloc_attempt), 2);
-    for (uint32_t retry{0}; ((retry < max_retries) && out_blkid.has_room()); ++retry) {
-        auto status = m_fb_cache->try_alloc_blks(alloc_req, s_alloc_resp);
-
-        // If the blk allocation is only partially completed, then we are ok in proceeding further for cases where
-        // caller does not want a contiguous allocation. In that case, return these partial results and then caller will
-        // use direct allocation to allocate remaining blks. In case where caller is also ok with partial allocation,
-        // then it doesn't matter if request is for contiguous allocation or not, we can return the partial results.
-        if ((status == BlkAllocStatus::SUCCESS) ||
-            ((status == BlkAllocStatus::PARTIAL) && (hints.partial_alloc_ok || !hints.is_contiguous))) {
-            // If the cache has depleted a bit, kick of sweep thread to fill the cache.
-            if (s_alloc_resp.need_refill) { request_more_blks(nullptr, false /* fill_entire_cache */); }
-            BLKALLOC_LOG(TRACE, "Alloced first blk_num={}", s_alloc_resp.out_blks[0].to_string());
-
-            // Convert the response block cache entries to blkids
-            for (size_t piece{0}; piece < s_alloc_resp.out_blks.size(); ++piece) {
-                auto& e = s_alloc_resp.out_blks[piece];
-                if (out_blkid.has_room()) {
-                    out_blkid.add(e.get_blk_num(), e.blk_count(), m_chunk_id);
-                    num_allocated += e.blk_count();
-                } else {
-                    // We are not able to put all of the response to out_blkid, because it doesn't have room,
-                    // If caller is ok with partial allocation, we can free remaining entry and send partial result.
-                    // If caller is not ok with partial allocation, we should discard entire allocation and retry
-                    if (hints.partial_alloc_ok) {
-                        s_alloc_resp.excess_blks.insert(s_alloc_resp.excess_blks.end(),
-                                                        s_alloc_resp.out_blks.begin() + piece,
-                                                        s_alloc_resp.out_blks.end());
-                    } else {
-                        num_allocated = 0;
-                        out_blkid = MultiBlkId{};
-                        status = BlkAllocStatus::TOO_MANY_PIECES;
-                    }
-                    break;
-                }
-            }
-
-            if (status != BlkAllocStatus::TOO_MANY_PIECES) { break; }
-        }
-
-        discard_current_allocation();
-        if ((retry + 1) < max_retries) {
-            COUNTER_INCREMENT(m_metrics, num_retries, 1);
-            auto const min_nblks = std::max< blk_count_t >(m_cfg.highest_slab_blks_count() * 2, nblks);
-            BLKALLOC_LOG(DEBUG,
-                         "Failed to allocate {} blks from blk cache, requesting refill at least {} blks "
-                         "and retry={}",
-                         nblks, min_nblks, retry);
-            request_more_blks_wait(nullptr /* seg */, min_nblks);
-        }
+void SlabBlkAllocator::free(BlkId const& bid) {
+    if (cfg_.alloc_mode == AllocMode::CompactAlloc) {
+        // CompactAlloc: free directly into slab; update ondisk_bm_ if persistent.
+        auto& portion = seg_mgr_.blkid_to_portion(bid.blk_num());
+        portion.slab_cache_.free_blk(bid);
+    } else {
+        // ExpandedAlloc: inmem_bm_->free() resets bits and injects into slab (inject_slab_on_free=true).
+        inmem_bm_->free(bid);
     }
 
-    free_excess_blocks();
-
-    return num_allocated;
-}
-
-blk_count_t VarsizeBlkAllocator::alloc_blks_direct(blk_count_t nblks, blk_alloc_hints const& hints,
-                                                   MultiBlkId& out_blkid) {
-    // Search all segments starting with some random portion num within each segment
-    static thread_local std::random_device rd{};
-    static thread_local std::default_random_engine re{rd()};
-
-    if (m_start_portion_num == INVALID_PORTION_NUM) { m_start_portion_num = m_rand_portion_num_generator(re); }
-
-    auto portion_num = m_start_portion_num;
-    // save m_start_portion_num to local variable as m_start_portion_num can be changed by other threads.
-    auto start_portion_num = m_start_portion_num;
-    auto const max_pieces = hints.is_contiguous ? 1u : MultiBlkId::max_pieces;
-
-    blk_count_t const min_blks = hints.is_contiguous ? nblks : std::min< blk_count_t >(nblks, hints.min_blks_per_piece);
-    blk_count_t nblks_remain = nblks;
-    do {
-        BlkAllocPortion& portion = get_blk_portion(portion_num);
-        auto cur_blk_id = portion_num * get_blks_per_portion();
-        auto const end_blk_id = cur_blk_id + get_blks_per_portion() - 1;
-        {
-            auto lock{portion.portion_auto_lock()};
-            while (nblks_remain && (cur_blk_id <= end_blk_id) && out_blkid.has_room()) {
-                // Get next reset bits and insert to cache and then reset those bits
-                auto const b = m_cache_bm->get_next_contiguous_n_reset_bits(
-                    cur_blk_id, end_blk_id, std::min(min_blks, nblks_remain), nblks_remain);
-                if (b.nbits == 0) { break; }
-                HS_DBG_ASSERT_GE(end_blk_id, b.start_bit, "Expected start bit to be smaller than end bit");
-                HS_DBG_ASSERT_LE(b.nbits, nblks_remain);
-                HS_DBG_ASSERT_GE(b.nbits, std::min(min_blks, nblks_remain));
-                HS_DBG_ASSERT_GE(end_blk_id, (b.start_bit + b.nbits - 1),
-                                 "Expected end bit to be smaller than portion end bit");
-
-                nblks_remain -= b.nbits;
-                out_blkid.add(b.start_bit, b.nbits, m_chunk_id);
-
-                BLKALLOC_LOG(DEBUG, "Allocated directly from portion={} nnblks={} Blk_num={} nblks={} set_bit_count={}",
-                             portion_num, nblks, b.start_bit, b.nbits, get_alloced_blk_count());
-
-                // Set the bitmap indicating the blocks are allocated
-                m_cache_bm->set_bits(b.start_bit, b.nbits);
-                cur_blk_id = b.start_bit + b.nbits;
-            }
-        }
-        if (nblks_remain) {
-            auto curr_portion = portion_num;
-            if (++portion_num == get_num_portions()) { portion_num = 0; }
-            BLKALLOC_LOG(
-                TRACE, "alloc direct unable to find in curr portion {}, will searching in portion={}, start_portion={},continue={}, out_blkid num_pieces={} , max_pieces={}",
-                curr_portion, portion_num, start_portion_num, hints.is_contiguous, out_blkid.num_pieces(), max_pieces);
-        }
-    } while (nblks_remain && (portion_num != start_portion_num) && (out_blkid.num_pieces() < max_pieces));
-
-    // save which portion we were at for next allocation;
-    m_start_portion_num = portion_num;
-
-    COUNTER_INCREMENT(m_metrics, num_blks_alloc_direct, 1);
-    return (nblks - nblks_remain);
-}
-
-// since this function will only be called during HS recovery, we can safe to update the cache bitmap directly without
-// touching the slab caches.
-BlkAllocStatus VarsizeBlkAllocator::reserve_on_cache(BlkId const& bid) {
-    BlkAllocPortion& portion = blknum_to_portion(bid.blk_num());
-    {
-        auto lock{portion.portion_auto_lock()};
-#ifndef NDEBUG
-        auto const start_blk_id = portion.get_portion_num() * get_blks_per_portion();
-        auto const end_blk_id = start_blk_id + get_blks_per_portion() - 1;
-        HS_DBG_ASSERT_LE(start_blk_id, bid.blk_num(), "Expected start bit to be greater than portion start bit");
-        HS_DBG_ASSERT_GE(end_blk_id, (bid.blk_num() + bid.blk_count() - 1),
-                         "Expected end bit to be smaller than portion end bit");
-#endif
-        m_cache_bm->set_bits(bid.blk_num(), bid.blk_count());
-        incr_alloced_blk_count(bid.blk_count());
+    if (ondisk_bm_) {
+        ondisk_bm_->free(bid);
     }
-    BLKALLOC_LOG(TRACE, "mark blk alloced directly to portion={} blkid={} set_bits_count={}",
-                 blknum_to_portion_num(bid.blk_num()), bid.to_string(), get_alloced_blk_count());
-    return BlkAllocStatus::SUCCESS;
-}
 
-void VarsizeBlkAllocator::free(BlkId const& bid) {
-    blk_count_t n_freed = (m_cfg.m_use_slabs && (bid.blk_count() <= m_cfg.highest_slab_blks_count()))
-        ? free_blks_slab(r_cast< MultiBlkId const& >(bid))
-        : free_blks_direct(r_cast< MultiBlkId const& >(bid));
-
-    if (is_persistent()) { free_on_disk(bid); }
-    decr_alloced_blk_count(n_freed);
-    BLKALLOC_LOG(TRACE, "Freed blk_num={}", bid.to_string());
-}
-
-blk_count_t VarsizeBlkAllocator::free_blks_slab(MultiBlkId const& bid) {
-    static thread_local std::vector< blk_cache_entry > excess_blks;
-    excess_blks.clear();
-
-    auto const do_free = [this](BlkId const& b) {
-        m_fb_cache->try_free_blks(blkid_to_blk_cache_entry(b, 2), excess_blks);
-        return b.blk_count();
-    };
-
-    blk_count_t n_freed{0};
+    blk_count_t total{0};
     if (bid.is_multi()) {
-        auto it = bid.iterate();
+        auto it = r_cast< MultiBlkId const& >(bid).iterate();
         while (auto const b = it.next()) {
-            n_freed += do_free(*b);
+            total += b->blk_count();
         }
     } else {
-        n_freed += do_free(bid);
+        total = bid.blk_count();
     }
-
-    for (auto const& e : excess_blks) {
-        BLKALLOC_LOG(TRACE, "Freeing in bitmap of entry={} - excess of free_blks size={}", e.to_string(),
-                     excess_blks.size());
-        free_blks_direct(MultiBlkId{blk_cache_entry_to_blkid(e)});
-    }
-    return n_freed;
+    alloced_blk_count_.fetch_sub(total, std::memory_order_relaxed);
 }
 
-blk_count_t VarsizeBlkAllocator::free_blks_direct(MultiBlkId const& bid) {
-    auto const do_free = [this](BlkId const& b) {
-        BlkAllocPortion& portion = blknum_to_portion(b.blk_num());
-        {
-            auto const start_blk_id = portion.get_portion_num() * get_blks_per_portion();
-            auto const end_blk_id = start_blk_id + get_blks_per_portion() - 1;
-            auto lock{portion.portion_auto_lock()};
-            HS_DBG_ASSERT_LE(start_blk_id, b.blk_num(), "Expected start bit to be greater than portion start bit");
-            HS_DBG_ASSERT_GE(end_blk_id, (b.blk_num() + b.blk_count() - 1),
-                             "Expected end bit to be smaller than portion end bit");
-            BLKALLOC_REL_ASSERT(m_cache_bm->is_bits_set(b.blk_num(), b.blk_count()), "Expected bits to be set");
-            m_cache_bm->reset_bits(b.blk_num(), b.blk_count());
-        }
-        BLKALLOC_LOG(TRACE, "Freeing directly to portion={} blkid={} set_bits_count={}",
-                     blknum_to_portion_num(b.blk_num()), b.to_string(), get_alloced_blk_count());
-        return b.blk_count();
-    };
+// ---- commit / persist / recovery ----
 
-    blk_count_t n_freed{0};
-    if (bid.is_multi()) {
-        auto it = bid.iterate();
-        while (auto const b = it.next()) {
-            n_freed += do_free(*b);
-        }
-    } else {
-        n_freed += do_free(bid);
-    }
-    return n_freed;
-}
-
-bool VarsizeBlkAllocator::is_blk_alloced(BlkId const& bid, bool use_lock) const {
-    auto check_bits_set = [this](BlkId const& b, bool use_lock) {
-        if (use_lock) {
-            BlkAllocPortion const& portion = blknum_to_portion_const(b.blk_num());
-            auto lock{portion.portion_auto_lock()};
-            return m_cache_bm->is_bits_set(b.blk_num(), b.blk_count());
+BlkAllocStatus SlabBlkAllocator::commit(BlkId const& bid) {
+    if (inmem_bm_) {
+        rcu_read_lock();
+        const bool is_recovering = (rcu_dereference(recovering_) != nullptr);
+        if (is_recovering) {
+            inmem_bm_->commit(bid); // Journal replay during recovery: mark block in both bitmaps.
         } else {
-            return m_cache_bm->is_bits_set(b.blk_num(), b.blk_count());
+            BLKALLOC_DBG_ASSERT(inmem_bm_->is_blk_alloced(bid, true),
+                                "commit() called on bid not already set in inmem_bm");
         }
-    };
-
-    bool ret;
-    if (bid.is_multi()) {
-        auto& mbid = r_cast< MultiBlkId const& >(bid);
-        auto it = mbid.iterate();
-        while (auto const b = it.next()) {
-            ret = check_bits_set(*b, use_lock);
-            if (!ret) { break; }
-        }
-    } else {
-        ret = check_bits_set(bid, use_lock);
+        rcu_read_unlock();
     }
-    return ret;
+    return (ondisk_bm_) ? ondisk_bm_->commit(bid) : BlkAllocStatus::SUCCESS;
 }
 
-blk_num_t VarsizeBlkAllocator::available_blks() const { return get_total_blks() - get_used_blks(); }
-
-blk_num_t VarsizeBlkAllocator::get_defrag_nblks() const {
-    // TODO: implement this
-    BLKALLOC_REL_ASSERT(false, "VarsizeBlkAllocator get_defrag_nblks Not implemented")
-    return 0;
-}
-
-blk_num_t VarsizeBlkAllocator::get_used_blks() const { return get_alloced_blk_count(); }
-
-#ifdef _PRERELEASE
-void VarsizeBlkAllocator::alloc_sanity_check(blk_count_t nblks, blk_alloc_hints const& hints,
-                                             MultiBlkId const& out_blkid) const {
-    if (HS_DYNAMIC_CONFIG(generic.sanity_check_level)) {
-        blk_count_t alloced_nblks{0};
-        auto it = out_blkid.iterate();
-        while (auto const b = it.next()) {
-            BlkAllocPortion const& portion = blknum_to_portion_const(b->blk_num());
-            auto lock{portion.portion_auto_lock()};
-
-            BLKALLOC_REL_ASSERT(m_cache_bm->is_bits_set(b->blk_num(), b->blk_count()),
-                                "Expected blkid={} to be already set in cache bitmap", b->to_string());
-            if (is_persistent()) {
-                BLKALLOC_REL_ASSERT(!is_blk_alloced_on_disk(*b), "Expected blkid={} to be already free in disk bitmap",
-                                    b->to_string());
-            }
-            alloced_nblks += b->blk_count();
-        }
-        BLKALLOC_REL_ASSERT((nblks == alloced_nblks), "Requested blks={} alloced_blks={} num_pieces={}", nblks,
-                            alloced_nblks, out_blkid.num_pieces());
-        BLKALLOC_REL_ASSERT((!hints.is_contiguous || (out_blkid.num_pieces() == 1)),
-                            "Multiple blkids allocated for contiguous request");
+BlkAllocator::BufferGuard SlabBlkAllocator::acquire_buffer() {
+    if (!ondisk_bm_) {
+        return make_buffer_guard({}, []() {});
     }
-}
-#endif
-
-/**
- * @brief Request more blocks to be filled into cache from optionally a specified segment. This method can be run on
- * any thread and concurrently.
- *
- * @param seg [OPTIONAL] If seg is nullptr, then it picks the 1st segment to allocate from.
- * @param fill_entire_cache Should entire blk cache be filled or we need to fill upto the limit requested
- *
- * This function must be called under a lock acquired externally for m_mutex
- */
-void VarsizeBlkAllocator::request_more_blks(BlkAllocSegment* seg, bool fill_entire_cache) {
-    if (m_state == BlkAllocatorState::WAITING) {
-        if (prepare_sweep(seg, fill_entire_cache)) {
-            {
-                std::unique_lock< std::mutex > lock{s_sweeper_mutex};
-                s_sweeper_queue.emplace(this);
-            }
-            s_sweeper_cv.notify_one();
-        }
-        m_cv.notify_all();
-        BLKALLOC_LOG(DEBUG, "Allocator is requested to refill blk cache and move to {} state", m_state);
-    } else {
-        BLKALLOC_LOG(TRACE, "Allocator is requested to refill blk cache but it is in {} state, ignoring this request",
-                     m_state);
-    }
+    return ondisk_bm_->acquire_buffer();
 }
 
-void VarsizeBlkAllocator::request_more_blks_wait(BlkAllocSegment* seg, blk_count_t wait_for_blks_count) {
-    std::unique_lock< std::mutex > lock{m_mutex};
-    request_more_blks(seg, false);
-
-    if ((m_state == BlkAllocatorState::SWEEP_SCHEDULED) || (m_state == BlkAllocatorState::SWEEPING)) {
-        // Wait for notification that it is either done sweeping or if it is sweeping it satisfies the requirement
-        // to wait for blks
-        m_cur_fill_session->urgent_need_atleast(wait_for_blks_count);
-        m_cv.wait(lock, [this]() {
-            return (((m_state != BlkAllocatorState::SWEEPING) && (m_state != BlkAllocatorState::SWEEP_SCHEDULED)) ||
-                    (!m_cur_fill_session->is_urgent_req_pending()));
-        });
-        BLKALLOC_LOG(DEBUG, "Refill session={} refilled {} blks overall and atleast {} blks since waiting",
-                     m_cur_fill_session->session_id, m_cur_fill_session->overall_refilled_num_blks,
-                     wait_for_blks_count);
-    } else {
-        BLKALLOC_LOG(DEBUG,
-                     "Allocator is requested to refill blk cache but it is in {} state, so ignoring this request",
-                     m_state);
-    }
+void SlabBlkAllocator::recovery_completed() {
+    bool* old = rcu_xchg_pointer(&recovering_, nullptr);
+    synchronize_rcu();
+    delete old;
 }
 
-/* This method assumes that mutex to protect state is already taken. */
-bool VarsizeBlkAllocator::prepare_sweep(BlkAllocSegment* seg, bool fill_entire_cache) {
-    m_sweep_segment = seg;
-    m_cur_fill_session = m_fb_cache->create_cache_fill_session(fill_entire_cache);
-    if (!(m_cur_fill_session->slab_requirements.empty())) {
-        m_state = BlkAllocatorState::SWEEP_SCHEDULED;
+// ---- query ----
+
+bool SlabBlkAllocator::is_blk_alloced(BlkId const& b, bool use_lock) const {
+    if (inmem_bm_) { return inmem_bm_->is_blk_alloced(b, use_lock); }
+    return ondisk_bm_ ? ondisk_bm_->is_blk_alloced(b, use_lock) : true;
+}
+
+bool SlabBlkAllocator::is_blk_alloced_on_disk(BlkId const& b, bool use_lock) const {
+    if (!ondisk_bm_) {
         return true;
-    } else {
-        BLKALLOC_LOG(TRACE, "no slabs need filling");
-        return false;
     }
+    return ondisk_bm_->is_blk_alloced(b, use_lock);
 }
 
-#if 0
-blk_num_t VarsizeBlkAllocator::blk_cache_entries_to_blkids(const std::vector< blk_cache_entry >& entries,
-                                                           MultiBlkId& out_blkid) {
-    uint32_t num_added{0};
-    for (auto const& e : entries) {
-        if (out_blkid.has_room()) {
-            out_blkid.add(e.get_blk_num(), e.blk_count(), m_chunk_id);
-            ++num_added;
-        } else {
-            break;
-        }
-    }
-
-    return num_added;
-}
-#endif
-
-BlkId VarsizeBlkAllocator::blk_cache_entry_to_blkid(blk_cache_entry const& e) {
-    return BlkId{e.get_blk_num(), e.blk_count(), m_chunk_id};
+blk_num_t SlabBlkAllocator::available_blks() const {
+    const auto used = alloced_blk_count_.load(std::memory_order_acquire);
+    return (used >= 0 && static_cast< blk_num_t >(used) <= num_blks_) ? (num_blks_ - static_cast< blk_num_t >(used))
+                                                                      : 0;
 }
 
-blk_cache_entry VarsizeBlkAllocator::blkid_to_blk_cache_entry(BlkId const& bid, blk_temp_t preferred_level) {
-    return blk_cache_entry{bid.blk_num(), bid.blk_count(), preferred_level};
+blk_num_t SlabBlkAllocator::get_used_blks() const {
+    const auto used = alloced_blk_count_.load(std::memory_order_acquire);
+    return (used >= 0) ? static_cast< blk_num_t >(used) : 0;
 }
 
-std::string VarsizeBlkAllocator::to_string() const {
-    return fmt::format("BlkAllocator={} state={} total_blks={} cached_blks={} alloced_blks={}", get_name(), m_state,
-                       get_total_blks(), m_fb_cache->total_free_blks(), get_alloced_blk_count());
+std::string SlabBlkAllocator::to_string() const {
+    return fmt::format("SlabBlkAllocator name={} total_blks={} used={} available={}", name_, num_blks_,
+                       get_used_blks(), available_blks());
 }
 
-nlohmann::json VarsizeBlkAllocator::get_metrics_in_json() { return m_metrics.get_result_in_json(true); }
+nlohmann::json SlabBlkAllocator::get_status(int) const {
+    return nlohmann::json{};
+}
+
 } // namespace homestore

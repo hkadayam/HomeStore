@@ -15,7 +15,6 @@
  *********************************************************************************/
 #pragma once
 #include <atomic>
-#include <array>
 #include <memory>
 #include <mutex>
 
@@ -65,38 +64,26 @@ ENUM(cp_status_t, uint8_t,
      ////////////// Cleanup Phase //////////////
      cp_cleaning);
 
-class CPContext;
 class CPManager;
 
-VENUM(cp_consumer_t, uint8_t,
-      HS_CLIENT = 0,       // Client of the homestore module
-      INDEX_SVC = 1,       // Index service module
-      BLK_DATA_SVC = 2,    // Block data service module
-      REPLICATION_SVC = 3, // Replication service module
-      SENTINEL = 4         // Should always be the last in this list
-);
+using CPConsumer = std::string_view;
 
 struct CP {
-    std::atomic< cp_status_t > m_cp_status{cp_status_t::cp_unknown};
-    sisl::AtomicCounter< int64_t > m_enter_cnt;
-    CPManager* m_cp_mgr;
-    cp_id_t m_cp_id;
-    std::array< std::unique_ptr< CPContext >, (size_t)cp_consumer_t::SENTINEL > m_contexts;
-    folly::SharedPromise< bool > m_comp_promise;
-    bool m_is_on_shutdown{false}; // Is this CP taken as part of shutdown of homestore
+    std::atomic< cp_status_t > cp_status_{cp_status_t::cp_unknown};
+    sisl::AtomicCounter< int64_t > enter_cnt_;
+    CPManager* cp_mgr_;
+    cp_id_t cp_id_;
+    folly::SharedPromise< bool > comp_promise_;
+    bool is_on_shutdown_{false};
 
 public:
-    CP(CPManager* mgr) : m_cp_mgr{mgr} {}
+    CP(CPManager* mgr) : cp_mgr_{mgr} {}
 
-    cp_id_t id() const { return m_cp_id; }
-    cp_status_t get_status() const { return m_cp_status.load(); }
-    CPContext* context(cp_consumer_t consumer) const { return m_contexts[(size_t)consumer].get(); }
-    void set_context(cp_consumer_t consumer, std::unique_ptr< CPContext > context) {
-        m_contexts[(size_t)consumer] = std::move(context);
-    }
+    cp_id_t id() const { return cp_id_; }
+    cp_status_t get_status() const { return cp_status_.load(); }
 
     std::string to_string() const {
-        return fmt::format("CP={}: status={}, enter_count={}", m_cp_id, enum_name(get_status()), m_enter_cnt.get());
+        return fmt::format("CP={}: status={}, enter_count={}", cp_id_, enum_name(get_status()), enter_cnt_.get());
     }
 };
 } // namespace homestore

@@ -2,25 +2,35 @@
 
 #include <array>
 #include <homestore/index_service.hpp>
-#include <homestore/btree/detail/btree_internal.hpp>
-#include <homestore/checkpoint/cp_mgr.hpp>
-#include <homestore/btree/detail/btree_node.hpp>
+#include <homestore/index/btree/detail/btree_internal.h>
+#include <homestore/checkpoint/cp_mgr.h>
+#include <homestore/index/btree/detail/btree_node.h>
+#include <homestore/index/btree/btree_async.h>
 
 namespace homestore {
+
+/// UnderlyingBtree — storage-backend interface.
+///
+/// create_node / read_node return an unlocked Node (lock_type == None).
+/// BtreeBase::read_node(id, LockType) acquires the lock after fetching the Node.
+///
+/// write_node / refresh_node / remove_node / on_root_changed
+/// receive const-ref Nodes; the backend may call node->get() to reach NodeCore.
 class UnderlyingBtree {
 public:
     virtual ~UnderlyingBtree() = default;
 
-    virtual BtreeNodePtr create_node(bool is_leaf, CPContext* context) = 0;
-    virtual btree_status_t write_node(BtreeNodePtr const& node, CPContext* context) = 0;
-    virtual btree_status_t read_node(bnodeid_t id, BtreeNodePtr& node) const = 0;
-    virtual btree_status_t refresh_node(BtreeNodePtr const& node, bool for_read_modify_write, CPContext* context) = 0;
-    virtual void remove_node(BtreeNodePtr const& node, CPContext* context) = 0;
-    virtual btree_status_t transact_nodes(const BtreeNodeList& new_nodes, const BtreeNodeList& removed_nodes,
-                                          const BtreeNodePtr& left_child_node, const BtreeNodePtr& parent_node,
-                                          CPContext* context) = 0;
-    virtual BtreeLinkInfo load_root_node_id() = 0;
-    virtual btree_status_t on_root_changed(BtreeNodePtr const& root, CPContext* context) = 0;
+    // Returns an Node core backed by the underlying storage.
+    virtual Node create_node(bool is_leaf) = 0;
+
+    // Returns an unlocked Node for an existing on-disk/in-memory node.
+    virtual Node read_node(bnodeid_t id) const = 0;
+
+    virtual btree_status_t write_node(Node const& node) = 0;
+    virtual btree_status_t prepare_for_write(Node const& node) = 0;
+    virtual void remove_node(Node const& node) = 0;
+    virtual NodeId load_root_node_id() = 0;
+    virtual btree_status_t on_root_changed(Node const& root) = 0;
     virtual uint64_t space_occupied() const = 0;
 };
 
@@ -31,7 +41,7 @@ struct BtreeSuperBlock {
 
     bnodeid_t root_node_id{empty_bnodeid}; // Btree Root Node ID
     uint64_t root_link_version{0};
-    uint32_t node_size{0};              // Node size used for this btree
+    uint32_t node_size{0}; // Node size used for this btree
     std::array< uint8_t, underlying_btree_sb_size > underlying_btree_sb;
 };
 
@@ -43,7 +53,7 @@ struct BtreeRouteTracer {
     std::vector< std::string > m_ops_routes;
     uint32_t m_max_buf_size_per_op; // Max size after which the buffer is rolled over
     bool m_log_if_rolled;
-    mutable iomgr::FiberManagerLib::shared_mutex m_append_mtx;
+    mutable BtreeMutex m_append_mtx;
 
     BtreeRouteTracer(uint32_t buf_size_per_op = 1 * 1024 * 1024, bool log_if_buf_rolled = false);
     void enable(Op op) { m_enabled_ops[uint32_cast(op)] = true; }
@@ -75,16 +85,14 @@ public:
     BtreeSuperBlock const& bt_super_blk() const {
         return *(r_cast< BtreeSuperBlock const* >(super_blk()->underlying_index_sb.data()));
     }
-
     BtreeSuperBlock& bt_super_blk() {
         return const_cast< BtreeSuperBlock& >(s_cast< const BtreeBase* >(this)->bt_super_blk());
     }
 
-    virtual BtreeNodePtr new_node(bnodeid_t id, bool is_leaf, BtreeNode::Allocator::Token token) const = 0;
-    virtual BtreeNodePtr load_node(uint8_t* node_buf, bnodeid_t id, BtreeNode::Allocator::Token token) const = 0;
-
-    // virtual BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf,
-    //                              BtreeNode::Allocator::Token token) const = 0;
+    /// Allocate a fresh concrete NodeCore (e.g. SimpleNode<K,V>, VariantNode<K,V>) via placement-new.
+    /// Called by the backend's create_node/read_node implementations.
+    virtual NodeCore* alloc_node_core(bnodeid_t id, bool is_leaf) const = 0;
+    virtual NodeCore* load_node_core(uint8_t* node_buf, bnodeid_t id) const = 0;
 
     uint64_t space_occupied() const override;
     uint32_t ordinal() const override;
@@ -96,66 +104,43 @@ public:
     [[nodiscard]] CPGuard bt_cp_guard();
 
 public:
-    virtual btree_status_t write_node(const BtreeNodePtr& node, CPContext* context);
-    virtual void read_node_or_fail(bnodeid_t id, BtreeNodePtr& node) const;
-    virtual BtreeNodePtr create_leaf_node(CPContext* context);
-    virtual BtreeNodePtr create_interior_node(CPContext* context);
-    virtual void remove_node(const BtreeNodePtr& node, locktype_t cur_lock, CPContext* context);
+    virtual btree_status_t write_node(Node const& node);
+
+    virtual Node create_leaf_node();
+    virtual Node create_interior_node();
+
+    // Takes Node by value: unlocks first, then removes from backing store.
+    // After this call the Node is in a disarmed (lock_type==NONE) state; the
+    // destructor on function-exit releases only the backend reference.
+    virtual void remove_node(Node node);
 
 protected:
     virtual btree_status_t create_root_node();
-    virtual BtreeNodePtr clone_temp_node(BtreeNode const& node);
-    virtual btree_status_t read_and_lock_node(bnodeid_t id, BtreeNodePtr& node_ptr, locktype_t int_lock_type,
-                                              locktype_t leaf_lock_type, CPContext* context) const;
-    virtual btree_status_t get_child_and_lock_node(const BtreeNodePtr& node, uint32_t index, BtreeLinkInfo& child_info,
-                                                   BtreeNodePtr& child_node, locktype_t int_lock_type,
-                                                   locktype_t leaf_lock_type, CPContext* context) const;
+    virtual Node clone_temp_node(NodeCore const& node) = 0;
 
-    virtual btree_status_t upgrade_node_locks(const BtreeNodePtr& parent_node, const BtreeNodePtr& child_node,
-                                              locktype_t& parent_cur_lock, locktype_t& child_cur_lock,
-                                              CPContext* context);
-    virtual btree_status_t upgrade_node_lock(const BtreeNodePtr& node, locktype_t& cur_lock, CPContext* context);
-    virtual btree_status_t _lock_node(const BtreeNodePtr& node, locktype_t type, CPContext* context, const char* fname,
-                                      int line) const;
-    virtual void unlock_node(const BtreeNodePtr& node, locktype_t type) const;
+    // Reads and locks a node.  Returns {success, locked_Node}; on failure
+    // the returned Node is invalid (valid() == false).
+    virtual BtreeTask< std::pair< btree_status_t, Node > > read_node(NodeId id, LockType lock_type) const;
 
-#ifdef _DEBUG
-public:
-    struct NodeLockInfo {
-        BtreeNode* node;
-        Clock::time_point start_time;
-        const char* fname;
-        int line;
+    virtual BtreeTask< std::pair< btree_status_t, Node > >
+    get_child_node(Node const& parent_node, uint32_t index, NodeId& child_nodeid, LockType lock_type) const;
 
-        void dump() const { LOGINFO("node locked by file: {}, line: {}", fname, line); }
-    };
+    // Upgrade READ → WRITE lock on parent and child atomically.
+    // Updates node.lock_type() on success.
+    virtual BtreeTask< btree_status_t > upgrade_node_locks(Node& parent_node, Node& child_node);
+    virtual BtreeTask< btree_status_t > upgrade_node_lock(Node& node);
 
-    struct BtreeThreadVariables {
-        std::vector< BtreeBase::NodeLockInfo > wr_locked_nodes;
-        std::vector< BtreeBase::NodeLockInfo > rd_locked_nodes;
-    };
+    // Acquires the requested lock; sets node.lock_type() on success.
+    virtual BtreeTask< btree_status_t > lock_node(Node& node, LockType type) const;
 
-    // This workaround of BtreeThreadVariables is needed instead of directly declaring statics
-    // to overcome the gcc bug, pointer here: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=66944
-    static BtreeThreadVariables* thread_vars() {
-        auto this_id(boost::this_fiber::get_id());
-        static thread_local std::map< boost::fibers::fiber::id, std::unique_ptr< BtreeThreadVariables > > fiber_map;
-        if (fiber_map.count(this_id)) { return fiber_map[this_id].get(); }
-        fiber_map[this_id] = std::make_unique< BtreeThreadVariables >();
-        return fiber_map[this_id].get();
-    }
-    virtual void observe_lock_time(const BtreeNodePtr& node, locktype_t type, uint64_t time_spent) const;
-    virtual void check_lock_debug();
-
-    static void _start_of_lock(const BtreeNodePtr& node, locktype_t ltype, const char* fname, int line);
-    static bool remove_locked_node(const BtreeNodePtr& node, locktype_t ltype, NodeLockInfo* out_info);
-    static uint64_t end_of_lock(const BtreeNodePtr& node, locktype_t ltype);
-#endif
+    // Releases the lock currently held by node and resets node.lock_type() to NONE.
+    // Use only inside upgrade sequences — normal unlock is handled by Node's destructor.
+    virtual void unlock_node(Node& node) const;
 
 protected:
     shared< BtreeStore > m_store;
-    unique< UnderlyingBtree > m_bt_private;
-    BtreeLinkInfo m_root_node_info;
+    unique< UnderlyingBtree > m_underlying;
+    NodeId m_root_node_info;
 
     BtreeConfig m_bt_cfg;
     BtreeMetrics m_metrics;

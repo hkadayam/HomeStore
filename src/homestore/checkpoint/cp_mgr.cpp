@@ -15,111 +15,140 @@
  *********************************************************************************/
 #include <urcu.h>
 
+#include <folly/coro/Sleep.h>
+#include <folly/coro/WithCancellation.h>
+#include <folly/io/async/Request.h>
+
 #include <homestore/homestore.hpp>
-#include <homestore/meta_service.hpp>
-#include <homestore/checkpoint/cp_mgr.hpp>
-#include <homestore/homestore.hpp>
+#include <homestore/checkpoint/cp_mgr.h>
 #include "common/homestore_assert.hpp"
 #include "common/homestore_config.hpp"
 #include "common/resource_mgr.hpp"
-#include "cp_internal.hpp"
 #ifdef _PRERELEASE
 #include "common/crash_simulator.hpp"
 #endif
+
+#include <iomanager/iomanager.h>
+
 namespace homestore {
-iomgr::FiberManagerLib::FiberLocal< std::stack< CP* > > CPGuard::t_cp_stack;
 
-CPManager& cp_mgr() { return hs()->cp_mgr(); }
+////////////////////////////////////////////////////////////////////////////
+// CPGuard — per-coroutine CP stack via RequestContext
+////////////////////////////////////////////////////////////////////////////
 
-CPManager::CPManager() :
-        m_metrics{std::make_unique< CPMgrMetrics >()},
-        m_wd_cp{std::make_unique< CPWatchdog >(this)},
-        m_sb{"CPSuperBlock"} {
-    // m_trigger_reasons{enum_count< CPTriggerReason >(), 0ul} {
-    meta_service().register_handler(
-        "CPSuperBlock",
-        [this](meta_blk* mblk, sisl::ByteView buf, size_t size) { on_meta_blk_found(std::move(buf), (void*)mblk); },
-        nullptr);
+// Per-coroutine stack stored in the current RequestContext (saved/restored on every co_await).
+class CPStackData : public folly::RequestData {
+public:
+    std::stack< CP* > stack;
+    bool hasCallback() override { return false; }
+};
 
-    start_cp_thread();
+folly::RequestToken CPGuard::s_token{"homestore.cp_stack"};
+
+std::stack< CP* >& CPGuard::cp_stack() {
+    auto ctx = folly::RequestContext::get();
+    auto* data = static_cast< CPStackData* >(ctx->getContextData(s_token));
+    if (!data) {
+        ctx->setContextData(s_token, std::make_unique< CPStackData >());
+        data = static_cast< CPStackData* >(ctx->getContextData(s_token));
+    }
+    return data->stack;
 }
 
-CPManager::~CPManager() { HS_REL_ASSERT(!m_cur_cp, "CPManager is tiering down without calling shutdown"); }
+////////////////////////////////////////////////////////////////////////////
+// CPManager
+////////////////////////////////////////////////////////////////////////////
 
-void CPManager::start(bool first_time_boot) {
+CPManager::CPManager() : metrics_{std::make_unique< CPMgrMetrics >()}, wd_cp_{std::make_unique< CPWatchdog >(this)} {
+}
+
+CPManager::~CPManager() {
+    HS_REL_ASSERT(!cur_cp_, "CPManager is tiering down without calling shutdown");
+}
+
+folly::coro::Task< void > CPManager::start(bool first_time_boot) {
+    sb_ = co_await ModuleMetaBlk< CPManagerSuperBlock >::open("CPSuperBlock");
+    create_first_cp();
     if (first_time_boot) {
-        m_sb.create(sizeof(cp_mgr_super_block));
-        create_first_cp();
-        m_sb.write();
+        co_await sb_.write();
     }
 }
 
 void CPManager::start_timer() {
     LOGINFO("cp timer is set to {} usec", HS_DYNAMIC_CONFIG(generic.cp_timer_us));
-    m_cp_timer_hdl = iomanager.schedule_global_timer(
-        HS_DYNAMIC_CONFIG(generic.cp_timer_us) * 1000, true, nullptr /*cookie*/, iomgr::reactor_regex::all_worker,
-        [this](void*) { trigger_cp_flush(false /* false */, CPTriggerReason::Timer); }, true /* wait_to_schedule */);
-}
-
-void CPManager::on_meta_blk_found(const sisl::ByteView& buf, void* meta_cookie) {
-    m_sb.load(buf, meta_cookie);
-    create_first_cp();
-    HS_REL_ASSERT_EQ(m_sb->magic, cp_sb_magic, "Invalid Checkpoint metablk, magic mismatch");
-    HS_REL_ASSERT_EQ(m_sb->version, cp_sb_version, "Invalid version of checkpoint metablk");
+    cp_timer_started_ = true;
+    spawn_detached(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+        const auto interval = std::chrono::microseconds(HS_DYNAMIC_CONFIG(generic.cp_timer_us));
+        while (true) {
+            try {
+                co_await folly::coro::co_withCancellation(cp_timer_cancel_src_.getToken(),
+                                                          folly::coro::sleep(interval));
+            } catch (const folly::OperationCancelled&) { break; }
+            trigger_cp_flush(false, CPTriggerReason::Timer);
+        }
+        cp_timer_done_baton_.post();
+    });
 }
 
 void CPManager::create_first_cp() {
-    m_cur_cp = new CP(this);
-    m_cur_cp->m_cp_status = cp_status_t::cp_io_ready;
-    m_cur_cp->m_cp_id = m_sb->m_last_flushed_cp + 1;
+    cur_cp_ = new CP(this);
+    cur_cp_->cp_status_ = cp_status_t::cp_io_ready;
+    cur_cp_->cp_id_ = sb_->m_last_flushed_cp + 1;
 }
 
 void CPManager::shutdown() {
-    LOGINFO("Stopping cp timer");
-    iomanager.cancel_timer(m_cp_timer_hdl, true);
-    m_cp_timer_hdl = iomgr::null_timer_handle;
+    // Cancel the periodic timer before touching any shared CP state.
+    if (cp_timer_started_) {
+        cp_timer_cancel_src_.requestCancellation();
+        cp_timer_done_baton_.wait();
+    }
 
     {
-        std::unique_lock< std::mutex > lk(m_trigger_cp_mtx);
-        m_cp_shutdown_initiated = true;
+        std::unique_lock< std::mutex > lk(trigger_cp_mtx_);
+        cp_shutdown_initiated_ = true;
     }
 
 #ifdef _PRERELEASE
     if (!hs()->crash_simulator().is_in_crashing_phase()) {
 #endif
         LOGINFO("Trigger cp flush at CP shutdown");
-        auto success =
-            do_trigger_cp_flush(true /* force */, true /* flush_on_shutdown */, CPTriggerReason::Timer).get();
+        auto success = do_trigger_cp_flush(/*force=*/true, /*flush_on_shutdown=*/true, CPTriggerReason::Timer).get();
         HS_REL_ASSERT_EQ(success, true, "CP Flush failed");
         LOGINFO("Trigger cp done");
 #ifdef _PRERELEASE
     }
 #endif
 
-    delete (m_cur_cp);
-    rcu_xchg_pointer(&m_cur_cp, nullptr);
+    delete (cur_cp_);
+    rcu_xchg_pointer(&cur_cp_, nullptr);
 
-    m_metrics.reset();
-    if (m_wd_cp) {
-        m_wd_cp->stop();
-        m_wd_cp.reset();
+    metrics_.reset();
+    if (wd_cp_) {
+        wd_cp_->stop();
+        wd_cp_.reset();
     }
 }
 
-void CPManager::register_consumer(cp_consumer_t consumer_id, std::unique_ptr< CPCallbacks > callbacks) {
-    size_t idx = (size_t)consumer_id;
-    m_cp_cb_table[idx] = std::move(callbacks);
-    if (m_cp_cb_table[idx]) {
-        m_cur_cp->m_contexts[idx] = std::move(m_cp_cb_table[idx]->on_switchover_cp(nullptr, m_cur_cp));
-    }
+void CPManager::register_consumer(CPConsumer consumer, shared< CPCallbacks > callbacks) {
+    // Notify consumer of the current CP so it can initialize its own state.
+    callbacks->on_switchover_cp(nullptr, cur_cp_);
+
+    // Copy-and-swap: atomically publish the updated map.
+    auto old = consumers_.load();
+    auto updated = std::make_shared< ConsumerMap >(*old);
+    updated->emplace(consumer, std::move(callbacks));
+    consumers_.store(std::move(updated));
 }
 
-CPCallbacks* CPManager::get_consumer(cp_consumer_t consumer_id) {
-    size_t idx = (size_t)consumer_id;
-    return m_cp_cb_table[idx].get();
+CPCallbacks* CPManager::get_consumer(CPConsumer consumer) {
+    auto consumers = consumers_.load();
+    auto it = consumers->find(consumer);
+    return (it != consumers->end()) ? it->second.get() : nullptr;
 }
 
-[[nodiscard]] CPGuard CPManager::cp_guard() { return CPGuard{this}; }
+[[nodiscard]] CPGuard CPManager::cp_guard() {
+    return CPGuard{this};
+}
 
 CP* CPManager::cp_io_enter() {
     rcu_read_lock();
@@ -132,14 +161,13 @@ CP* CPManager::cp_io_enter() {
     }
     cp_ref(cp);
     rcu_read_unlock();
-
     return cp;
 }
 
 void CPManager::cp_ref(CP* cp) {
-    cp->m_enter_cnt.increment(1);
+    cp->enter_cnt_.increment(1);
 #ifndef NDEBUG
-    auto status = cp->m_cp_status.load();
+    auto status = cp->cp_status_.load();
     HS_DBG_ASSERT((status == cp_status_t::cp_io_ready || status == cp_status_t::cp_trigger ||
                    status == cp_status_t::cp_flush_prepare),
                   "cp status {}", status);
@@ -147,80 +175,75 @@ void CPManager::cp_ref(CP* cp) {
 }
 
 void CPManager::cp_io_exit(CP* cp) {
-    HS_DBG_ASSERT_NE(cp->m_cp_status, cp_status_t::cp_flushing);
-    if (cp->m_enter_cnt.decrement_testz(1) && (cp->m_cp_status == cp_status_t::cp_flush_prepare)) {
-        m_wd_cp->set_cp(cp);
+    HS_DBG_ASSERT_NE(cp->cp_status_, cp_status_t::cp_flushing);
+    if (cp->enter_cnt_.decrement_testz(1) && (cp->cp_status_ == cp_status_t::cp_flush_prepare)) {
+        wd_cp_->set_cp(cp);
         cp_start_flush(cp);
     }
 }
 
 CP* CPManager::get_cur_cp() {
-    CP* p = rcu_dereference(m_cur_cp);
+    CP* p = rcu_dereference(cur_cp_);
     return p;
 }
 
-folly::Future< bool > CPManager::trigger_cp_flush(bool force, CPTriggerReason reason) {
-    return do_trigger_cp_flush(force, false /* flush_on_shutdown */, reason);
+folly::SemiFuture< bool > CPManager::trigger_cp_flush(bool force, CPTriggerReason reason) {
+    return do_trigger_cp_flush(force, /*flush_on_shutdown=*/false, reason);
 }
 
-folly::Future< bool > CPManager::do_trigger_cp_flush(bool force, bool flush_on_shutdown, CPTriggerReason reason) {
-    std::unique_lock< std::mutex > lk(m_trigger_cp_mtx);
+folly::SemiFuture< bool > CPManager::do_trigger_cp_flush(bool force, bool flush_on_shutdown, CPTriggerReason reason) {
+    std::unique_lock< std::mutex > lk(trigger_cp_mtx_);
 
-    if (m_in_flush_phase) {
+    if (in_flush_phase_) {
         // If we are already flushing, we create a back-to-back CP queue only if force is set and if we are not in
         // shutdown phase. Triggering a back-2-back CP in shutdown state is dangerous, as it can cause the CPManager to
         // be destructed while back-2-back CP is triggered.
-        if (force && (!m_cp_shutdown_initiated || flush_on_shutdown)) {
-            if (!m_pending_trigger_cp) {
-                m_pending_trigger_cp = true;
-                m_pending_trigger_cp_comp = std::move(folly::SharedPromise< bool >{});
+        if (force && (!cp_shutdown_initiated_ || flush_on_shutdown)) {
+            if (!pending_trigger_cp_) {
+                pending_trigger_cp_ = true;
+                pending_trigger_cp_comp_ = std::move(folly::SharedPromise< bool >{});
             }
-
-            // If multiple threads call trigger, they all get the future from the same promise.
-            return m_pending_trigger_cp_comp.getFuture();
+            return pending_trigger_cp_comp_.getSemiFuture();
         } else {
-            return folly::makeFuture< bool >(false);
+            return folly::makeSemiFuture< bool >(false);
         }
     }
-    m_in_flush_phase = true;
-    //++m_trigger_reasons[(size_t)reason];
+    in_flush_phase_ = true;
 
-    folly::Future< bool > ret_fut = folly::Future< bool >::makeEmpty();
+    folly::SemiFuture< bool > ret_fut = folly::SemiFuture< bool >::makeEmpty();
     auto cur_cp = cp_guard();
-    cur_cp->m_cp_status = cp_status_t::cp_trigger;
-    cur_cp->m_is_on_shutdown = flush_on_shutdown;
+    cur_cp->cp_status_ = cp_status_t::cp_trigger;
+    cur_cp->is_on_shutdown_ = flush_on_shutdown;
     CP_PERIODIC_LOG(INFO, cur_cp->id(), "Time to flush the CP {}", cur_cp->to_string());
-    COUNTER_INCREMENT(*m_metrics, cp_cnt, 1);
-    m_wd_cp->set_cp(cur_cp.get());
+    COUNTER_INCREMENT(*metrics_, cp_cnt, 1);
+    wd_cp_->set_cp(cur_cp.get());
 
-    // allocate a new cp and ask consumers to switchover to new cp
+    // Allocate a new cp and ask consumers to switchover to new cp.
     auto new_cp = new CP(this);
-    new_cp->m_cp_id = cur_cp->m_cp_id + 1;
+    new_cp->cp_id_ = cur_cp->cp_id_ + 1;
 
     CP_PERIODIC_LOG(DEBUG, new_cp->id(), "Create New CP session");
-    size_t idx{0};
-    for (auto& consumer : m_cp_cb_table) {
-        if (consumer) { new_cp->m_contexts[idx] = std::move(consumer->on_switchover_cp(cur_cp.get(), new_cp)); }
-        ++idx;
+    auto consumers = consumers_.load();
+    for (auto& [id, cb] : *consumers) {
+        cb->on_switchover_cp(cur_cp.get(), new_cp);
     }
 
-    if (m_pending_trigger_cp) {
+    if (pending_trigger_cp_) {
         // Triggered because of back-2-back CP, use the pending promise/future.
-        cur_cp->m_comp_promise = std::move(m_pending_trigger_cp_comp);
-        m_pending_trigger_cp = false;
+        cur_cp->comp_promise_ = std::move(pending_trigger_cp_comp_);
+        pending_trigger_cp_ = false;
     } else {
-        cur_cp->m_comp_promise = std::move(folly::SharedPromise< bool >{});
+        cur_cp->comp_promise_ = std::move(folly::SharedPromise< bool >{});
     }
-    ret_fut = cur_cp->m_comp_promise.getFuture();
+    ret_fut = cur_cp->comp_promise_.getSemiFuture();
 
-    cur_cp->m_cp_status = cp_status_t::cp_flush_prepare;
-    new_cp->m_cp_status = cp_status_t::cp_io_ready;
-    rcu_xchg_pointer(&m_cur_cp, new_cp);
+    cur_cp->cp_status_ = cp_status_t::cp_flush_prepare;
+    new_cp->cp_status_ = cp_status_t::cp_io_ready;
+    rcu_xchg_pointer(&cur_cp_, new_cp);
     synchronize_rcu();
 
-    // At this point we are sure that there is no thread working on prev_cp without incrementing the cp_enter count
-    // We need to unlock the trigger mtx section before cp_guard goes out of context, because exit cp critical section
-    // might start cp flush and we don't want that to hold this mutex.
+    // Unlock before cp_guard goes out of scope: exiting the CP critical section may trigger cp_start_flush,
+    // and we must not hold the mutex at that point.
     lk.unlock();
 
     HS_PERIODIC_LOG(DEBUG, cp, "Active CP switch completed");
@@ -228,257 +251,213 @@ folly::Future< bool > CPManager::do_trigger_cp_flush(bool force, bool flush_on_s
 }
 
 void CPManager::cp_start_flush(CP* cp) {
-    std::vector< folly::Future< bool > > futs;
     CP_PERIODIC_LOG(INFO, cp->id(), "Starting CP flush");
-    cp->m_cp_status = cp_status_t::cp_flushing;
+    cp->cp_status_ = cp_status_t::cp_flushing;
 
-    for (size_t svcid = 0; svcid < (size_t)cp_consumer_t::SENTINEL; svcid++) {
-        if (svcid == (size_t)cp_consumer_t::REPLICATION_SVC) { continue; }
-        auto& consumer = m_cp_cb_table[svcid];
-        bool participated = (cp->m_contexts[svcid] != nullptr);
-        if (consumer && participated) { futs.emplace_back(std::move(consumer->cp_flush(cp))); }
-    }
-
-    folly::collectAllUnsafe(futs).thenValue([this, cp](auto) {
-#ifdef _PRERELEASE
-        if (hs()->crash_simulator().is_in_crashing_phase()) {
-            on_cp_flush_done(cp);
-            return;
+    spawn_detached(ReactorTarget::any(), [this, cp]() -> folly::coro::Task< void > {
+        // Flush all consumers one at a time; sequential ordering is intentional.
+        auto consumers = consumers_.load();
+        for (auto& [id, cb] : *consumers) {
+            co_await cb->cp_flush(cp);
         }
-#endif
-        // Sync flushing replication svc at last as the cp_lsn updated here
-        // other component should at least flushed to cp_lsn
-        auto& repl_cp = m_cp_cb_table[(size_t)cp_consumer_t::REPLICATION_SVC];
-        if (repl_cp) { repl_cp->cp_flush(cp).wait(); }
-        // All consumers have flushed for the cp
-        on_cp_flush_done(cp);
-    });
-}
 
-void CPManager::on_cp_flush_done(CP* cp) {
-    HS_DBG_ASSERT_EQ(cp->m_cp_status, cp_status_t::cp_flushing);
-    cp->m_cp_status = cp_status_t::cp_flush_done;
-
-    iomanager.run_on_forget(pick_blocking_io_fiber(), [this, cp]() {
-        // Persist the superblock with this flushed cp information
-        ++(m_sb->m_last_flushed_cp);
-        m_sb.write();
+        // Persist superblock with updated last-flushed CP id.
+        HS_DBG_ASSERT_EQ(cp->cp_status_, cp_status_t::cp_flushing);
+        cp->cp_status_ = cp_status_t::cp_flush_done;
+        ++(sb_->m_last_flushed_cp);
+        co_await sb_.write();
 
         CP_PERIODIC_LOG(INFO, cp->id(), "CP Flush completed");
         cleanup_cp(cp);
 
-        // Setting promise will cause the CP manager destructor to cleanup before getting a chance to do the
-        // checking if shutdown has been initiated or not.
-        auto promise = std::move(cp->m_comp_promise);
-        m_wd_cp->reset_cp();
-        bool is_shutdown_cp = cp->m_is_on_shutdown;
+        // Move the promise out before deleting cp: fulfilling it may wake shutdown and destroy CPManager.
+        auto promise = std::move(cp->comp_promise_);
+        wd_cp_->reset_cp();
+        bool is_shutdown_cp = cp->is_on_shutdown_;
         delete cp;
 
         bool trigger_back_2_back_cp{false};
-
         {
-            std::unique_lock< std::mutex > lk(m_trigger_cp_mtx);
-            m_in_flush_phase = false;
-            trigger_back_2_back_cp = m_pending_trigger_cp;
+            std::unique_lock< std::mutex > lk(trigger_cp_mtx_);
+            in_flush_phase_ = false;
+            trigger_back_2_back_cp = pending_trigger_cp_;
         }
 
         promise.setValue(true);
-        if (!is_shutdown_cp) { // No need of back_2_back cp etc on shutdown.
-            // Dont access any cp state after this, in case trigger_back_2_back_cp is false, because its false on
-            // cp_shutdown_initated and setting this promise could destruct the CPManager itself.
+        if (!is_shutdown_cp) {
+            // Do not access CPManager state after this unless trigger_back_2_back_cp is true:
+            // fulfilling the promise above may allow shutdown to destroy CPManager.
             if (trigger_back_2_back_cp) {
                 HS_PERIODIC_LOG(INFO, cp, "Triggering back to back CP");
-                COUNTER_INCREMENT(*m_metrics, back_to_back_cps, 1);
+                COUNTER_INCREMENT(*metrics_, back_to_back_cps, 1);
                 trigger_cp_flush(false, CPTriggerReason::Timer);
             }
-
 #ifdef _PRERELEASE
-            if (hs()->crash_simulator().is_in_crashing_phase()) { hs()->crash_simulator().crash_now(); }
+            if (hs()->crash_simulator().is_in_crashing_phase()) {
+                hs()->crash_simulator().crash_now();
+            }
 #endif
         }
     });
 }
 
 void CPManager::cleanup_cp(CP* cp) {
-    cp->m_cp_status = cp_status_t::cp_cleaning;
-    for (auto& consumer : m_cp_cb_table) {
-        if (consumer) { consumer->cp_cleanup(cp); }
+    cp->cp_status_ = cp_status_t::cp_cleaning;
+    auto consumers = consumers_.load();
+    for (auto& [id, cb] : *consumers) {
+        cb->cp_cleanup(cp);
     }
 }
 
-void CPManager::start_cp_thread() {
-    // Start WBCache flush threads
-    struct Context {
-        std::condition_variable cv;
-        std::mutex mtx;
-        int32_t thread_cnt{0};
-    };
-    auto ctx = std::make_shared< Context >();
-
-    // Start a reactor with 2 fibers (1 for sync io)
-    // Prevent deadlock with sync_io fibers.
-    // Multiple sync_io fibers may acquire a thread-level mutex and perform synchronous I/O using io_uring.
-    // This can block the fiber and allow other fibers to be scheduled.
-    // If another fiber tries to acquire the same mutex, a deadlock can occur.
-    iomanager.create_reactor("cp_io", iomgr::INTERRUPT_LOOP, 2u, [this, ctx](bool is_started) {
-        if (is_started) {
-            {
-                std::unique_lock< std::mutex > lk{ctx->mtx};
-                auto v = iomanager.sync_io_capable_fibers();
-                m_cp_io_fibers.insert(m_cp_io_fibers.end(), v.begin(), v.end());
-                ++(ctx->thread_cnt);
-            }
-            ctx->cv.notify_one();
-        }
-    });
-
-    {
-        std::unique_lock< std::mutex > lk{ctx->mtx};
-        ctx->cv.wait(lk, [ctx] { return (ctx->thread_cnt == 1); });
-    }
+bool CPManager::has_cp_flushed(cp_id_t cp_id) const {
+    return (sb_->m_last_flushed_cp >= cp_id);
 }
 
-iomgr::io_fiber_t CPManager::pick_blocking_io_fiber() const {
-    static thread_local std::random_device s_rd{};
-    static thread_local std::default_random_engine s_re{s_rd()};
-    static auto rand_fiber = std::uniform_int_distribution< size_t >(0, m_cp_io_fibers.size() - 1);
-    return m_cp_io_fibers[rand_fiber(s_re)];
-}
+////////////////////////////////////////////////////////////////////////////
+// CPGuard
+////////////////////////////////////////////////////////////////////////////
 
-bool CPManager::has_cp_flushed(cp_id_t cp_id) const { return (m_sb->m_last_flushed_cp >= cp_id); }
-
-//////////////////////////////////////// CP Guard class ////////////////////////////////////////////
 CPGuard::CPGuard(CPManager* mgr) {
-    if (mgr == nullptr) { return; }
-
-    if (t_cp_stack->empty()) {
-        // First CP in this thread stack.
-        m_cp = mgr->cp_io_enter();
-    } else {
-        // Nested CP sections
-        m_cp = t_cp_stack->top();
-        m_cp->m_cp_mgr->cp_ref(m_cp);
-    }
-    t_cp_stack->push(m_cp);
-    m_pushed = true; // m_pushed represented if this is added to current thread stack
-}
-
-CPGuard::~CPGuard() {
-    if (m_pushed && !t_cp_stack->empty()) {
-        //        HS_DBG_ASSERT_EQ((void*)m_cp, (void*)t_cp_stack.top(), "CPGuard mismatch of CP pointers");
-        t_cp_stack->pop();
-    }
-    if (m_cp) { m_cp->m_cp_mgr->cp_io_exit(m_cp); }
-}
-
-CPGuard::CPGuard(const CPGuard& other) {
-    m_cp = other.m_cp;
-    m_pushed = false;
-    if (m_cp) { m_cp->m_cp_mgr->cp_ref(m_cp); }
-}
-
-CPGuard CPGuard::operator=(const CPGuard& other) {
-    m_cp = other.m_cp;
-    m_pushed = false;
-    if (m_cp) { m_cp->m_cp_mgr->cp_ref(m_cp); }
-    return *this;
-}
-
-CP* CPGuard::operator->() { return get(); }
-CPContext* CPGuard::context(cp_consumer_t consumer) {
-    CP* cp = get();
-    return cp ? cp->context(consumer) : nullptr;
-}
-
-CP* CPGuard::get() {
-    // HS_DBG_ASSERT_NE((void*)m_cp, (void*)nullptr, "CPGuard get on empty CP pointer");
-    if (!m_pushed && m_cp) {
-        // m_pushed is false in case cp guard is moved from one thread to other
-        t_cp_stack->push(m_cp);
-        m_pushed = true;
-    }
-    return m_cp;
-}
-
-//////////////////////////////////////// CP Watchdog class //////////////////////////////////////////
-CPWatchdog::CPWatchdog(CPManager* cp_mgr) :
-        m_cp{nullptr}, m_cp_mgr{cp_mgr}, m_timer_sec{HS_DYNAMIC_CONFIG(generic.cp_watchdog_timer_sec)} {
-    LOGINFO("CP watchdog timer setting to : {} seconds", m_timer_sec);
-    m_timer_hdl =
-        iomanager.schedule_global_timer(m_timer_sec * 1000 * 1000 * 1000, true, nullptr, iomgr::reactor_regex::all_user,
-                                        [this](void* cookie) { cp_watchdog_timer(); });
-}
-
-void CPWatchdog::reset_cp() {
-    std::unique_lock< std::shared_mutex > lk{m_cp_mtx};
-    m_cp = nullptr;
-    m_progress_pct = 0;
-}
-
-void CPWatchdog::set_cp(CP* cp) {
-    std::unique_lock< std::shared_mutex > lk{m_cp_mtx};
-    m_cp = cp;
-    m_last_state_ch_time = Clock::now();
-}
-
-void CPWatchdog::stop() {
-    iomanager.cancel_timer(m_timer_hdl);
-    m_timer_hdl = iomgr::null_timer_handle;
-    {
-        std::unique_lock< std::shared_mutex > lk{m_cp_mtx};
-        m_cp = nullptr;
-    }
-}
-
-void CPWatchdog::cp_watchdog_timer() {
-    std::unique_lock< std::shared_mutex > lk{m_cp_mtx};
-
-    // check if any cp to track
-    if (m_cp == nullptr) { return; }
-    const auto status = m_cp->get_status();
-    if ((status != cp_status_t::cp_flush_prepare) || (status != cp_status_t::cp_flushing)) { return; }
-
-    uint32_t cum_pct{0};
-    uint32_t count{0};
-    for (auto& consumer : m_cp_mgr->consumer_list()) {
-        if (consumer) {
-            ++count;
-            cum_pct += consumer->cp_progress_percent();
-        }
-    }
-    if (m_progress_pct > cum_pct / count) {
-        // We are making progress in flushing the data.
-        m_progress_pct = cum_pct / count;
+    if (mgr == nullptr) {
         return;
     }
 
-    if (get_elapsed_time_ms(m_last_state_ch_time) >= m_timer_sec * 1000) {
-        LOGINFO("cp progress percent {} is not changed. time elapsed {}, cp state={} ", m_progress_pct,
-                get_elapsed_time_ms(m_last_state_ch_time), m_cp->to_string());
+    auto& stk = cp_stack();
+    if (stk.empty()) {
+        cp_ = mgr->cp_io_enter();
+    } else {
+        cp_ = stk.top();
+        cp_->cp_mgr_->cp_ref(cp_);
     }
+    stk.push(cp_);
+    pushed_ = true;
+}
 
-    // check if enough time passed since last state change
-    uint32_t max_time_multiplier = 12;
-    if (get_elapsed_time_ms(m_last_state_ch_time) < max_time_multiplier * m_timer_sec * 1000) {
-        uint32_t repair_attempted{0};
-        for (auto& consumer : m_cp_mgr->consumer_list()) {
-            if (consumer) {
-                const auto pct = consumer->cp_progress_percent();
-                if (pct != 100) {
-                    consumer->repair_slow_cp();
-                    ++repair_attempted;
-                }
-            }
-            if (repair_attempted) { return; }
-        }
-
-        HS_REL_ASSERT(0, "cp seems to be stuck. CP State={} total time elapsed {}", m_cp->to_string(),
-                      get_elapsed_time_ms(m_last_state_ch_time));
+CPGuard::~CPGuard() {
+    if (pushed_ && !cp_stack().empty()) {
+        cp_stack().pop();
+    }
+    if (cp_) {
+        cp_->cp_mgr_->cp_io_exit(cp_);
     }
 }
 
-cp_id_t CPContext::id() const { return m_cp->id(); }
+CPGuard::CPGuard(const CPGuard& other) {
+    cp_ = other.cp_;
+    pushed_ = false;
+    if (cp_) {
+        cp_->cp_mgr_->cp_ref(cp_);
+    }
+}
 
-void CPContext::complete(bool status) { m_flush_comp.setValue(status); }
+CPGuard CPGuard::operator=(const CPGuard& other) {
+    cp_ = other.cp_;
+    pushed_ = false;
+    if (cp_) {
+        cp_->cp_mgr_->cp_ref(cp_);
+    }
+    return *this;
+}
+
+CP* CPGuard::operator->() {
+    return get();
+}
+
+CP* CPGuard::get() {
+    if (!pushed_ && cp_) {
+        cp_stack().push(cp_);
+        pushed_ = true;
+    }
+    return cp_;
+}
+
+////////////////////////////////////////////////////////////////////////////
+// CPWatchdog
+////////////////////////////////////////////////////////////////////////////
+
+CPWatchdog::CPWatchdog(CPManager* cp_mgr) :
+        cp_{nullptr}, cp_mgr_{cp_mgr}, timer_sec_{HS_DYNAMIC_CONFIG(generic.cp_watchdog_timer_sec)} {
+    LOGINFO("CP watchdog timer setting to : {} seconds", timer_sec_);
+    spawn_detached(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+        while (true) {
+            try {
+                co_await folly::coro::co_withCancellation(cancel_src_.getToken(),
+                                                          folly::coro::sleep(std::chrono::seconds(timer_sec_)));
+            } catch (const folly::OperationCancelled&) { break; }
+            if (stopped_) {
+                break;
+            }
+            cp_watchdog_timer();
+        }
+        done_baton_.post();
+    });
+}
+
+void CPWatchdog::reset_cp() {
+    std::unique_lock< std::shared_mutex > lk{cp_mtx_};
+    cp_ = nullptr;
+    progress_pct_ = 0;
+}
+
+void CPWatchdog::set_cp(CP* cp) {
+    std::unique_lock< std::shared_mutex > lk{cp_mtx_};
+    cp_ = cp;
+    last_state_ch_time_ = Clock::now();
+}
+
+void CPWatchdog::stop() {
+    stopped_.store(true);
+    cancel_src_.requestCancellation();
+    done_baton_.wait();
+    std::unique_lock< std::shared_mutex > lk{cp_mtx_};
+    cp_ = nullptr;
+}
+
+void CPWatchdog::cp_watchdog_timer() {
+    std::unique_lock< std::shared_mutex > lk{cp_mtx_};
+
+    if (cp_ == nullptr) {
+        return;
+    }
+    const auto status = cp_->get_status();
+    if ((status != cp_status_t::cp_flush_prepare) || (status != cp_status_t::cp_flushing)) {
+        return;
+    }
+
+    uint32_t cum_pct{0};
+    uint32_t count{0};
+    auto consumer = cp_mgr_->consumers();
+    for (auto& [id, cb] : *consumer) {
+        ++count;
+        cum_pct += cb->cp_progress_percent();
+    }
+    if (progress_pct_ > cum_pct / count) {
+        progress_pct_ = cum_pct / count;
+        return;
+    }
+
+    if (get_elapsed_time_ms(last_state_ch_time_) >= timer_sec_ * 1000) {
+        LOGINFO("cp progress percent {} is not changed. time elapsed {}, cp state={} ", progress_pct_,
+                get_elapsed_time_ms(last_state_ch_time_), cp_->to_string());
+    }
+
+    uint32_t max_time_multiplier = 12;
+    if (get_elapsed_time_ms(last_state_ch_time_) < max_time_multiplier * timer_sec_ * 1000) {
+        uint32_t repair_attempted{0};
+        for (auto& [id, cb] : *consumer) {
+            const auto pct = cb->cp_progress_percent();
+            if (pct != 100) {
+                cb->repair_slow_cp();
+                ++repair_attempted;
+            }
+            if (repair_attempted) {
+                return;
+            }
+        }
+
+        HS_REL_ASSERT(0, "cp seems to be stuck. CP State={} total time elapsed {}", cp_->to_string(),
+                      get_elapsed_time_ms(last_state_ch_time_));
+    }
+}
 
 } // namespace homestore

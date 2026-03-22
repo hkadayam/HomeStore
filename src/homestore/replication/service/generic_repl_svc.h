@@ -26,7 +26,7 @@
 #include <homestore/homestore.hpp>
 #include <homestore/replication_service.hpp>
 #include <homestore/replication/repl_dev.h>
-#include <homestore/checkpoint/cp_mgr.hpp>
+#include <homestore/checkpoint/cp_mgr.h>
 #include <homestore/superblk_handler.hpp>
 
 namespace homestore {

@@ -19,8 +19,8 @@
 #include <vector>
 
 #include <folly/futures/Future.h>
-#include <homestore/checkpoint/cp_mgr.hpp>
-#include <homestore/checkpoint/cp.hpp>
+#include <homestore/checkpoint/cp_mgr.h>
+#include <homestore/checkpoint/cp.h>
 #include <homestore/homestore_decl.hpp>
 #include <homestore/index/index_common.h>
 

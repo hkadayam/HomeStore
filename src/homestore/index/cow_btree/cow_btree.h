@@ -4,8 +4,8 @@
 #include <sisl/fds/concurrent_insert_vector.h>
 #include <sisl/cache/simple_cache.hpp>
 #include <homestore/blk.h>
-#include <homestore/btree/btree_base.hpp>
-#include <homestore/checkpoint/cp_mgr.hpp>
+#include <homestore/index/btree/btree_base.h>
+#include <homestore/checkpoint/cp_mgr.h>
 
 #include "common/large_id_reserver.hpp"
 #include "common/concurrent_vector.hpp"
@@ -56,9 +56,6 @@ public:
     btree_status_t read_node(bnodeid_t id, BtreeNodePtr& node) const override;
     btree_status_t refresh_node(const BtreeNodePtr& node, bool for_read_modify_write, CPContext* context) override;
     void remove_node(const BtreeNodePtr& node, CPContext* context) override;
-    btree_status_t transact_nodes(const BtreeNodeList& new_nodes, const BtreeNodeList& removed_nodes,
-                                  const BtreeNodePtr& left_child_node, const BtreeNodePtr& parent_node,
-                                  CPContext* context) override;
     BtreeLinkInfo load_root_node_id() override;
     btree_status_t on_root_changed(BtreeNodePtr const& root, CPContext* context) override;
     uint64_t space_occupied() const override;

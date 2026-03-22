@@ -20,7 +20,7 @@
 #include "common/homestore_assert.hpp"
 #include "common/homestore_config.hpp"
 #include <homestore/blk.h>
-#include <homestore/checkpoint/cp_mgr.hpp>
+#include <homestore/checkpoint/cp_mgr.h>
 #include <homestore/homestore.hpp>
 #include <homestore/superblk_handler.hpp>
 

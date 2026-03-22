@@ -29,7 +29,7 @@
 #include <homestore/logstore_service.hpp>
 #include <homestore/index_service.hpp>
 #include <homestore/homestore.hpp>
-#include <homestore/checkpoint/cp_mgr.hpp>
+#include <homestore/checkpoint/cp_mgr.h>
 
 #include "common/homestore_utils.hpp"
 #include "common/homestore_config.hpp"

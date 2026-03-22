@@ -27,7 +27,7 @@
 #include <homestore/homestore.hpp>
 #include <homestore/index_service.hpp>
 #include <homestore/replication_service.hpp>
-#include <homestore/checkpoint/cp_mgr.hpp>
+#include <homestore/checkpoint/cp_mgr.h>
 #include <device/HSSuperBlk.h>
 #include <iomgr/iomgr_config_generated.h>
 #include <common/homestore_assert.hpp>

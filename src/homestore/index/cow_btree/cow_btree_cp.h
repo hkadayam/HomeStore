@@ -21,8 +21,8 @@
 #include <folly/futures/Future.h>
 #include <sisl/fds/concurrent_insert_vector.h>
 #include <sisl/fds/atomic_counter.h>
-#include <homestore/checkpoint/cp_mgr.hpp>
-#include <homestore/checkpoint/cp.hpp>
+#include <homestore/checkpoint/cp_mgr.h>
+#include <homestore/checkpoint/cp.h>
 #include <iomgr/fiber_lib.hpp>
 #include "device/virtual_dev.hpp"
 #include "index/cow_btree/cow_btree_store.h"

@@ -6,10 +6,10 @@
 
 #include <sisl/cache/simple_cache.hpp>
 #include <homestore/blk.h>
-#include <homestore/btree/btree_store.h>
-#include <homestore/btree/detail/btree_internal.hpp>
+#include <homestore/index/btree/btree_store.h>
+#include <homestore/index/btree/detail/btree_internal.h>
 #include <homestore/superblk_handler.hpp>
-#include <homestore/checkpoint/cp_mgr.hpp>
+#include <homestore/checkpoint/cp_mgr.h>
 #include <homestore/index_service.hpp>
 #include "common/homestore_utils.hpp"
 #include "index/cow_btree/cow_btree.h"

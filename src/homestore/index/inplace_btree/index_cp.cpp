@@ -1,7 +1,7 @@
 #include <stack>
 #include <unordered_map>
 
-#include <homestore/checkpoint/cp_mgr.hpp>
+#include <homestore/checkpoint/cp_mgr.h>
 #include "index/index_cp.hpp"
 #include "index/wb_cache.hpp"
 #include "common/homestore_assert.hpp"

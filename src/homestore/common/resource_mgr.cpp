@@ -15,7 +15,7 @@
  *********************************************************************************/
 #include <homestore/homestore.hpp>
 #include <homestore/logstore_service.hpp>
-#include <homestore/checkpoint/cp_mgr.hpp>
+#include <homestore/checkpoint/cp_mgr.h>
 #include <iomgr/iomgr_flip.hpp>
 #include "resource_mgr.hpp"
 #include "homestore_assert.hpp"

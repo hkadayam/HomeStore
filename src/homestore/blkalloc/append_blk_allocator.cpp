@@ -13,8 +13,8 @@
  * specific language governing permissions and limitations under the License.
  * *
  * *********************************************************************************/
-#include <homestore/checkpoint/cp_mgr.hpp>
-#include <homestore/checkpoint/cp.hpp>
+#include <homestore/checkpoint/cp_mgr.h>
+#include <homestore/checkpoint/cp.h>
 #include <homestore/meta_service.hpp>
 
 #include "append_blk_allocator.h"

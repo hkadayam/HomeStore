@@ -15,17 +15,23 @@
  *********************************************************************************/
 #pragma once
 #include <atomic>
-#include <array>
-#include <mutex>
 #include <memory>
-#include <functional>
+#include <mutex>
+#include <stack>
+#include <unordered_map>
 
-#include <iomgr/iomgr.hpp>
 #include <sisl/metrics/metrics.h>
 #include <sisl/fds/enum.h>
+#include <sisl/fds/utils.h>
+#include <folly/CancellationToken.h>
+#include <folly/coro/Task.h>
+#include <folly/futures/Future.h>
+#include <folly/futures/SharedPromise.h>
+#include <folly/io/async/Request.h>
+#include <folly/synchronization/Baton.h>
 
-#include <homestore/superblk_handler.hpp>
-#include <homestore/checkpoint/cp.hpp>
+#include <homestore/meta/module_meta_blk.hpp>
+#include <homestore/checkpoint/cp.h>
 
 namespace homestore {
 class CPMgrMetrics : public sisl::MetricsGroup {
@@ -46,42 +52,22 @@ public:
     ~CPMgrMetrics() { deregister_me_from_farm(); }
 };
 
-class CPContext {
-protected:
-    CP* m_cp;
-    folly::Promise< bool > m_flush_comp;
-
-public:
-    CPContext(CP* cp) : m_cp{cp} {}
-    virtual ~CPContext() = default;
-
-    CP* cp() { return m_cp; }
-    cp_id_t id() const;
-
-    void complete(bool status);
-    folly::Future< bool > get_future() { return m_flush_comp.getFuture(); }
-};
-
 class CPCallbacks {
 public:
     virtual ~CPCallbacks() = default;
 
-    /// @brief CPManager calls this method when a new CP is triggered and it is time to switchover the dirty buffer
-    /// collection to the new CP and flush the existing CP.
-    /// @param cur_cp Pointer to the current CP session which about to be switchedover
-    /// @param new_cp Pointer to the new CP session which will be switched over to
-    /// @return Returns the CPContext it has gathered so far as part of current cp session.
-    virtual std::unique_ptr< CPContext > on_switchover_cp(CP* cur_cp, CP* new_cp) = 0;
+    /// @brief CPManager calls this method when a new CP is triggered. Consumers must switch their dirty buffer
+    /// collection to new_cp and prepare old cur_cp for flushing. Consumers own their per-CP state internally.
+    /// @param cur_cp Pointer to the CP about to be flushed (null on first registration)
+    /// @param new_cp Pointer to the new CP session to accumulate into
+    virtual void on_switchover_cp(CP* cur_cp, CP* new_cp) = 0;
 
-    /// @brief After gathering CPContext from all consumers, CPManager calls this method to flush the dirty buffers
-    /// accumulated in this CP. Once CP flush is completed, consumers are required to set the promise corresponding to
-    /// returned future.
-    /// @param cp CP pointer to which the dirty buffers have to be flushed
-    /// @param done_cb Callback after cp is done
-    virtual folly::Future< bool > cp_flush(CP* cp) = 0;
+    /// @brief CPManager calls this once per CP flush, one consumer at a time (sequential). Consumers flush all dirty
+    /// data accumulated since the previous CP. Returns true on success.
+    /// @param cp CP pointer to flush
+    virtual folly::coro::Task< bool > cp_flush(CP* cp) = 0;
 
-    /// @brief After all consumers flushed the CP, CPManager calls this method to clean up any CP related structures
-    /// @param cp
+    /// @brief After all consumers flushed the CP, CPManager calls this method to clean up any CP related structures.
     virtual void cp_cleanup(CP* cp) = 0;
 
     /// @brief While CP is progressing, CPManager calls this method frequently to check its flush progress.
@@ -93,13 +79,31 @@ public:
     virtual void repair_slow_cp() {}
 };
 
-class CPWatchdog;
+class CPWatchdog {
+public:
+    explicit CPWatchdog(CPManager* cp_mgr);
+    void set_cp(CP* cp);
+    void reset_cp();
+    void cp_watchdog_timer();
+    void stop();
+
+private:
+    CP* cp_{nullptr};
+    CPManager* cp_mgr_;
+    std::shared_mutex cp_mtx_;
+    Clock::time_point last_state_ch_time_;
+    uint64_t timer_sec_{0};
+    uint32_t progress_pct_{0};
+    std::atomic< bool > stopped_{false};
+    folly::CancellationSource cancel_src_;
+    folly::Baton<> done_baton_;
+};
 
 static constexpr uint64_t cp_sb_magic{0xc0c0c01a};
 static constexpr uint32_t cp_sb_version{0x1};
 
 #pragma pack(1)
-struct cp_mgr_super_block {
+struct CPManagerSuperBlock {
     uint64_t magic{cp_sb_magic};
     uint32_t version{cp_sb_version};
     cp_id_t m_last_flushed_cp{-1};
@@ -109,21 +113,20 @@ struct cp_mgr_super_block {
 class CPManager;
 class CPGuard {
 private:
-    CP* m_cp{nullptr};
-    bool m_pushed{false};
+    CP* cp_{nullptr};
+    bool pushed_{false};
 
-    // Why we need this thread_local variable and that too of type stack?
-    // thread_local variable is needed because we wanted to make cp critical section re-entrant. So when a thread enters
-    // into a critical section and crosses methods and other code within the stack needs to enter to critical section,
-    // having this facility make sure that it uses already entered critical section within the stack.
+    // s_token is a pre-computed key used to store the CP stack in the current coroutine's RequestContext.
+    // RequestContext is saved and restored across every co_await, giving per-coroutine isolation: coroutine A's
+    // stack is invisible to coroutine B even when both run on the same OS thread.
     //
-    // Why do we need a stack instead of only one CP* to track current critical section?
-    // It is because CPGuard can be moved from one thread to other. The thread which it is moved to can be accessed
-    // on a different cp critical section than one passed to. For example, if thread 1 gets into cp1 critical section
-    // and passes the cp1 to thread2. However, before accessing cp1, thread2 already takes cp2 critical section and then
-    // access cp1, then it needs to wind up with cp1 and once cp1 is done, has to go back to cp2. This nesting can
-    // potentially happen recursively (although such pattern is not great, it can exist). That is why we use stack here
-    static iomgr::FiberManagerLib::FiberLocal< std::stack< CP* > > t_cp_stack;
+    // The stack (not just a single CP pointer) is necessary so that nested CPGuards within a synchronous call chain
+    // all reuse the outermost CP, even if a CP switch happened after the outermost guard was taken.
+    //
+    // CPGuard must NOT be held across a co_await: doing so keeps enter_cnt_ non-zero across the suspension,
+    // which stalls any pending CP flush until the coroutine resumes and releases the guard.
+    static folly::RequestToken s_token;
+    static std::stack< CP* >& cp_stack();
 
 public:
     CPGuard(CPManager* mgr);
@@ -132,7 +135,6 @@ public:
     CPGuard(const CPGuard& other);
     virtual CPGuard operator=(const CPGuard& other);
 
-    CPContext* context(cp_consumer_t consumer);
     virtual CP* operator->();
     virtual CP* get();
 };
@@ -157,44 +159,51 @@ public:
     static constexpr size_t max_concurent_cps{2};
 
 private:
-    CP* m_cur_cp{nullptr}; // Current CP information
-    std::unique_ptr< CPMgrMetrics > m_metrics;
-    std::mutex m_trigger_cp_mtx;
-    std::array< std::unique_ptr< CPCallbacks >, (size_t)cp_consumer_t::SENTINEL > m_cp_cb_table;
-    std::unique_ptr< CPWatchdog > m_wd_cp;
-    superblk< cp_mgr_super_block > m_sb;
-    std::vector< iomgr::io_fiber_t > m_cp_io_fibers;
-    iomgr::timer_handle_t m_cp_timer_hdl;
-    bool m_cp_shutdown_initiated{false};
-    bool m_in_flush_phase{false};
-    bool m_pending_trigger_cp{false}; // Is there is a waiter for a cp flush to start
-    folly::SharedPromise< bool > m_pending_trigger_cp_comp;
-    // std::vector< uint64_t > m_trigger_reasons;
+    CP* cur_cp_{nullptr};
+    std::unique_ptr< CPMgrMetrics > metrics_;
+    std::mutex trigger_cp_mtx_;
+    std::unique_ptr< CPWatchdog > wd_cp_;
+    ModuleMetaBlk< CPManagerSuperBlock > sb_;
+
+    // RCU consumer map: readers do a lock-free atomic_load, writers copy-and-swap (registration is rare).
+    // Values are shared_ptr so the map is cheaply copyable on write.
+    using ConsumerMap = std::unordered_map< CPConsumer, shared< CPCallbacks > >;
+    std::atomic< shared< const ConsumerMap > > consumers_{std::make_shared< ConsumerMap >()};
+
+    // State maintanence
+    bool cp_shutdown_initiated_{false};
+    bool in_flush_phase_{false};
+    bool pending_trigger_cp_{false};
+    folly::SharedPromise< bool > pending_trigger_cp_comp_;
+
+    // Timer Related
+    bool cp_timer_started_{false};
+    folly::CancellationSource cp_timer_cancel_src_;
+    folly::Baton<> cp_timer_done_baton_;
 
 public:
     CPManager();
     virtual ~CPManager();
 
-    /// @brief Start the CPManager, which creates a first cp session.
+    /// @brief Start the CPManager, which opens or recovers the CP superblock and creates the first cp session.
     /// @param first_time_boot
-    void start(bool first_time_boot);
+    folly::coro::Task< void > start(bool first_time_boot);
 
     /// @brief Start the cp timer so that periodic cps are started
     void start_timer();
 
-    /// @brief Shutdown the checkpoint manager services. It will not trigger a flush, but cancels any existing
-    /// checkpoint session abruptly. If caller needs clean shutdown, then they explicitly needs to trigger cp flush
-    /// before calling shutdown.
+    /// @brief Shutdown the checkpoint manager services. It will trigger a flush, wait for the CP to be flushed
+    /// and does a clean shutdown
     void shutdown();
 
-    /// @brief Register a CP consumer to the checkpoint manager. CP consumer provides the callback they are interested
-    /// in the checkpoint process. Each consumer gets a CPContext, which consumer can put its own dirty buffer info
-    /// @param consumer_id : Pre-determined consumer id. Consumers are compile time defined. It doesn't support dynamic
-    /// consumer registeration
-    /// @param callbacks : Callbacks denoted by the consumers. Details are provided in CPCallbacks class
-    void register_consumer(cp_consumer_t consumer_id, std::unique_ptr< CPCallbacks > callbacks);
+    /// @brief Register a CP consumer. The consumer is immediately notified via on_switchover_cp(nullptr, cur_cp)
+    /// so it can initialize its internal per-CP state. Each registered consumer receives all future CP lifecycle
+    /// callbacks. Consumers own their per-CP state; nothing is stored in the CP object itself.
+    /// @param consumer_id Consumer identifier a string that uniquely identifies the consumer (e.g. "IndexService")
+    /// @param callbacks   Consumer's callbacks implementation (shared ownership, passed as shared<CPCallbacks>)
+    void register_consumer(CPConsumer consumer_id, shared< CPCallbacks > callbacks);
 
-    CPCallbacks* get_consumer(cp_consumer_t consumer_id);
+    CPCallbacks* get_consumer(CPConsumer consumer_id);
 
     /// @brief Call this method before every IO that needs to be checkpointed. It marks the entrance of critical section
     /// of the returned CP and ensures that until it is exited, flush of the CP will not happen.
@@ -222,13 +231,15 @@ public:
     /// @brief Trigger a checkpoint flush on all subsystems registered. There is only 1 checkpoint per checkpoint
     /// manager. Checkpoint flush will wait for cp to exited all critical io sections.
     /// @param force : Do we need to force queue the checkpoint flush, in case previous checkpoint is being flushed
-    folly::Future< bool > trigger_cp_flush(bool force = false, CPTriggerReason reason = CPTriggerReason::Unknown);
+    /// @param reason : The reason for triggering the checkpoint, used for logging and metrics
+    /// @return Returns a future which will be fulfilled when the flush is completed. The future result is true if flush
+    /// is successful, false otherwise (e.g. flush failed or was not triggered because another flush is in progress and
+    /// force was false).
+    folly::SemiFuture< bool > trigger_cp_flush(bool force = false, CPTriggerReason reason = CPTriggerReason::Unknown);
 
-    const std::array< std::unique_ptr< CPCallbacks >, (size_t)cp_consumer_t::SENTINEL >& consumer_list() const {
-        return m_cp_cb_table;
-    }
-
-    iomgr::io_fiber_t pick_blocking_io_fiber() const;
+    /// @brief Get the list of Consumers and their callbacks registered to CPManager
+    /// @return Returns the list of Consumers and their callbacks registered to CPManager
+    shared< const ConsumerMap > consumers() const { return consumers_.load(); }
 
     /// @brief Is the given cp has already finished flushing
     /// @param cp_id
@@ -239,13 +250,9 @@ private:
     void cp_ref(CP* cp);
     void create_first_cp();
     void cp_start_flush(CP* cp);
-    void on_cp_flush_done(CP* cp);
     void cleanup_cp(CP* cp);
-    void on_meta_blk_found(const sisl::ByteView& buf, void* meta_cookie);
-    void start_cp_thread();
-    folly::Future< bool > do_trigger_cp_flush(bool force, bool flush_on_shutdown,
-                                              CPTriggerReason reason = CPTriggerReason::Unknown);
+    folly::SemiFuture< bool > do_trigger_cp_flush(bool force, bool flush_on_shutdown,
+                                                  CPTriggerReason reason = CPTriggerReason::Unknown);
 };
 
-extern CPManager& cp_mgr();
 } // namespace homestore

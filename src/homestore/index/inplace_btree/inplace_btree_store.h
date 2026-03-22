@@ -18,12 +18,12 @@
 #include <vector>
 #include <atomic>
 #include <homestore/index/index_internal.hpp>
-#include <homestore/btree/btree.ipp>
+#include <homestore/index/btree/btree.ipp>
 #include <homestore/superblk_handler.hpp>
 #include <homestore/index_service.hpp>
-#include <homestore/checkpoint/cp_mgr.hpp>
+#include <homestore/checkpoint/cp_mgr.h>
 #include <homestore/index/wb_cache_base.hpp>
-#include <homestore/btree/detail/btree_internal.hpp>
+#include <homestore/index/btree/detail/btree_internal.h>
 #include <iomgr/iomgr_flip.hpp>
 
 namespace homestore {
@@ -192,12 +192,12 @@ public:
             BtreeNode* n = this->init_node(idx_buf->raw_buffer(), idx_buf->blkid().to_integer(), false /* init_buf */,
                                            BtreeNode::identify_leaf_node(idx_buf->raw_buffer()));
             static_cast< IndexBtreeNode* >(n)->attach_buf(idx_buf);
-            auto edge_id = n->next_bnode();
+            auto edge_id = n->next_node();
 
             BT_DBG_ASSERT(!n->has_valid_edge(),
                           "root {} already has a valid edge {}, so we should have found the new root node",
                           n->to_string(), n->get_edge_value().bnode_id());
-            n->set_next_bnode(empty_bnodeid);
+            n->set_next_node(empty_bnodeid);
             n->set_edge_value(BtreeLinkInfo{edge_id, 0});
             LOGTRACEMOD(wbcache, "change root node {}: edge updated to {} and invalidate the next node! ", n->node_id(),
                         edge_id);
@@ -212,87 +212,86 @@ public:
 
     void delete_stale_children(IndexBufferPtr const& idx_buf) override {
                                            BtreeNode::identify_leaf_node(idx_buf->raw_buffer()));
-            static_cast< IndexBtreeNode* >(n)->attach_buf(idx_buf);
-            auto cpg = cp_mgr().cp_guard();
-            idx_buf->m_dirtied_cp_id = cpg->id();
-            BtreeNodePtr bn = BtreeNodePtr{n};
+                                           static_cast< IndexBtreeNode* >(n)->attach_buf(idx_buf);
+                                           auto cpg = cp_mgr().cp_guard();
+                                           idx_buf->m_dirtied_cp_id = cpg->id();
+                                           BtreeNodePtr bn = BtreeNodePtr{n};
 
-            if (!bn->is_leaf()) {
-                LOGTRACEMOD(wbcache, "delete_stale_links cp={} buf={}", cpg->id(), idx_buf->to_string());
-                delete_stale_links(bn, (void*)cpg.context(cp_consumer_t::INDEX_SVC));
-            }
-        }
+                                           if (!bn->is_leaf()) {
+                                               LOGTRACEMOD(wbcache, "delete_stale_links cp={} buf={}", cpg->id(),
+                                                           idx_buf->to_string());
+                                               delete_stale_links(bn, (void*)cpg.context(cp_consumer_t::INDEX_SVC));
+                                           }
     }
+}
 
     void repair_node(IndexBufferPtr const& idx_buf) override {
-        if (idx_buf->is_meta_buf()) {
-            // meta_buf. It is ok to ignore this call, because repair will be done from root before meta_buf is
-            // attempted to repair, which would have updated the meta_buf already.
-            LOGTRACEMOD(wbcache, "Ignoring repair on meta buf {} root id {} ", idx_buf->to_string(),
-                        this->root_node_id());
-            return;
-        }
-        BtreeNode* n = this->init_node(idx_buf->raw_buffer(), idx_buf->blkid().to_integer(), false /* init_buf */,
-                                       BtreeNode::identify_leaf_node(idx_buf->raw_buffer()));
-        static_cast< IndexBtreeNode* >(n)->attach_buf(idx_buf);
-        auto cpg = cp_mgr().cp_guard();
-
-        // Set the cp_id to current cp buf, since repair doesn't call get_writable_buf (unlike regular IO path), so
-        // we need to set it here, so that other code path assumes correct cp
-        idx_buf->m_dirtied_cp_id = cpg->id();
-        BtreeNodePtr bn = BtreeNodePtr{n};
-
-        // Only for interior nodes we need to repair its links
-        if (!bn->is_leaf()) {
-            LOGTRACEMOD(wbcache, "repair_node cp={} buf={}", cpg->id(), idx_buf->to_string());
-            repair_links(bn, (void*)cpg.context(cp_consumer_t::INDEX_SVC));
-        }
-
-        if (idx_buf->m_up_buffer && idx_buf->m_up_buffer->is_meta_buf()) {
-            // Our up buffer is a meta buffer, which means that we are the new root node, we need to update the
-            // meta_buf with new root as well
-            LOGTRACEMOD(wbcache, "root change for after repairing {}\n\n", idx_buf->to_string());
-            on_root_changed(bn, (void*)cpg.context(cp_consumer_t::INDEX_SVC));
-        }
+    if (idx_buf->is_meta_buf()) {
+        // meta_buf. It is ok to ignore this call, because repair will be done from root before meta_buf is
+        // attempted to repair, which would have updated the meta_buf already.
+        LOGTRACEMOD(wbcache, "Ignoring repair on meta buf {} root id {} ", idx_buf->to_string(), this->root_node_id());
+        return;
     }
+    BtreeNode* n = this->init_node(idx_buf->raw_buffer(), idx_buf->blkid().to_integer(), false /* init_buf */,
+                                   BtreeNode::identify_leaf_node(idx_buf->raw_buffer()));
+    static_cast< IndexBtreeNode* >(n)->attach_buf(idx_buf);
+    auto cpg = cp_mgr().cp_guard();
+
+    // Set the cp_id to current cp buf, since repair doesn't call get_writable_buf (unlike regular IO path), so
+    // we need to set it here, so that other code path assumes correct cp
+    idx_buf->m_dirtied_cp_id = cpg->id();
+    BtreeNodePtr bn = BtreeNodePtr{n};
+
+    // Only for interior nodes we need to repair its links
+    if (!bn->is_leaf()) {
+        LOGTRACEMOD(wbcache, "repair_node cp={} buf={}", cpg->id(), idx_buf->to_string());
+        repair_links(bn, (void*)cpg.context(cp_consumer_t::INDEX_SVC));
+    }
+
+    if (idx_buf->m_up_buffer && idx_buf->m_up_buffer->is_meta_buf()) {
+        // Our up buffer is a meta buffer, which means that we are the new root node, we need to update the
+        // meta_buf with new root as well
+        LOGTRACEMOD(wbcache, "root change for after repairing {}\n\n", idx_buf->to_string());
+        on_root_changed(bn, (void*)cpg.context(cp_consumer_t::INDEX_SVC));
+    }
+}
 
 protected:
-    ////////////////// Override Implementation of underlying store requirements //////////////////
-    BtreeNodePtr create_node(bool is_leaf) override {
-        return wb_cache().alloc_buf([this, is_leaf](const IndexBufferPtr& idx_buf) -> BtreeNodePtr {
-            BtreeNode* n = this->init_node(idx_buf->raw_buffer(), idx_buf->blkid().to_integer(), true, is_leaf);
-            static_cast< IndexBtreeNode* >(n)->attach_buf(idx_buf);
-            return BtreeNodePtr{n};
-        });
-    }
+////////////////// Override Implementation of underlying store requirements //////////////////
+BtreeNodePtr create_node(bool is_leaf) override {
+    return wb_cache().alloc_buf([this, is_leaf](const IndexBufferPtr& idx_buf) -> BtreeNodePtr {
+        BtreeNode* n = this->init_node(idx_buf->raw_buffer(), idx_buf->blkid().to_integer(), true, is_leaf);
+        static_cast< IndexBtreeNode* >(n)->attach_buf(idx_buf);
+        return BtreeNodePtr{n};
+    });
+}
 
-    btree_status_t write_node_impl(const BtreeNodePtr& node, void* context) override {
-        auto cp_ctx = r_cast< CPContext* >(context);
-        auto idx_node = static_cast< IndexBtreeNode* >(node.get());
+btree_status_t write_node_impl(const BtreeNodePtr& node, void* context) override {
+    auto cp_ctx = r_cast< CPContext* >(context);
+    auto idx_node = static_cast< IndexBtreeNode* >(node.get());
 
-        node->set_checksum();
-        auto prev_state = idx_node->m_idx_buf->m_state.exchange(index_buf_state_t::DIRTY);
-        idx_node->m_idx_buf->m_node_level = node->level();
-        if (prev_state == index_buf_state_t::CLEAN) {
-            // It was clean before, dirtying it first time, add it to the wb_cache list to flush
-            if (idx_node->m_idx_buf->m_dirtied_cp_id != -1) {
-                BT_DBG_ASSERT_EQ(idx_node->m_idx_buf->m_dirtied_cp_id, cp_ctx->id(),
-                                 "Writing a node which was not acquired by this cp");
-            }
-            node->set_modified_cp_id(cp_ctx->id());
-            wb_cache().write_buf(node, idx_node->m_idx_buf, cp_ctx);
-        } else {
-            BT_DBG_ASSERT_NE(
-                (int)prev_state, (int)index_buf_state_t::FLUSHING,
-                "Writing on a node buffer which was currently in flushing state on cur_cp={} buffer_cp_id={}",
-                cp_ctx->id(), idx_node->m_idx_buf->m_dirtied_cp_id);
+    node->set_checksum();
+    auto prev_state = idx_node->m_idx_buf->m_state.exchange(index_buf_state_t::DIRTY);
+    idx_node->m_idx_buf->m_node_level = node->level();
+    if (prev_state == index_buf_state_t::CLEAN) {
+        // It was clean before, dirtying it first time, add it to the wb_cache list to flush
+        if (idx_node->m_idx_buf->m_dirtied_cp_id != -1) {
             BT_DBG_ASSERT_EQ(idx_node->m_idx_buf->m_dirtied_cp_id, cp_ctx->id(),
+                             "Writing a node which was not acquired by this cp");
         }
-        return btree_status_t::success;
+        node->set_modified_cp_id(cp_ctx->id());
+        wb_cache().write_buf(node, idx_node->m_idx_buf, cp_ctx);
+    } else {
+        BT_DBG_ASSERT_NE((int)prev_state, (int)index_buf_state_t::FLUSHING,
+                         "Writing on a node buffer which was currently in flushing state on cur_cp={} buffer_cp_id={}",
+                         cp_ctx->id(), idx_node->m_idx_buf->m_dirtied_cp_id);
+            BT_DBG_ASSERT_EQ(idx_node->m_idx_buf->m_dirtied_cp_id, cp_ctx->id(),
+    }
+    return btree_status_t::success;
 
     btree_status_t transact_nodes(const BtreeNodeList& new_nodes, const BtreeNodeList& freed_nodes,
-                                  const BtreeNodePtr& left_child_node, const BtreeNodePtr& parent_node,
-                                  void* context) override {
+                                  const BtreeNodePtr& left_child_node, const BtreeNodePtr& parent_node, void* context)
+        override {
         CPContext* cp_ctx = r_cast< CPContext* >(context);
 
         IndexBufferPtrList new_node_bufs;
@@ -316,7 +315,7 @@ protected:
         return btree_status_t::success;
     }
 
-    btree_status_t read_node_impl(bnodeid_t id, BtreeNodePtr& node) const override {
+    btree_status_t read_node_impl(bnodeid_t id, BtreeNodePtr & node) const override {
         try {
             wb_cache().read_buf(id, node, [this](const IndexBufferPtr& idx_buf) mutable -> BtreeNodePtr {
                 bool is_leaf = BtreeNode::identify_leaf_node(idx_buf->raw_buffer());
@@ -517,8 +516,8 @@ protected:
                 if (auto ret = read_node_impl(cur_child_info.bnode_id(), cur_child); ret == btree_status_t::success) {
                     if (!cur_child->is_node_deleted() && cur_child->total_entries()) {
                         last_child_last_key = cur_child->get_last_key< K >();
-                        if (cur_child->next_bnode() != empty_bnodeid &&
-                            read_node_impl(cur_child->next_bnode(), next_cur_child) == btree_status_t::success) {
+                        if (cur_child->next_node() != empty_bnodeid &&
+                            read_node_impl(cur_child->next_node(), next_cur_child) == btree_status_t::success) {
                             LOGTRACEMOD(
                                 wbcache,
                                 "Last child last key {} for child_node [{}] parent node [{}],  next neigbor is [{}]",
@@ -560,13 +559,13 @@ protected:
                     BtreeNodePtr true_sibling;
                     BtreeLinkInfo sibling_info;
 
-                    auto sibling_node_id = parent_node->next_bnode();
+                    auto sibling_node_id = parent_node->next_node();
                     while (sibling_node_id != empty_bnodeid) {
                         if (auto ret = read_node_impl(sibling_node_id, sibling); ret == btree_status_t::success) {
                             if (sibling->is_node_deleted()) {
                                 // Do we need to free the sibling node here?
                                 siblings.push_back(sibling);
-                                sibling_node_id = sibling->next_bnode();
+                                sibling_node_id = sibling->next_node();
                                 LOGTRACEMOD(wbcache, "Sibling node [{}] is deleted, continue to next sibling",
                                             sibling->to_string());
                                 continue;
@@ -574,7 +573,7 @@ protected:
                             auto sibling_last_key = sibling->get_last_key< K >();
                             if (next_cur_child && sibling_last_key.compare(last_child_neighbor_key) < 0) {
                                 siblings.push_back(sibling);
-                                sibling_node_id = sibling->next_bnode();
+                                sibling_node_id = sibling->next_node();
                             } else {
                                 true_sibling = sibling;
                                 break;
@@ -589,7 +588,7 @@ protected:
                     }
                     if (sibling_node_id != empty_bnodeid) {
                         last_parent_key = last_child_last_key;
-                        parent_node->set_next_bnode(true_sibling->node_id());
+                        parent_node->set_next_node(true_sibling->node_id());
                         for (auto sibling : siblings) {
                             LOGTRACEMOD(wbcache, "Sibling list [{}]", sibling->to_string());
                         }
@@ -616,7 +615,7 @@ protected:
         auto cur_parent = parent_node;
         BtreeNodeList new_parent_nodes;
         do {
-            if (child_node->has_valid_edge() || (child_node->is_leaf() && child_node->next_bnode() == empty_bnodeid)) {
+            if (child_node->has_valid_edge() || (child_node->is_leaf() && child_node->next_node() == empty_bnodeid)) {
                 if (child_node->is_node_deleted()) {
                     // Edge node is merged, we need to set the current last entry as edge
                     if (cur_parent->total_entries() > 0) {
@@ -638,12 +637,12 @@ protected:
                     } else {
                         auto tsib_id = find_true_sibling(cur_parent);
                         if (tsib_id != empty_bnodeid) {
-                            cur_parent->set_next_bnode(tsib_id);
+                            cur_parent->set_next_node(tsib_id);
                             LOGTRACEMOD(wbcache,
                                         "True sibling [{}] for parent_node [{}], So don't add child [{}] here ",
                                         tsib_id, cur_parent->to_string(), child_node->to_string());
                         } else {
-                            cur_parent->set_next_bnode(empty_bnodeid);
+                            cur_parent->set_next_node(empty_bnodeid);
                             // if this child node previously belonged to this parent node, we need to add it but as edge
                             // o.w, not this node
                             if (orig_child_infos.contains(child_node->node_id())) {
@@ -694,27 +693,27 @@ protected:
                                 "loop ends",
                                 child_node->to_string());
                     // now update  the next of parent node by skipping all deleted siblings of this parent node
-                    auto valid_sibling = cur_parent->next_bnode();
+                    auto valid_sibling = cur_parent->next_node();
                     while (valid_sibling != empty_bnodeid) {
                         BtreeNodePtr sibling;
                         if (read_node_impl(valid_sibling, sibling) == btree_status_t::success) {
                             if (sibling->is_node_deleted()) {
-                                valid_sibling = sibling->next_bnode();
+                                valid_sibling = sibling->next_node();
                                 continue;
                             }
-                            // cur_parent->set_next_bnode(sibling->node_id());
+                            // cur_parent->set_next_node(sibling->node_id());
                             break;
                         }
                         LOGTRACEMOD(wbcache, "Failed to read child node {} for parent node [{}] reason {}",
                                     valid_sibling, cur_parent->to_string(), ret);
                     }
                     if (valid_sibling != empty_bnodeid) {
-                        cur_parent->set_next_bnode(valid_sibling);
+                        cur_parent->set_next_node(valid_sibling);
                         LOGTRACEMOD(wbcache, "Repairing node={}, child_node=[{}] is an edge node, end loop",
                                     cur_parent->node_id(), child_node->to_string());
 
                     } else {
-                        cur_parent->set_next_bnode(empty_bnodeid);
+                        cur_parent->set_next_node(empty_bnodeid);
                         LOGTRACEMOD(wbcache, "Repairing node={}, child_node=[{}] is an edge node, end loop",
                                     cur_parent->node_id(), child_node->to_string());
                     }
@@ -732,10 +731,9 @@ protected:
                     break;
                 }
 
-                new_parent->set_next_bnode(cur_parent->next_bnode());
-                cur_parent->set_next_bnode(new_parent->node_id());
+                new_parent->set_next_node(cur_parent->next_node());
+                cur_parent->set_next_node(new_parent->node_id());
                 new_parent->set_level(cur_parent->level());
-                cur_parent->inc_link_version();
 
                 new_parent_nodes.push_back(new_parent);
                 cur_parent = std::move(new_parent);
@@ -771,8 +769,8 @@ protected:
                                 "Repairing node={}, child_node=[{}] is deleted, set next of previous child node [{}] "
                                 "to this child node [{}]",
                                 cur_parent->node_id(), child_node->to_string(), pre_child_node->to_string(),
-                                child_node->next_bnode());
-                    pre_child_node->set_next_bnode(child_node->next_bnode());
+                                child_node->next_node());
+                    pre_child_node->set_next_node(child_node->next_node());
                     // repairing the next of previous child node
                     // We need to set the state of the previous child node to clean, so that it can be flushed
                     IndexBtreeNode* idx_node = static_cast< IndexBtreeNode* >(pre_child_node.get());
@@ -784,7 +782,7 @@ protected:
                                 child_last_key.to_string());
                     // update it here to go to the next child node and unlock this node
                     LOGTRACEMOD(wbcache, "update the child node next to the next of previous child node");
-                    child_node->set_next_bnode(child_node->next_bnode());
+                    child_node->set_next_node(child_node->next_node());
                 }
             }
 
@@ -792,7 +790,7 @@ protected:
                         cur_parent->to_string());
 
             // Move to the next child node
-            auto const next_node_id = child_node->next_bnode();
+            auto const next_node_id = child_node->next_node();
             this->unlock_node(child_node, locktype_t::READ);
             if (!child_node->is_node_deleted()) {
                 // We need to free the child node
@@ -890,7 +888,7 @@ protected:
         if (node->has_valid_edge()) {
             sibling_id = node->get_edge_value().bnode_id();
         } else {
-            sibling_id = node->next_bnode();
+            sibling_id = node->next_node();
         }
         if (sibling_id == empty_bnodeid) {
             return empty_bnodeid;

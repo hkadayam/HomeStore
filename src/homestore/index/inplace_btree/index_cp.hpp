@@ -19,9 +19,9 @@
 #include <homestore/blk.h>
 #include <homestore/index/index_internal.hpp>
 #include <homestore/index_service.hpp>
-#include <homestore/checkpoint/cp_mgr.hpp>
-#include <homestore/checkpoint/cp.hpp>
-#include <homestore/btree/detail/btree_node.hpp>
+#include <homestore/checkpoint/cp_mgr.h>
+#include <homestore/checkpoint/cp.h>
+#include <homestore/index/btree/detail/btree_node.h>
 #include "device/virtual_dev.hpp"
 
 namespace homestore {

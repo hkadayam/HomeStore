@@ -1,4 +1,4 @@
-#include <homestore/checkpoint/cp_mgr.hpp>
+#include <homestore/checkpoint/cp_mgr.h>
 #include "index/cow_btree/cow_btree_cp.h"
 #include "index/cow_btree/cow_btree_store.h"
 #include "index/index_cp.h"

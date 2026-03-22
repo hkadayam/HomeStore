@@ -29,9 +29,9 @@
 #include <homestore/homestore_decl.hpp>    // dev_info, HSDevType
 #include <sisl/fds/bitset.h>
 
-// TODO: hs_super_blk.h still has iomgr deps; will be cleaned up when
+// TODO: HSSuperBlk.h still has iomgr deps; will be cleaned up when
 // device_metadata is fully separated from iomgr.
-#include "device/hs_super_blk.h"           // pdev_info_header, first_block, hs_super_blk
+#include "device/HSSuperBlk.h"           // PDevInfoHeader, first_block, HSSuperBlk
 
 #include "iomanager/drive_interface.hpp"   // DriveInterface, IoDevice, IOBuffer
 #include "device/chunk.h"              // ChunkInfo, ChunkInterval, ChunkIntervalSet, Chunk
@@ -90,9 +90,9 @@ public:
     static folly::coro::Task< std::shared_ptr< PhysicalDev > >
     load(dev_info dinfo, int oflags);
 
-    /// Build a pdev_info_header for a device (used by DeviceManager too).
+    /// Build a PDevInfoHeader for a device (used by DeviceManager too).
     /// Mirrors Rust's PhysicalDev::create_pdev_info().
-    static pdev_info_header create_pdev_info(const dev_info& dinfo, uint32_t pdev_id);
+    static PDevInfoHeader create_pdev_info(const dev_info& dinfo, uint32_t pdev_id);
 
     /// Read the first block from a device without constructing a PhysicalDev.
     static folly::coro::Task< first_block >
@@ -194,7 +194,7 @@ private:
     /// Common low-level init: opens device, measures size, populates fields.
     /// Returns a heap-allocated PhysicalDev wrapped in shared_ptr.
     static folly::coro::Task< std::shared_ptr< PhysicalDev > >
-    construct(dev_info dinfo, int oflags, pdev_info_header pinfo);
+    construct(dev_info dinfo, int oflags, PDevInfoHeader pinfo);
 
     // ── Locked helpers (called with chunk_mutex_ held) ────────────────────────
 
@@ -223,7 +223,7 @@ private:
     std::string                       devname_;
     HSDevType                         dev_type_{HSDevType::Data};
     dev_info                          dev_info_{"", HSDevType::Data};
-    pdev_info_header                  pdev_info_;
+    PDevInfoHeader                  pdev_info_;
     uint64_t                          devsize_{0};
     bool                              super_blk_in_footer_{false};
 

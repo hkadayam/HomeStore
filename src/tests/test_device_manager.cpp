@@ -186,7 +186,7 @@ TEST_F(DeviceMgrTest, SmallStripedVDevCreation) {
 
     // Create a vdev small to one minimal chunk per pdev
     auto num_chunks = uint32_cast(m_pdevs.size() * 2);
-    auto size = m_pdevs.size() * hs_super_blk::min_chunk_size(homestore::HSDevType::Data);
+    auto size = m_pdevs.size() * HSSuperBlk::min_chunk_size(homestore::HSDevType::Data);
 
     LOGINFO("Step 1: Creating vdev of name={} with size={}", name, in_bytes(size));
     auto vdev =

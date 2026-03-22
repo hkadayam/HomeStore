@@ -28,7 +28,7 @@
 #include <homestore/index_service.hpp>
 #include <homestore/replication_service.hpp>
 #include <homestore/checkpoint/cp_mgr.hpp>
-#include <device/hs_super_blk.h>
+#include <device/HSSuperBlk.h>
 #include <iomgr/iomgr_config_generated.h>
 #include <common/homestore_assert.hpp>
 
@@ -543,7 +543,7 @@ private:
     }
 
     void init_raw_device(homestore::dev_info const& dinfo) {
-        static auto zero_size = hs_super_blk::first_block_size() * 1024;
+        static auto zero_size = HSSuperBlk::first_block_size() * 1024;
         static std::vector< int > zeros(zero_size, 0);
 
         if (!std::filesystem::exists(dinfo.dev_name)) {
@@ -554,7 +554,7 @@ private:
         HS_REL_ASSERT(fd != -1, "Failed to open device");
 
         auto const write_sz =
-            pwrite(fd, zeros.data(), zero_size /* size */, hs_super_blk::first_block_offset() /* offset */);
+            pwrite(fd, zeros.data(), zero_size /* size */, HSSuperBlk::first_block_offset() /* offset */);
         HS_REL_ASSERT(write_sz == zero_size, "Failed to write to device");
         LOGINFO("Successfully zeroed the 1st {} bytes of device {}", zero_size, dinfo.dev_name);
         ::close(fd);

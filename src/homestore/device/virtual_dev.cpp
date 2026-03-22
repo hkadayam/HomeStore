@@ -23,7 +23,7 @@
 
 #include "sisl/logging/logging.h"
 #include "blkalloc/slab_blk_allocator.h"
-#include "device/hs_super_blk.h"     // hs_super_blk layout constants
+#include "device/HSSuperBlk.h"     // HSSuperBlk layout constants
 #include "device/physical_dev.h" // PhysicalDev
 #include "device/virtual_dev.h"
 
@@ -633,10 +633,10 @@ std::pair< uint64_t, shared< Chunk > > VirtualDev::to_dev_offset(const BlkId& bi
 // Private Helpers - VDevInfo management
 // ──────────────────────────────────────────────────────────────────────────────
 uint64_t VDevInfo::vdev_info_offset(uint32_t vdev_id) {
-    constexpr uint32_t max_vdevs = hs_super_blk::MAX_VDEVS_IN_SYSTEM;
+    constexpr uint32_t max_vdevs = HSSuperBlk::MAX_VDEVS_IN_SYSTEM;
     const uint64_t bitmap_raw = ((max_vdevs + 7u) / 8u) + 4096u;
     const uint64_t bitmap_size = ((bitmap_raw + 4095u) / 4096u) * 4096u;
-    const uint64_t array_offset = hs_super_blk::vdev_sb_offset() + bitmap_size;
+    const uint64_t array_offset = HSSuperBlk::vdev_sb_offset() + bitmap_size;
     return array_offset + static_cast< uint64_t >(vdev_id) * SIZE;
 }
 

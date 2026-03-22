@@ -26,7 +26,7 @@
 #include <sisl/fds/bitset.h>
 
 #include <homestore/homestore_decl.hpp> // dev_info, HSDevType, io_flag, shared, unique
-#include "device/hs_super_blk.h"        // first_block_header, hs_super_blk
+#include "device/HSSuperBlk.h"        // FirstBlockHeader, HSSuperBlk
 #include "device/physical_dev.h"    // PhysicalDev
 #include "device/virtual_dev.h"     // VirtualDev, VDevParameters, VDevInfo
 
@@ -44,7 +44,7 @@ struct DeviceManagerState {
 
     std::unique_ptr< sisl::Bitset > vdev_slot_bm; // one bit per vdev_id slot
     uint32_t cur_pdev_id{0};
-    first_block_header first_blk_hdr{};
+    FirstBlockHeader first_blk_hdr{};
     bool first_time_boot{true};
     bool boot_in_degraded_mode{false};
 };
@@ -118,13 +118,13 @@ private:
     // ── Superblock layout helpers (constexpr, no I/O) ────────────────────────
     // The vdev area of the superblock has this layout:
     //   [ vdev_slot_bitmap | VDevInfo[0] | VDevInfo[1] | ... | VDevInfo[N-1] ]
-    // The bitmap is page-aligned; its offset equals hs_super_blk::vdev_sb_offset().
+    // The bitmap is page-aligned; its offset equals HSSuperBlk::vdev_sb_offset().
 
     static constexpr uint64_t vdev_slot_bitmap_size() {
-        constexpr uint64_t raw = (hs_super_blk::MAX_VDEVS_IN_SYSTEM + 7u) / 8u + 4096u;
+        constexpr uint64_t raw = (HSSuperBlk::MAX_VDEVS_IN_SYSTEM + 7u) / 8u + 4096u;
         return ((raw + 4095u) / 4096u) * 4096u;
     }
-    static constexpr uint64_t vdev_slot_bitmap_offset() { return hs_super_blk::vdev_sb_offset(); }
+    static constexpr uint64_t vdev_slot_bitmap_offset() { return HSSuperBlk::vdev_sb_offset(); }
 
 private:
     // ── Immutable after construction ──────────────────────────────────────────

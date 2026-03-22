@@ -61,18 +61,18 @@ folly::coro::Task< void > close_and_uncache_dev(std::string devname) {
 
 // ── Static helpers ────────────────────────────────────────────────────────────
 
-pdev_info_header PhysicalDev::create_pdev_info(const dev_info& dinfo, uint32_t pdev_id) {
+PDevInfoHeader PhysicalDev::create_pdev_info(const dev_info& dinfo, uint32_t pdev_id) {
     // TODO: compute data_offset properly from superblock layout constants
-    // (hs_super_blk::total_size) once hs_super_blk is decoupled from iomgr.
+    // (HSSuperBlk::total_size) once HSSuperBlk is decoupled from iomgr.
     const uint64_t data_offset = 8192;
 
-    disk_attr attr{};
+    DiskAttr attr{};
     attr.phys_page_size = 512;
     attr.align_size = 512;
     attr.atomic_phys_page_size = 512;
     attr.num_streams = 0;
 
-    pdev_info_header hdr;
+    PDevInfoHeader hdr;
     hdr.pdev_id = pdev_id;
     hdr.data_offset = data_offset;
     hdr.size = dinfo.dev_size;
@@ -88,7 +88,7 @@ folly::coro::Task< first_block > PhysicalDev::read_first_block(const std::string
 
     DriveInterface di{};
     IOBuffer buf{first_block::s_io_fb_size};
-    auto [ec, rbuf] = co_await di.read(*iodev, std::move(buf), hs_super_blk::first_block_offset());
+    auto [ec, rbuf] = co_await di.read(*iodev, std::move(buf), HSSuperBlk::first_block_offset());
     if (ec) { throw std::system_error(ec, "read_first_block failed on " + devname); }
 
     first_block fb;
@@ -103,7 +103,7 @@ folly::coro::Task< uint64_t > PhysicalDev::get_dev_size(const std::string& devna
 
 // ── Factory: construct (private) ─────────────────────────────────────────────
 folly::coro::Task< std::shared_ptr< PhysicalDev > > PhysicalDev::construct(dev_info dinfo, int oflags,
-                                                                           pdev_info_header pinfo) {
+                                                                           PDevInfoHeader pinfo) {
     // Allocate via make_shared so enable_shared_from_this works immediately.
     auto pdev = std::make_shared< PhysicalDev >();
 
@@ -564,12 +564,12 @@ uint64_t PhysicalDev::chunk_info_offset_nth(uint32_t slot) const {
         static_cast< uint64_t >(slot) * ChunkInfo::SIZE;
 }
 
-uint64_t PhysicalDev::chunk_sb_offset() const { return hs_super_blk::chunk_sb_offset(); }
+uint64_t PhysicalDev::chunk_sb_offset() const { return HSSuperBlk::chunk_sb_offset(); }
 
 size_t PhysicalDev::chunk_info_bitmap_size() const {
-    return static_cast< size_t >(hs_super_blk::chunk_info_bitmap_size(dev_info_));
+    return static_cast< size_t >(HSSuperBlk::chunk_info_bitmap_size(dev_info_));
 }
 
-uint32_t PhysicalDev::max_chunks_in_pdev() const { return hs_super_blk::max_chunks_in_pdev(dev_info_); }
+uint32_t PhysicalDev::max_chunks_in_pdev() const { return HSSuperBlk::max_chunks_in_pdev(dev_info_); }
 
 } // namespace homestore

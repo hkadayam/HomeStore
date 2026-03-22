@@ -36,21 +36,21 @@
 namespace homestore {
 
 #pragma pack(1)
-struct disk_attr {
+struct DiskAttr {
     // all fields in this structure are a copy from iomgr::drive_attributes;
     uint32_t phys_page_size{0};        // Physical page size of flash ssd/nvme. This is optimal size to do IO
     uint32_t align_size{0};            // size alignment supported by drives/kernel
     uint32_t atomic_phys_page_size{0}; // atomic page size of the drive_sync_write_count
     uint32_t num_streams{0};
 
-    disk_attr() = default;
-    disk_attr(const iomgr::drive_attributes& iomgr_attr) :
+    DiskAttr() = default;
+    DiskAttr(const iomgr::drive_attributes& iomgr_attr) :
             phys_page_size{iomgr_attr.phys_page_size},
             align_size{iomgr_attr.align_size},
             atomic_phys_page_size{iomgr_attr.atomic_phys_page_size},
             num_streams{iomgr_attr.num_streams} {}
 
-    disk_attr& operator=(const iomgr::drive_attributes& iomgr_attr) {
+    DiskAttr& operator=(const iomgr::drive_attributes& iomgr_attr) {
         phys_page_size = iomgr_attr.phys_page_size;
         align_size = iomgr_attr.align_size;
         atomic_phys_page_size = iomgr_attr.atomic_phys_page_size;
@@ -74,7 +74,7 @@ struct disk_attr {
     }
 };
 
-struct first_block_header {
+struct FirstBlockHeader {
     static constexpr const char* PRODUCT_NAME{"HomeStore4x"};
     static constexpr size_t s_product_name_size{64};
     static constexpr uint32_t CURRENT_SUPERBLOCK_VERSION{4};
@@ -102,13 +102,13 @@ public:
     }
 };
 
-struct pdev_info_header {
+struct PDevInfoHeader {
 public:
     uint64_t data_offset{0};         // Offset within pdev where data starts
     uint64_t size{0};                // Total pdev size
     uint32_t pdev_id{0};             // Device ID for this store instance.
     uint32_t max_pdev_chunks{0};     // Max chunks in this pdev possible
-    disk_attr dev_attr;              // Attributes homestore expects from all the devices.
+    DiskAttr dev_attr;              // Attributes homestore expects from all the devices.
     uint8_t mirror_super_block{0x0}; // Have we mirrored the super block on head/tail
     uuid_t system_uuid;              // Current system uuid stamp to protect from device exchange
 
@@ -135,15 +135,15 @@ public:
     uint32_t checksum{0};             // Checksum of the entire first block (excluding this field)
     uint32_t formatting_done : 1 {0}; // Has formatting completed yet
     uint32_t reserved : 31 {0};
-    first_block_header hdr;         // Information about the entire system
-    pdev_info_header this_pdev_hdr; // Information about the current pdev
+    FirstBlockHeader hdr;         // Information about the entire system
+    PDevInfoHeader this_pdev_hdr; // Information about the current pdev
 
 public:
     uint64_t get_magic() const { return magic; }
 
     bool is_valid() const {
         return ((magic == HOMESTORE_MAGIC) &&
-                (std::string(hdr.product_name) == std::string(first_block_header::PRODUCT_NAME) &&
+                (std::string(hdr.product_name) == std::string(FirstBlockHeader::PRODUCT_NAME) &&
                  (formatting_done != 0x0)));
     }
 
@@ -157,7 +157,7 @@ public:
 static_assert(sizeof(first_block) <= first_block::s_atomic_fb_size);
 
 /////////////// Overarching super block information ////////////////
-class hs_super_blk {
+class HSSuperBlk {
 public:
     // Minium chunk size we can create in data device. Keeping this lower will increase number of chunks and thus
     // area for super block will be higher.
@@ -184,7 +184,7 @@ public:
     static uint64_t chunk_info_bitmap_size(const dev_info& dinfo) {
         // Chunk bitmap area has bitmap of max_chunks rounded off to 4k page
         // add 4KB headroom for bitmap serialized header
-        auto bytes = sisl::round_up(hs_super_blk::max_chunks_in_pdev(dinfo), 8) / 8 + 4096;
+        auto bytes = sisl::round_up(HSSuperBlk::max_chunks_in_pdev(dinfo), 8) / 8 + 4096;
         return sisl::round_up(bytes, 4096);
     }
 

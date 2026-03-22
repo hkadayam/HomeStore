@@ -1,62 +1,41 @@
-/*********************************************************************************
- * Modifications Copyright 2017-2019 eBay Inc.
+/***************************************************************************
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *    https://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software distributed
- * under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
- * CONDITIONS OF ANY KIND, either express or implied. See the License for the
- * specific language governing permissions and limitations under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
  *
- *********************************************************************************/
+ * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
+ ***************************************************************************/
+
+#include <fmt/format.h>
+
 #include "device/chunk.h"
-#include "device/device.h"
-#include "device/physical_dev.hpp"
-#include "common/homestore_utils.hpp"
-#include "blkalloc/blk_allocator.h"
+#include "device/physical_dev.h"
 
 namespace homestore {
-Chunk::Chunk(PhysicalDev* pdev, const chunk_info& cinfo, uint32_t chunk_slot) :
-        m_chunk_info{cinfo}, m_pdev{pdev}, m_chunk_slot{chunk_slot}, m_stream_id{pdev->chunk_to_stream_id(cinfo)} {}
 
+// Mirrors Rust's Chunk::new(chunk_info, chunk_slot, pdev).
+Chunk::Chunk(ChunkInfo info, uint32_t chunk_slot, std::shared_ptr< PhysicalDev > pdev) :
+        chunk_info_{std::move(info)}, chunk_slot_{chunk_slot}, pdev_{std::move(pdev)} {}
+
+// Mirrors Rust's Chunk::to_string().
+// Format: "Chunk[id={}, slot={}, offset={}, size={}]"
 std::string Chunk::to_string() const {
-    return fmt::format("chunk_id={}, vdev_id={}, start_offset={}, size={}, slot_num_in_pdev={} "
-                       "pdev_ordinal={} vdev_ordinal={} stream_id={}",
-                       chunk_id(), vdev_id(), start_offset(), in_bytes(size()), slot_number(), pdev_ordinal(),
-                       vdev_ordinal(), stream_id());
+    // Copy packed fields to local vars first to avoid UB from unaligned reads
+    // (chunk_info_ is #pragma pack(1)).
+    const uint32_t id     = chunk_info_.chunk_id;
+    const uint64_t offset = chunk_info_.chunk_start_offset;
+    const uint64_t sz     = chunk_info_.chunk_size;
+
+    return fmt::format("Chunk[id={}, slot={}, offset={}, size={}]",
+                       id, chunk_slot_, offset, sz);
 }
 
-float Chunk::get_blk_usage() const {
-    return s_cast<float>(m_blk_allocator->get_used_blks()) / s_cast<float>(m_blk_allocator->get_total_blks());
-}
-
-void Chunk::set_user_private(const sisl::Blob& data) {
-    std::unique_lock lg{m_mgmt_mutex};
-    m_chunk_info.set_user_private(data);
-    m_chunk_info.compute_checksum();
-    write_chunk_info();
-}
-
-void Chunk::write_chunk_info() {
-    auto buf = hs_utils::iobuf_alloc(chunk_info::size, sisl::Buftag::superblk, physical_dev()->align_size());
-    auto cinfo = new (buf) chunk_info();
-    *cinfo = m_chunk_info;
-    physical_dev_mutable()->write_super_block(buf, chunk_info::size,
-                                              physical_dev()->chunk_info_offset_nth(slot_number()));
-    cinfo->~chunk_info();
-    hs_utils::iobuf_free(buf, sisl::Buftag::superblk);
-}
-
-nlohmann::json Chunk::get_status([[maybe_unused]] int log_level) const {
-    nlohmann::json j;
-    j["chunk_id"] = chunk_id();
-    j["vdev_id"] = vdev_id();
-    j["start_offset"] = start_offset();
-    j["size"] = size();
-    j["slot_alloced?"] = is_busy();
-    return j;
-}
 } // namespace homestore

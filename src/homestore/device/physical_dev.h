@@ -1,239 +1,236 @@
-/*********************************************************************************
- * Modifications Copyright 2017-2019 eBay Inc.
+/***************************************************************************
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *    https://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software distributed
- * under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
- * CONDITIONS OF ANY KIND, either express or implied. See the License for the
- * specific language governing permissions and limitations under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
  *
- *********************************************************************************/
+ * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
+ ***************************************************************************/
 #pragma once
-#include <vector>
+
+#include <cstdint>
+#include <memory>
 #include <string>
-#include "hs_super_blk.h"
+#include <system_error>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
-#ifdef __linux__
-#include <fcntl.h>
-#include <sys/uio.h>
-#include <unistd.h>
-#endif
+#include <folly/coro/Mutex.h>
+#include <folly/coro/Task.h>
 
-#include <boost/icl/split_interval_set.hpp>
-#include <nlohmann/json.hpp>
-#include <homestore/crc.h>
-#include <sisl/metrics/metrics.h>
-#include <sisl/logging/logging.h>
-#include <homestore/homestore_decl.hpp>
+#include <homestore/homestore_decl.hpp>    // dev_info, HSDevType
+#include <sisl/fds/bitset.h>
 
-#include "hs_super_blk.h"
+// TODO: hs_super_blk.h still has iomgr deps; will be cleaned up when
+// device_metadata is fully separated from iomgr.
+#include "device/hs_super_blk.h"           // pdev_info_header, first_block, hs_super_blk
+
+#include "iomanager/drive_interface.hpp"   // DriveInterface, IoDevice, IOBuffer
+#include "device/chunk.h"              // ChunkInfo, ChunkInterval, ChunkIntervalSet, Chunk
 
 namespace homestore {
-class PhysicalDevMetrics : public sisl::MetricsGroupWrapper {
+
+// ── Global device cache ───────────────────────────────────────────────────────
+// Mirrors Rust's CACHED_OPENED_DEVS / open_and_cache_dev / close_and_uncache_dev.
+// The cache avoids reopening the same device when both a format pass and a load
+// pass reference the same underlying file/block device.
+folly::coro::Task< std::shared_ptr< IoDevice > > open_and_cache_dev(std::string devname, int oflags);
+folly::coro::Task< void >                        close_and_uncache_dev(std::string devname);
+
+// ── ChunkProvisioner ──────────────────────────────────────────────────────────
+// Mirrors Rust's inner ChunkProvisioner struct.
+// All mutable chunk-related state is grouped here and protected by
+// PhysicalDev::chunk_mutex_ (a folly::coro::Mutex so it can be held across
+// co_await points — identical to Rust's AsyncMutex<ChunkProvisioner>).
+struct ChunkProvisioner {
+    ChunkIntervalSet                                     chunk_data_area;   // occupied ranges
+    std::unique_ptr< sisl::Bitset >                     chunk_info_slots;  // slot bitmap
+    std::unordered_set< uint64_t >                      chunk_start;       // start-offset dedup set
+    std::unordered_map< uint32_t, std::shared_ptr< Chunk > > chunks;       // keyed by chunk_id
+};
+
+// ── PhysicalDev ───────────────────────────────────────────────────────────────
+// C++ port of Rust's PhysicalDev (physical_dev.rs).
+//
+// Design notes vs the old device/physical_dev.hpp:
+//  • Factory methods create() / load() replace the single constructor.
+//    create() is for first-time format; load() is for recovery.
+//  • All IO and chunk operations are folly coroutines (Task<>), matching Rust's
+//    async/await.
+//  • Stream concept removed — Rust dropped it; chunks are keyed by chunk_id.
+//  • ChunkProvisioner bundles all chunk state behind a single coroutine mutex
+//    so the lock can be held across disk writes, just as Rust's AsyncMutex does.
+//  • Metrics removed for now; can be re-added via a separate observer.
+//  • ChunkInfo / ChunkInterval / ChunkIntervalSet all live in chunk.h (chunk.rs).
+class PhysicalDev : public std::enable_shared_from_this< PhysicalDev > {
 public:
-    explicit PhysicalDevMetrics(const std::string& devname) : sisl::MetricsGroupWrapper{"PhysicalDev", devname} {
-        REGISTER_COUNTER(drive_sync_write_count, "Drive sync write count");
-        REGISTER_COUNTER(drive_sync_read_count, "Drive sync read count");
-        REGISTER_COUNTER(drive_async_write_count, "Drive async write count");
-        REGISTER_COUNTER(drive_async_read_count, "Drive async read count");
-        REGISTER_COUNTER(drive_write_vector_count, "Total Count of buffer provided for write");
-        REGISTER_COUNTER(drive_read_vector_count, "Total Count of buffer provided for read");
-        REGISTER_COUNTER(drive_read_errors, "Total drive read errors");
-        REGISTER_COUNTER(drive_write_errors, "Total drive write errors");
-        REGISTER_COUNTER(drive_spurios_events, "Total number of spurious events per drive");
-        REGISTER_COUNTER(drive_skipped_chunk_bm_writes, "Total number of skipped writes for chunk bitmap");
-
-        REGISTER_HISTOGRAM(drive_write_latency, "BlkStore drive write latency in us");
-        REGISTER_HISTOGRAM(drive_read_latency, "BlkStore drive read latency in us");
-
-        REGISTER_HISTOGRAM(write_io_sizes, "Write IO Sizes", "io_sizes", {"io_direction", "write"},
-                           HistogramBucketsType(ExponentialOfTwoBuckets));
-        REGISTER_HISTOGRAM(read_io_sizes, "Read IO Sizes", "io_sizes", {"io_direction", "read"},
-                           HistogramBucketsType(ExponentialOfTwoBuckets));
-
-        register_me_to_farm();
-    }
-
-    PhysicalDevMetrics(const PhysicalDevMetrics&) = delete;
-    PhysicalDevMetrics(PhysicalDevMetrics&&) noexcept = delete;
-    PhysicalDevMetrics& operator=(const PhysicalDevMetrics&) = delete;
-    PhysicalDevMetrics& operator=(PhysicalDevMetrics&&) noexcept = delete;
-
-    ~PhysicalDevMetrics() { deregister_me_from_farm(); }
-};
-
-class Chunk;
-using ChunkIntervalSet = boost::icl::split_interval_set< uint64_t >;
-using ChunkInterval = ChunkIntervalSet::interval_type;
-
-#pragma pack(1)
-struct chunk_info {
-    static constexpr size_t size = 512;
-    static constexpr size_t user_private_size = 128;
-    static constexpr size_t selector_private_size = 64;
-
-    uint64_t chunk_start_offset{0}; // 0: Start offset of the chunk within a pdev
-    uint64_t chunk_size{0};         // 8: Chunk size
-
-    uint32_t vdev_id{0};           // 24: Virtual device id this chunk hosts. UINT32_MAX if chunk is free
-    uint32_t chunk_id{0};          // 28: ID for this chunk - unique for entire homestore across devices
-    uint32_t chunk_ordinal{0};     // 32: Chunk ordinal within the vdev on this pdev
-    uint8_t chunk_allocated{0x00}; // 36: Is chunk allocated or free
-    uint16_t checksum{0};          // 37: checksum of this chunk info
-    uint8_t padding[25]{};         // 39: pad to make it 128 bytes total
-    uint8_t chunk_selector_private[selector_private_size]{}; // 64: Chunk selector private area
-    uint8_t user_private[user_private_size]{};               // 128: Opaque user of the chunk information
-
-    uint64_t get_chunk_size() const { return chunk_size; }
-    uint32_t get_chunk_id() const { return chunk_id; }
-    bool is_allocated() const { return (chunk_allocated != 0x00); }
-    void set_allocated() { chunk_allocated = 0x01; }
-    void set_free() { chunk_allocated = 0x00; }
-
-    void set_selector_private(const sisl::Blob& data) {
-        std::memcpy(&chunk_selector_private, data.cbytes(), std::min(data.size(), uint32_cast(selector_private_size)));
-    }
-    void set_user_private(const sisl::Blob& data) {
-        if (data.size() != 0) {
-            std::memcpy(&user_private, data.cbytes(), std::min(data.size(), uint32_cast(user_private_size)));
-        }
-    }
-
-    void compute_checksum() {
-        checksum = 0;
-        checksum = crc16_t10dif(hs_init_crc_16, r_cast< const unsigned char* >(this), sizeof(chunk_info));
-    }
-};
-#pragma pack()
-
-static_assert(sizeof(chunk_info) <= chunk_info::size, "Chunk info sizeof() mismatch");
-
-struct Stream {
-    uint32_t m_stream_id;
-    std::map< uint32_t, shared< Chunk > > m_chunks_map; // Chunks within the stream of the physical device
-
-    Stream(uint32_t stream_id) : m_stream_id{stream_id} {}
-};
-
-class PhysicalDev {
-private:
-    iomgr::io_device_ptr m_iodev;
-    iomgr::DriveInterface* m_drive_iface; // Interface to do IO
-    PhysicalDevMetrics m_metrics;
-    std::string m_devname;                              // Physical device path
-    HSDevType m_dev_type;                               // Device type
-    dev_info m_dev_info;                                // Input device info
-    pdev_info_header m_pdev_info;                       // Persistent information about this physical device
-    uint64_t m_devsize{0};                              // Actual device size
-    bool m_super_blk_in_footer;                         // Indicate if the super blk is stored in the footer as well
-    std::mutex m_chunk_op_mtx;                          // Mutex for all chunk related operations
-    std::vector< Stream > m_streams;                    // List of streams in the system
-    ChunkIntervalSet m_chunk_data_area;                 // Range of chunks data area created
-    std::unique_ptr< sisl::Bitset > m_chunk_info_slots; // Slots to write the chunk info
-    uint32_t m_chunk_sb_size{0};                        // Total size of the chunk sb at present
-    std::unordered_set< uint64_t > m_chunk_start;       // Store and verify start offset of all chunks for debugging.
-
-public:
-    PhysicalDev(const dev_info& dinfo, int oflags, const pdev_info_header& pinfo);
-    PhysicalDev(const PhysicalDev&) = delete;
-    PhysicalDev(PhysicalDev&&) noexcept = delete;
+    PhysicalDev()                              = default;
+    PhysicalDev(const PhysicalDev&)            = delete;
     PhysicalDev& operator=(const PhysicalDev&) = delete;
-    PhysicalDev& operator=(PhysicalDev&&) noexcept = delete;
-    virtual ~PhysicalDev();
+    ~PhysicalDev()                             = default;
 
-    /////////// Super Block related methods /////////////
-    static first_block read_first_block(const std::string& devname, int oflags);
-    static uint64_t get_dev_size(const std::string& devname);
+    // ── Factory methods ───────────────────────────────────────────────────────
 
-    std::error_code read_super_block(uint8_t* buf, uint32_t sb_size, uint64_t offset);
-    void write_super_block(uint8_t const* buf, uint32_t sb_size, uint64_t offset);
-    void close_device();
+    /// First-time format: creates pdev_info from dinfo, opens the device, and
+    /// initialises the on-disk chunk bitmap. Mirrors Rust's PhysicalDev::create().
+    static folly::coro::Task< std::shared_ptr< PhysicalDev > >
+    create(dev_info dinfo, int oflags, uint32_t pdev_id);
 
-    //////////////////////////// Chunk Creation/Load related methods /////////////////////////////////////////
+    /// Recovery: reads the existing pdev_info from the first block, opens the
+    /// device, and replays all chunk metadata from disk.
+    /// Mirrors Rust's PhysicalDev::load().
+    static folly::coro::Task< std::shared_ptr< PhysicalDev > >
+    load(dev_info dinfo, int oflags);
 
-    /// @brief Create multiple same sized chunks on this device. In case of unavailable space it throws the exception,
-    /// but cleans up any partially created chunks.
-    ///
-    /// @param chunk_ids: List of chunk ids to be created. The ordinal of the chunks are assigned in the order of this
-    /// list, thus first chunk id is assigned with ordinal 0, then next with 1 etc..
-    /// @param vdev_id: Vdev this chunk should be part of.
-    /// @param size: Size of each chunk
-    /// @return Vector of chunks that are created
-    std::vector< shared< Chunk > > create_chunks(const std::vector< uint32_t >& chunk_ids, uint32_t vdev_id,
-                                                 uint64_t size);
+    /// Build a pdev_info_header for a device (used by DeviceManager too).
+    /// Mirrors Rust's PhysicalDev::create_pdev_info().
+    static pdev_info_header create_pdev_info(const dev_info& dinfo, uint32_t pdev_id);
 
-    /// @brief Create a chunks on this device. In case of unavailable space it throws the std::out_of_range exception
-    ///
-    /// @param chunk_ids: Chunk ID for the chunk to be created. This ID is expected to be system wide unique
-    /// @param vdev_id: Vdev this chunk should be part of.
-    /// @param size: Size of each chunk
-    /// @param ordinal: Ordinal for a pdev within the vdev. This is useful to match similar vdevs from different pdevs
-    /// for mirroring
-    /// @param private_data: data to be stored in chunk private space.
-    /// @return Shared instance of chunk class created
-    shared< Chunk > create_chunk(uint32_t chunk_id, uint32_t vdev_id, uint64_t size, uint32_t ordinal,
-                                 const sisl::Blob& private_data = {});
+    /// Read the first block from a device without constructing a PhysicalDev.
+    static folly::coro::Task< first_block >
+    read_first_block(const std::string& devname, int oflags);
 
-    void load_chunks(std::function< bool(cshared< Chunk >&) >&& chunk_found_cb);
-    void remove_chunks(std::vector< shared< Chunk > >& chunks);
-    void remove_chunk(cshared< Chunk >& chunk);
-    void format_chunks();
+    /// Return the total device/file size in bytes.
+    static folly::coro::Task< uint64_t > get_dev_size(const std::string& devname);
 
-    //////////////////////////// Stream access methods ////////////////////////////
-    Stream& get_stream_mutable(uint32_t stream_id) { return m_streams[stream_id]; }
-    const Stream& get_stream(uint32_t stream_id) const { return m_streams[stream_id]; };
-    uint32_t num_streams() const { return uint32_cast(m_streams.size()); }
-    uint32_t chunk_to_stream_id(const chunk_info& cinfo) const;
-    uint32_t chunk_to_stream_id(cshared< Chunk >& chunk) const;
-    Stream& get_stream(cshared< Chunk >& chunk);
+    // ── Super block ───────────────────────────────────────────────────────────
 
-    ///////////// Pointer Getters ///////////////////////
-    PhysicalDevMetrics& metrics() { return m_metrics; }
-    iomgr::DriveInterface* drive_iface() const { return m_drive_iface; }
-    uint32_t pdev_id() const { return m_pdev_info.pdev_id; }
-    const std::string& get_devname() const { return m_devname; }
+    /// Write buf to offset (and optionally mirrored to the footer).
+    folly::coro::Task< void > write_super_block(const IOBuffer& buf, uint64_t offset);
 
-    /////////////////////////////////////// IO Methods //////////////////////////////////////////
-    folly::Future< std::error_code > async_write(const char* data, uint32_t size, uint64_t offset,
-                                                 bool part_of_batch = false);
-    folly::Future< std::error_code > async_writev(const iovec* iov, int iovcnt, uint32_t size, uint64_t offset,
-                                                  bool part_of_batch = false);
-    folly::Future< std::error_code > async_read(char* data, uint32_t size, uint64_t offset, bool part_of_batch = false);
-    folly::Future< std::error_code > async_readv(iovec* iov, int iovcnt, uint32_t size, uint64_t offset,
-                                                 bool part_of_batch = false);
-    folly::Future< std::error_code > async_write_zero(uint64_t size, uint64_t offset);
-    folly::Future< std::error_code > queue_fsync();
+    /// Read into buf. Caller retains ownership; returns error_code.
+    folly::coro::Task< std::error_code >
+    read_super_block(IOBuffer& buf, uint64_t offset);
 
-    std::error_code sync_write(const char* data, uint32_t size, uint64_t offset);
-    std::error_code sync_writev(const iovec* iov, int iovcnt, uint32_t size, uint64_t offset);
-    std::error_code sync_read(char* data, uint32_t size, uint64_t offset);
-    std::error_code sync_readv(iovec* iov, int iovcnt, uint32_t size, uint64_t offset);
-    std::error_code sync_write_zero(uint64_t size, uint64_t offset);
-    void submit_batch();
+    folly::coro::Task< void > close_device();
 
-    ///////////// Parameters Getters ///////////////////////
-    uint32_t optimal_page_size() const { return m_pdev_info.dev_attr.phys_page_size; }
-    uint32_t align_size() const { return m_pdev_info.dev_attr.align_size; }
-    uint32_t atomic_page_size() const { return m_pdev_info.dev_attr.atomic_phys_page_size; }
+    // ── Data IO ───────────────────────────────────────────────────────────────
+    // All async; mirrors Rust's write / writev / read / readv / write_zero / fsync.
 
-    uint64_t data_start_offset() const { return m_pdev_info.data_offset; }
-    uint64_t data_end_offset() const {
-        return m_super_blk_in_footer ? (m_devsize - m_pdev_info.data_offset) : m_devsize;
-    }
+    folly::coro::Task< void > write(const IOBuffer& buf, uint64_t offset);
+    folly::coro::Task< void > writev(std::vector< IOBuffer > bufs, uint64_t offset);
 
-    uint64_t data_size() const { return data_end_offset() - data_start_offset(); }
+    folly::coro::Task< std::error_code >
+    read(IOBuffer& buf, uint64_t offset);
 
+    folly::coro::Task< std::error_code >
+    readv(std::vector< IOBuffer >& bufs, uint64_t offset);
+
+    folly::coro::Task< void > write_zero(uint64_t size, uint64_t offset);
+    folly::coro::Task< void > fsync();
+
+    // ── Chunk management ─────────────────────────────────────────────────────
+
+    /// Initialise the on-disk chunk slot bitmap (first-time format).
+    folly::coro::Task< void > format_chunks();
+
+    /// Allocate one chunk slot; chunk_id = (pdev_id + 1) * slot_number.
+    /// Mirrors Rust's create_chunk().
+    folly::coro::Task< std::shared_ptr< Chunk > >
+    create_chunk(uint32_t vdev_id, uint64_t size, uint32_t ordinal,
+                 const uint8_t* user_private = nullptr, size_t user_private_size = 0);
+
+    /// Allocate num_chunks slots in batch; ordinals start at start_ordinal.
+    /// Mirrors Rust's create_chunks().
+    folly::coro::Task< std::vector< std::shared_ptr< Chunk > > >
+    create_chunks(uint32_t vdev_id, uint32_t num_chunks, uint64_t size,
+                  uint32_t start_ordinal = 0);
+
+    /// Load all chunks from disk. Returns vdev_id → [chunks] for recovery.
+    /// Mirrors Rust's load_chunks() → HashMap<vdev_id, Vec<Arc<Chunk>>>.
+    folly::coro::Task< std::unordered_map< uint32_t, std::vector< std::shared_ptr< Chunk > > > >
+    load_chunks();
+
+    /// Remove a single chunk (frees slot, persists bitmap).
+    folly::coro::Task< void > remove_chunk(const std::shared_ptr< Chunk >& chunk);
+
+    /// Remove a batch; batches the final bitmap write for efficiency.
+    /// Mirrors Rust's remove_chunks() which avoids one bitmap write per chunk.
+    folly::coro::Task< void > remove_chunks(const std::vector< std::shared_ptr< Chunk > >& chunks);
+
+    /// Convenience: remove all chunks belonging to vdev_id.
+    folly::coro::Task< void > remove_chunks_for_vdev(uint32_t vdev_id);
+
+    /// Mark chunk as unallocated (chunk_allocated = 0) for pool reuse.
+    /// Persists updated ChunkInfo; calls chunk->update_info().
+    folly::coro::Task< void > deactivate_chunk(const std::shared_ptr< Chunk >& chunk);
+
+    /// Mark chunk as allocated with a new creation_order (from pool reuse).
+    /// Persists updated ChunkInfo; calls chunk->update_info().
+    folly::coro::Task< void > reactivate_chunk(const std::shared_ptr< Chunk >& chunk,
+                                               uint32_t new_creation_order);
+
+    // ── Chunk accessors ───────────────────────────────────────────────────────
+
+    folly::coro::Task< std::vector< std::shared_ptr< Chunk > > > get_all_chunks();
+    folly::coro::Task< std::shared_ptr< Chunk > >                get_chunk(uint32_t chunk_id);
+    folly::coro::Task< std::vector< std::shared_ptr< Chunk > > > get_chunks_for_vdev(uint32_t vdev_id);
+    folly::coro::Task< size_t >                                  get_chunk_count();
+
+    // ── Parameter getters (sync — immutable after construction) ──────────────
+    uint32_t           pdev_id()           const { return pdev_info_.pdev_id; }
+    const std::string& get_devname()       const { return devname_; }
+    uint32_t           optimal_page_size() const { return pdev_info_.dev_attr.phys_page_size; }
+    uint32_t           align_size()        const { return pdev_info_.dev_attr.align_size; }
+    uint32_t           atomic_page_size()  const { return pdev_info_.dev_attr.atomic_phys_page_size; }
+    uint64_t           data_start_offset() const { return pdev_info_.data_offset; }
+    uint64_t           data_end_offset()   const;
+    uint64_t           data_size()         const { return data_end_offset() - data_start_offset(); }
+
+    /// Byte offset of slot n's ChunkInfo record within the superblock area.
     uint64_t chunk_info_offset_nth(uint32_t slot) const;
 
 private:
-    void do_remove_chunk(cshared< Chunk >& chunk);
-    void populate_chunk_info(chunk_info* cinfo, uint32_t vdev_id, uint64_t size, uint32_t chunk_id, uint32_t ordinal,
-                             const sisl::Blob& private_data);
-    void free_chunk_info(chunk_info* cinfo);
-    ChunkInterval find_next_chunk_area(uint64_t size) const;
+    // ── Private factory helper ────────────────────────────────────────────────
+
+    /// Common low-level init: opens device, measures size, populates fields.
+    /// Returns a heap-allocated PhysicalDev wrapped in shared_ptr.
+    static folly::coro::Task< std::shared_ptr< PhysicalDev > >
+    construct(dev_info dinfo, int oflags, pdev_info_header pinfo);
+
+    // ── Locked helpers (called with chunk_mutex_ held) ────────────────────────
+
+    /// Find a free region and fill in all fields of cinfo.
+    void populate_chunk_info_locked(ChunkProvisioner& prov, ChunkInfo& cinfo,
+                                    uint32_t vdev_id, uint64_t size,
+                                    uint32_t chunk_id, uint32_t ordinal,
+                                    const uint8_t* private_data, size_t private_size);
+
+    /// Clear chunk data-area bookkeeping and mark cinfo free.
+    static void free_chunk_info_locked(ChunkProvisioner& prov, ChunkInfo& cinfo);
+
+    /// Walk chunk_data_area to find the first gap of at least `size` bytes.
+    ChunkInterval find_next_chunk_area_locked(const ChunkIntervalSet& data_area,
+                                              uint64_t size) const;
+
+    // ── Superblock layout helpers ─────────────────────────────────────────────
+    uint64_t chunk_sb_offset()        const;
+    size_t   chunk_info_bitmap_size() const;
+    uint32_t max_chunks_in_pdev()     const;
+
+private:
+    // ── Fields ────────────────────────────────────────────────────────────────
+    std::shared_ptr< IoDevice >       iodev_;
+    std::shared_ptr< DriveInterface > drive_iface_;
+    std::string                       devname_;
+    HSDevType                         dev_type_{HSDevType::Data};
+    dev_info                          dev_info_{"", HSDevType::Data};
+    pdev_info_header                  pdev_info_;
+    uint64_t                          devsize_{0};
+    bool                              super_blk_in_footer_{false};
+
+    // All mutable chunk state lives here, protected by chunk_mutex_.
+    // Mirrors Rust's AsyncMutex<ChunkProvisioner>.
+    folly::coro::Mutex chunk_mutex_;
+    ChunkProvisioner   chunk_provisioner_;
 };
+
 } // namespace homestore

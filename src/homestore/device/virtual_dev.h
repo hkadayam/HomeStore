@@ -1,326 +1,357 @@
-/*********************************************************************************
- * Modifications Copyright 2017-2019 eBay Inc.
+/***************************************************************************
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *    https://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software distributed
- * under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
- * CONDITIONS OF ANY KIND, either express or implied. See the License for the
- * specific language governing permissions and limitations under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
  *
- *********************************************************************************/
+ * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
+ ***************************************************************************/
 #pragma once
 
 #include <atomic>
-#include <functional>
-#include <limits>
+#include <cstdint>
+#include <cstring>
 #include <memory>
-#include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <system_error>
-#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
-#include <sisl/metrics/metrics.h>
-#include <sisl/logging/logging.h>
-#include <sisl/fds/obj_life_counter.h>
-#include <sisl/fds/atomic_counter.h>
-#include <sisl/fds/enum.h>
-#include <sisl/fds/concurrent_insert_vector.h>
+#include <folly/coro/Task.h>
+#include <sisl/fds/urcu_helper.h>
 
-#include <homestore/checkpoint/cp_mgr.hpp>
-#include <homestore/homestore_decl.hpp>
-#include "device/device.h"
-#include <homestore/chunk_selector.h>
+#include <homestore/blk.h>              // BlkId, MultiBlkId, BlkAllocStatus, blk_alloc_hints, blk_count_t
+#include <homestore/crc.h>              // crc16_t10dif, hs_init_crc_16
+#include <homestore/homestore_decl.hpp> // HSDevType, blk_allocator_type_t
+
+#include "iomanager/drive_interface.hpp" // IOBuffer
+#include "device/chunk.h"            // Chunk, ChunkPool, ChunkInfo
+#include "device/chunk_selector.h"   // IChunkSelector, ChunkSelectorType, concrete selectors
 
 namespace homestore {
+
 class PhysicalDev;
-class Chunk;
 class BlkAllocator;
 
-class VirtualDevMetrics : public sisl::MetricsGroupWrapper {
-public:
-    explicit VirtualDevMetrics(const char* const inst_name) : sisl::MetricsGroupWrapper{"VirtualDev", inst_name} {
-        REGISTER_COUNTER(vdev_read_count, "vdev total read cnt");
-        REGISTER_COUNTER(vdev_write_count, "vdev total write cnt");
-        REGISTER_COUNTER(vdev_truncate_count, "vdev total truncate cnt");
-        REGISTER_COUNTER(vdev_high_watermark_count, "vdev total high watermark cnt");
-        REGISTER_COUNTER(vdev_num_alloc_failure, "vdev blk alloc failure cnt");
-        REGISTER_COUNTER(unalign_writes, "unalign write cnt");
-        REGISTER_COUNTER(default_chunk_allocation_cnt, "default chunk allocation count");
-        REGISTER_COUNTER(random_chunk_allocation_cnt,
-                         "random chunk allocation count"); // ideally it should be zero for hdd
-        register_me_to_farm();
+VENUM(MultiPDevOpts, uint8_t, AllPDevStriped = 0, AllPDevMirrored = 1, SingleFirstPDev = 2, SingleRandomPDev = 3);
+VENUM(VDevSizeType, uint8_t, Static = 0, Dynamic = 1);
+VENUM(BlkAllocatorType, uint8_t, None = 0, SlabCompact = 1, SlabExtend = 2, Append = 3);
+
+// Which chunk to remove during shrink (for Dynamic VDevs only).
+ENUM(ChunkToShrink, uint8_t,
+     Last,     // Remove the chunk with the highest creation_order.
+     Specific, // Remove a specific chunk by ID; pass specific_chunk_id to shrink().
+);
+
+// ── VDevInfo ──────────────────────────────────────────────────────────────────
+// On-disk metadata for one virtual device.
+// Binary layout is #pragma pack(1), identical to Rust's VDevInfo (#[repr(C, packed)]).
+//
+// Field offsets:
+//    0  vdev_size           u64  (8)
+//    8  vdev_id             u32  (4)
+//   12  num_mirrors         u32  (4)
+//   16  blk_size            u32  (4)
+//   20  num_primary_chunks  u32  (4)
+//   24  chunk_size          u32  (4)
+//   28  size_type           u8   (1)
+//   29  slot_allocated      u8   (1)
+//   30  failed              u8   (1)
+//   31  hs_dev_type         u8   (1)
+//   32  multi_pdev_choice   u8   (1)
+//   33  name                u8[64]
+//   97  checksum            u16  (2)
+//   99  alloc_type          u8   (1)
+//  100  chunk_sel_type      u8   (1)
+//  101  use_slab_allocator  u8   (1)
+//  102  padding             u8[154]
+//  256  user_private        u8[256]
+//  512  = VDevInfo::SIZE
+#pragma pack(1)
+struct VDevInfo {
+    static constexpr size_t SIZE = 512;
+    static constexpr size_t USER_PRIVATE_SIZE = 256;
+    static constexpr size_t MAX_NAME_LEN = 64;
+
+    uint64_t vdev_size{0};                     //   0
+    uint32_t vdev_id{0};                       //   8
+    uint32_t num_mirrors{0};                   //  12
+    uint32_t blk_size{0};                      //  16
+    uint32_t num_primary_chunks{0};            //  20
+    uint32_t chunk_size{0};                    //  24
+    uint8_t size_type{0};                      //  28  (VDevSizeType as u8)
+    uint8_t slot_allocated{0};                 //  29
+    uint8_t failed{0};                         //  30
+    uint8_t hs_dev_type{0};                    //  31  (HSDevType as u8)
+    uint8_t multi_pdev_choice{0};              //  32  (MultiPDevOpts as u8)
+    char name[MAX_NAME_LEN]{};                 //  33
+    uint16_t checksum{0};                      //  97
+    uint8_t alloc_type{0};                     //  99  (BlkAllocatorType as u8)
+    uint8_t chunk_sel_type{0};                 // 100  (ChunkSelectorType as u8)
+    uint8_t use_slab_allocator{0};             // 101
+    uint8_t padding[154]{};                    // 102
+    uint8_t user_private[USER_PRIVATE_SIZE]{}; // 256
+
+    // ── Accessors ──────────────────────────────────────────────────────────
+    bool is_allocated() const { return slot_allocated == 0x01; }
+    void set_allocated() { slot_allocated = 0x01; }
+    void set_free() { slot_allocated = 0x00; }
+
+    bool is_failed() const { return failed == 0x01; }
+
+    void set_name(const std::string& n) {
+        std::strncpy(name, n.c_str(), MAX_NAME_LEN - 1);
+        name[MAX_NAME_LEN - 1] = '\0';
+    }
+    std::string get_name() const { return std::string{name}; }
+
+    void compute_checksum() {
+        checksum = 0;
+        checksum = crc16_t10dif(hs_init_crc_16, reinterpret_cast< const unsigned char* >(this), sizeof(VDevInfo));
     }
 
-    VirtualDevMetrics(VirtualDevMetrics const&) = delete;
-    VirtualDevMetrics(VirtualDevMetrics&&) noexcept = delete;
-    VirtualDevMetrics& operator=(VirtualDevMetrics const&) = delete;
-    VirtualDevMetrics& operator=(VirtualDevMetrics&&) noexcept = delete;
+    const uint8_t* to_bytes() const { return reinterpret_cast< const uint8_t* >(this); }
 
-    ~VirtualDevMetrics() { deregister_me_from_farm(); }
+    /// Byte offset of this vdev's record within the superblock area on any pdev.
+    /// Mirrors Rust's VDevInfo::vdev_info_offset(vdev_id).
+    static uint64_t vdev_info_offset(uint32_t vdev_id);
+};
+#pragma pack()
+
+static_assert(sizeof(VDevInfo) == VDevInfo::SIZE, "VDevInfo size mismatch");
+
+// ── VDevParameters ────────────────────────────────────────────────────────────
+// Creation parameters for a new VirtualDev. Mirrors Rust's VDevParameters.
+struct VDevParameters {
+    std::string vdev_name;
+    uint64_t vdev_size{0};
+    uint32_t num_chunks{0};
+    uint64_t chunk_size{0};
+    uint64_t incremental_chunk_size{0}; // Only for Dynamic VDevs
+    VDevSizeType size_type{VDevSizeType::Static};
+    uint32_t blk_size{4096};
+    HSDevType dev_type{HSDevType::Data};
+    MultiPDevOpts multi_pdev_opts{MultiPDevOpts::SingleFirstPDev};
+    uint32_t num_mirrors{0};
+    BlkAllocatorType alloc_type{BlkAllocatorType::SlabCompact};
+    ChunkSelectorType chunk_sel_type{ChunkSelectorType::RoundRobin};
+    bool use_slab_allocator{false};
+    std::optional< size_t > chunk_pool_limit; // nullopt = no pooling; Some(n) = pool ≤ n per size
 };
 
-/*
- * VirtualDev: Virtual device implements a similar functionality of RAID striping, customized however. Virtual devices
- * can be created across multiple physical devices. Unlike RAID, its io is not always in a bigger strip sizes. It
- * support n-mirrored writes.
- *
- */
-static constexpr uint32_t VIRDEV_BLKSIZE{512};
-static constexpr uint64_t CHUNK_EOF{0xabcdabcd};
-static constexpr off_t INVALID_OFFSET{std::numeric_limits< off_t >::max()};
+// ── VDevMutableState ──────────────────────────────────────────────────────────
+// All mutable VDev state, bundled for clone-on-write (RCU). chunk_selector is rebuilt atomically together with the
+// chunk set so reads always see a consistent (chunks, selector) pair with no extra locking.
+struct VDevMutableState {
+    VDevInfo vdev_info;
+    std::unordered_set< uint32_t > pdevs;                       // pdev_ids in use
+    std::unordered_map< uint32_t, shared< Chunk > > all_chunks; // chunk_id → Chunk (hot path)
+    std::vector< shared< Chunk > > chunks_by_creation_order;    // sorted (cold path)
+    uint64_t total_chunk_num{0};
+    uint32_t next_creation_order{0};         // monotonically increasing
+    shared< IChunkSelector > chunk_selector; // rebuilt on every chunk-set change
+};
 
-struct blkalloc_cp;
-
-class VirtualDev;
-ENUM(vdev_event_t, uint8_t, SIZE_THRESHOLD_REACHED, VDEV_ERRORED_OUT);
-
-using vdev_event_cb_t = std::function< void(VirtualDev&, vdev_event_t, const std::string&) >;
-class VDevCPContext;
-
+// ── VirtualDev ────────────────────────────────────────────────────────────────
+//
+// Key design:
+//  • RCU mutable state: sisl::urcu_data<VDevMutableState> — reads are truly lock-free (atomic load + folly::rcu_reader
+//    guard, ~2-5 ns),
+//  • Dynamic expand()/shrink() for VDevSizeType::Dynamic vdevs.
+//  • ChunkPool integration for efficient chunk reuse in dynamic vdevs.
+//  • Public constructor takes VDevInfo + pdevs; create()/load() are static factories.
+//  • All I/O uses folly coroutines (Task<>)
 class VirtualDev {
-protected:
-    vdev_info m_vdev_info;      // This device block info
-    DeviceManager& m_dmgr;      // Device Manager back pointer
-    std::string m_name;         // Name of the vdev
-    vdev_event_cb_t m_event_cb; // Callback registered for any events
-    VirtualDevMetrics m_metrics;
-
-    std::mutex m_mgmt_mutex;          // Any mutex taken for management operations (like adding/removing chunks).
-    std::set< PhysicalDev* > m_pdevs; // PDevs this vdev is working on
-    std::map< uint16_t, shared< Chunk > > m_all_chunks; // All chunks part of this vdev
-    uint64_t m_total_chunk_num{0};                      // Total number of chunks
-    std::shared_ptr< ChunkSelector > m_chunk_selector;  // Instance of chunk selector
-    blk_allocator_type_t m_allocator_type;
-    chunk_selector_type_t m_chunk_selector_type;
-    bool m_auto_recovery;
-    bool m_use_slab_in_blk_allocator;
-
 public:
-    VirtualDev(DeviceManager& dmgr, const vdev_info& vinfo, vdev_event_cb_t event_cb, bool is_auto_recovery,
-               shared< ChunkSelector > custom_chunk_selector = nullptr);
+    VirtualDev() = delete;
+    VirtualDev(const VirtualDev&) = delete;
+    VirtualDev& operator=(const VirtualDev&) = delete;
+    ~VirtualDev() = default;
 
-    VirtualDev(VirtualDev const& other) = delete;
-    VirtualDev& operator=(VirtualDev const& other) = delete;
-    VirtualDev(VirtualDev&&) noexcept = delete;
-    VirtualDev& operator=(VirtualDev&&) noexcept = delete;
-    virtual ~VirtualDev() = default;
+    // ──────────────────────────────────────────────────────────────────────────────
+    // Constructors and Factory Methods (create/load)
+    // ──────────────────────────────────────────────────────────────────────────────
 
-    /// @brief Run any initialization of the vdev after recovery or first time.
-    virtual void init() {}
+    /// Single constructor: initialises immutable fields from VDevInfo and stores pdevs.
+    /// Use the create() / load() static factories rather than calling this directly.
+    VirtualDev(VDevInfo info, std::vector< shared< PhysicalDev > > pdevs);
 
-    /// @brief Adds chunk to the vdev. It is expected that this will happen at startup time and hence it only
-    /// takes lock for writing and not reading
-    ///
-    /// @param chunk Chunk to be added
-    virtual void add_chunk(cshared< Chunk >& chunk, bool is_fresh_chunk);
+    /// First-time creation: allocates chunks across pdevs and writes superblock metadata.
+    /// Mirrors Rust's VirtualDev::create().
+    static folly::coro::Task< unique< VirtualDev > > create(VDevParameters params, uint32_t vdev_id,
+                                                            const std::vector< shared< PhysicalDev > >& pdevs);
 
-    /// @brief Remove chunk from the vdev.
-    ///
-    /// @param chunk Chunk to be removed.
-    virtual void remove_chunk(cshared< Chunk >& chunk);
+    /// Recovery: constructs VDev from persisted VDevInfo. Caller should then call on_chunk_found() for each chunk
+    /// (which atomically rebuilds the selector), then load_blk_allocator(). Mirrors Rust's VirtualDev::load().
+    static unique< VirtualDev > load(VDevInfo vinfo, std::vector< shared< PhysicalDev > > pdevs);
 
-    /// @brief Formats the vdev asynchronously by zeroing the entire vdev. It will use underlying physical device
-    /// capabilities to zero them if fast zero is possible, otherwise will zero block by block
-    /// @param cb Callback after formatting is completed.
-    virtual folly::Future< std::error_code > async_format();
+    /// Destroy the entire vdev and remove all its chunks and remove the vdev info. Upon completion next load
+    /// will not have any trace of this vdev.
+    folly::coro::Task< void > destroy();
 
-    /////////////////////// Block Allocation related methods /////////////////////////////
-    /// @brief This method allocates contigous blocks in the vdev
-    /// @param nblks : Number of blocks to allocate
-    /// @param hints : Hints about block allocation, (specific device to allocate, stream etc)
-    /// @param out_blkid : Reference to where allocated BlkId to be placed
-    /// @return BlkAllocStatus : Status about the allocation
-    virtual BlkAllocStatus alloc_contiguous_blks(blk_count_t nblks, blk_alloc_hints const& hints, BlkId& out_blkid);
+    // ──────────────────────────────────────────────────────────────────────────────
+    // Public APIs: Device Resizing section with chunks
+    // ──────────────────────────────────────────────────────────────────────────────
+    /// Expand: allocate one new chunk for a Dynamic vdev. Returns the new chunk.
+    folly::coro::Task< shared< Chunk > > expand(uint64_t chunk_size);
 
-    /// @brief This method allocates blocks in the vdev and it could be non-contiguous, hence multiple BlkIds are
-    /// returned
-    /// @param nblks : Number of blocks to allocate
-    /// @param hints : Hints about block allocation, (specific device to allocate, stream etc)
-    /// @param out_blkid : Reference to the MultiBlkd which can hold multiple blkids.
-    /// @return BlkAllocStatus : Status about the allocation
-    virtual BlkAllocStatus alloc_blks(blk_count_t nblks, blk_alloc_hints const& hints, MultiBlkId& out_blkid);
+    /// Shrink: remove a chunk from a Dynamic vdev.
+    /// Pooling enabled → deactivate + park in pool; disabled → permanently remove.
+    /// Returns the removed chunk_id. Mirrors Rust's shrink().
+    folly::coro::Task< uint32_t > shrink(ChunkToShrink which, uint32_t specific_chunk_id = 0);
 
-    virtual BlkAllocStatus alloc_blks(blk_count_t nblks, blk_alloc_hints const& hints,
-                                      std::vector< BlkId >& out_blkids);
+    /// Register one chunk with this vdev (recovery or post-create). Forwards to on_chunks_added().
+    void on_chunk_added(const shared< Chunk >& chunk, bool newly_created);
 
-    /// @brief Checks if a given block id is allocated in the in-memory version of the blk allocator
-    /// @param blkid : BlkId to check for allocation
-    /// @return true or false
-    virtual bool is_blk_alloced(BlkId const& blkid) const;
+    /// Register a batch of chunks. Active chunks enter all_chunks and rebuild the selector atomically;
+    /// inactive chunks go to chunk_pool_. newly_created=true also constructs a fresh blk allocator per chunk.
+    void on_chunks_added(std::vector< shared< Chunk > > chunks, bool newly_created);
 
-    /// @brief Commits the blkid in on-disk version of the blk allocator. The blkid is assumed to be allocated using
-    /// alloc_blk or alloc_contiguous_blk method earlier (either after reboot or prior to reboot). It is not required
-    /// to call this method if alloc_blk is called and system is not restarted. Typical use case of this method is
-    /// during recovery where alloc_blk is called but before it was checkpointed, it crashed and we are trying to
-    /// recover Please note that even calling this method is not guaranteed to persisted until checkpoint is taken.
-    /// @param blkid BlkId to commit explicitly.
-    /// @return Allocation Status
-    virtual BlkAllocStatus commit_blk(BlkId const& blkid);
+    /// Enable chunk pooling for dynamic vdevs.
+    void enable_chunk_pooling(size_t pool_limit);
 
-    virtual void free_blk(BlkId const& b, VDevCPContext* vctx = nullptr);
+    /// Get the nth chunk (0-indexed by creation_order), creating it if needed.
+    /// Returns (chunk, is_newly_created). Mirrors Rust's get_or_create_nth_chunk().
+    folly::coro::Task< std::pair< shared< Chunk >, bool > > get_or_create_nth_chunk(size_t n);
 
-    /////////////////////// Write API related methods /////////////////////////////
-    /// @brief Asynchornously write the buffer to the device on a given blkid
-    /// @param buf : Buffer to write data from
-    /// @param size : Size of the buffer
-    /// @param bid : BlkId which was previously allocated. It is expected that entire size was allocated previously.
-    /// @param part_of_batch : Is this write part of batch io. If true, caller is expected to call submit_batch at
-    /// the end of the batch, otherwise this write request will not be queued.
-    /// @return future< bool > Future result of success or failure
-    folly::Future< std::error_code > async_write(const char* buf, uint32_t size, BlkId const& bid,
-                                                 bool part_of_batch = false);
+    // ──────────────────────────────────────────────────────────────────────────────
+    // Public APIs: I/Os
+    // ──────────────────────────────────────────────────────────────────────────────
+    folly::coro::Task< void > write(const IOBuffer& buf, const BlkId& bid);
+    folly::coro::Task< void > writev(std::vector< IOBuffer > bufs, const BlkId& bid);
+    folly::coro::Task< std::pair< std::error_code, IOBuffer > > read(IOBuffer buf, const BlkId& bid);
+    folly::coro::Task< void > format();
+    folly::coro::Task< void > fsync();
 
-    folly::Future< std::error_code > async_write(const char* buf, uint32_t size, cshared< Chunk >& chunk,
-                                                 uint64_t offset_in_chunk);
+    // ──────────────────────────────────────────────────────────────────────────────
+    // Public APIs: Block Allocations
+    // ──────────────────────────────────────────────────────────────────────────────
+    BlkAllocStatus alloc_contiguous_blks(blk_count_t nblks, const blk_alloc_hints& hints, BlkId& out_blkid);
+    BlkAllocStatus alloc_blks(blk_count_t nblks, const blk_alloc_hints& hints, MultiBlkId& out_blkid);
+    void free_blk(const BlkId& bid);
+    BlkAllocStatus commit_blk(const BlkId& bid);
 
-    /// @brief Asynchornously write the buffer to the device on a given blkid from vector of buffer
-    /// @param iov : Vector of buffer to write data from
-    /// @param iovcnt : Count of buffer
-    /// @param bid  BlkId which was previously allocated. It is expected that entire size was allocated previously.
-    /// @param part_of_batch : Is this write part of batch io. If true, caller is expected to call submit_batch at
-    /// the end of the batch, otherwise this write request will not be queued.
-    /// @return future< bool > Future result of success or failure
-    folly::Future< std::error_code > async_writev(const iovec* iov, int iovcnt, BlkId const& bid,
-                                                  bool part_of_batch = false);
+    // ──────────────────────────────────────────────────────────────────────────────
+    // Public APIs: Getters
+    // ──────────────────────────────────────────────────────────────────────────────
+    shared< Chunk > get_nth_chunk(size_t n) const;
+    std::vector< shared< Chunk > > get_chunks() const;
+    std::vector< shared< Chunk > > get_chunks_by_creation_order() const;
 
-    // TODO: This needs to be removed once Journal starting to use AppendBlkAllocator
-    folly::Future< std::error_code > async_writev(const iovec* iov, const int iovcnt, cshared< Chunk >& chunk,
-                                                  uint64_t offset_in_chunk);
+    uint32_t vdev_id() const { return vdev_id_; }
+    const std::string& name() const { return name_; }
+    uint32_t block_size() const { return blk_size_; }
+    HSDevType hs_dev_type() const { return hs_dev_type_; }
+    VDevSizeType size_type() const { return size_type_; }
+    BlkAllocatorType allocator_type() const { return allocator_type_; }
+    ChunkSelectorType chunk_selector_type() const { return chunk_selector_type_; }
+    uint64_t incremental_chunk_size() const { return incremental_chunk_size_; }
+    uint64_t size() const;
+    uint64_t num_chunks() const;
 
-    /// @brief Synchronously write the buffer to the blkid
-    /// @param buf : Buffer to write data from
-    /// @param size : Size of the buffer
-    /// @param bid : BlkId which was previously allocated. It is expected that entire size was allocated previously.
-    /// @return ssize_t: Size of the data actually written.
-    std::error_code sync_write(const char* buf, uint32_t size, BlkId const& bid);
+    // ── VDevInfo ──────────────────────────────────────────────────────────────
 
-    // TODO: This needs to be removed once Journal starting to use AppendBlkAllocator
-    std::error_code sync_write(const char* buf, uint32_t size, cshared< Chunk >& chunk, uint64_t offset_in_chunk);
+    /// Recompute vdev_size and num_primary_chunks from actual loaded chunks.
+    void adjust_vdev_info();
 
-    /// @brief Synchronously write the vector of buffers to the blkid
-    /// @param iov : Vector of buffer to write data from
-    /// @param iovcnt : Count of buffer
-    /// @param bid  BlkId which was previously allocated. It is expected that entire size was allocated previously.
-    /// @return ssize_t: Size of the data actually written.
-    std::error_code sync_writev(const iovec* iov, int iovcnt, BlkId const& bid);
+    /// Write VDevInfo to ALL physical devices (mirrored for redundancy).
+    /// Mirrors Rust's write_vdev_info().
+    folly::coro::Task< void > write_vdev_info();
 
-    // TODO: This needs to be removed once Journal starting to use AppendBlkAllocator
-    std::error_code sync_writev(const iovec* iov, int iovcnt, cshared< Chunk >& chunk, uint64_t offset_in_chunk);
+    // ── Block allocators ──────────────────────────────────────────────────────
 
-    /////////////////////// Read API related methods /////////////////////////////
+    /// (Re-)construct block allocator for one chunk (or all if chunk == nullptr).
+    void init_blk_allocator(shared< Chunk >& chunk = nullptr);
 
-    /// @brief Asynchronously read the data for a given BlkId.
-    /// @param buf : Buffer to read data to
-    /// @param size : Size of the buffer
-    /// @param bid : BlkId from data needs to be read
-    /// @param part_of_batch : Is this read part of batch io. If true, caller is expected to call submit_batch at
-    /// the end of the batch, otherwise this read request will not be queued.
-    /// @return future< bool > Future result of success or failure
-    folly::Future< std::error_code > async_read(char* buf, uint64_t size, BlkId const& bid, bool part_of_batch = false);
+    /// Recovery: load block allocators from on-disk buffers (chunk_id → ByteArray).
+    void load_blk_allocator(const std::unordered_map< uint32_t, sisl::ByteArray >& chunk_buffers = {});
 
-    /// @brief Asynchronously read the data for a given BlkId to the vector of buffers
-    /// @param iov : Vector of buffer to write read to
-    /// @param iovcnt : Count of buffer
-    /// @param size : Size of the actual data, it is really to optimize the iovec from iterating again to get size
-    /// @param bid : BlkId from data needs to be read
-    /// @param part_of_batch : Is this read part of batch io. If true, caller is expected to call submit_batch at
-    /// the end of the batch, otherwise this read request will not be queued.
-    /// @return future< bool > Future result of success or failure
-    folly::Future< std::error_code > async_readv(iovec* iovs, int iovcnt, uint64_t size, BlkId const& bid,
-                                                 bool part_of_batch = false);
+    uint64_t chunk_size_bytes() const;
+    VDevInfo get_vdev_info() const;
 
-    /// @brief Synchronously read the data for a given BlkId.
-    /// @param buf : Buffer to read data to
-    /// @param size : Size of the buffer
-    /// @param bid : BlkId from data needs to be read
-    /// @return ssize_t: Size of the data actually read.
-    std::error_code sync_read(char* buf, uint32_t size, BlkId const& bid);
-
-    // TODO: This needs to be removed once Journal starting to use AppendBlkAllocator
-    std::error_code sync_read(char* buf, uint32_t size, cshared< Chunk >& chunk, uint64_t offset_in_chunk);
-
-    std::pair< std::error_code, sisl::IoBlobSafe > sync_read(BlkId const& bid);
-
-    /// @brief Synchronously read the data for a given BlkId to vector of buffers
-    /// @param iov : Vector of buffer to write read to
-    /// @param iovcnt : Count of buffer
-    /// @param size : Size of the actual data, it is really to optimize the iovec from iterating again to get size
-    /// @return ssize_t: Size of the data actually read.
-    std::error_code sync_readv(iovec* iov, int iovcnt, BlkId const& bid);
-
-    // TODO: This needs to be removed once Journal starting to use AppendBlkAllocator
-    std::error_code sync_readv(iovec* iov, int iovcnt, cshared< Chunk >& chunk, uint64_t offset_in_chunk);
-
-    /////////////////////// Other API related methods /////////////////////////////
-
-    /// @brief Fsync the underlying physical devices that vdev is sitting on asynchornously
-    /// @return future< bool > Future result with bool to indicate when fsync is actually executed
-    folly::Future< std::error_code > queue_fsync_pdevs();
-
-    /// @brief Submit the batch of IOs previously queued as part of async read/write APIs.
-    void submit_batch();
-
-    ////////////////////// Checkpointing related methods ///////////////////////////
-    /// @brief
-    ///
-    /// @param cp
-    void cp_flush(VDevCPContext* v_cp_ctx);
-
-    /// @brief : percentage CP has been progressed, this api is normally used for cp watchdog;
-    int cp_progress_percent();
-
-    std::unique_ptr< CPContext > create_cp_context(CP* cp);
-
-    void recovery_completed();
-
-    ////////////////////////// Standard Getters ///////////////////////////////
-    virtual uint64_t available_blks() const;
-    virtual uint64_t size() const { return m_vdev_info.vdev_size; }
-    virtual uint64_t used_size() const;
-    virtual uint64_t num_chunks() const { return m_vdev_info.num_primary_chunks; }
-    virtual uint32_t block_size() const { return m_vdev_info.blk_size; }
-    virtual vdev_info info() const { return m_vdev_info; }
-    virtual void update_info(const vdev_info& info) { m_vdev_info = info; }
-    virtual uint32_t num_mirrors() const { return 0; }
-    virtual std::string to_string() const;
-    virtual nlohmann::json get_status(int log_level) const;
-    virtual uint64_t get_total_chunk_num() const { return m_total_chunk_num; }
-
-    uint8_t get_dev_type() const { return m_vdev_info.hs_dev_type; }
-    uint32_t align_size() const;
-    uint32_t optimal_page_size() const;
-    uint32_t atomic_page_size() const;
-
-    static uint64_t get_len(const iovec* iov, int iovcnt);
-    const std::set< PhysicalDev* >& get_pdevs() const { return m_pdevs; }
-    std::map< uint16_t, shared< Chunk > > get_chunks() const;
-    shared< Chunk > get_next_chunk(cshared< Chunk >& chunk);
-    bool is_blk_exist(MultiBlkId const& b) const;
-
-    ///////////////////////// Meta operations on vdev ////////////////////////
-    void update_vdev_private(const sisl::Blob& data);
+    size_t num_chunks_actual() const;
 
 private:
-    uint64_t to_dev_offset(BlkId const& b, Chunk** chunk) const;
-    bool is_chunk_available(cshared< Chunk >& chunk) const;
-    BlkAllocStatus alloc_blks_from_chunk(blk_count_t nblks, blk_alloc_hints const& hints, MultiBlkId& out_blkid,
-                                         Chunk* chunk);
-};
+    // ── RCU helpers ───────────────────────────────────────────────────────────
+    // Reads are lock-free (~2-5 ns): atomic load + folly::rcu_reader guard.
+    // Writes clone + make_and_exchange under chunk_mgmt_mutex_ + grace period.
+    // Mirrors Rust's mutable_state.load_full() / mutable_state.store(Arc::new(s)).
+    //
+    // IMPORTANT: do NOT hold a load_state() result across any call to store_state()
+    // (that would deadlock synchronize_rcu()). Always scope load_state() before
+    // calling store_state(), or use clone_state() which releases the guard immediately.
 
-// place holder for future needs in which components underlying virtualdev needs cp flush context;
-class VDevCPContext : public CPContext {
-public:
-    sisl::ConcurrentInsertVector< BlkId > m_free_blkid_list;
+    sisl::_urcu_access_ptr< VDevMutableState > load_state() const { return mutable_state_.get(); }
 
-public:
-    VDevCPContext(CP* cp);
-    virtual ~VDevCPContext() = default;
+    // Copy current state; RCU guard is acquired and released inside this call.
+    VDevMutableState clone_state() const {
+        auto acc = mutable_state_.get();
+        return *acc.get(); // copy, then acc (rcu_reader) drops
+    }
+
+    // Install new state: atomically swap + wait for RCU grace period.
+    // Must NOT be called while any load_state() result is still in scope on this thread.
+    void store_state(VDevMutableState new_state) { mutable_state_.make_and_exchange(std::move(new_state)); }
+
+    // ── Internal helpers ──────────────────────────────────────────────────────
+
+    std::pair< uint64_t, shared< Chunk > > to_dev_offset(const BlkId& bid) const;
+
+    void construct_blk_allocator(const shared< Chunk >& chunk,
+                                 std::optional< sisl::ByteArray > buffer = std::nullopt);
+
+    shared< Chunk > select_chunk_for_alloc(blk_count_t nblks, const blk_alloc_hints& hints,
+                                           std::optional< uint32_t > last_failed_id) const;
+
+    static std::vector< shared< PhysicalDev > > pick_pdevs(const std::vector< shared< PhysicalDev > >& pdevs,
+                                                           MultiPDevOpts opts);
+
+    static void adjust_vdev_params(VDevParameters& params);
+
+    /// Remove one chunk from mutable state (all_chunks, counters, selector). Called by shrink().
+    void on_chunk_removed(const shared< Chunk >& chunk);
+
+    static shared< IChunkSelector > build_chunk_selector(ChunkSelectorType type,
+                                                         const std::vector< shared< Chunk > >& chunks);
+
+private:
+    // ── Immutable fields (set once at construction, cached for hot-path access) ──
+    std::string name_;
+    uint32_t vdev_id_;
+    HSDevType hs_dev_type_;
+    uint32_t blk_size_;
+    MultiPDevOpts multi_pdev_choice_;
+    VDevSizeType size_type_;
+    BlkAllocatorType allocator_type_;
+    ChunkSelectorType chunk_selector_type_;
+    bool use_slab_allocator_;
+    uint64_t incremental_chunk_size_;
+    std::vector< shared< PhysicalDev > > pdevs_; // physical devices backing this vdev
+
+    // ── Mutable state (RCU) ───────────────────────────────────────────────────
+    // sisl::urcu_data<T>: reads are truly lock-free (folly::rcu_reader, ~2-5 ns).
+    // Writes call make_and_exchange() which waits for a grace period — cheap for
+    // infrequent writes (expand/shrink/recovery), not on the I/O hot path.
+    sisl::urcu_data< VDevMutableState > mutable_state_;
+
+    // ── Chunk management mutex ────────────────────────────────────────────────
+    // Serializes all writes to mutable_state_ (expand, shrink, on_chunks_added, on_chunk_removed, destroy).
+    // Does NOT protect reads — RCU handles that.
+    mutable std::mutex chunk_mgmt_mutex_;
+
+    // ── Optional chunk pool (Dynamic vdevs only) ──────────────────────────────
+    // Has its own internal mutex (std::mutex inside ChunkPool).
+    std::optional< ChunkPool > chunk_pool_;
 };
 
 } // namespace homestore

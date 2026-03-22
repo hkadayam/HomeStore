@@ -1,0 +1,156 @@
+/***************************************************************************
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *    https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
+ ***************************************************************************/
+#pragma once
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <folly/coro/Mutex.h>
+#include <folly/coro/Task.h>
+
+#include <homestore/blk.h>              // BlkId
+#include <homestore/homestore_decl.hpp> // shared<>, unique<>
+
+#include "iomanager/drive_interface.hpp" // IOBuffer
+#include "meta/meta_blk.hpp"         // MetaBlk
+#include "meta/meta_client_info.hpp" // MetaClientInfo
+
+namespace homestore {
+
+class VirtualDev;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MetaClientState
+//
+// All mutable per-client state, protected by a single coroutine mutex.
+// ──────────────────────────────────────────────────────────────────────────────
+struct MetaClientState {
+    folly::coro::Mutex mutex; // Protects all fields below
+    MetaClientInfo info{};
+    std::unordered_map< BlkId, MetaBlk > meta_blks;
+    BlkId tail_blkid{};                                // Invalid = chain empty
+};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MetaClient
+//
+// Represents one registered metadata client.  Manages a singly-rooted,
+// doubly-linked chain of MetaBlks on the meta vdev.
+//
+// MetaClient is movable but not copyable.
+// ──────────────────────────────────────────────────────────────────────────────
+class MetaClient {
+public:
+    // ── Factories ─────────────────────────────────────────────────────────────
+
+    /// Create a brand-new client, persist its MetaClientInfo to disk.
+    static folly::coro::Task< MetaClient > create(std::string name, uint8_t client_id, shared< VirtualDev > vdev);
+
+    /// Load an existing client from a recovered MetaClientInfo.
+    /// Traverses the on-disk chain from info.first_blkid and rebuilds meta_blks.
+    static folly::coro::Task< MetaClient > load(MetaClientInfo info, shared< VirtualDev > vdev);
+
+    // ── Queries ───────────────────────────────────────────────────────────────
+    folly::coro::Task< uint8_t > client_id() const;
+    folly::coro::Task< std::string > client_name() const;
+    folly::coro::Task< size_t > num_meta_blks() const;
+
+    // ── Block management ──────────────────────────────────────────────────────
+
+    /// Allocate a fresh MetaBlk (not yet in the chain). Call write_meta_blk() to actually persist and link it.
+    folly::coro::Task< MetaBlk > create_meta_blk(std::string_view name, std::optional< size_t > estimated_data_size);
+
+    /// Find a block by name.  Returns std::nullopt if not found.
+    folly::coro::Task< std::optional< MetaBlk > > get_meta_blk(std::string_view name);
+
+    /// Write data to a MetaBlk.
+    ///
+    /// - New block (not yet in chain): data written, block appended to the tail, and client info is updated on disk.
+    /// - Existing block: data is overwritten in-place (no relinking needed).
+    folly::coro::Task< void > write_meta_blk(MetaBlk blk, const IOBuffer& data);
+
+    /// Read the payload from an existing MetaBlk.
+    folly::coro::Task< IOBuffer > read_meta_blk(const MetaBlk& blk);
+
+    /// Remove a MetaBlk from the chain and free all its blocks on the vdev.
+    folly::coro::Task< void > remove_meta_blk(const MetaBlk& blk);
+
+    // ── Recovery ──────────────────────────────────────────────────────────────
+
+    /// Iterate over all recovered blocks lazily, one IOBuffer at a time.
+    ///
+    /// visitor signature: folly::coro::Task<void>(MetaBlk, IOBuffer)
+    ///
+    /// Each IOBuffer is released before the next block is read, keeping peak memory at O(1) blocks.  Replaces the Rust
+    /// recovered_blocks() Stream.
+    template < typename Visitor >
+    folly::coro::Task< void > for_each_recovered_block(Visitor visitor);
+
+    // ── Move-only ─────────────────────────────────────────────────────────────
+    MetaClient() = default;
+    MetaClient(MetaClient&&) = default;
+    MetaClient& operator=(MetaClient&&) = default;
+    MetaClient(const MetaClient&) = delete;
+    MetaClient& operator=(const MetaClient&) = delete;
+
+private:
+    shared< MetaClientState > state_;
+    shared< VirtualDev > meta_vdev_;
+    BlkId info_bid_{};
+
+    folly::coro::Task< void > write_client_info(const MetaClientInfo& info);
+
+    /// Calculate the BlkId of the on-disk slot that holds this client's
+    /// MetaClientInfo (derived from client_id and the vdev's block size).
+    static BlkId calc_info_bid(uint8_t client_id, const VirtualDev& vdev);
+};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// for_each_recovered_block — template body (must be in the header)
+// ──────────────────────────────────────────────────────────────────────────────
+template < typename Visitor >
+folly::coro::Task< void > MetaClient::for_each_recovered_block(Visitor visitor) {
+    // Snapshot the block IDs under the lock, then release before any I/O.
+    std::vector< BlkId > blk_ids;
+    {
+        auto lock = co_await state_->mutex.co_scoped_lock();
+        blk_ids.reserve(state_->meta_blks.size());
+        for (const auto& [id, _] : state_->meta_blks) {
+            blk_ids.push_back(id);
+        }
+    }
+
+    // Read and visit one block at a time (lazy — O(1) IOBuffers live at once).
+    for (const BlkId& id : blk_ids) {
+        MetaBlk blk_copy;
+        {
+            auto lock = co_await state_->mutex.co_scoped_lock();
+            auto it = state_->meta_blks.find(id);
+            if (it == state_->meta_blks.end()) continue; // removed concurrently
+            blk_copy = it->second.clone();
+        }
+
+        IOBuffer data = co_await blk_copy.read_data(*meta_vdev_);
+
+        // 'data' is released after visitor returns, before the next iteration.
+        co_await visitor(std::move(blk_copy), std::move(data));
+    }
+}
+
+} // namespace homestore

@@ -143,17 +143,17 @@ struct SgIterator {
 // (for pool-vs-regular allocation decisions).
 
 enum class Buftag : uint8_t {
-    common       = 0,
-    bitset       = 1,
-    superblk     = 2,
-    metablk      = 3,
-    logread      = 4,
-    logwrite     = 5,
-    compression  = 6,
+    common = 0,
+    bitset = 1,
+    superblk = 2,
+    metablk = 3,
+    logread = 4,
+    logwrite = 5,
+    compression = 6,
     data_journal = 7,
-    btree_journal= 8,
-    btree_node   = 9,
-    Sentinel     = 10,
+    btree_journal = 8,
+    btree_node = 9,
+    Sentinel = 10,
 };
 static constexpr size_t kNumBuftags{static_cast< size_t >(Buftag::Sentinel)};
 
@@ -170,7 +170,7 @@ public:
 
     AlignedAllocatorMetrics() : MetricsGroup("AlignedAllocation", "Singleton") {
         static constexpr std::array< std::string_view, kNumBuftags > kTagNames{
-            "common", "bitset", "superblk", "metablk", "logread",
+            "common",   "bitset",      "superblk",     "metablk",       "logread",
             "logwrite", "compression", "data_journal", "btree_journal", "btree_node"};
         for (size_t t = 0; t < kNumBuftags; ++t) {
             const std::string name = "buftag_" + std::string{kTagNames[t]};
@@ -207,21 +207,25 @@ inline size_t buf_usable_size(void* p) {
 
 inline uint8_t* aligned_alloc(size_t align, size_t sz, Buftag tag = Buftag::common) {
     void* ptr{nullptr};
-    if (::posix_memalign(&ptr, align, round_up(sz, align)) != 0) { throw std::bad_alloc{}; }
+    if (::posix_memalign(&ptr, align, round_up(sz, align)) != 0) {
+        throw std::bad_alloc{};
+    }
     aligned_alloc_metrics().increment(tag, buf_usable_size(ptr));
     return static_cast< uint8_t* >(ptr);
 }
 
 inline void aligned_free(uint8_t* p, Buftag tag = Buftag::common) {
-    if (!p) return;
+    if (!p)
+        return;
     aligned_alloc_metrics().decrement(tag, buf_usable_size(static_cast< void* >(p)));
     ::free(p);
 }
 
 inline uint8_t* aligned_realloc(uint8_t* old_buf, size_t align, size_t new_sz, size_t old_sz = 0,
-                                 Buftag tag = Buftag::common) {
+                                Buftag tag = Buftag::common) {
     const size_t old_real{(old_sz != 0) ? old_sz : buf_usable_size(static_cast< void* >(old_buf))};
-    if (old_real >= new_sz) return old_buf;
+    if (old_real >= new_sz)
+        return old_buf;
     uint8_t* const new_buf{aligned_alloc(align, new_sz, tag)};
     if (old_buf) {
         std::memcpy(new_buf, old_buf, old_real);
@@ -235,7 +239,9 @@ inline uint8_t* aligned_realloc(uint8_t* old_buf, size_t align, size_t new_sz, s
 template < typename T, Buftag Tag = Buftag::common >
 struct AlignedDeleter {
     void operator()(T* p) {
-        if constexpr (std::is_destructible_v< std::decay_t< T > >) { p->~T(); }
+        if constexpr (std::is_destructible_v< std::decay_t< T > >) {
+            p->~T();
+        }
         aligned_free(r_cast< uint8_t* >(p), Tag);
     }
 };
@@ -294,7 +300,9 @@ public:
     constexpr AlignedTypeAllocator(AlignedTypeAllocator< U, Alignment > const&) noexcept {}
 
     T* allocate(std::size_t nelems) {
-        if (nelems > std::numeric_limits< std::size_t >::max() / sizeof(T)) { throw std::bad_array_new_length(); }
+        if (nelems > std::numeric_limits< std::size_t >::max() / sizeof(T)) {
+            throw std::bad_array_new_length();
+        }
         return r_cast< T* >(aligned_alloc(Alignment, nelems * sizeof(T), Buftag::common));
     }
 
@@ -332,8 +340,7 @@ public:
         Blob::bytes_ = aligned_ ? aligned_alloc(align_size, sz, tag) : static_cast< uint8_t* >(::malloc(sz));
     }
 
-    void buf_alloc_and_init(size_t sz, uint32_t align_size = 512, Buftag tag = Buftag::common,
-                            uint8_t init_val = 0) {
+    void buf_alloc_and_init(size_t sz, uint32_t align_size = 512, Buftag tag = Buftag::common, uint8_t init_val = 0) {
         buf_alloc(sz, align_size, tag);
         std::memset(Blob::bytes_, init_val, sz);
     }
@@ -382,12 +389,14 @@ public:
 
 public:
     IoBlobSafe() = default;
-    IoBlobSafe(uint32_t sz, uint32_t alignment = 0, Buftag tag = Buftag::common) :
+    IoBlobSafe(uint32_t sz, uint32_t alignment = 512, Buftag tag = Buftag::common) :
             IoBlob(sz, alignment, tag), tag_{tag} {}
     IoBlobSafe(uint8_t* bytes, uint32_t size, bool is_aligned) : IoBlob(bytes, size, is_aligned) {}
     IoBlobSafe(uint8_t const* bytes, uint32_t size, bool is_aligned) : IoBlob(bytes, size, is_aligned) {}
     ~IoBlobSafe() {
-        if (Blob::bytes_ != nullptr) { IoBlob::buf_free(tag_); }
+        if (Blob::bytes_ != nullptr) {
+            IoBlob::buf_free(tag_);
+        }
     }
 
     IoBlobSafe(IoBlobSafe const&) = delete;
@@ -398,7 +407,9 @@ public:
 
     IoBlobSafe& operator=(IoBlobSafe const&) = delete;
     IoBlobSafe& operator=(IoBlobSafe&& other) {
-        if (Blob::bytes_ != nullptr) { this->buf_free(tag_); }
+        if (Blob::bytes_ != nullptr) {
+            this->buf_free(tag_);
+        }
         *static_cast< IoBlob* >(this) = std::move(*static_cast< IoBlob* >(&other));
         tag_ = other.tag_;
         other.bytes_ = nullptr;
@@ -417,6 +428,8 @@ using ByteArray = shared< IoBlobSafe >;
 inline ByteArray make_byte_array(uint32_t sz, uint32_t alignment = 0, Buftag tag = Buftag::common) {
     return std::make_shared< IoBlobSafe >(sz, alignment, tag);
 }
+
+inline ByteArray make_byte_array(IoBlobSafe&& blob) { return std::make_shared< IoBlobSafe >(std::move(blob)); }
 
 struct ByteView {
 public:
@@ -466,7 +479,9 @@ public:
     }
 
     ByteArray extract(uint32_t alignment = 0) const {
-        if (can_do_shallow_copy()) { return base_buf_; }
+        if (can_do_shallow_copy()) {
+            return base_buf_;
+        }
         auto base_buf = make_byte_array(view_.size(), alignment, base_buf_->tag_);
         std::memcpy(base_buf->bytes(), view_.cbytes(), view_.size());
         return base_buf;

@@ -9,6 +9,7 @@
 
 #include <folly/coro/Task.h>
 #include <folly/io/async/EventBase.h>
+#include <sisl/fds/buffer.h>
 
 namespace homestore {
 
@@ -18,34 +19,12 @@ namespace homestore {
 void drive_interface_init_reactor(folly::EventBase* eb);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// IOBuffer — 4096-aligned heap buffer, safe for O_DIRECT.
-// Move-only; non-copyable.
+// IOBuffer — aligned heap buffer, safe for O_DIRECT (512-byte default alignment).
+// Move-only; non-copyable.  Alias for sisl::IoBlobSafe — callers can wrap in
+// ByteArray (shared<IoBlobSafe>) for shared ownership at the persistence layer.
 // ─────────────────────────────────────────────────────────────────────────────
 
-class IOBuffer {
-public:
-    /// Allocates at least `size` bytes rounded up to 4096.
-    explicit IOBuffer(size_t size);
-    ~IOBuffer();
-
-    IOBuffer(IOBuffer&&) noexcept;
-    IOBuffer& operator=(IOBuffer&&) noexcept;
-    IOBuffer(const IOBuffer&)            = delete;
-    IOBuffer& operator=(const IOBuffer&) = delete;
-
-    uint8_t*       data()       noexcept { return data_; }
-    const uint8_t* data() const noexcept { return data_; }
-    size_t         size() const noexcept { return size_; }
-
-private:
-    static constexpr size_t kAlign = 4096;
-    static size_t align_up(size_t n) noexcept {
-        return (n + kAlign - 1) & ~(kAlign - 1);
-    }
-
-    uint8_t* data_{nullptr};
-    size_t   size_{0};
-};
+using IOBuffer = sisl::IoBlobSafe;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IoDevice — an open file or block-device file descriptor.
@@ -99,13 +78,14 @@ public:
 
     // ── Read ──────────────────────────────────────────────────────────────────
 
-    /// Positioned read. `buf` is moved in and returned with the result.
-    folly::coro::Task<std::pair<std::error_code, IOBuffer>>
-    read(const IoDevice& dev, IOBuffer buf, uint64_t offset);
+    /// Positioned read into buf. Caller retains ownership; buf must remain
+    /// valid until the Task completes (guaranteed when caller co_awaits).
+    folly::coro::Task<std::error_code>
+    read(const IoDevice& dev, IOBuffer& buf, uint64_t offset);
 
-    /// Scatter read. `bufs` are moved in and returned with the result.
-    folly::coro::Task<std::pair<std::error_code, std::vector<IOBuffer>>>
-    readv(const IoDevice& dev, std::vector<IOBuffer> bufs, uint64_t offset);
+    /// Scatter read into bufs. Same lifetime contract as read().
+    folly::coro::Task<std::error_code>
+    readv(const IoDevice& dev, std::vector<IOBuffer>& bufs, uint64_t offset);
 
     // ── Write ─────────────────────────────────────────────────────────────────
 
@@ -114,9 +94,9 @@ public:
     folly::coro::Task<std::error_code>
     write(const IoDevice& dev, const IOBuffer& buf, uint64_t offset);
 
-    /// Gather write. `bufs` are moved in (kept alive inside the Task).
+    /// Gather write. Caller must std::move the vector in.
     folly::coro::Task<std::error_code>
-    writev(const IoDevice& dev, std::vector<IOBuffer> bufs, uint64_t offset);
+    writev(const IoDevice& dev, std::vector<IOBuffer>&& bufs, uint64_t offset);
 
     // ── Misc ──────────────────────────────────────────────────────────────────
 

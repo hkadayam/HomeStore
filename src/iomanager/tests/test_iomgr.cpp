@@ -22,12 +22,8 @@ SISL_OPTION_GROUP(test_iomgr,
 static uint32_t g_num_reactors{4};
 static uint32_t g_num_iters{5};
 
-// Each test owns the full iomgr lifecycle to stay independent.
-class IOMgrTest : public ::testing::Test {
-protected:
-    void SetUp() override    { init_iomgr(g_num_reactors); }
-    void TearDown() override { stop_iomgr(); }
-};
+// All tests share one iomgr instance (created in main).
+class IOMgrTest : public ::testing::Test {};
 
 // ── Basic dispatch ─────────────────────────────────────────────────────────────
 
@@ -56,7 +52,7 @@ TEST_F(IOMgrTest, SpawnDetachedFiresAndForgets) {
         [&done]() -> folly::coro::Task<void> {
             done.post();
             co_return;
-        }());
+        });
     done.wait();
 }
 
@@ -116,7 +112,7 @@ TEST_F(IOMgrTest, CancellableRecurringTimer) {
                 ++fire_count;
             }
             done.post();
-        }());
+        });
 
     // Let a few ticks fire, then cancel.
     std::this_thread::sleep_for(55ms);
@@ -149,14 +145,14 @@ TEST_F(IOMgrTest, YieldAllowsOtherTaskToRun) {
             }
             EXPECT_GT(b_ran.load(), 0) << "B never ran during A's yields";
             done.post();
-        }());
+        });
 
     // Task B: increment counter and return immediately.
     iomgr().spawn_detached(ReactorTarget::reactor(0),
         [&b_ran]() -> folly::coro::Task<void> {
             b_ran.fetch_add(1);
             co_return;
-        }());
+        });
 
     done.wait();
 }
@@ -196,7 +192,7 @@ TEST_F(IOMgrTest, AsyncBroadcastToAllReactors) {
                     all_done.post();
                 }
                 co_return;
-            }());
+            });
     }
 
     all_done.wait();
@@ -254,7 +250,7 @@ TEST_F(IOMgrTest, AsyncRelayBroadcast) {
                             all_done.post();
                         }
                         co_return;
-                    }());
+                    });
             }
             co_return;
         }());
@@ -285,5 +281,8 @@ int main(int argc, char* argv[]) {
     g_num_iters    = SISL_OPTIONS["num_iters"].as<uint32_t>();
     sisl::logging::SetLogger("test_iomgr");
     ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
+    init_iomgr(g_num_reactors);
+    int rc = RUN_ALL_TESTS();
+    stop_iomgr();
+    return rc;
 }

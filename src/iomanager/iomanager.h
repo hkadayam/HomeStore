@@ -8,6 +8,7 @@
 #include <memory>
 #include <vector>
 
+#include <folly/Try.h>
 #include <folly/synchronization/Baton.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
 #include <folly/io/async/EventBase.h>
@@ -15,6 +16,7 @@
 #include <folly/coro/Task.h>
 #include <folly/coro/BlockingWait.h>
 #include <folly/coro/Sleep.h>
+#include <folly/coro/Invoke.h>
 
 namespace homestore {
 
@@ -84,9 +86,11 @@ public:
 
     // ── Dispatch ──────────────────────────────────────────────────────────────
 
-    // Fire-and-forget. Schedules task on the target reactor, does not wait.
-    template <typename T>
-    void spawn_detached(ReactorTarget target, folly::coro::Task<T> task);
+    // Fire-and-forget. Accepts a zero-arg factory that returns Task<T>.
+    // The factory is invoked on the reactor thread, so reference captures
+    // in the lambda body remain valid (CP.51: do not pass already-created Tasks).
+    template <typename F>
+    void spawn_detached(ReactorTarget target, F factory);
 
     // Dispatch task to the target reactor and co_await the result.
     // Call from a coroutine context.
@@ -131,16 +135,14 @@ private:
 // Template implementations (must be in the header)
 // ─────────────────────────────────────────────────────────────────────────────
 
-template <typename T>
-void IOManager::spawn_detached(ReactorTarget target, folly::coro::Task<T> task) {
+template <typename F>
+void IOManager::spawn_detached(ReactorTarget target, F factory) {
     auto* eb = resolve_target(target);
-    // Hop to the reactor thread first, then start the coroutine there.
-    // This avoids a race where the SemiFuture (from .start()) is destroyed
-    // on the calling thread while the reactor thread is simultaneously
-    // beginning execution — both the start and the SemiFuture discard now
-    // happen on the same reactor thread.
+    // co_invoke moves factory into a heap-allocated coroutine frame so the
+    // lambda closure outlives all suspension points (CP.51 fix).
+    auto task = folly::coro::co_invoke(std::move(factory));
     eb->runInEventBaseThread([eb, task = std::move(task)]() mutable {
-        (void)std::move(task).scheduleOn(eb).start();
+        std::move(task).scheduleOn(eb).startInlineUnsafe([](auto) {});
     });
 }
 
@@ -154,7 +156,22 @@ folly::coro::Task<T> IOManager::spawn_waitable(ReactorTarget target,
 template <typename T>
 T IOManager::spawn_and_block(ReactorTarget target, folly::coro::Task<T> task) {
     auto* eb = resolve_target(target);
-    return folly::coro::blockingWait(std::move(task).scheduleOn(eb));
+    // Use TaskWithExecutor::start(tryCallback) to run the task on the reactor
+    // and signal completion via a Baton.  This avoids blockingWait, which can
+    // leave a stale FunctionLoopCallback on the EventBase after it returns.
+    folly::Baton<> baton;
+    folly::Try<T> result;
+
+    eb->runInEventBaseThread([eb, task = std::move(task), &baton, &result]() mutable {
+        std::move(task).scheduleOn(eb).startInlineUnsafe(
+            [&baton, &result](folly::Try<T> t) {
+                result = std::move(t);
+                baton.post();
+            });
+    });
+
+    baton.wait();
+    return std::move(result).value();
 }
 
 template <typename Fn>
@@ -190,9 +207,9 @@ IOManager& iomgr();
 // Convenience free functions (mirror Rust's free functions)
 // ─────────────────────────────────────────────────────────────────────────────
 
-template <typename T>
-void spawn_detached(ReactorTarget target, folly::coro::Task<T> task) {
-    iomgr().spawn_detached(target, std::move(task));
+template <typename F>
+void spawn_detached(ReactorTarget target, F factory) {
+    iomgr().spawn_detached(target, std::move(factory));
 }
 
 template <typename T>

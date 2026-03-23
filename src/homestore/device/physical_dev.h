@@ -42,8 +42,8 @@ namespace homestore {
 // Mirrors Rust's CACHED_OPENED_DEVS / open_and_cache_dev / close_and_uncache_dev.
 // The cache avoids reopening the same device when both a format pass and a load
 // pass reference the same underlying file/block device.
-folly::coro::Task< std::shared_ptr< IoDevice > > open_and_cache_dev(std::string devname, int oflags);
-folly::coro::Task< void >                        close_and_uncache_dev(std::string devname);
+folly::coro::Task< std::shared_ptr< IoDevice > > open_and_cache_dev(const std::string& devname, int oflags);
+folly::coro::Task< void >                        close_and_uncache_dev(const std::string& devname);
 
 // ── ChunkProvisioner ──────────────────────────────────────────────────────────
 // Mirrors Rust's inner ChunkProvisioner struct.
@@ -116,7 +116,7 @@ public:
     // All async; mirrors Rust's write / writev / read / readv / write_zero / fsync.
 
     folly::coro::Task< void > write(const IOBuffer& buf, uint64_t offset);
-    folly::coro::Task< void > writev(std::vector< IOBuffer > bufs, uint64_t offset);
+    folly::coro::Task< void > writev(std::vector< IOBuffer >&& bufs, uint64_t offset);
 
     folly::coro::Task< std::error_code >
     read(IOBuffer& buf, uint64_t offset);

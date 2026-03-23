@@ -36,7 +36,7 @@ std::mutex s_dev_cache_mtx;
 std::unordered_map< std::string, std::shared_ptr< IoDevice > > s_dev_cache;
 } // namespace
 
-folly::coro::Task< std::shared_ptr< IoDevice > > open_and_cache_dev(std::string devname, int oflags) {
+folly::coro::Task< std::shared_ptr< IoDevice > > open_and_cache_dev(const std::string& devname, int oflags) {
     {
         std::lock_guard lg{s_dev_cache_mtx};
         auto it = s_dev_cache.find(devname);
@@ -52,7 +52,7 @@ folly::coro::Task< std::shared_ptr< IoDevice > > open_and_cache_dev(std::string 
     co_return it->second;
 }
 
-folly::coro::Task< void > close_and_uncache_dev(std::string devname) {
+folly::coro::Task< void > close_and_uncache_dev(const std::string& devname) {
     std::lock_guard lg{s_dev_cache_mtx};
     s_dev_cache.erase(devname);
     // IoDevice destructor closes the fd when the last shared_ptr drops.
@@ -127,12 +127,10 @@ folly::coro::Task< std::shared_ptr< PhysicalDev > > PhysicalDev::construct(dev_i
 
     std::cout << "Device " << dinfo.dev_name << " opened, size=" << rounded << "\n";
 
-    auto di = dinfo;
-    di.dev_size = actual;
-
     pdev->devname_ = dinfo.dev_name;
     pdev->dev_type_ = dinfo.dev_type;
-    pdev->dev_info_ = std::move(di);
+    dinfo.dev_size = actual;
+    pdev->dev_info_ = std::move(dinfo);
     pdev->pdev_info_ = pinfo;
     pdev->devsize_ = rounded;
     pdev->super_blk_in_footer_ = (pinfo.mirror_super_block != 0);
@@ -188,7 +186,7 @@ folly::coro::Task< void > PhysicalDev::write(const IOBuffer& buf, uint64_t offse
     if (ec) { throw std::system_error(ec, "write failed on " + devname_); }
 }
 
-folly::coro::Task< void > PhysicalDev::writev(std::vector< IOBuffer > bufs, uint64_t offset) {
+folly::coro::Task< void > PhysicalDev::writev(std::vector< IOBuffer >&& bufs, uint64_t offset) {
     auto ec = co_await drive_iface_->writev(*iodev_, std::move(bufs), offset);
     if (ec) { throw std::system_error(ec, "writev failed on " + devname_); }
 }
@@ -219,10 +217,7 @@ folly::coro::Task< void > PhysicalDev::format_chunks() {
 
     const auto bitmap_data = bitset.serialize(pdev_info_.dev_attr.align_size);
     assert(bitmap_data->size() <= chunk_info_bitmap_size());
-
-    IOBuffer sb_buf{bitmap_data->size()};
-    std::memcpy(sb_buf.data(), bitmap_data->cbytes(), bitmap_data->size());
-    co_await write_super_block(sb_buf, chunk_sb_offset());
+    co_await write_super_block(*bitmap_data, chunk_sb_offset());
 
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     chunk_provisioner_.chunk_info_slots = std::make_unique< sisl::Bitset >(std::move(bitset));
@@ -259,9 +254,7 @@ folly::coro::Task< std::shared_ptr< Chunk > > PhysicalDev::create_chunk(uint32_t
 
     // Persist the updated bitmap.
     const auto bm = prov.chunk_info_slots->serialize(pdev_info_.dev_attr.align_size);
-    IOBuffer bm_buf{bm->size()};
-    std::memcpy(bm_buf.data(), bm->cbytes(), bm->size());
-    co_await write_super_block(bm_buf, chunk_sb_offset());
+    co_await write_super_block(*bm, chunk_sb_offset());
 
     std::cout << "Created chunk " << chunk_id << " (slot " << cslot << ", vdev " << vdev_id << ")\n";
     co_return chunk;
@@ -317,9 +310,7 @@ PhysicalDev::create_chunks(uint32_t vdev_id, uint32_t num_chunks, uint64_t size,
 
     // Persist the updated bitmap once for the entire batch.
     const auto bm = prov.chunk_info_slots->serialize(pdev_info_.dev_attr.align_size);
-    IOBuffer bm_buf{bm->size()};
-    std::memcpy(bm_buf.data(), bm->cbytes(), bm->size());
-    co_await write_super_block(bm_buf, chunk_sb_offset());
+    co_await write_super_block(*bm, chunk_sb_offset());
 
     co_return ret_chunks;
 }
@@ -398,9 +389,7 @@ folly::coro::Task< void > PhysicalDev::remove_chunk(const std::shared_ptr< Chunk
 
     prov.chunk_info_slots->reset_bit(slot);
     const auto bm = prov.chunk_info_slots->serialize(pdev_info_.dev_attr.align_size);
-    IOBuffer bm_buf{bm->size()};
-    std::memcpy(bm_buf.data(), bm->cbytes(), bm->size());
-    co_await write_super_block(bm_buf, chunk_sb_offset());
+    co_await write_super_block(*bm, chunk_sb_offset());
 
     std::cout << "Removed chunk " << chunk_id << "\n";
     co_return;
@@ -422,12 +411,10 @@ folly::coro::Task< void > PhysicalDev::remove_chunks(const std::vector< std::sha
         prov.chunk_info_slots->reset_bit(chunk->slot_number());
     }
 
-    // Single bitmap write for the entire batch — mirrors Rust's batched approach.
+    // Single bitmap write for the entire batch.
     if (prov.chunk_info_slots) {
         const auto bm = prov.chunk_info_slots->serialize(pdev_info_.dev_attr.align_size);
-        IOBuffer bm_buf{bm->size()};
-        std::memcpy(bm_buf.data(), bm->cbytes(), bm->size());
-        co_await write_super_block(bm_buf, chunk_sb_offset());
+        co_await write_super_block(*bm, chunk_sb_offset());
     }
     co_return;
 }

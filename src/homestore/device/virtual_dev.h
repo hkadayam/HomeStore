@@ -30,7 +30,7 @@
 #include <folly/coro/Task.h>
 #include <sisl/fds/urcu_helper.h>
 
-#include <homestore/blk.h>              // BlkId, MultiBlkId, BlkAllocStatus, blk_alloc_hints, blk_count_t
+#include <homestore/blk.h>              // BlkId, BlkIds, BlkAllocStatus, blk_alloc_hints, blk_count_t
 #include <homestore/crc.h>              // crc16_t10dif, hs_init_crc_16
 #include <homestore/homestore_decl.hpp> // HSDevType, blk_allocator_type_t
 
@@ -228,8 +228,9 @@ public:
     // Public APIs: I/Os
     // ──────────────────────────────────────────────────────────────────────────────
     folly::coro::Task< void > write(const IOBuffer& buf, const BlkId& bid);
-    folly::coro::Task< void > writev(std::vector< IOBuffer > bufs, const BlkId& bid);
-    folly::coro::Task< std::pair< std::error_code, IOBuffer > > read(IOBuffer buf, const BlkId& bid);
+    folly::coro::Task< void > writev(std::vector< IOBuffer >&& bufs, const BlkId& bid);
+    folly::coro::Task< std::error_code > read(IOBuffer& buf, const BlkId& bid);
+    folly::coro::Task< std::error_code > readv(std::vector< IOBuffer >& bufs, const BlkId& bid);
     folly::coro::Task< void > format();
     folly::coro::Task< void > fsync();
 
@@ -237,7 +238,7 @@ public:
     // Public APIs: Block Allocations
     // ──────────────────────────────────────────────────────────────────────────────
     BlkAllocStatus alloc_contiguous_blks(blk_count_t nblks, const blk_alloc_hints& hints, BlkId& out_blkid);
-    BlkAllocStatus alloc_blks(blk_count_t nblks, const blk_alloc_hints& hints, MultiBlkId& out_blkid);
+    BlkAllocStatus alloc_blks(blk_count_t nblks, const blk_alloc_hints& hints, BlkIds& out_blkids);
     void free_blk(const BlkId& bid);
     BlkAllocStatus commit_blk(const BlkId& bid);
 
@@ -245,6 +246,7 @@ public:
     // Public APIs: Getters
     // ──────────────────────────────────────────────────────────────────────────────
     shared< Chunk > get_nth_chunk(size_t n) const;
+    shared< Chunk > get_chunk(uint32_t chunk_id) const; // O(1) lookup by chunk_id; nullptr if not found
     std::vector< shared< Chunk > > get_chunks() const;
     std::vector< shared< Chunk > > get_chunks_by_creation_order() const;
 
@@ -275,6 +277,9 @@ public:
 
     /// Recovery: load block allocators from on-disk buffers (chunk_id → ByteArray).
     void load_blk_allocator(const std::unordered_map< uint32_t, sisl::ByteArray >& chunk_buffers = {});
+
+    /// Recovery: load block allocator for a single chunk from its on-disk bitmap buffer.
+    void load_blk_allocator(uint32_t chunk_id, const sisl::ByteArray& buffer);
 
     uint64_t chunk_size_bytes() const;
     VDevInfo get_vdev_info() const;

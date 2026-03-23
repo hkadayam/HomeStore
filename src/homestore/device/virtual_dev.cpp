@@ -254,14 +254,19 @@ folly::coro::Task< void > VirtualDev::write(const IOBuffer& buf, const BlkId& bi
     co_await chunk->physical_dev()->write(buf, dev_offset);
 }
 
-folly::coro::Task< void > VirtualDev::writev(std::vector< IOBuffer > bufs, const BlkId& bid) {
+folly::coro::Task< void > VirtualDev::writev(std::vector< IOBuffer >&& bufs, const BlkId& bid) {
     auto [dev_offset, chunk] = to_dev_offset(bid);
     co_await chunk->physical_dev()->writev(std::move(bufs), dev_offset);
 }
 
-folly::coro::Task< std::pair< std::error_code, IOBuffer > > VirtualDev::read(IOBuffer buf, const BlkId& bid) {
+folly::coro::Task< std::error_code > VirtualDev::read(IOBuffer& buf, const BlkId& bid) {
     auto [dev_offset, chunk] = to_dev_offset(bid);
-    co_return co_await chunk->physical_dev()->read(std::move(buf), dev_offset);
+    co_return co_await chunk->physical_dev()->read(buf, dev_offset);
+}
+
+folly::coro::Task< std::error_code > VirtualDev::readv(std::vector< IOBuffer >& bufs, const BlkId& bid) {
+    auto [dev_offset, chunk] = to_dev_offset(bid);
+    co_return co_await chunk->physical_dev()->readv(bufs, dev_offset);
 }
 
 folly::coro::Task< void > VirtualDev::format() {
@@ -287,44 +292,51 @@ folly::coro::Task< void > VirtualDev::fsync() {
 // Public APIs: Block Allocations
 // ──────────────────────────────────────────────────────────────────────────────
 BlkAllocStatus VirtualDev::alloc_contiguous_blks(blk_count_t nblks, const blk_alloc_hints& hints, BlkId& out_blkid) {
-    MultiBlkId mbid;
-    const BlkAllocStatus st = alloc_blks(nblks, hints, mbid);
-    if (st == BlkAllocStatus::SUCCESS || (st == BlkAllocStatus::PARTIAL && hints.partial_alloc_ok)) {
-        if (mbid.num_pieces() != 1) {
-            return BlkAllocStatus::FAILED;
-        }
-        out_blkid = mbid.to_single_blkid();
+    blk_alloc_hints contig_hints = hints;
+    contig_hints.is_contiguous = true;
+
+    BlkIds blkids;
+    BlkAllocStatus st = alloc_blks(nblks, contig_hints, blkids);
+    if (st == BlkAllocStatus::SUCCESS && blkids.size() == 1) {
+        out_blkid = blkids.front();
     }
     return st;
 }
 
-BlkAllocStatus VirtualDev::alloc_blks(blk_count_t nblks, const blk_alloc_hints& hints, MultiBlkId& out_blkid) {
+BlkAllocStatus VirtualDev::alloc_blks(blk_count_t nblks, const blk_alloc_hints& hints, BlkIds& out_blkids) {
     auto state = load_state();
     const uint64_t max_attempts = hints.chunk_id_hint.is_valid() ? 1 : state->total_chunk_num;
     std::optional< uint32_t > last_failed;
     uint64_t attempt = 0;
+    blk_count_t remaining = nblks;
 
-    for (;;) {
-        auto chunk = select_chunk_for_alloc(nblks, hints, last_failed);
+    while (remaining > 0) {
+        auto chunk = select_chunk_for_alloc(remaining, hints, last_failed);
         if (!chunk) {
-            return BlkAllocStatus::SPACE_FULL;
+            return out_blkids.empty() ? BlkAllocStatus::SPACE_FULL : BlkAllocStatus::PARTIAL;
         }
         if (!chunk->has_blk_allocator()) {
             return BlkAllocStatus::FAILED;
         }
 
-        BlkAllocStatus st = chunk->blk_allocator_mutable()->alloc_blks(nblks, hints, out_blkid);
+        BlkIds blkids;
+        BlkAllocStatus st = chunk->blk_allocator_mutable()->alloc(remaining, hints, blkids);
         if (st == BlkAllocStatus::SUCCESS || (st == BlkAllocStatus::PARTIAL && hints.partial_alloc_ok)) {
-            return st;
+            for (auto const& bid : blkids) {
+                out_blkids.push_back(bid);
+                remaining -= bid.blk_count();
+            }
+            continue;
         }
         if (!hints.can_look_for_other_chunk || hints.chunk_id_hint.is_valid()) {
-            return st;
+            return out_blkids.empty() ? st : BlkAllocStatus::PARTIAL;
         }
         if (++attempt >= max_attempts) {
-            return BlkAllocStatus::SPACE_FULL;
+            return out_blkids.empty() ? BlkAllocStatus::SPACE_FULL : BlkAllocStatus::PARTIAL;
         }
         last_failed = chunk->chunk_id();
     }
+    return BlkAllocStatus::SUCCESS;
 }
 
 void VirtualDev::free_blk(const BlkId& bid) {
@@ -370,6 +382,16 @@ void VirtualDev::load_blk_allocator(const std::unordered_map< uint32_t, sisl::By
     }
 }
 
+void VirtualDev::load_blk_allocator(uint32_t chunk_id, const sisl::ByteArray& buffer) {
+    auto state = load_state();
+    auto it = state->all_chunks.find(chunk_id);
+    if (it == state->all_chunks.end()) {
+        LOGWARN("load_blk_allocator: chunk_id={} not found in VDev '{}'", chunk_id, name_);
+        return;
+    }
+    construct_blk_allocator(it->second, buffer);
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Public APIs: Getters
 // ──────────────────────────────────────────────────────────────────────────────
@@ -390,6 +412,12 @@ std::vector< shared< Chunk > > VirtualDev::get_chunks_by_creation_order() const 
 shared< Chunk > VirtualDev::get_nth_chunk(size_t n) const {
     auto& v = load_state()->chunks_by_creation_order;
     return (n < v.size()) ? v[n] : nullptr;
+}
+
+shared< Chunk > VirtualDev::get_chunk(uint32_t chunk_id) const {
+    auto& m = load_state()->all_chunks;
+    auto it = m.find(chunk_id);
+    return (it != m.end()) ? it->second : nullptr;
 }
 
 uint64_t VirtualDev::size() const {
@@ -618,7 +646,6 @@ shared< Chunk > VirtualDev::select_chunk_for_alloc(blk_count_t nblks, const blk_
 }
 
 std::pair< uint64_t, shared< Chunk > > VirtualDev::to_dev_offset(const BlkId& bid) const {
-    assert(!bid.is_multi() && "write/read requires a single (non-multi) BlkId");
     auto state = load_state();
     auto it = state->all_chunks.find(bid.chunk_num());
     if (it == state->all_chunks.end()) {

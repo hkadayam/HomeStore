@@ -13,42 +13,47 @@
  *
  *********************************************************************************/
 #pragma once
-#include <functional>
 
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+#include <folly/Unit.h>
+#include <folly/futures/Future.h>
+#include <folly/futures/Promise.h>
 #include <folly/small_vector.h>
 #include <sisl/cache/simple_hashmap.hpp>
 #include <sisl/fds/utils.h>
-#include <sisl/metrics/metrics.h>
-#include <folly/Function.h>
-#include <homestore/blk.h>
+
+#include <homestore/blk.h> // BlkId, blk_num_t, blk_count_t, chunk_num_t
 
 namespace homestore {
-typedef folly::Function< void(void) > after_remove_cb_t;
 
-struct blk_track_waiter {
-    blk_track_waiter(after_remove_cb_t&& cb) : m_cb{std::move(cb)} {
-#ifdef _PRERELEASE
-        m_start_time = Clock::now();
-#endif
-    }
+// ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// BlkReadTracker
+//
+// Tracks concurrent reads on block ranges so that invalidate (free) can safely wait until all in-flight reads on the
+// target blocks have completed.  Coroutine-friendly: wait_on() returns a SemiFuture<Unit> that can be co_awaited.
+//
+// Usage:
+//   tracker.insert(bid);                           // before issuing a read
+//   auto [ec, buf] = co_await vdev.read(buf, bid);
+//   tracker.remove(bid);                           // after read completes
+//
+//   co_await tracker.wait_on(bid);                 // blocks until ref_cnt drops to zero for all aligned ranges
+//   vdev.free_blk(bid);                            // now safe to free
+// ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-    ~blk_track_waiter() {
-#ifdef _PRERELEASE
-        // TODO: enable this after data service is ready;
-        // HISTOGRAM_OBSERVE(get_data_service().get_blk_read_tracker_inst().get_metrics(),
-        //                   blktrack_erase_blk_rescheduled_latency, get_elapsed_time_us(m_start_time, CLock::now()));
-#endif
-        m_cb();
-    }
-
-    after_remove_cb_t m_cb;
-
-#ifdef _PRERELEASE
-    Clock::time_point m_start_time;
-#endif
+// Waiter wraps a folly::Promise and fulfils it in its destructor.  Because multiple BlkTrackRecords may hold a
+// shared_ptr<BlkTrackWaiter> (one per aligned range), the promise is fulfilled only when the last range releases its
+// copy — exactly mirroring the Rust Arc<BlkTrackWaiter> + oneshot::Sender pattern.
+struct BlkTrackWaiter {
+    folly::Promise< folly::Unit > promise;
+    explicit BlkTrackWaiter(folly::Promise< folly::Unit > p) : promise{std::move(p)} {}
+    ~BlkTrackWaiter() { promise.setValue(folly::unit); }
+    BlkTrackWaiter(const BlkTrackWaiter&) = delete;
+    BlkTrackWaiter& operator=(const BlkTrackWaiter&) = delete;
 };
-
-typedef std::shared_ptr< blk_track_waiter > blk_track_waiter_ptr;
 
 //
 // clang-format off
@@ -73,7 +78,7 @@ typedef std::shared_ptr< blk_track_waiter > blk_track_waiter_ptr;
 //   ---------------------------------------------------------------
 //  | 1, 2, ... 15, 16 | 17, 18, ..., 31, 32 | 33, 34, ..., 47, 48 |  Blk Number (unique within same chunk)
 //   ---------------------------------------------------------------
-//     BlkTrackRecord-1    BlkTrackRecord-2             Record-1 and Record-2 could belongs to two different read (or one read); 
+//     BlkTrackRecord-1    BlkTrackRecord-2             Record-1 and Record-2 could belongs to two different read (or one read);
 //                                                      Record-1/2 could be referenced by multiple reads fall through on same base ids;
 //      [ ],  [ ],  [ ]     [ ], [ ], [ ]               m_waiters: vector of shared_ptr
 //       |     |      \     /     |    |
@@ -84,96 +89,48 @@ typedef std::shared_ptr< blk_track_waiter > blk_track_waiter_ptr;
 //  clang-format on
 //
 struct BlkTrackRecord {
-    BlkId m_key; // aligned key
-    int64_t m_ref_cnt{0};
-    folly::small_vector< blk_track_waiter_ptr, 8 > m_waiters; // multiple waiters can wait on same record
-};
-
-class BlkReadTrackerMetrics : public sisl::MetricsGroup {
-public:
-    explicit BlkReadTrackerMetrics() : sisl::MetricsGroupWrapper("BlkReadTracker", "DataSvc") {
-#ifdef _PRERELEASE
-        REGISTER_COUNTER(blktrack_pending_blk_read_map_sz, "Size of pending blk read map", sisl::PublishAs::Gauge);
-        REGISTER_COUNTER(blktrack_erase_blk_rescheduled, "Erase blk rescheduled due to concurrent rw");
-        REGISTER_HISTOGRAM(blktrack_erase_blk_rescheduled_latency, "Erase blk rescheduled latency");
-#endif
-        register_me_to_farm();
-    }
-
-    BlkReadTrackerMetrics(const BlkReadTrackerMetrics&) = delete;
-    BlkReadTrackerMetrics& operator=(const BlkReadTrackerMetrics&) = delete;
-    BlkReadTrackerMetrics(BlkReadTrackerMetrics&&) noexcept = delete;
-    BlkReadTrackerMetrics& operator=(BlkReadTrackerMetrics&&) noexcept = delete;
-
-    ~BlkReadTrackerMetrics() { deregister_me_from_farm(); }
+    BlkId key; // aligned key
+    int64_t ref_cnt{0};
+    folly::small_vector< shared< BlkTrackWaiter >, 8 > waiters; // multiple waiters can wait on same record
 };
 
 class BlkReadTracker {
-    static constexpr uint32_t s_expected_num_records = 1000;
-    static constexpr uint16_t s_entries_per_record = 8; // this number could be candidate to tune perf;
-
-private:
-    sisl::SimpleHashMap< BlkId, BlkTrackRecord > m_pending_reads_map;
-    BlkReadTrackerMetrics m_metrics;
-    uint32_t m_entries_per_record{s_entries_per_record};
+    static constexpr uint32_t kExpectedNumRecords = 1000;
+    static constexpr uint16_t kDefaultEntriesPerRecord = 8;
 
 public:
     BlkReadTracker();
-    ~BlkReadTracker();
+    ~BlkReadTracker() = default;
 
     BlkReadTracker(const BlkReadTracker&) = delete;
     BlkReadTracker& operator=(const BlkReadTracker&) = delete;
-    BlkReadTracker(BlkReadTracker&&) noexcept = delete;
-    BlkReadTracker& operator=(BlkReadTracker&&) noexcept = delete;
+    BlkReadTracker(BlkReadTracker&&) = delete;
+    BlkReadTracker& operator=(BlkReadTracker&&) = delete;
 
-    uint16_t entries_per_record() const;
-    
-    BlkReadTrackerMetrics& get_metrics();
+    uint16_t entries_per_record() const { return entries_per_record_; }
+    void set_entries_per_record(uint16_t n) { entries_per_record_ = n; }
 
-    void set_entries_per_record(uint16_t num_entries);
+    /// Mark a block range as being read (increment ref count for every aligned range it touches).
+    void insert(const BlkId& bid) { merge(bid, 1, nullptr); }
 
-    /**
-     * @brief :  Insert the blkid into read tracker. If entry already exists, it will increment the reference count of
-     * the blkid It symbolises that this blkid is being read right now.
-     *
-     * @param blkid : the blkid that is being added for reference;
-     */
-    void insert(const BlkId& blkid);
+    /// Mark a read as complete (decrement ref count).  When a range's ref count drops to zero any waiters are
+    /// notified and the record is removed.
+    void remove(const BlkId& bid) { merge(bid, -1, nullptr); }
 
-    /**
-     * @brief : decrease the reference count of the BlkId by 1 in this read tracker.
-     * If the ref count drops to zero, it means no read is pending on this blkid and if there is a waiter on this blkid,
-     * callback should be triggered and all entries associated with this blkid (there could be more than one
-     * sub_ranges) should be removed.
-     *
-     * @param blkid : blkid that is being dereferneced;
-     */
-    void remove(const BlkId& blkid);
-
-    /**
-     * @brief : Check if the reference count of the blkid is 0 or entry itself doesn't exists.
-     * It will do the callback if the ref count is zero or the blkid entry doesn't exsit;
-     *
-     * @param blkid : blkid that caller wants to wait on for pending read;
-     * @param after_remove_cb : the callback to be sent after read on this blkid are all completed;
-     */
-    void wait_on(MultiBlkId const& blkids, after_remove_cb_t&& after_remove_cb);
-
-    /**
-     * @brief : get size of the pending map;
-     *
-     * @return : size of the pending map;
-     */
-    // uint64_t get_size() const { return m_pending_reads_map.get_size(); }
+    /// Returns a SemiFuture that resolves when no in-flight reads overlap the given block range.  If there are no
+    /// pending reads the future is already fulfilled (fast path — no heap allocation).  For blocks spanning multiple
+    /// aligned ranges the future resolves only when ALL ranges are free.
+    ///
+    /// The Arc pattern: a single Promise is wrapped in shared_ptr<BlkTrackWaiter>.  Each aligned range's record
+    /// holds one copy.  ~BlkTrackWaiter (which calls promise.setValue) fires only when the LAST shared_ptr is
+    /// destroyed — i.e. when every range has released its ref.
+    folly::SemiFuture< folly::Unit > wait_on(const BlkId& bid);
 
 private:
-    /**
-     * @brief
-     *
-     * @param blkid
-     * @param new_ref_count
-     * @param waiters
-     */
-    void merge(const BlkId& blkid, int64_t new_ref_count, const std::shared_ptr< blk_track_waiter >& waiters);
+    void merge(const BlkId& bid, int64_t ref_delta, const shared< BlkTrackWaiter >& waiter);
+
+    sisl::SimpleHashMap< BlkId, BlkTrackRecord > pending_reads_map_;
+    uint16_t entries_per_record_{kDefaultEntriesPerRecord};
 };
+
 } // namespace homestore

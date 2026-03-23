@@ -18,8 +18,8 @@
 
 #include <sisl/fds/compact_bitset.h>
 #include <sisl/logging/logging.h>
-#include <homestore/btree/detail/btree_node.hpp>
-#include <homestore/btree/btree_kv.hpp>
+#include <homestore/index/btree/detail/btree_node.h>
+#include <homestore/index/btree/btree_kv.h>
 
 namespace homestore {
 
@@ -669,7 +669,7 @@ public:
         auto str = fmt::format("{}id={} level={} nEntries={} {} next_node={} available_size={} ",
                                (print_friendly ? "------------------------------------------------------------\n" : ""),
                                this->node_id(), this->level(), this->total_entries(),
-                               (this->is_leaf() ? "LEAF" : "INTERIOR"), this->next_bnode(), this->available_size());
+                               (this->is_leaf() ? "LEAF" : "INTERIOR"), this->next_node(), this->available_size());
         if (!this->is_leaf() && (this->has_valid_edge())) {
             fmt::format_to(std::back_inserter(str), "edge_id={}.{}", this->edge_info().m_bnodeid,
                            this->edge_info().m_link_version);

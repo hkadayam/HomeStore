@@ -19,7 +19,7 @@
 #include <vector>
 #include <fmt/format.h>
 #include <sisl/fds/buffer.h>
-#include <homestore/btree/detail/btree_internal.hpp>
+#include <homestore/index/btree/detail/btree_internal.h>
 
 namespace homestore {
 
@@ -171,8 +171,6 @@ class BtreeTraversalState {
 protected:
     const BtreeKeyRange< K > m_input_range;
     BtreeKeyRange< K > m_working_range;
-    bool m_trimmed{false};   // Keep track of trimmed, so that a shift doesn't do unwanted copy of input_range
-    bool m_exhausted{false}; // The entire working range is exhausted
 
 public:
     BtreeTraversalState(BtreeKeyRange< K >&& inp_range) :
@@ -181,37 +179,26 @@ public:
     BtreeTraversalState(BtreeTraversalState&& other) = default;
 
     const BtreeKeyRange< K >& input_range() const { return m_input_range; }
-    const BtreeKeyRange< K >& working_range() const {
-        DEBUG_ASSERT_EQ(m_exhausted, false, "requested for working range on an exhausted traversal state");
-        return m_working_range;
-    }
+    const BtreeKeyRange< K >& working_range() const { return m_working_range; }
 
-    // Returns the mutable reference to the end key, which caller can update it to trim down the end key
+    // Trim the end key of the working range to a child boundary before descending.
     void trim_working_range(K&& end_key, bool end_incl) {
         m_working_range.set_end_key(std::move(end_key), end_incl);
-        m_trimmed = true;
     }
 
-    // Shift the working range start to previous working range end_key
+    // Shift working range start to current end_key (exclusive) and reset end to full input_range end.
+    // Used after each leaf so the next sibling sees the right remaining range.
     void shift_working_range() {
-        if (m_trimmed) {
-            m_working_range.set_start_key(std::move(m_working_range.m_end_key), false);
-            m_working_range.m_end_key = m_input_range.end_key();
-            m_working_range.m_end_incl = m_input_range.is_end_inclusive();
-            m_trimmed = false;
-        } else {
-            m_exhausted = true;
-        }
+        m_working_range.set_start_key(std::move(m_working_range.m_end_key), false);
+        m_working_range.m_end_key = m_input_range.end_key();
+        m_working_range.m_end_incl = m_input_range.is_end_inclusive();
     }
 
-    // Shift the working range start to specific end key
+    // Shift working range start to a specific key (e.g. last_failed_key from multi_put).
     void shift_working_range(K&& start_key, bool start_incl) {
         m_working_range.set_start_key(std::move(start_key), start_incl);
-        if (m_trimmed) {
-            m_working_range.m_end_key = m_input_range.end_key();
-            m_working_range.m_end_incl = m_input_range.is_end_inclusive();
-            m_trimmed = false;
-        }
+        m_working_range.m_end_key = m_input_range.end_key();
+        m_working_range.m_end_incl = m_input_range.is_end_inclusive();
     }
 
     const K& first_key() const { return m_working_range.start_key(); }
@@ -229,52 +216,30 @@ private:
     bool is_end_inclusive() const { return m_input_range.is_end_inclusive(); }
 };
 
-class BtreeLinkInfo : public BtreeValue {
-public:
-    struct bnode_link_info {
-        bnodeid_t m_bnodeid{empty_bnodeid};
-        uint64_t m_link_version{0}; // Link version between parent and a child
-    };
-
-private:
-    bnode_link_info info;
+class NodeId : public BtreeValue {
+    bnodeid_t id_{empty_bnodeid};
 
 public:
-    BtreeLinkInfo() = default;
-    explicit BtreeLinkInfo(bnodeid_t id, uint64_t v) {
-        info.m_bnodeid = id;
-        info.m_link_version = v;
-    }
-    BtreeLinkInfo(bnode_link_info l) : info{l} {}
-    BtreeLinkInfo& operator=(const BtreeLinkInfo& other) = default;
+    NodeId() = default;
+    explicit NodeId(bnodeid_t id) : id_{id} {}
 
-    bnodeid_t bnode_id() const { return info.m_bnodeid; }
-    uint64_t link_version() const { return info.m_link_version; }
-    void set_bnode_id(bnodeid_t bid) { info.m_bnodeid = bid; }
-    void set_link_version(uint64_t v) { info.m_link_version = v; }
-    bool has_valid_bnode_id() const { return (info.m_bnodeid != empty_bnodeid); }
+    bnodeid_t id() const { return id_; }
+    void set_id(bnodeid_t id) { id_ = id; }
+    bool is_valid() const { return id_ != empty_bnodeid; }
 
     sisl::Blob serialize() const override {
         sisl::Blob b;
-        b.set_size(sizeof(bnode_link_info));
-        b.set_bytes(r_cast< const uint8_t* >(&info));
+        b.set_size(sizeof(bnodeid_t));
+        b.set_bytes(r_cast< const uint8_t* >(&id_));
         return b;
     }
-    uint32_t serialized_size() const override { return sizeof(bnode_link_info); }
-    static uint32_t get_fixed_size() { return sizeof(bnode_link_info); }
-    std::string to_string() const override { return fmt::format("{}.{}", info.m_bnodeid, info.m_link_version); }
-
+    uint32_t serialized_size() const override { return sizeof(bnodeid_t); }
+    static uint32_t get_fixed_size() { return sizeof(bnodeid_t); }
     void deserialize(const sisl::Blob& b, bool copy) override {
-        DEBUG_ASSERT_EQ(b.size(), sizeof(bnode_link_info), "BtreeLinkInfo deserialize received invalid blob");
-        auto other = r_cast< bnode_link_info const* >(b.cbytes());
-        set_bnode_id(other->m_bnodeid);
-        set_link_version(other->m_link_version);
+        DEBUG_ASSERT_EQ(b.size(), sizeof(bnodeid_t), "NodeId deserialize received invalid blob");
+        id_ = *r_cast< bnodeid_t const* >(b.cbytes());
     }
-
-    friend std::ostream& operator<<(std::ostream& os, const BtreeLinkInfo& b) {
-        os << b.to_string();
-        return os;
-    }
+    std::string to_string() const override { return fmt::format("{}", id_); }
 };
 
 ENUM(put_filter_decision, uint8_t, keep, replace, remove);

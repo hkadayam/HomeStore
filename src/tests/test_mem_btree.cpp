@@ -24,9 +24,9 @@
 
 #include "test_common/range_scheduler.hpp"
 #include <homestore/homestore.hpp>
-#include <homestore/btree/node_variant/simple_node.hpp>
-#include <homestore/btree/node_variant/varlen_node.hpp>
-#include <homestore/btree/node_variant/prefix_node.hpp>
+#include <homestore/index/btree/node_variant/simple_node.hpp>
+#include <homestore/index/btree/node_variant/varlen_node.hpp>
+#include <homestore/index/btree/node_variant/prefix_node.hpp>
 #include "btree_helpers/btree_test_helper.hpp"
 
 using namespace homestore;

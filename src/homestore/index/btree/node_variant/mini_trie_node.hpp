@@ -17,8 +17,8 @@
 #pragma once
 
 #include <sisl/logging/logging.h>
-#include <homestore/btree/node_variant/variant_node.hpp>
-#include <homestore/btree/btree_kv.hpp>
+#include <homestore/index/btree/node_variant/variant_node.hpp>
+#include <homestore/index/btree/btree_kv.h>
 
 namespace homestore {
 // Internal format of variable node:
@@ -707,7 +707,7 @@ private:
             (print_friendly ? "---------------------------------------------------------------------\n" : ""),
             this->node_id(), this->level(), this->total_entries(), (this->is_leaf() ? "LEAF" : "INTERIOR"),
             get_var_node_header_const()->m_available_space,
-            (this->next_bnode() == empty_bnodeid) ? "" : fmt::format(" next_node={}", this->next_bnode()));
+            (this->next_node() == empty_bnodeid) ? "" : fmt::format(" next_node={}", this->next_node()));
         if (!this->is_leaf() && (this->has_valid_edge())) {
             fmt::format_to(std::back_inserter(str), "edge_id={}.{}", this->edge_info().m_bnodeid,
                            this->edge_info().m_link_version);

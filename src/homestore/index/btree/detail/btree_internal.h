@@ -19,7 +19,6 @@
 #include <boost/preprocessor/facilities/empty.hpp>
 #include <boost/preprocessor/facilities/identity.hpp>
 #include <folly/small_vector.h>
-#include <boost/intrusive_ptr.hpp>
 #include <boost/vmd/is_empty.hpp>
 #include <sisl/fds/utils.h>
 #include <sisl/metrics/metrics.h>
@@ -205,17 +204,13 @@ VENUM(btree_node_type, uint32_t, FIXED = 0, VAR_VALUE = 1, VAR_KEY = 2, VAR_OBJE
 ENUM(btree_status_t, uint32_t, success, not_found, retry, has_more, node_read_failed, put_failed, space_not_avail,
      cp_mismatch, merge_not_required, merge_failed, crc_mismatch, not_supported, node_freed)
 
-class BtreeNode;
-using BtreeNodePtr = boost::intrusive_ptr< BtreeNode >;
-using BtreeNodeList = folly::small_vector< BtreeNodePtr, 3 >;
-void intrusive_ptr_add_ref(BtreeNode* node);
-void intrusive_ptr_release(BtreeNode* node);
+class NodeCore;
 
 ENUM(btree_event_t, uint8_t, READ, MUTATE, REMOVE, SPLIT, REPAIR, MERGE);
 
 struct trace_route_entry {
     bnodeid_t node_id{empty_bnodeid};
-    BtreeNode* node{nullptr};
+    NodeCore* node{nullptr};
     uint32_t start_idx{0};
     uint32_t end_idx{0};
     uint32_t num_entries{0};

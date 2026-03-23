@@ -1,7 +1,7 @@
 #pragma once
 
 #include <folly/futures/Future.h>
-#include <homestore/btree/detail/btree_internal.hpp>
+#include <homestore/index/btree/detail/btree_internal.h>
 #include <homestore/homestore_decl.hpp>
 
 namespace homestore {

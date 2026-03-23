@@ -15,9 +15,9 @@
  *********************************************************************************/
 #pragma once
 
-#include <homestore/btree/btree_kv.hpp>
-#include <homestore/btree/node_variant/variant_node.hpp>
-#include <homestore/btree/detail/btree_internal.hpp>
+#include <homestore/index/btree/btree_kv.h>
+#include <homestore/index/btree/node_variant/variant_node.hpp>
+#include <homestore/index/btree/detail/btree_internal.h>
 
 using namespace std;
 using namespace boost;
@@ -257,7 +257,7 @@ public:
     }
 
     std::string to_string(bool print_friendly = false) const override {
-        auto snext = this->next_bnode() == empty_bnodeid ? "" : fmt::format("next_node={}", this->next_bnode());
+        auto snext = this->next_node() == empty_bnodeid ? "" : fmt::format("next_node={}", this->next_node());
         auto str = fmt::format("{}id={} level={} nEntries={} {} {} ",
                                (print_friendly ? "------------------------------------------------------------\n" : ""),
                                this->node_id(), this->level(), this->total_entries(),
@@ -279,7 +279,7 @@ public:
 
     std::string to_dot_keys_impl(std::true_type) const {
         std::string str;
-        std::string snext = this->next_bnode() == empty_bnodeid ? "" : fmt::format("next_node={}", this->next_bnode());
+        std::string snext = this->next_node() == empty_bnodeid ? "" : fmt::format("next_node={}", this->next_node());
         str += fmt::format(R"("{}" [
                 shape = none,
                 labelloc="c",

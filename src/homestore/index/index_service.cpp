@@ -15,7 +15,7 @@
  *********************************************************************************/
 #include <homestore/homestore.hpp>
 #include <homestore/index_service.hpp>
-#include <homestore/btree/detail/btree_node.hpp>
+#include <homestore/index/btree/detail/btree_node.h>
 
 #include <folly/futures/Future.h>
 #include "common/homestore_utils.hpp"

@@ -25,7 +25,7 @@
 #include <sisl/fds/enum.h>
 #include <iomgr/iomgr_flip.hpp>
 #include <boost/algorithm/string.hpp>
-#include <homestore/btree/btree.ipp>
+#include <homestore/index/btree/btree.ipp>
 
 #include "test_common/range_scheduler.hpp"
 #include "shadow_map.hpp"

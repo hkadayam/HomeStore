@@ -14,7 +14,7 @@
  *
  *********************************************************************************/
 #include <sisl/fds/thread_vector.h>
-#include <homestore/btree/detail/btree_node.hpp>
+#include <homestore/index/btree/detail/btree_node.h>
 #include <homestore/index_service.hpp>
 #include <homestore/homestore.hpp>
 #include "device/chunk.h"

@@ -19,23 +19,19 @@
 #include <array>
 #include <queue>
 
-#include <boost/intrusive_ptr.hpp>
 #include <folly/small_vector.h>
-#include <iomgr/fiber_lib.hpp>
 
-#include <homestore/btree/detail/btree_req.hpp>
-#include <homestore/btree/btree_kv.hpp>
-#include <homestore/btree/detail/btree_internal.hpp>
-#include <homestore/btree/detail/btree_node.hpp>
+#include <homestore/index/btree/btree_async.h>
+#include <homestore/index/btree/detail/btree_req.h>
+#include <homestore/index/btree/btree_kv.h>
+#include <homestore/index/btree/detail/btree_internal.h>
+#include <homestore/index/btree/detail/btree_node.h>
 #include <homestore/index_service.hpp>
-#include <homestore/btree/btree_base.hpp>
+#include <homestore/index/btree/btree_base.h>
 
 namespace homestore {
 
 class BtreeStore;
-
-template < typename K >
-using PutPaginateCookie = unique< BtreeRangePutRequest< K > >;
 
 template < typename K >
 using RemovePaginateCookie = unique< BtreeRangeRemoveRequest< K > >;
@@ -48,12 +44,7 @@ class Btree : public BtreeBase {
 public:
     /////////////////////////////////////// All External APIs /////////////////////////////
     Btree(BtreeConfig const& cfg, uuid_t uuid = uuid_t{}, uuid_t parent_uuid = uuid_t{}, uint32_t user_sb_size = 0);
-    Btree(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb);
     virtual ~Btree();
-
-    // Destroy the entire btree from persistent and from memory. It is to be noted that all blocks are not destroyed at
-    // one go. For persistent btree, it might be a staged operation on multiple checkpoints.
-    folly::Future< folly::Unit > destroy() override;
 
     // @brief Inserts or updates a key-value pair in the B-tree.
     //
@@ -72,8 +63,8 @@ public:
     //
     // @return The status of the put operation.
     //
-    btree_status_t put_one(BtreeKey const& key, BtreeValue const& value, btree_put_type put_type,
-                           BtreeValue* existing_val = nullptr, put_filter_cb_t filter_cb = nullptr);
+    BtreeTask< btree_status_t > put_one(BtreeKey const& key, BtreeValue const& value, btree_put_type put_type,
+                                        BtreeValue* existing_val = nullptr, PutFilter* filter = nullptr);
 
     // @brief Inserts or updates a range of key-value pairs in the B-tree.
     //
@@ -116,35 +107,15 @@ public:
     //    c. keep - keep the existing value as is and don't modify the key to new value.
     // In this non-interval key case, the range of keys are all updated with the same value.
     //
-    // About batch size:
-    // The batch size is the number of keys that will be processed in one go. It will return with btree_status::has_more
-    // and the caller is expected to call put_range_next() method with the cookie passed to resume the next batch until
-    // it returns btree_status::success. It is to be noted that, the batch size is a best effort from the btree and at
-    // any iteration it could put between 1 to batch_size keys (it will at least put one_key and at most batch_size keys
-    // per iteration).
-    //
     // @param inp_range The range of keys to insert, upsert or update
     // @param put_type The type of put operation (e.g., insert, update, upsert).
     // @param value The value to be associated with the key. Behavior is different for interval and non-interval keys
     // (see above)
-    // @param batch_size The number of keys to process in one go. Default is to attempt to process all keys in one go.
-    // Please see the note above about the batch size.
-    // @param filter_cb Optional callback function to apply a filter before insertion. (See above for details)
+    // @param filter Optional filter to apply before insertion. (See above for details)
     //
-    // @return The status of the put operation and a cookie, if it returns btree_status::has_more, then the caller is
-    // expected to call put_range_next()
-    std::pair< btree_status_t, PutPaginateCookie< K > >
-    put_range(BtreeKeyRange< K >&& inp_range, btree_put_type put_type, BtreeValue const& value,
-              uint32_t batch_size = std::numeric_limits< uint32_t >::max(), put_filter_cb_t filter_cb = nullptr);
-
-    // @brief Continuation of the put_range call for the next batch of keys. Calling this method without calling
-    // put_range first returns error.
-    //
-    // @param cookie The cookie returned by the put_range call
-    //
-    // @return The status of the put operation and a cookie, if it returns btree_status::has_more, then the caller is
-    // expected to call put_range_next() again. Failing to do so will result in memory leak.
-    btree_status_t put_range_next(PutPaginateCookie< K >& cookie);
+    // @return The status of the put operation
+    BtreeTask< btree_status_t > put_range(BtreeKeyRange< K >&& inp_range, btree_put_type put_type,
+                                          BtreeValue const& value, PutFilter* filter = nullptr);
 
     // @brief Gets the value associated with the specified key from the B-tree.
     //
@@ -152,7 +123,7 @@ public:
     // @param out_val A pointer to store the value associated with the key. (Should be non-nullptr)
     //
     // @return The status of the get operation.
-    btree_status_t get_one(BtreeKey const& key, BtreeValue* out_val);
+    BtreeTask< btree_status_t > get_one(BtreeKey const& key, BtreeValue* out_val);
 
     // @brief Gets any one value associated with the given key range. If the key range matches multiple keys, then btree
     // will randomly pick one key and return the value associated with it.
@@ -162,7 +133,7 @@ public:
     // @param out_val A pointer to store the value associated with the picked key. (Should be non-nullptr)
     //
     // @return The status of the get_any operation.
-    btree_status_t get_any(BtreeKeyRange< K >&& inp_range, BtreeKey* out_key, BtreeValue* out_val);
+    BtreeTask< btree_status_t > get_any(BtreeKeyRange< K >&& inp_range, BtreeKey* out_key, BtreeValue* out_val);
 
     // @brief Removes the key-value pair associated with the specified key from the B-tree.
     //
@@ -170,7 +141,7 @@ public:
     // @param out_val An optional pointer to store the value associated with the key before removal.
     //
     // @return The status of the remove operation.
-    btree_status_t remove_one(BtreeKey const& key, BtreeValue* out_val);
+    BtreeTask< btree_status_t > remove_one(BtreeKey const& key, BtreeValue* out_val);
 
     // @brief Removes any one key-value pair associated with the given key range. If the key range matches multiple
     // keys, then btree will randomly pick one key and remove the key-value pair associated with it.
@@ -182,124 +153,193 @@ public:
     // return status is btree_status_t::success.
     //
     // @return The status of the remove_any operation.
-    btree_status_t remove_any(BtreeKeyRange< K >&& inp_range, BtreeKey* out_key, BtreeValue* out_val);
+    BtreeTask< btree_status_t > remove_any(BtreeKeyRange< K >&& inp_range, BtreeKey* out_key, BtreeValue* out_val);
 
-    std::pair< btree_status_t, RemovePaginateCookie< K > >
+    BtreeTask< std::pair< btree_status_t, RemovePaginateCookie< K > > >
     remove_range(BtreeKeyRange< K >&& inp_range, uint32_t batch_size = std::numeric_limits< uint32_t >::max(),
-                 remove_filter_cb_t filter_cb = nullptr);
+                 RemoveFilter* filter = nullptr);
 
-    btree_status_t remove_range_next(RemovePaginateCookie< K >& cookie);
+    BtreeTask< btree_status_t > remove_range_next(RemovePaginateCookie< K >& cookie);
 
-    std::pair< btree_status_t, QueryPaginateCookie< K > >
+    BtreeTask< std::pair< btree_status_t, QueryPaginateCookie< K > > >
     query(BtreeKeyRange< K >&& inp_range, std::vector< std::pair< K, V > >& out_kvs,
           uint32_t batch_size = std::numeric_limits< uint32_t >::max(),
           BtreeQueryType query_type = BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY,
-          get_filter_cb_t filter_cb = nullptr);
+          GetFilter* filter = nullptr);
 
-    btree_status_t query_next(QueryPaginateCookie< K >& cookie, std::vector< std::pair< K, V > >& out_kvs);
+    BtreeTask< btree_status_t > query_next(QueryPaginateCookie< K >& cookie,
+                                           std::vector< std::pair< K, V > >& out_kvs);
+
+    // @brief Scan a key range for inline GC (applying filter to existing entries), stamp the insert key via
+    // filter->mutate_key(), then insert it — used for MVCC/versioned insert patterns.
+    //
+    // @param insert_key   Key to insert (may be mutated by filter->mutate_key before write).
+    // @param value        Value to insert.
+    // @param scan_range   Range to scan for entries to GC before the insert.
+    // @param filter       Optional 2-phase filter applied to each entry in scan_range.
+    // @param max_scan     Cap on how many entries to inspect during the GC scan.
+    //
+    // @return {status, was_inserted}  was_inserted is false if the key already existed and filter said Keep.
+    BtreeTask< std::pair< btree_status_t, bool > >
+    scan_and_put_one(BtreeKey& insert_key, BtreeValue const& value, BtreeKeyRange< K > const& scan_range,
+                     PutFilter* filter = nullptr, size_t max_scan = std::numeric_limits< size_t >::max());
+
+    // @brief Insert a pre-sorted vector of key/value pairs in a single tree traversal.
+    //
+    // @param entries   Sorted vector of (key, value) pairs to insert.
+    // @param put_type  Put semantics (INSERT_ONLY, INSERT_OR_REPLACE, etc.)
+    //
+    // @return status and aggregate PutStats for the entire batch.
+    BtreeTask< std::pair< btree_status_t, PutStats > > batch_put(std::vector< std::pair< K, V > >&& entries,
+                                                                  btree_put_type put_type);
+
+    // @brief Retrieve the first (leftmost) key/value in a range.
+    //
+    // @param inp_range  Range to search.
+    // @param out_key    Receives the first key found (must be non-nullptr).
+    // @param out_val    Receives the value of the first key found (must be non-nullptr).
+    //
+    // @return btree_status_t::success if found, btree_status_t::not_found otherwise.
+    BtreeTask< btree_status_t > get_first(BtreeKeyRange< K >&& inp_range, BtreeKey* out_key, BtreeValue* out_val) {
+        inp_range.set_multi_option(MultiMatchOption::LEFT_MOST);
+        CO_RETURN CO_AWAIT(get_any(std::move(inp_range), out_key, out_val));
+    }
+
+    // @brief Start a paginated traversal returning a QueryResultHandle.
+    //
+    // Unlike query() the handle owns the continuation state; pass it to query_next_batch() to fetch the next page.
+    //
+    // @param inp_range      Range to query.
+    // @param batch_size     Max entries per batch.
+    // @param filter         Optional per-entry filter.
+    // @param reverse_order  Iterate from high to low key if true.
+    // @param query_type     Sweep vs tree-traversal vs serializable.
+    //
+    // @return QueryResultHandle whose has_more() == true if further pages exist.
+    BtreeTask< QueryResultHandle< K, V > >
+    query_traversal(BtreeKeyRange< K >&& inp_range, uint32_t batch_size = std::numeric_limits< uint32_t >::max(),
+                    GetFilter* filter = nullptr, bool reverse_order = false,
+                    BtreeQueryType query_type = BtreeQueryType::SWEEP_NON_INTRUSIVE_PAGINATION_QUERY);
+
+    // @brief Fetch the next page from a QueryResultHandle returned by query_traversal().
+    //
+    // @param handle  Handle returned by query_traversal() or a previous query_next_batch() call.
+    //                Must have has_more() == true.
+    //
+    // @return New QueryResultHandle for this page.  has_more() == false on the final page.
+    BtreeTask< QueryResultHandle< K, V > > query_next_batch(QueryResultHandle< K, V >&& handle);
 
     nlohmann::json get_status(int log_level) const;
 
     nlohmann::json get_metrics_in_json(bool updated);
 
-    std::string to_string() const;
+    BtreeTask< std::string > to_string() const;
 
-    std::string to_custom_string(BtreeNode::ToStringCallback< K, V > cb) const;
+    BtreeTask< std::string > to_custom_string(NodeCore::ToStringCallback< K, V > cb) const;
 
-    std::string to_digraph_visualize_format() const;
+    BtreeTask< std::string > to_digraph_visualize_format() const;
 
-    void dump(const std::string& file, std::string format = "string",
-              BtreeNode::ToStringCallback< K, V > cb = nullptr) const;
+    BtreeTask< void > dump(const std::string& file, std::string format = "string",
+                           NodeCore::ToStringCallback< K, V > cb = nullptr) const;
 
     bnodeid_t root_node_id() const;
 
-    uint64_t count_keys(bnodeid_t start_bnodeid = empty_bnodeid) const;
+    BtreeTask< uint64_t > count_keys(bnodeid_t start_bnodeid = empty_bnodeid) const;
 
 private:
     /////////////////////////////////// Mutate Impl methods /////////////////////////
     template < typename ReqT >
-    btree_status_t put(ReqT& put_req);
-
-    ///////// Mutate Impl Methods
-    template < typename ReqT >
-    btree_status_t do_put(const BtreeNodePtr& my_node, locktype_t curlock, ReqT& req);
+    BtreeTask< btree_status_t > put(ReqT& put_req);
 
     template < typename ReqT >
-    btree_status_t mutate_write_leaf_node(const BtreeNodePtr& my_node, ReqT& req);
+    BtreeTask< btree_status_t > do_put(Node my_node, ReqT& req); // owns the lock; RAII unlock on return
 
     template < typename ReqT >
-    btree_status_t check_split_root(ReqT& req);
+    btree_status_t mutate_write_leaf_node(Node const& my_node, ReqT& req); // sync: no async calls
 
     template < typename ReqT >
-    bool is_split_needed(const BtreeNodePtr& node, ReqT& req) const;
+    BtreeTask< btree_status_t > check_split_root(ReqT& req);
 
-    btree_status_t split_node(const BtreeNodePtr& parent_node, const BtreeNodePtr& child_node, uint32_t parent_ind,
-                              K* out_split_key, CPContext* context);
+    template < typename ReqT >
+    bool is_split_needed(Node const& node, ReqT& req) const; // sync: no async calls
+
+    btree_status_t split_node(Node const& parent_node, Node const& child_node, uint32_t parent_ind,
+                              K* out_split_key); // sync: no async calls
 
     ///////////////////////////////// Get Impl Methods /////////////////////////////////
     template < typename ReqT >
-    btree_status_t get(ReqT& get_req);
+    BtreeTask< btree_status_t > get(ReqT& get_req);
 
     template < typename ReqT >
-    btree_status_t do_get(const BtreeNodePtr& my_node, ReqT& greq);
+    BtreeTask< btree_status_t > do_get(Node my_node, ReqT& greq); // owns the lock
 
     ///////////////////////////////// Remove Impl Methods /////////////////////////////////
     template < typename ReqT >
-    btree_status_t remove(ReqT& rreq);
+    BtreeTask< btree_status_t > remove(ReqT& rreq);
 
     template < typename ReqT >
-    btree_status_t do_remove(const BtreeNodePtr& my_node, locktype_t curlock, ReqT& rreq);
+    BtreeTask< btree_status_t > do_remove(Node my_node, ReqT& rreq); // owns the lock
 
     template < typename ReqT >
-    btree_status_t check_collapse_root(ReqT& rreq);
+    BtreeTask< btree_status_t > check_collapse_root(ReqT& rreq);
 
-    btree_status_t merge_nodes(const BtreeNodePtr& parent_node, const BtreeNodePtr& leftmost_node, uint32_t start_indx,
-                               uint32_t end_indx, CPContext* context);
+    BtreeTask< btree_status_t > merge_nodes(Node const& parent_node, Node const& leftmost_node,
+                                            uint32_t start_indx, uint32_t end_indx);
 
     ///////////////////////////////// Query Impl Methods /////////////////////////////////
-    btree_status_t query(BtreeQueryRequest< K >& query_req, std::vector< std::pair< K, V > >& out_values);
-
-    btree_status_t do_sweep_query(BtreeNodePtr& my_node, BtreeQueryRequest< K >& qreq,
-                                  std::vector< std::pair< K, V > >& out_values);
-
-    btree_status_t do_traversal_query(const BtreeNodePtr& my_node, BtreeQueryRequest< K >& qreq,
+    BtreeTask< btree_status_t > query(BtreeQueryRequest< K >& query_req,
                                       std::vector< std::pair< K, V > >& out_values);
 
+    BtreeTask< btree_status_t > do_sweep_query(Node my_node, BtreeQueryRequest< K >& qreq,
+                                               std::vector< std::pair< K, V > >& out_values); // owns the lock
+
+    BtreeTask< btree_status_t > do_traversal_query(Node my_node, BtreeQueryRequest< K >& qreq,
+                                                   std::vector< std::pair< K, V > >& out_values); // owns the lock
+
+    PutFilterDecision apply_put_filter(Node const& node, uint32_t idx, PutFilter* filter) const; // sync
+
 #ifdef SERIALIZABLE_QUERY_IMPLEMENTATION
-    btree_status_t do_serialzable_query(const BtreeNodePtr& my_node, BtreeSerializableQueryRequest& qreq,
+    btree_status_t do_serialzable_query(Node const& my_node, BtreeSerializableQueryRequest& qreq,
                                         std::vector< std::pair< K, V > >& out_values);
     btree_status_t sweep_query(BtreeQueryRequest< K >& qreq, std::vector< std::pair< K, V > >& out_values);
     btree_status_t serializable_query(BtreeSerializableQueryRequest& qreq,
                                       std::vector< std::pair< K, V > >& out_values);
 #endif
 
-private:
     /////////////////////////////// Internal Node Management Methods ////////////////////////////////////
-    // BtreeNode* init_node(uint8_t* node_buf, bnodeid_t id, bool init_buf, bool is_leaf,
-    //                      BtreeNode::Allocator::Token token) const override;
-    virtual BtreeNodePtr new_node(bnodeid_t id, bool is_leaf, BtreeNode::Allocator::Token token) const override;
-    virtual BtreeNodePtr load_node(uint8_t* node_buf, bnodeid_t id, BtreeNode::Allocator::Token token) const override;
+    virtual NodeCore* alloc_node_core(bnodeid_t id, bool is_leaf) const override;
+    virtual NodeCore* load_node_core(uint8_t* node_buf, bnodeid_t id) const override;
+    virtual Node      clone_temp_node(NodeCore const& node) override;
 
     /////////////////////////////////// Helper Methods ///////////////////////////////////////
-    btree_status_t post_order_traversal(locktype_t acq_lock, const auto& cb);
-    btree_status_t post_order_traversal(const BtreeNodePtr& node, locktype_t acq_lock, const auto& cb);
-    void get_all_kvs(std::vector< std::pair< K, V > >& kvs) const;
-    uint64_t get_btree_node_cnt() const;
-    uint64_t get_child_node_cnt(bnodeid_t bnodeid) const;
-    void to_string_internal(bnodeid_t bnodeid, std::string& buf) const;
-    void to_custom_string_internal(bnodeid_t bnodeid, std::string& buf,
-                                   BtreeNode::ToStringCallback< K, V > const& cb) const;
-    void to_dot_keys(bnodeid_t bnodeid, std::string& buf, std::map< uint32_t, std::vector< uint64_t > >& l_map,
-                     std::map< uint64_t, BtreeVisualizeVariables >& info_map) const;
-    void validate_sanity_child(const BtreeNodePtr& parent_node, uint32_t ind) const;
-    void validate_sanity_next_child(const BtreeNodePtr& parent_node, uint32_t ind) const;
-    void print_node(const bnodeid_t& bnodeid) const;
+    BtreeTask< btree_status_t > post_order_traversal(LockType acq_lock, const auto& cb);
+    BtreeTask< btree_status_t > post_order_traversal(Node node, LockType acq_lock, const auto& cb); // owns the lock
+    BtreeTask< void > get_all_kvs(std::vector< std::pair< K, V > >& kvs) const;
+    BtreeTask< uint64_t > get_btree_node_cnt() const;
+    BtreeTask< uint64_t > get_child_node_cnt(bnodeid_t bnodeid) const;
+    BtreeTask< void > to_string_internal(bnodeid_t bnodeid, std::string& buf) const;
+    BtreeTask< void > to_custom_string_internal(bnodeid_t bnodeid, std::string& buf,
+                                                NodeCore::ToStringCallback< K, V > const& cb) const;
+    BtreeTask< void > to_dot_keys(bnodeid_t bnodeid, std::string& buf,
+                                  std::map< uint32_t, std::vector< uint64_t > >& l_map,
+                                  std::map< uint64_t, BtreeVisualizeVariables >& info_map) const;
+    void validate_sanity_child(Node const& parent_node, uint32_t ind) const;
+    void validate_sanity_next_child(Node const& parent_node, uint32_t ind) const;
+    BtreeTask< void > print_node(const bnodeid_t& bnodeid) const;
 
-    void append_route_trace(BtreeRequest& req, const BtreeNodePtr& node, btree_event_t event, uint32_t start_idx = 0,
+    void append_route_trace(BtreeRequest& req, Node const& node, btree_event_t event, uint32_t start_idx = 0,
                             uint32_t end_idx = 0) const;
 
 protected:
-    mutable iomgr::FiberManagerLib::shared_mutex m_btree_lock;
+    mutable BtreeMutex m_btree_lock;
     std::atomic< bool > m_destroyed{false};
+
+#ifdef BTREE_SYNC_MODE
+    auto lock_tree_shared() const { return BtreeSharedLockGuard{m_btree_lock}; }
+    auto lock_tree_excl()   const { return BtreeExclLockGuard{m_btree_lock}; }
+#else
+    auto lock_tree_shared() const { return m_btree_lock.co_rlock(); }
+    auto lock_tree_excl()   const { return m_btree_lock.co_wlock(); }
+#endif
 };
 } // namespace homestore

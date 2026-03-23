@@ -25,14 +25,14 @@
 #include <sisl/logging/logging.h>
 #include <sisl/fds/buffer.hpp>
 
-#include <homestore/btree/btree.hpp>
-#include <homestore/btree/detail/btree_common.ipp>
-#include <homestore/btree/detail/btree_node_mgr.ipp>
-#include <homestore/btree/detail/btree_mutate_impl.ipp>
-#include <homestore/btree/detail/btree_query_impl.ipp>
-#include <homestore/btree/detail/btree_get_impl.ipp>
-#include <homestore/btree/detail/btree_remove_impl.ipp>
-#include <homestore/btree/detail/btree_node.hpp>
+#include <homestore/index/btree/btree.h>
+#include <homestore/index/btree/detail/btree_common.ipp>
+#include <homestore/index/btree/detail/btree_node_mgr.ipp>
+#include <homestore/index/btree/detail/mutate_impl.ipp>
+#include <homestore/index/btree/detail/btree_query_impl.ipp>
+#include <homestore/index/btree/detail/get_impl.ipp>
+#include <homestore/index/btree/detail/btree_remove_impl.ipp>
+#include <homestore/index/btree/detail/btree_node.h>
 
 namespace homestore {
 template < typename K, typename V >
@@ -55,98 +55,102 @@ Btree< K, V >::~Btree() {
     if (is_ephemeral()) { destroy(); }
 }
 
-#if 0
 template < typename K, typename V >
-void Btree< K, V >::set_root_node_info(const BtreeLinkInfo& info) {
-    m_root_node_info = info;
-}
-#endif
-
-template < typename K, typename V >
-btree_status_t Btree< K, V >::put_one(BtreeKey const& key, BtreeValue const& value, btree_put_type put_type,
-                                      BtreeValue* existing_val, put_filter_cb_t filter_cb) {
-    BtreeSinglePutRequest req{*this, &key, &value, put_type, existing_val, std::move(filter_cb)};
-    auto const status = put(req);
-    return status;
+BtreeTask< btree_status_t > Btree< K, V >::put_one(BtreeKey const& key, BtreeValue const& value,
+                                                    btree_put_type put_type, BtreeValue* existing_val,
+                                                    PutFilter* filter) {
+    BtreeSinglePutRequest req{*this, &key, &value, put_type, existing_val, filter};
+    CO_RETURN CO_AWAIT(put(req));
 }
 
 template < typename K, typename V >
-std::pair< btree_status_t, PutPaginateCookie< K > >
-Btree< K, V >::put_range(BtreeKeyRange< K >&& inp_range, btree_put_type put_type, BtreeValue const& value,
-                         uint32_t batch_size, put_filter_cb_t filter_cb) {
-    auto req_ptr = std::make_unique< BtreeRangePutRequest< K > >(*this, std::move(inp_range), put_type, &value,
-                                                                 batch_size, std::move(filter_cb));
-    auto const status = put(*req_ptr);
-    return std::pair(status, std::move(req_ptr));
+BtreeTask< btree_status_t > Btree< K, V >::put_range(BtreeKeyRange< K >&& inp_range, btree_put_type put_type,
+                                                      BtreeValue const& value, PutFilter* filter) {
+    BtreeRangePutRequest< K > req{*this, std::move(inp_range), put_type, &value, filter};
+    CO_RETURN CO_AWAIT(put(req));
 }
 
 template < typename K, typename V >
-btree_status_t Btree< K, V >::put_range_next(PutPaginateCookie< K >& cookie) {
-    auto const status = put(*cookie);
-    if (status != btree_status_t::has_more) { cookie.reset(); }
-    return status;
+BtreeTask< std::pair< btree_status_t, bool > >
+Btree< K, V >::scan_and_put_one(BtreeKey& insert_key, BtreeValue const& value,
+                                 BtreeKeyRange< K > const& scan_range, PutFilter* filter, size_t max_scan) {
+    BtreeScanPutRequest< K > req{*this, insert_key, value, scan_range, filter, max_scan};
+    auto ret = CO_AWAIT(put(req));
+    CO_RETURN {ret, req.m_inserted};
 }
 
 template < typename K, typename V >
-btree_status_t Btree< K, V >::get_one(BtreeKey const& key, BtreeValue* out_val) {
+BtreeTask< std::pair< btree_status_t, PutStats > >
+Btree< K, V >::batch_put(std::vector< std::pair< K, V > >&& entries, btree_put_type put_type) {
+    if (entries.empty()) CO_RETURN {btree_status_t::success, PutStats{}};
+    BtreeBatchPutRequest< K, V > req{*this, std::move(entries), put_type};
+    auto ret = CO_AWAIT(put(req));
+    CO_RETURN {ret, req.m_stats};
+}
+
+template < typename K, typename V >
+BtreeTask< btree_status_t > Btree< K, V >::get_one(BtreeKey const& key, BtreeValue* out_val) {
     BtreeSingleGetRequest req{*this, &key, out_val};
-    return get(req);
+    CO_RETURN CO_AWAIT(get(req));
 }
 
 template < typename K, typename V >
-btree_status_t Btree< K, V >::get_any(BtreeKeyRange< K >&& inp_range, BtreeKey* out_key, BtreeValue* out_val) {
+BtreeTask< btree_status_t > Btree< K, V >::get_any(BtreeKeyRange< K >&& inp_range, BtreeKey* out_key,
+                                                    BtreeValue* out_val) {
     BtreeGetAnyRequest< K > req{*this, std::move(inp_range), out_key, out_val};
-    return get(req);
+    CO_RETURN CO_AWAIT(get(req));
 }
 
 template < typename K, typename V >
-btree_status_t Btree< K, V >::remove_one(BtreeKey const& key, BtreeValue* out_val) {
+BtreeTask< btree_status_t > Btree< K, V >::remove_one(BtreeKey const& key, BtreeValue* out_val) {
     BtreeSingleRemoveRequest req{*this, &key, out_val};
-    return remove(req);
+    CO_RETURN CO_AWAIT(remove(req));
 }
 
 template < typename K, typename V >
-btree_status_t Btree< K, V >::remove_any(BtreeKeyRange< K >&& inp_range, BtreeKey* out_key, BtreeValue* out_val) {
+BtreeTask< btree_status_t > Btree< K, V >::remove_any(BtreeKeyRange< K >&& inp_range, BtreeKey* out_key,
+                                                       BtreeValue* out_val) {
     BtreeRemoveAnyRequest< K > req{*this, std::move(inp_range), out_key, out_val};
-    return remove(req);
+    CO_RETURN CO_AWAIT(remove(req));
 }
 
 template < typename K, typename V >
-std::pair< btree_status_t, RemovePaginateCookie< K > >
-Btree< K, V >::remove_range(BtreeKeyRange< K >&& inp_range, uint32_t batch_size, remove_filter_cb_t filter_cb) {
+BtreeTask< std::pair< btree_status_t, RemovePaginateCookie< K > > >
+Btree< K, V >::remove_range(BtreeKeyRange< K >&& inp_range, uint32_t batch_size, RemoveFilter* filter) {
     auto req_ptr =
-        std::make_unique< BtreeRangeRemoveRequest< K > >(*this, std::move(inp_range), batch_size, std::move(filter_cb));
-    auto status = remove(*req_ptr);
-    return std::pair(status, std::move(req_ptr));
+        std::make_unique< BtreeRangeRemoveRequest< K > >(*this, std::move(inp_range), batch_size, filter);
+    auto status = CO_AWAIT(remove(*req_ptr));
+    CO_RETURN std::pair(status, std::move(req_ptr));
 }
 
 template < typename K, typename V >
-btree_status_t Btree< K, V >::remove_range_next(RemovePaginateCookie< K >& cookie) {
-    auto const status = remove(*cookie);
+BtreeTask< btree_status_t > Btree< K, V >::remove_range_next(RemovePaginateCookie< K >& cookie) {
+    auto const status = CO_AWAIT(remove(*cookie));
     if (status != btree_status_t::has_more) { cookie.reset(); }
-    return status;
+    CO_RETURN status;
 }
 
 template < typename K, typename V >
-std::pair< btree_status_t, QueryPaginateCookie< K > >
+BtreeTask< std::pair< btree_status_t, QueryPaginateCookie< K > > >
 Btree< K, V >::query(BtreeKeyRange< K >&& inp_range,            // Input range to query for
                      std::vector< std::pair< K, V > >& out_kvs, // Results will be appended
                      uint32_t batch_size,                       // Batch size, default the whole set
                      BtreeQueryType query_type,                 // See query_impl for more details
-                     get_filter_cb_t filter_cb                  // Any filtering condition while picking the result set
+                     GetFilter* filter                          // Any filtering condition while picking the result set
 ) {
     auto req_ptr = std::make_unique< BtreeQueryRequest< K > >(*this, std::move(inp_range), query_type, batch_size,
-                                                              std::move(filter_cb));
-    auto status = query(*req_ptr, out_kvs);
-    return std::pair(status, std::move(req_ptr));
+                                                              filter);
+    auto status = CO_AWAIT(query(*req_ptr, out_kvs));
+    CO_RETURN std::pair(status, std::move(req_ptr));
 }
 
 template < typename K, typename V >
-btree_status_t Btree< K, V >::query_next(QueryPaginateCookie< K >& cookie, std::vector< std::pair< K, V > >& out_kvs) {
-    if (cookie == nullptr) { return btree_status_t::success; }
-    auto const status = query(*cookie, out_kvs);
+BtreeTask< btree_status_t > Btree< K, V >::query_next(QueryPaginateCookie< K >& cookie,
+                                                       std::vector< std::pair< K, V > >& out_kvs) {
+    if (cookie == nullptr) { CO_RETURN btree_status_t::success; }
+    auto const status = CO_AWAIT(query(*cookie, out_kvs));
     if (status != btree_status_t::has_more) { cookie.reset(); }
-    return status;
+    CO_RETURN status;
 }
 
 #if 0
@@ -187,28 +191,28 @@ nlohmann::json Btree< K, V >::get_metrics_in_json(bool updated) {
 }
 
 template < typename K, typename V >
-std::string Btree< K, V >::to_string() const {
+BtreeTask< std::string > Btree< K, V >::to_string() const {
     std::string buf;
-    m_btree_lock.lock_shared();
-    to_string_internal(m_root_node_info.bnode_id(), buf);
-    m_btree_lock.unlock_shared();
+    {
+        auto tree_lock = CO_AWAIT(lock_tree_shared());
+        CO_AWAIT(to_string_internal(m_root_node_info.bnode_id(), buf));
+    }
     BT_LOG(DEBUG, "Pre order traversal of tree:\n<{}>", buf);
-
-    return buf;
+    CO_RETURN buf;
 }
 
 template < typename K, typename V >
-std::string Btree< K, V >::to_custom_string(BtreeNode::ToStringCallback< K, V > cb) const {
+BtreeTask< std::string > Btree< K, V >::to_custom_string(NodeCore::ToStringCallback< K, V > cb) const {
     std::string buf;
-    m_btree_lock.lock_shared();
-    to_custom_string_internal(m_root_node_info.bnode_id(), buf, std::move(cb));
-    m_btree_lock.unlock_shared();
-
-    return buf;
+    {
+        auto tree_lock = CO_AWAIT(lock_tree_shared());
+        CO_AWAIT(to_custom_string_internal(m_root_node_info.bnode_id(), buf, std::move(cb)));
+    }
+    CO_RETURN buf;
 }
 
 template < typename K, typename V >
-std::string Btree< K, V >::to_digraph_visualize_format() const {
+BtreeTask< std::string > Btree< K, V >::to_digraph_visualize_format() const {
     std::map< uint32_t, std::vector< uint64_t > > level_map;
     std::map< uint64_t, BtreeVisualizeVariables > info_map;
     std::string buf = "digraph G\n"
@@ -217,9 +221,10 @@ std::string Btree< K, V >::to_digraph_visualize_format() const {
                       R"(graph [splines="polyline"];
                     )";
 
-    m_btree_lock.lock_shared();
-    to_dot_keys(m_root_node_info.bnode_id(), buf, level_map, info_map);
-    m_btree_lock.unlock_shared();
+    {
+        auto tree_lock = CO_AWAIT(lock_tree_shared());
+        CO_AWAIT(to_dot_keys(m_root_node_info.bnode_id(), buf, level_map, info_map));
+    }
     for (const auto& [child, info] : info_map) {
         if (info.parent) {
             buf += fmt::format(R"(
@@ -239,38 +244,40 @@ std::string Btree< K, V >::to_digraph_visualize_format() const {
     }
 
     buf += "\n" + result + " }\n";
-    return buf;
+    CO_RETURN buf;
 }
 
 template < typename K, typename V >
-void Btree< K, V >::dump(const std::string& file, std::string format, BtreeNode::ToStringCallback< K, V > cb) const {
+BtreeTask< void > Btree< K, V >::dump(const std::string& file, std::string format,
+                                       NodeCore::ToStringCallback< K, V > cb) const {
     if (file.empty()) {
         BT_LOG(ERROR, "Wrong file name to dump btree");
-        return;
+        CO_RETURN_VOID;
     }
 
     std::string buf;
     if (format == "string") {
         BT_LOG(DEBUG, "Dumping btree in string format");
-        buf = to_string();
+        buf = CO_AWAIT(to_string());
     } else if (format == "dot") {
         BT_LOG(DEBUG, "Dumping btree to dot format");
-        buf = to_digraph_visualize_format();
+        buf = CO_AWAIT(to_digraph_visualize_format());
     } else if (format == "custom") {
         if (cb == nullptr) {
             BT_LOG(WARN, "Custom format requested but no callback provided, dumping as string");
-            buf = to_string();
+            buf = CO_AWAIT(to_string());
         } else {
-            buf = to_custom_string(std::move(cb));
+            buf = CO_AWAIT(to_custom_string(std::move(cb)));
         }
     } else {
         BT_LOG(ERROR, "Invalid format={} to dump btree", format);
-        return;
+        CO_RETURN_VOID;
     }
 
     std::ofstream o(file);
     o.write(buf.c_str(), buf.size());
     o.flush();
+    CO_RETURN_VOID;
 }
 
 template < typename K, typename V >
@@ -279,25 +286,25 @@ bnodeid_t Btree< K, V >::root_node_id() const {
 }
 
 template < typename K, typename V >
-uint64_t Btree< K, V >::count_keys(bnodeid_t bnodeid) const {
-    BtreeNodePtr node;
-    locktype_t acq_lock = locktype_t::READ;
-    if (read_and_lock_node(bnodeid, node, acq_lock, acq_lock, nullptr) != btree_status_t::success) { return 0; }
+BtreeTask< uint64_t > Btree< K, V >::count_keys(bnodeid_t bnodeid) const {
+    if (bnodeid == empty_bnodeid) { CO_RETURN 0ULL; }
+    auto [ret, node] = CO_AWAIT(read_node(bnodeid, LockType::Read));
+    if (ret != btree_status_t::success) { CO_RETURN 0ULL; }
     uint64_t result = 0;
     if (!node->is_leaf()) {
         uint32_t i = 0;
         while (i < node->total_entries()) {
-            BtreeLinkInfo p;
-            node->get_nth_value(i, &p, false);
-            result += count_keys(p.bnode_id());
+            BtreeLinkInfo child_info;
+            node->get_nth_value(i, &child_info, false);
+            result += CO_AWAIT(count_keys(child_info.bnode_id()));
             ++i;
         }
-        if (node->has_valid_edge()) { result += count_keys(node->edge_id()); }
+        if (node->has_valid_edge()) { result += CO_AWAIT(count_keys(node->edge_id())); }
     } else {
         result = node->total_entries();
     }
-    unlock_node(node, acq_lock);
-    return result;
+    // RAII: node unlocks when it goes out of scope
+    CO_RETURN result;
 }
 
 // TODO: Commenting out flip till we figure out how to move flip dependency inside sisl package.

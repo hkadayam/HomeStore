@@ -21,10 +21,10 @@
 #include <memory>
 #include <array>
 
-#include <homestore/btree/btree_kv.hpp>
-#include <homestore/btree/node_variant/simple_node.hpp>
-#include <homestore/btree/node_variant/varlen_node.hpp>
-#include <homestore/btree/node_variant/prefix_node.hpp>
+#include <homestore/index/btree/btree_kv.h>
+#include <homestore/index/btree/node_variant/simple_node.hpp>
+#include <homestore/index/btree/node_variant/varlen_node.hpp>
+#include <homestore/index/btree/node_variant/prefix_node.hpp>
 
 static constexpr uint32_t g_max_keysize{100}; // for  node size = 512 : free space : 442 => 100+100+6(record size) = 46%
 static constexpr uint32_t g_max_valsize{100};

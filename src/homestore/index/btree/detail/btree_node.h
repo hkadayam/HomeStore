@@ -17,19 +17,28 @@
 #pragma once
 #include <cstdint>
 #include <functional>
-#include <iomgr/fiber_lib.hpp>
+#include <memory>
 
 #include <sisl/fds/atomic_counter.h>
 #include <sisl/fds/enum.h>
 #include <sisl/fds/obj_life_counter.h>
-#include <homestore/btree/detail/btree_internal.hpp>
-#include <homestore/btree/btree_kv.hpp>
+#include <homestore/index/btree/btree_async.h>
+#include <homestore/index/btree/detail/btree_internal.h>
+#include <homestore/index/btree/btree_kv.h>
 #include <homestore/crc.h>
 
 namespace homestore {
-ENUM(locktype_t, uint8_t, NONE, READ, WRITE)
+/// Node locking modes.
+/// ReadInteriorWriteLeaf is the standard descend-for-mutation mode: interior nodes are read-locked,
+/// leaf nodes are write-locked. This avoids holding exclusive locks high in the tree during descent.
+ENUM(LockType, uint8_t, None, Read, Write, ReadInteriorWriteLeaf)
 
-class BtreeNode : public sisl::ObjLifeCounter< BtreeNode > {
+/// Resolve to the actual Read/Write lock type for a node of the given type.
+inline LockType resolve_node_lock_type(LockType lt, bool is_leaf) {
+    return (lt == LockType::ReadInteriorWriteLeaf) ? (is_leaf ? LockType::Write : LockType::Read) : lt;
+}
+
+class NodeCore : public sisl::ObjLifeCounter< NodeCore > {
     using node_find_result_t = std::pair< bool, uint32_t >;
 
 public:
@@ -41,41 +50,35 @@ public:
         uint8_t magic{BTREE_NODE_MAGIC};     // offset=0
         uint8_t version{BTREE_NODE_VERSION}; // offset=1
         uint16_t checksum{0};                // offset=2
-
-        uint32_t nentries : 30; // offset 4
-        uint32_t leaf : 1;
-        uint32_t node_deleted : 1;
+        uint32_t nentries;                   // offset 4
 
         bnodeid_t node_id{empty_bnodeid};   // offset=8
         bnodeid_t next_node{empty_bnodeid}; // offset=16
+        uint64_t node_gen{0};               // offset=24: Generation of this node, incremented on every update
 
-        uint64_t node_gen{0};     // offset=24: Generation of this node, incremented on every update
-        uint64_t link_version{0}; // offset=32: Version of the link between its parent, updated if structure changes
-        BtreeLinkInfo::bnode_link_info edge_info; // offset=40: Edge entry information
+        bnodeid_t edge_id;          // offset=32: Edge entry information
+        int64_t modified_cp_id{-1}; // offset=40: Checkpoint ID of the last modification of this node
 
-        int64_t modified_cp_id{-1};   // offset=56: Checkpoint ID of the last modification of this node
-        uint16_t level;               // offset=64: Level of the node within the tree
-        uint16_t node_size;           // offset=66: Size of node, max 64K
-        uint8_t node_type;            // offset=68: Type of the node (simple vs varlen etc..)
-        uint8_t reserved[3]{0, 0, 0}; // offset=69-72: Reserved
+        uint16_t level;            // offset=48: Level of the node within the tree
+        uint16_t node_size;        // offset=50: Size of node, max 64K
+        uint8_t node_type;         // offset=52: Type of the node (simple vs varlen etc..)
+        uint8_t leaf : 1;          // offset=53: Is leaf or not, TODO: Cache this in wrapper to avoid bit ops
+        uint8_t node_deleted : 1;  // offset=53: Is node deleted or not
+        uint8_t reserved[2]{0, 0}; // offset=54-55: Reserved
 
         PersistentHeader() : nentries{0}, leaf{0}, node_deleted{0} {}
         std::string to_string() const {
             auto snext = (next_node == empty_bnodeid) ? "" : " next=" + std::to_string(next_node);
-            auto sedge = (edge_info.m_bnodeid == empty_bnodeid)
-                ? ""
-                : fmt::format(" edge={}.{}", edge_info.m_bnodeid, edge_info.m_link_version);
-            return fmt::format("magic={} version={} csum={} node_id={}{} nentries={} node_type={} is_leaf={} "
-                               "node_deleted={} node_gen={} modified_cp_id={} link_version={}{} level={} ",
+            auto sedge = (edge_info.m_bnodeid == empty_bnodeid) ? "" : fmt::format(" edge={}", edge_info.m_bnodeid);
+            return fmt::format("magic={} version={} csum={} node_id={} nentries={} node_type={} is_leaf={} "
+                               "deleted?={} gen={} modified_cp_id={}{}{} level={} ",
                                magic, version, checksum, node_id, snext, nentries, node_type, leaf, node_deleted,
-                               node_gen, modified_cp_id, link_version, sedge, level);
+                               node_gen, modified_cp_id, snext, sedge, level);
         }
 
         std::string to_compact_string() const {
             auto snext = (next_node == empty_bnodeid) ? "" : " next=" + std::to_string(next_node);
-            auto sedge = (edge_info.m_bnodeid == empty_bnodeid)
-                ? ""
-                : fmt::format(" edge={}.{}", edge_info.m_bnodeid, edge_info.m_link_version);
+            auto sedge = (edge_info.m_bnodeid == empty_bnodeid) ? "" : fmt::format(" edge={}", edge_info.m_bnodeid);
             return fmt::format("id={}{}{} {} level={} nentries={}{} mod_cp={}", node_id, snext, sedge,
                                leaf ? "LEAF" : "INTERIOR", level, nentries, (node_deleted == 0x1) ? "  Deleted" : "",
                                modified_cp_id);
@@ -83,100 +86,42 @@ public:
     };
 #pragma pack()
 
-    struct Allocator {
-        using Token = uint8_t;
-        std::function< uint8_t*(uint32_t size) > alloc_btree_node;
-        std::function< void(BtreeNode* node) > free_btree_node;
-        std::function< uint8_t*(uint32_t size) > alloc_node_buf;
-        std::function< void(uint8_t*) > free_node_buf;
-        static constexpr Token default_token = 0;
-
-        Allocator() :
-                alloc_btree_node{[](uint32_t size) -> uint8_t* { return new uint8_t[size]; }},
-                free_btree_node{[](BtreeNode* node) {
-                    node->~BtreeNode();
-                    delete[] uintptr_cast(node);
-                }},
-                alloc_node_buf{[](uint32_t size) { return new uint8_t[size]; }},
-                free_node_buf{[](uint8_t* buf) { delete[] buf; }} {}
-
-        Allocator(std::function< uint8_t*(uint32_t size) > alloc_node_cb,
-                  std::function< void(BtreeNode* node) > free_node_cb,
-                  std::function< uint8_t*(uint32_t size) > alloc_buf_cb, std::function< void(uint8_t*) > free_buf_cb) :
-                alloc_btree_node{std::move(alloc_node_cb)},
-                free_btree_node{std::move(free_node_cb)},
-                alloc_node_buf{std::move(alloc_buf_cb)},
-                free_node_buf{std::move(free_buf_cb)} {}
-        Allocator(const Allocator& b) = default;
-        Allocator(Allocator&& b) = default;
-        Allocator& operator=(const Allocator& b) = default;
-        Allocator& operator=(Allocator&& b) = default;
-        ~Allocator() = default;
-
-        struct List {
-            std::vector< Allocator > vec;
-            std::mutex mtx;
-            List() : vec{1, Allocator{}} {}
-        };
-
-        static List& allocators() {
-            static List s_allocators;
-            return s_allocators;
-        }
-
-        static Allocator& get(Allocator::Token token) { return allocators().vec[token]; }
-        static Token add(Allocator a) {
-            std::unique_lock lg{allocators().mtx};
-            allocators().vec.emplace_back(std::move(a));
-            return s_cast< Allocator::Token >(allocators().vec.size() - 1);
-        }
-
-        static void remove(Token t) {
-            std::unique_lock lg{allocators().mtx};
-            if (t == allocators().vec.size() - 1) {
-                allocators().vec.erase(allocators().vec.end() - 1);
-            } else {
-                allocators().vec[t] = Allocator{};
-            }
-        }
-    };
-
-    uint8_t* m_phys_node_buf;                      // Pointer to the physical node buffer
-    sisl::AtomicCounter< int32_t > m_refcount{0}; // Refcount of the node
-
-    Allocator::Token m_token;
-    std::atomic< uint8_t > m_phys_buf_share_count{0};
-    uint16_t m_variant_private_data{0}; // Data specific to variant (to reuse this wasted 16 bit space)
-
-    mutable iomgr::FiberManagerLib::shared_mutex m_lock;
+    /// Shared ownership of the persistent page buffer.
+    ///
+    /// The caller (storage backend) allocates the buffer and passes ownership in.
+    /// Both backends use std::shared_ptr<uint8_t> but create it differently:
+    ///   MemBtree  — std::shared_ptr<uint8_t>(new uint8_t[size], ...)
+    ///   COWBtree  — sisl::AlignedSharedPtr<uint8_t>::make_sized(align, size)
+    ///               (AlignedSharedPtr IS-A shared_ptr, so assignment works directly)
+    ///
+    /// Replacing the buffer (CoW on write) is a simple reassignment:
+    ///   node->m_phys_node_buf = new_buf;
+    /// The old buffer stays alive until all shared_ptr holders drop their copy.
+    std::shared_ptr< uint8_t > m_phys_node_buf;
+    mutable BtreeMutex m_lock;
 
 public:
-    BtreeNode(bnodeid_t id, bool is_leaf, uint32_t node_size, Allocator::Token token) :
-            m_phys_node_buf{Allocator::get(token).alloc_node_buf(node_size)}, m_token{token} {
-        new (m_phys_node_buf) PersistentHeader{};
+    /// Construct a fresh node. The caller allocates and provides the buffer.
+    NodeCore(std::shared_ptr< uint8_t > buf, bnodeid_t id, bool is_leaf, uint32_t node_size) :
+            m_phys_node_buf{std::move(buf)} {
+        new (m_phys_node_buf.get()) PersistentHeader{};
         set_node_id(id);
         set_leaf(is_leaf);
         set_node_size(node_size);
     }
 
-    BtreeNode(uint8_t* node_buf, bnodeid_t id, Allocator::Token token) : m_phys_node_buf{node_buf}, m_token{token} {
+    /// Construct from an existing buffer (e.g. after reading from disk/memory).
+    NodeCore(std::shared_ptr< uint8_t > buf, bnodeid_t id) : m_phys_node_buf{std::move(buf)} {
         DEBUG_ASSERT_EQ(node_id(), id);
         DEBUG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC);
         DEBUG_ASSERT_EQ(version(), BTREE_NODE_VERSION);
     }
 
-    virtual ~BtreeNode() {
-        DEBUG_ASSERT_EQ(m_phys_buf_share_count.load(), 0,
-                        "We are being asked to destruct node while its buffer is still shared");
-        Allocator::get(m_token).free_node_buf(m_phys_node_buf);
-    }
+    virtual ~NodeCore() = default; // shared_ptr deleter frees m_phys_node_buf automatically
 
     // Identify if a node is a leaf node or not, from raw buffer, by just reading PersistentHeader
     static bool identify_leaf_node(uint8_t* buf) { return (r_cast< PersistentHeader* >(buf))->leaf; }
     static std::string to_string_buf(uint8_t* buf) { return (r_cast< PersistentHeader* >(buf))->to_compact_string(); }
-    static BtreeLinkInfo::bnode_link_info identify_edge_info(uint8_t* buf) {
-        return (r_cast< PersistentHeader* >(buf))->edge_info;
-    }
 
     static bool is_valid_node(sisl::Blob const& buf) {
         auto phdr = r_cast< PersistentHeader const* >(buf.cbytes());
@@ -189,26 +134,6 @@ public:
         if (phdr->checksum != exp_checksum) { return false; }
 
         return true;
-    }
-
-    static void set_modified_cp_id(uint8_t* buf, int64_t cp_id) {
-        auto phdr = r_cast< PersistentHeader* >(buf);
-        phdr->modified_cp_id = cp_id;
-    }
-
-    static int64_t get_modified_cp_id(uint8_t const* buf) {
-        auto phdr = r_cast< PersistentHeader const* >(buf);
-        return phdr->modified_cp_id;
-    }
-
-    static bool is_node_deleted(uint8_t const* buf) {
-        auto phdr = r_cast< PersistentHeader const* >(buf);
-        return phdr->node_deleted == 0x1;
-    }
-
-    static bnodeid_t get_node_id(uint8_t const* buf) {
-        auto phdr = r_cast< PersistentHeader const* >(buf);
-        return phdr->node_id;
     }
 
     /// @brief Finds the index of the entry with the specified key in the node.
@@ -235,7 +160,7 @@ public:
                 DEBUG_ASSERT_EQ(found, false);
                 return std::make_pair(found, idx);
             }
-            if (outval) { *((BtreeLinkInfo*)outval) = get_edge_value(); }
+            if (outval) { *((NodeId*)outval) = get_edge_value(); }
         } else {
             if (outval) { get_nth_value(idx, outval, copy_val); }
         }
@@ -319,9 +244,9 @@ public:
         return found;
     }
 
-    virtual void overwrite(const BtreeNode& other_node) {
+    virtual void overwrite(const NodeCore& other_node) {
         DEBUG_ASSERT_EQ(node_size(), other_node.node_size(), "{}", get_persistent_header_const()->to_string());
-        std::memcpy(m_phys_node_buf, other_node.m_phys_node_buf, other_node.node_size());
+        std::memcpy(m_phys_node_buf.get(), other_node.m_phys_node_buf.get(), other_node.node_size());
     }
 
     void get_adjacent_indicies(uint32_t cur_ind, std::vector< uint32_t >& indices_list, uint32_t max_indices) const {
@@ -390,12 +315,12 @@ public:
         return true;
     }
 
-    virtual BtreeLinkInfo get_edge_value() const { return BtreeLinkInfo{edge_id(), edge_link_version()}; }
+    virtual NodeId get_edge_value() const { return NodeId{edge_id(), edge_link_version()}; }
 
     virtual void set_edge_value(const BtreeValue& v) {
         auto const b = v.serialize();
-        auto const l = r_cast< BtreeLinkInfo::bnode_link_info const* >(b.cbytes());
-        DEBUG_ASSERT_EQ(b.size(), sizeof(BtreeLinkInfo::bnode_link_info));
+        auto const l = r_cast< NodeId::bnode_link_info const* >(b.cbytes());
+        DEBUG_ASSERT_EQ(b.size(), sizeof(NodeId::bnode_link_info));
         set_edge_info(*l);
     }
 
@@ -408,34 +333,24 @@ public:
 
     // uint32_t total_entries() const { return (has_valid_edge() ? total_entries() + 1 : total_entries()); }
 
-    void lock(locktype_t l) const {
-        if (l == locktype_t::READ) {
-            m_lock.lock_shared();
-        } else if (l == locktype_t::WRITE) {
-            m_lock.lock();
-        }
-    }
+    /// Acquire a shared (read) lock. Use CO_AWAIT(node->lock_shared()).
+    BtreeTask< void > lock_shared() const { CO_RETURN CO_AWAIT(btree_lock_shared(m_lock)); }
 
-    void unlock(locktype_t l) const {
-        if (l == locktype_t::READ) {
-            m_lock.unlock_shared();
-        } else if (l == locktype_t::WRITE) {
-            m_lock.unlock();
-        }
-    }
+    /// Acquire an exclusive (write) lock. Use CO_AWAIT(node->lock_excl()).
+    BtreeTask< void > lock_excl() const { CO_RETURN CO_AWAIT(btree_lock_excl(m_lock)); }
 
-    void lock_upgrade() {
-        this->unlock(locktype_t::READ);
-        this->lock(locktype_t::WRITE);
-    }
+    /// Release a shared lock (always synchronous).
+    void unlock_shared() const { m_lock.unlock_shared(); }
+
+    /// Release an exclusive lock (always synchronous).
+    void unlock_excl() const { m_lock.unlock(); }
 
     template < typename K, typename V >
     using ToStringCallback = std::function< std::string(std::vector< std::pair< K, V > > const&) >;
 
     template < typename K, typename V >
     std::string to_custom_string(ToStringCallback< K, V > const& cb) const {
-        std::string snext =
-            (this->next_bnode() == empty_bnodeid) ? "" : fmt::format(" next_node={}", this->next_bnode());
+        std::string snext = (this->next_node() == empty_bnodeid) ? "" : fmt::format(" next_node={}", this->next_node());
         auto str = fmt::format("id={}.{} level={} nEntries={} {}{} node_gen={} ", this->node_id(), this->link_version(),
                                this->level(), this->total_entries(), (this->is_leaf() ? "LEAF" : "INTERIOR"), snext,
                                this->node_gen());
@@ -466,9 +381,7 @@ public:
         }
 
         // Should not happen
-        if (this->is_node_deleted()) {
-            fmt::format_to(std::back_inserter(str), " **DELETED** ");
-        }
+        if (this->is_node_deleted()) { fmt::format_to(std::back_inserter(str), " **DELETED** "); }
 
         return str;
     }
@@ -482,8 +395,8 @@ public:
     virtual void update(uint32_t ind, const BtreeValue& val) = 0;
     virtual void update(uint32_t ind, const BtreeKey& key, const BtreeValue& val) = 0;
 
-    virtual uint32_t move_out_to_right_by_entries(BtreeNode& other_node, uint32_t nentries) = 0;
-    virtual uint32_t move_out_to_right_by_size(BtreeNode& other_node, uint32_t size) = 0;
+    virtual uint32_t move_out_to_right_by_entries(NodeCore& other_node, uint32_t nentries) = 0;
+    virtual uint32_t move_out_to_right_by_size(NodeCore& other_node, uint32_t size) = 0;
 
     /// @brief Appends entries copied from another SimpleNode into this node, up to a specified size limit.
     ///
@@ -492,7 +405,7 @@ public:
     /// starting from the cursor, or the occupied size of the current node reaches `upto_size`,
     /// or the current node runs out of available entry slots.
     ///
-    /// @param o The source BtreeNode (expected to be the same variant as this) to copy entries from.
+    /// @param o The source NodeCore (expected to be the same variant as this) to copy entries from.
     /// @param other_cursor [in, out] The starting index within `other` node to begin copying.
     ///                     This cursor is advanced by the number of entries successfully copied.
     /// @param upto_size The target maximum occupied size for the current node after appending.
@@ -500,12 +413,12 @@ public:
     ///
     /// @return If any entries have been copied.
     /// @note Assumes appropriate node locks are held externally.
-    virtual bool append_copy_in_upto_size(const BtreeNode& other_node, uint32_t& other_cursor, uint32_t upto_size,
+    virtual bool append_copy_in_upto_size(const NodeCore& other_node, uint32_t& other_cursor, uint32_t upto_size,
                                           bool copy_only_if_fits) = 0;
 
 #if 0
-    virtual uint32_t copy_by_size(const BtreeNode& other_node, uint32_t start_idx, uint32_t size) = 0;
-    virtual uint32_t copy_by_entries(const BtreeNode& other_node, uint32_t start_idx, uint32_t nentries) = 0;
+    virtual uint32_t copy_by_size(const NodeCore& other_node, uint32_t start_idx, uint32_t size) = 0;
+    virtual uint32_t copy_by_entries(const NodeCore& other_node, uint32_t start_idx, uint32_t nentries) = 0;
     virtual uint32_t num_entries_by_size(uint32_t start_idx, uint32_t size) const = 0;
 #endif
 
@@ -563,44 +476,16 @@ protected:
     }
 
 public:
-    uint8_t* share_phys_node_buf() {
-        uint8_t* old_phys_buf{nullptr};
-        auto share_count = m_phys_buf_share_count.load();
-        if (share_count != 0) {
-            // Buffer was already shared with another party, we need to make a copy and share the new one
-            auto new_buf = Allocator::get(m_token).alloc_node_buf(node_size());
-            std::memcpy(new_buf, m_phys_node_buf, node_size());
-            old_phys_buf = m_phys_node_buf;
-            m_phys_node_buf = new_buf;
-        }
-        share_count = m_phys_buf_share_count.fetch_add(1);
-        if (old_phys_buf && (share_count == 0)) {
-            // We have checked if buffer was shared and actually copied the buffer, but before we increment the counter,
-            // release_buf has been called and reduced the count to 1. If thats the case, we have 2 unshared buffers and
-            // one of them has to be freed
-            Allocator::get(m_token).free_node_buf(old_phys_buf);
-        }
-        return m_phys_node_buf;
-    }
+    /// Returns a shared_ptr copy — caller holds shared ownership until done.
+    /// CoW backends can replace m_phys_node_buf underneath; old buffer lives until all copies are dropped.
+    std::shared_ptr< uint8_t > share_phys_node_buf() const { return m_phys_node_buf; }
 
-    void release_phys_node_buf(uint8_t* buf) {
-        auto const cur_count = m_phys_buf_share_count.fetch_sub(1);
-        if (cur_count > 1) {
-            // After sharing, the phys_node_buf was copied and modified, this release is not for the buf that is
-            // currently held, so we have to free the buf
-            DEBUG_ASSERT_NE((void*)buf, (void*)m_phys_node_buf,
-                            "We are asked to release current version buf, but with shared count more than 1, which "
-                            "means there is some out-of-order release going on");
-            Allocator::get(m_token).free_node_buf(buf);
-        }
-    }
-
-    PersistentHeader* get_persistent_header() { return r_cast< PersistentHeader* >(m_phys_node_buf); }
+    PersistentHeader* get_persistent_header() { return r_cast< PersistentHeader* >(m_phys_node_buf.get()); }
     const PersistentHeader* get_persistent_header_const() const {
-        return r_cast< const PersistentHeader* >(m_phys_node_buf);
+        return r_cast< const PersistentHeader* >(m_phys_node_buf.get());
     }
-    uint8_t* node_data_area() { return (m_phys_node_buf + sizeof(PersistentHeader)); }
-    const uint8_t* node_data_area_const() const { return (m_phys_node_buf + sizeof(PersistentHeader)); }
+    uint8_t* node_data_area() { return (m_phys_node_buf.get() + sizeof(PersistentHeader)); }
+    const uint8_t* node_data_area_const() const { return (m_phys_node_buf.get() + sizeof(PersistentHeader)); }
 
     uint8_t magic() const { return get_persistent_header_const()->magic; }
     void set_magic() { get_persistent_header()->magic = BTREE_NODE_MAGIC; }
@@ -640,30 +525,23 @@ public:
 
     void inc_gen() { get_persistent_header()->node_gen++; }
     void set_gen(uint64_t g) { get_persistent_header()->node_gen = g; }
-    uint64_t link_version() const { return get_persistent_header_const()->link_version; }
-    void set_link_version(uint64_t version) { get_persistent_header()->link_version = version; }
-    void inc_link_version() { ++(get_persistent_header()->link_version); }
 
     void set_node_deleted() { get_persistent_header()->node_deleted = 0x1; }
     bool is_node_deleted() const { return (get_persistent_header_const()->node_deleted == 0x1); }
 
-    BtreeLinkInfo link_info() const { return BtreeLinkInfo{node_id(), link_version()}; }
+    NodeId link_info() const { return NodeId{node_id()}; }
 
     virtual uint32_t occupied_size() const { return (node_data_size() - available_size()); }
     bool is_merge_needed(const BtreeConfig& cfg) const { return (occupied_size() < cfg.suggested_min_size()); }
 
-    bnodeid_t next_bnode() const { return get_persistent_header_const()->next_node; }
-    void set_next_bnode(bnodeid_t b) { get_persistent_header()->next_node = b; }
+    bnodeid_t next_node() const { return get_persistent_header_const()->next_node; }
+    void set_next_node(bnodeid_t b) { get_persistent_header()->next_node = b; }
 
     bnodeid_t edge_id() const { return get_persistent_header_const()->edge_info.m_bnodeid; }
     void set_edge_id(bnodeid_t edge) { get_persistent_header()->edge_info.m_bnodeid = edge; }
-    uint64_t edge_link_version() const { return get_persistent_header_const()->edge_info.m_link_version; }
-    void set_edge_link_version(uint64_t link_version) {
-        get_persistent_header()->edge_info.m_link_version = link_version;
-    }
 
-    BtreeLinkInfo::bnode_link_info edge_info() const { return get_persistent_header_const()->edge_info; }
-    void set_edge_info(const BtreeLinkInfo::bnode_link_info& info) { get_persistent_header()->edge_info = info; }
+    NodeId edge_as_val() const { return NodeId{edge_id()}; }
+    void set_edge(const NodeId& id) { set_edge_id(id.id()); }
 
     bool has_valid_edge() const {
         if (is_leaf()) { return false; }
@@ -671,19 +549,93 @@ public:
     }
 
     void set_modified_cp_id(int64_t id) { get_persistent_header()->modified_cp_id = id; }
-    friend void intrusive_ptr_add_ref(BtreeNode* node) { node->m_refcount.increment(1); }
+};
 
-    friend void intrusive_ptr_release(BtreeNode* node) {
-        if (node->m_refcount.decrement_testz(1)) {
-            // Do not delete it here, since node is generally an offset inside actual allocation and delete will fail
-            // here (with asan). So let the on_node_freed from the underlying store delete the allocation.
-            if (Allocator::get(node->m_token).free_btree_node) {
-                Allocator::get(node->m_token).free_btree_node(node);
-            } else {
-                delete node;
-            }
+///
+/// NodeHandle — abstract lifetime token for a NodeCore.
+/// Each storage backend (mem_btree, cow_btree, …) provides its own concrete
+/// implementation.
+///
+/// move_to(dest): placement-moves *this into dest; after the call *this is
+/// in a moved-from state and its destructor must be a no-op.  This lets
+/// Node store the handle inline (SBO) with zero heap allocation.
+///
+/// Implementations must static_assert(sizeof(Impl) <= Node::kStorageBytes).
+///
+class NodeHandle {
+public:
+    virtual ~NodeHandle() = default;
+    virtual NodeCore* get() = 0;
+    virtual bool valid() const = 0;
+    virtual void move_to(void* dest) noexcept = 0;
+};
+
+///
+/// Node — RAII lock guard with inline (SBO) NodeHandle storage.
+///
+/// kStorageBytes is public so each NodeHandle implementation can
+/// static_assert it fits, catching oversized handles at compile time.
+///
+/// Destructor sequence (lock_type_ != NONE):
+///   1. ~Node() body  — NodeCore::unlock()             [releases mutex]
+///   2. handle_->~NodeHandle() in body                 [releases backend reference]
+/// When lock_type_ == NONE (node loaded but not yet locked) only step 2 fires.
+///
+class Node {
+public:
+    static constexpr size_t kStorageBytes = 3 * sizeof(void*);
+
+private:
+    alignas(void*) std::byte storage_[kStorageBytes]{};
+    NodeHandle* handle_{nullptr};
+    LockType lock_type_{LockType::None};
+
+public:
+    Node() = default;
+
+    /// Transfers a backend-stack NodeHandle into inline storage via move_to().
+    Node(NodeHandle& src, LockType lt) : lock_type_{lt} {
+        src.move_to(storage_);
+        handle_ = r_cast< NodeHandle* >(storage_);
+    }
+
+    Node(Node&& o) noexcept : lock_type_{o.lock_type_} {
+        if (o.handle_) {
+            o.handle_->move_to(storage_);
+            handle_ = r_cast< NodeHandle* >(storage_);
+            o.handle_ = nullptr;
+            o.lock_type_ = LockType::None;
         }
     }
+    Node& operator=(Node&& o) noexcept {
+        if (this != &o) {
+            this->~Node();
+            new (this) Node(std::move(o));
+        }
+        return *this;
+    }
+    Node(const Node&) = delete;
+    Node& operator=(const Node&) = delete;
+
+    ~Node() {
+        if (handle_) {
+            if (lock_type_ == LockType::Read) {
+                handle_->get()->unlock_shared();
+            } else if (lock_type_ == LockType::Write) {
+                handle_->get()->unlock_excl();
+            }
+            handle_->~NodeHandle(); // then release backend reference (raw ptr, cache slot, etc.)
+            handle_ = nullptr;
+        }
+    }
+
+    NodeCore* operator->() const { return handle_->get(); }
+    NodeCore& operator*() const { return *handle_->get(); }
+    bool valid() const { return handle_ && handle_->valid(); }
+    LockType lock_type() const { return lock_type_; }
+    void set_lock_type(LockType lt) { lock_type_ = lt; }
 };
+
+using NodeList = folly::small_vector< Node, 3 >;
 
 } // namespace homestore

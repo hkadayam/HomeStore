@@ -20,7 +20,7 @@
 
 #include <iomgr/io_environment.hpp>
 #include <sisl/options/options.h>
-#include <homestore/btree/detail/btree_internal.hpp>
+#include <homestore/index/btree/detail/btree_internal.h>
 #include "test_common/homestore_test_common.hpp"
 #include "btree_helpers/btree_test_kvs.hpp"
 #include "test_common/range_scheduler.hpp"

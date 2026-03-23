@@ -56,24 +56,24 @@ list(APPEND COMMON_TEST_DEPS
     GTest::gmock
 )
 
-include_directories (BEFORE ${CMAKE_CURRENT_SOURCE_DIR})  # enables <sisl/...> and <iomanager/...>
-include_directories (BEFORE lib/)
+include_directories (BEFORE ${CMAKE_CURRENT_SOURCE_DIR})  # enables <sisl/...>, <iomanager/...>, <homestore/...>
 include_directories (BEFORE include/)
-include_directories (BEFORE ${CMAKE_CURRENT_BINARY_DIR}/lib)
+include_directories (BEFORE ${CMAKE_CURRENT_BINARY_DIR}/homestore)
 
 add_subdirectory(sisl)
 add_subdirectory(iomanager)
-add_subdirectory(lib/blkalloc)
-add_subdirectory(lib/device)
-add_subdirectory(lib/checkpoint)
-add_subdirectory(lib/common)
-add_subdirectory(lib/logstore)
-add_subdirectory(lib/meta)
-add_subdirectory(lib/index)
-add_subdirectory(lib/blkdata_svc/)
+add_subdirectory(homestore/blkalloc)
+add_subdirectory(homestore/device)
+add_subdirectory(homestore/checkpoint)
+add_subdirectory(homestore/common)
+add_subdirectory(homestore/logstore)
+add_subdirectory(homestore/meta)
+add_subdirectory(homestore/index)
+add_subdirectory(homestore/blkdata_svc/)
+add_subdirectory(homestore/blob)
 if (DEFINED REPLICATION)
   if (${REPLICATION} STREQUAL "ON")
-    add_subdirectory(lib/replication/)
+    add_subdirectory(homestore/replication/)
   endif()
 endif()
 
@@ -82,18 +82,20 @@ if(NOT DEFINED BUILD_TESTING OR BUILD_TESTING)
 endif()
 
 set(HOMESTORE_OBJECTS
-    $<TARGET_OBJECTS:hs_common> 
-    $<TARGET_OBJECTS:hs_device> 
-    $<TARGET_OBJECTS:hs_blkalloc> 
-    $<TARGET_OBJECTS:hs_logdev> 
+    $<TARGET_OBJECTS:hs_common>
+    $<TARGET_OBJECTS:hs_device>
+    $<TARGET_OBJECTS:hs_blkalloc>
+    $<TARGET_OBJECTS:hs_logdev>
     $<TARGET_OBJECTS:hs_metablk>
     $<TARGET_OBJECTS:hs_checkpoint>
     $<TARGET_OBJECTS:hs_index>
     $<TARGET_OBJECTS:hs_mem_btree>
     $<TARGET_OBJECTS:hs_cow_btree>
     $<TARGET_OBJECTS:hs_datasvc>
-    lib/homestore.cpp
-    lib/crc.cpp
+    $<TARGET_OBJECTS:hs_blob>
+    homestore/homestore.cpp
+    homestore/crc.cpp
+    homestore/managers.cpp
 )
 
 if (DEFINED REPLICATION)

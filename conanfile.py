@@ -98,6 +98,7 @@ class HomestoreConan(ConanFile):
         tc = CMakeToolchain(self)
         if self.options.testing != "off":
             tc.variables["TEST_TARGET"] = self.options.testing
+            tc.cache_variables["BUILD_TESTING"] = True
         tc.variables["CONAN_CMAKE_SILENT_OUTPUT"] = "ON"
         tc.variables['CMAKE_EXPORT_COMPILE_COMMANDS'] = 'ON'
         tc.variables["CTEST_OUTPUT_ON_FAILURE"] = "ON"
@@ -129,7 +130,8 @@ class HomestoreConan(ConanFile):
     def build(self):
         cmake = CMake(self)
         cmake.configure()
-        cmake.build()
+        target = self.conf.get("user.cmake:build_target", default=None, check_type=str)
+        cmake.build(target=target)
         if not self.conf.get("tools.build:skip_test", default=False):
             cmake.test()
 

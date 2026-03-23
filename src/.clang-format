@@ -16,10 +16,10 @@ AlignConsecutiveDeclarations: false
 AlignEscapedNewlines: Right
 AlignOperands:   false
 AlignTrailingComments: true
-AllowShortIfStatementsOnASingleLine: true
+AllowShortIfStatementsOnASingleLine: false
 AllowShortBlocksOnASingleLine: true
 AllowShortCaseLabelsOnASingleLine: false
-# AllowShortFunctionsOnASingleLine: InlineOnly
+AllowShortFunctionsOnASingleLine: InlineOnly
 # AllowShortLoopsOnASingleLine: false
 AlwaysBreakAfterReturnType: None
 AlwaysBreakTemplateDeclarations: true

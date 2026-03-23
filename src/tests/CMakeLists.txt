@@ -17,11 +17,6 @@ if (${build_nonio_tests})
     target_link_libraries(test_blkalloc homestore ${COMMON_TEST_DEPS} )
     add_test(NAME BlkAlloc COMMAND test_blkalloc)
 
-    add_executable(test_blk_cache_queue)
-    target_sources(test_blk_cache_queue PRIVATE test_blk_cache_queue.cpp ../lib/blkalloc/blk_cache_queue.cpp)
-    target_link_libraries(test_blk_cache_queue homestore ${COMMON_TEST_DEPS} )
-    add_test(NAME BlkCacheQueue COMMAND test_blk_cache_queue)
-
     set(TEST_JOURNAL_VDEV_SOURCES test_journal_vdev.cpp)
     add_executable(test_journal_vdev ${TEST_JOURNAL_VDEV_SOURCES})
     target_link_libraries(test_journal_vdev homestore ${COMMON_TEST_DEPS} GTest::gmock)

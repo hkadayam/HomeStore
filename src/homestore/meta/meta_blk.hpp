@@ -135,6 +135,8 @@ public:
     MetaBlkHeader& header() { return *reinterpret_cast< MetaBlkHeader* >(buffer.data()); }
     const MetaBlkHeader& header() const { return *reinterpret_cast< const MetaBlkHeader* >(buffer.data()); }
 
+    std::string name() const { return header().get_name(); }
+
     /// Mutable view of the payload bytes (after the header).
     std::span< uint8_t > data_slice() {
         return {buffer.data() + MetaBlkHeader::SIZE, buffer.size() - MetaBlkHeader::SIZE};

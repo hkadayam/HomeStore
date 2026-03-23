@@ -81,9 +81,10 @@ public:
 
     /// Write data to a MetaBlk.
     ///
-    /// - New block (not yet in chain): data written, block appended to the tail, and client info is updated on disk.
-    /// - Existing block: data is overwritten in-place (no relinking needed).
-    folly::coro::Task< void > write_meta_blk(MetaBlk blk, const IOBuffer& data);
+    /// - New block (is_fresh == true): data written, block appended to the tail, client info updated on disk,
+    ///   and is_fresh set to false so subsequent calls overwrite in-place.
+    /// - Existing block (is_fresh == false): data is overwritten in-place; no relinking.
+    folly::coro::Task< void > write_meta_blk(MetaBlk& blk, const IOBuffer& data);
 
     /// Read the payload from an existing MetaBlk.
     folly::coro::Task< IOBuffer > read_meta_blk(const MetaBlk& blk);

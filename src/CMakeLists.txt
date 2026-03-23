@@ -69,7 +69,6 @@ add_subdirectory(homestore/common)
 add_subdirectory(homestore/logstore)
 add_subdirectory(homestore/meta)
 add_subdirectory(homestore/index)
-add_subdirectory(homestore/blkdata_svc/)
 add_subdirectory(homestore/blob)
 if (DEFINED REPLICATION)
   if (${REPLICATION} STREQUAL "ON")
@@ -91,7 +90,6 @@ set(HOMESTORE_OBJECTS
     $<TARGET_OBJECTS:hs_index>
     $<TARGET_OBJECTS:hs_mem_btree>
     $<TARGET_OBJECTS:hs_cow_btree>
-    $<TARGET_OBJECTS:hs_datasvc>
     $<TARGET_OBJECTS:hs_blob>
     homestore/homestore.cpp
     homestore/crc.cpp

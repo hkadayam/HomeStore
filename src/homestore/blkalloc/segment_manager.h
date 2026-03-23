@@ -54,7 +54,7 @@ public:
 
     /// Allocate nblks. Returns SUCCESS on full alloc, PARTIAL on partial (non-contiguous only),
     /// SPACE_FULL on complete miss.
-    BlkAllocStatus try_alloc(blk_count_t nblks, bool is_contiguous, MultiBlkId& out);
+    BlkAllocStatus try_alloc(blk_count_t nblks, bool is_contiguous, BlkIds& out);
 
     /// Return bid to slab cache. Splits bid into power-of-2 chunks; inserts into slabs.
     /// Excess blocks that cannot fit (cache full) are dropped — caller already reset inmem_bm_.
@@ -79,13 +79,13 @@ private:
 
     /// Pop from slabs_[idx]; give exactly nblks to out; put (slab_size - nblks) excess back.
     /// Precondition: slab_size >= nblks.
-    BlkAllocStatus try_alloc_in_slab(slab_idx_t idx, blk_count_t nblks, MultiBlkId& out);
+    BlkAllocStatus try_alloc_in_slab(slab_idx_t idx, blk_count_t nblks, BlkIds& out);
 
     /// Search slabs_[target+1..NUM_SLABS), pop from the first non-empty one.
-    BlkAllocStatus break_up(slab_idx_t target_idx, blk_count_t nblks, MultiBlkId& out);
+    BlkAllocStatus break_up(slab_idx_t target_idx, blk_count_t nblks, BlkIds& out);
 
     /// Accumulate entries from slabs_[target-1..0] until nblks is satisfied (non-contiguous).
-    BlkAllocStatus merge_down(slab_idx_t target_idx, blk_count_t nblks, MultiBlkId& out);
+    BlkAllocStatus merge_down(slab_idx_t target_idx, blk_count_t nblks, BlkIds& out);
 
     std::array< Slab, NUM_SLABS > slabs_;
     std::atomic< blk_num_t > cached_blk_count_{0};

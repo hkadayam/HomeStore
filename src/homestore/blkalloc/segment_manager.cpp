@@ -67,7 +67,7 @@ void SlabCache::free_blk(BlkId const& bid) {
     }
 }
 
-BlkAllocStatus SlabCache::try_alloc_in_slab(slab_idx_t idx, blk_count_t nblks, MultiBlkId& out) {
+BlkAllocStatus SlabCache::try_alloc_in_slab(slab_idx_t idx, blk_count_t nblks, BlkIds& out) {
     if (idx >= NUM_SLABS)
         return BlkAllocStatus::SPACE_FULL;
 
@@ -79,7 +79,7 @@ BlkAllocStatus SlabCache::try_alloc_in_slab(slab_idx_t idx, blk_count_t nblks, M
     cached_blk_count_.fetch_sub(slab_size, std::memory_order_relaxed);
 
     // Precondition: slab_size >= nblks (ensured by callers using round-up slab index)
-    out.add(entry.blk_num(), nblks, chunk_id_);
+    out.push_back(BlkId{entry.blk_num(), nblks, chunk_id_});
     if (slab_size > nblks) {
         // Return the trailing excess back into the cache
         free_blk(BlkId{entry.blk_num() + nblks, slab_size - nblks, chunk_id_});
@@ -87,7 +87,7 @@ BlkAllocStatus SlabCache::try_alloc_in_slab(slab_idx_t idx, blk_count_t nblks, M
     return BlkAllocStatus::SUCCESS;
 }
 
-BlkAllocStatus SlabCache::break_up(slab_idx_t target_idx, blk_count_t nblks, MultiBlkId& out) {
+BlkAllocStatus SlabCache::break_up(slab_idx_t target_idx, blk_count_t nblks, BlkIds& out) {
     for (slab_idx_t idx = target_idx + 1; idx < NUM_SLABS; ++idx) {
         const auto st = try_alloc_in_slab(idx, nblks, out);
         if (st == BlkAllocStatus::SUCCESS) {
@@ -97,26 +97,26 @@ BlkAllocStatus SlabCache::break_up(slab_idx_t target_idx, blk_count_t nblks, Mul
     return BlkAllocStatus::SPACE_FULL;
 }
 
-BlkAllocStatus SlabCache::merge_down(slab_idx_t target_idx, blk_count_t nblks, MultiBlkId& out) {
+BlkAllocStatus SlabCache::merge_down(slab_idx_t target_idx, blk_count_t nblks, BlkIds& out) {
     if (target_idx == 0)
         return BlkAllocStatus::SPACE_FULL;
 
     blk_count_t remain = nblks;
-    for (slab_idx_t idx = target_idx - 1; remain > 0 && out.has_room(); --idx) {
+    for (slab_idx_t idx = target_idx - 1; remain > 0; --idx) {
         auto& slab = slabs_[idx];
         BlkId entry;
-        while (remain > 0 && out.has_room() && slab.free_blks_->readIfNotEmpty(entry)) {
+        while (remain > 0 && slab.free_blks_->readIfNotEmpty(entry)) {
             const blk_count_t slab_size = slab.slab_size_;
             cached_blk_count_.fetch_sub(slab_size, std::memory_order_relaxed);
 
             if (slab_size >= remain) {
-                out.add(entry.blk_num(), remain, chunk_id_);
+                out.push_back(BlkId{entry.blk_num(), remain, chunk_id_});
                 if (slab_size > remain) {
                     free_blk(BlkId{entry.blk_num() + remain, slab_size - remain, chunk_id_});
                 }
                 remain = 0;
             } else {
-                out.add(entry.blk_num(), slab_size, chunk_id_);
+                out.push_back(BlkId{entry.blk_num(), slab_size, chunk_id_});
                 remain -= slab_size;
             }
         }
@@ -129,7 +129,7 @@ BlkAllocStatus SlabCache::merge_down(slab_idx_t target_idx, blk_count_t nblks, M
     return (remain < nblks) ? BlkAllocStatus::PARTIAL : BlkAllocStatus::SPACE_FULL;
 }
 
-BlkAllocStatus SlabCache::try_alloc(blk_count_t nblks, bool is_contiguous, MultiBlkId& out) {
+BlkAllocStatus SlabCache::try_alloc(blk_count_t nblks, bool is_contiguous, BlkIds& out) {
     const slab_idx_t target_idx = std::min(slab_idx_for(nblks), static_cast< slab_idx_t >(NUM_SLABS - 1));
 
     // Step 1: Exact slab hit

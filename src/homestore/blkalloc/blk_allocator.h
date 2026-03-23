@@ -101,7 +101,7 @@ public:
     virtual ~BlkAllocator() = default;
 
     virtual BlkAllocStatus alloc_contiguous(BlkId& bid) = 0;
-    virtual BlkAllocStatus alloc(blk_count_t nblks, blk_alloc_hints const& hints, BlkId& out_blkid) = 0;
+    virtual BlkAllocStatus alloc(blk_count_t nblks, blk_alloc_hints const& hints, BlkIds& out_blkids) = 0;
     virtual void free(BlkId const& id) = 0;
 
     virtual BlkAllocStatus commit(BlkId const& bid) = 0;

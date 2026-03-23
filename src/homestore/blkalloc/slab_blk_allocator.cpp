@@ -173,20 +173,23 @@ void SlabBlkAllocator::request_sweep(blk_count_t wait_for_blks) {
 BlkAllocStatus SlabBlkAllocator::alloc_contiguous(BlkId& out_blkid) {
     blk_alloc_hints hints;
     hints.is_contiguous = true;
-    return alloc(1, hints, out_blkid);
+
+    BlkIds out_blkids;
+    auto const status = alloc(1, hints, out_blkids);
+    if (status == BlkAllocStatus::SUCCESS) {
+        out_blkid = out_blkids.front();
+    }
+    return status;
 }
 
-BlkAllocStatus SlabBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const& hints, BlkId& out_blkid) {
+BlkAllocStatus SlabBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const& hints, BlkIds& out_blkids) {
     COUNTER_INCREMENT(metrics_, num_alloc, 1);
-
-    MultiBlkId& mout = r_cast< MultiBlkId& >(out_blkid);
-    mout = MultiBlkId{};
 
     // CompactAlloc: slab is the only allocator — no bitmap fallback.
     if (cfg_.alloc_mode == AllocMode::CompactAlloc) {
         SegmentManager::Segment& seg = seg_mgr_.select_segment(hints);
         InmemPortion& portion = seg_mgr_.next_alloc_portion(seg);
-        const BlkAllocStatus status = portion.slab_cache_.try_alloc(nblks, hints.is_contiguous, mout);
+        const BlkAllocStatus status = portion.slab_cache_.try_alloc(nblks, hints.is_contiguous, out_blkids);
         if (status == BlkAllocStatus::SUCCESS) {
             alloced_blk_count_.fetch_add(nblks, std::memory_order_relaxed);
         } else {
@@ -201,13 +204,13 @@ BlkAllocStatus SlabBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const&
         SegmentManager::Segment& seg = seg_mgr_.select_segment(hints);
         InmemPortion& portion = seg_mgr_.next_alloc_portion(seg);
 
-        BlkAllocStatus status = portion.slab_cache_.try_alloc(nblks, hints.is_contiguous, mout);
+        BlkAllocStatus status = portion.slab_cache_.try_alloc(nblks, hints.is_contiguous, out_blkids);
 
         // Step 2: on cache miss, fill the cache inline and retry once.
         if (status != BlkAllocStatus::SUCCESS) {
             COUNTER_INCREMENT(metrics_, num_retries, 1);
             fill_cache_for_portion(portion);
-            status = portion.slab_cache_.try_alloc(nblks, hints.is_contiguous, mout);
+            status = portion.slab_cache_.try_alloc(nblks, hints.is_contiguous, out_blkids);
         }
 
         if (status == BlkAllocStatus::SUCCESS) {
@@ -221,13 +224,12 @@ BlkAllocStatus SlabBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const&
 
     // Direct bitmap scan across all portions via inmem_bm_->alloc().
     COUNTER_INCREMENT(metrics_, num_blks_alloc_direct, 1);
-    const BlkAllocStatus status = inmem_bm_->alloc(nblks, hints, out_blkid);
+    const BlkAllocStatus status = inmem_bm_->alloc(nblks, hints, out_blkids);
 
     if (status == BlkAllocStatus::SUCCESS || status == BlkAllocStatus::PARTIAL) {
         blk_count_t got{0};
-        auto it = mout.iterate();
-        while (auto const b = it.next()) {
-            got += b->blk_count();
+        for (auto const& bid : out_blkids) {
+            got += bid.blk_count();
         }
         alloced_blk_count_.fetch_add(got, std::memory_order_relaxed);
     } else {
@@ -253,16 +255,7 @@ void SlabBlkAllocator::free(BlkId const& bid) {
         ondisk_bm_->free(bid);
     }
 
-    blk_count_t total{0};
-    if (bid.is_multi()) {
-        auto it = r_cast< MultiBlkId const& >(bid).iterate();
-        while (auto const b = it.next()) {
-            total += b->blk_count();
-        }
-    } else {
-        total = bid.blk_count();
-    }
-    alloced_blk_count_.fetch_sub(total, std::memory_order_relaxed);
+    alloced_blk_count_.fetch_sub(bid.blk_count(), std::memory_order_relaxed);
 }
 
 // ---- commit / persist / recovery ----

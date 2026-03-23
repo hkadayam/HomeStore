@@ -58,7 +58,7 @@ public:
     ~BitmapBlkAllocator() override = default;
 
     BlkAllocStatus alloc_contiguous(BlkId& bid) override;
-    BlkAllocStatus alloc(blk_count_t nblks, blk_alloc_hints const& hints, BlkId& out_blkid) override;
+    BlkAllocStatus alloc(blk_count_t nblks, blk_alloc_hints const& hints, BlkIds& out_blkids) override;
     void free(BlkId const& bid) override;
 
     // Sets bits in bm_. CP-safe via commit_list_ when a buffer is acquired.
@@ -84,7 +84,7 @@ public:
     nlohmann::json get_status(int) const override { return {}; }
 
 private:
-    sisl::ThreadVector< MultiBlkId >* get_commit_list();
+    sisl::ThreadVector< BlkId >* get_commit_list();
     void do_set_bits(BlkId const& b);
     void do_release_buffer();
 
@@ -92,7 +92,7 @@ private:
     SegmentManager& seg_mgr_;
     bool inject_slab_on_free_;
     // Non-null while acquire_buffer() is active; new commits are appended here.
-    sisl::ThreadVector< MultiBlkId >* commit_list_{nullptr};
+    sisl::ThreadVector< BlkId >* commit_list_{nullptr};
     std::atomic< int64_t > alloced_blk_count_{0};
 };
 

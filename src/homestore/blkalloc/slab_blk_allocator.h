@@ -158,7 +158,7 @@ public:
     ~SlabBlkAllocator() override;
 
     BlkAllocStatus alloc_contiguous(BlkId& bid) override;
-    BlkAllocStatus alloc(blk_count_t nblks, blk_alloc_hints const& hints, BlkId& out_blkid) override;
+    BlkAllocStatus alloc(blk_count_t nblks, blk_alloc_hints const& hints, BlkIds& out_blkids) override;
     void free(BlkId const& bid) override;
 
     // During recovery: commits into both ondisk_bm_ and inmem_bm_.

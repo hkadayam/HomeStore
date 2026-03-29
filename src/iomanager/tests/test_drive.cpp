@@ -110,9 +110,9 @@ TEST_F(DriveTest, SingleReactorWriteReadVerify) {
 
                 // Read back
                 IOBuffer rbuf{static_cast<uint32_t>(kBlockSize)};
-                auto [rec, rbuf2] = co_await drive.read(*m_iodev, std::move(rbuf), offset);
+                auto rec = co_await drive.read(*m_iodev, rbuf, offset);
                 EXPECT_FALSE(rec) << "read failed at offset " << offset << ": " << rec.message();
-                EXPECT_TRUE(verify_pattern(rbuf2, offset)) << "data mismatch at offset " << offset;
+                EXPECT_TRUE(verify_pattern(rbuf, offset)) << "data mismatch at offset " << offset;
             }
         }());
 }
@@ -155,9 +155,9 @@ TEST_F(DriveTest, MultiReactorConcurrentWriteReadVerify) {
 
                     // Read back
                     IOBuffer rbuf{static_cast<uint32_t>(kBlockSize)};
-                    auto [rec, rbuf2] = co_await drive.read(*m_iodev, std::move(rbuf), aligned);
+                    auto rec = co_await drive.read(*m_iodev, rbuf, aligned);
                     EXPECT_FALSE(rec) << "read error: " << rec.message();
-                    EXPECT_TRUE(verify_pattern(rbuf2, aligned)) << "mismatch at " << aligned;
+                    EXPECT_TRUE(verify_pattern(rbuf, aligned)) << "mismatch at " << aligned;
 
                     ++completed;
                 }
@@ -197,10 +197,10 @@ TEST_F(DriveTest, WriteZeroThenVerify) {
             // Verify zeros.
             for (uint64_t off = offset; off < offset + size; off += kBlockSize) {
                 IOBuffer rbuf{static_cast<uint32_t>(kBlockSize)};
-                auto [rec, rbuf2] = co_await drive.read(*m_iodev, std::move(rbuf), off);
+                auto rec = co_await drive.read(*m_iodev, rbuf, off);
                 EXPECT_FALSE(rec) << "read failed: " << rec.message();
-                const auto* p = reinterpret_cast<const uint64_t*>(rbuf2.cbytes());
-                for (size_t i = 0; i < rbuf2.size() / sizeof(uint64_t); ++i) {
+                const auto* p = reinterpret_cast<const uint64_t*>(rbuf.cbytes());
+                for (size_t i = 0; i < rbuf.size() / sizeof(uint64_t); ++i) {
                     EXPECT_EQ(p[i], 0u) << "non-zero at offset " << off << " word " << i;
                 }
             }

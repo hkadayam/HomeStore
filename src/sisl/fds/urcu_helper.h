@@ -32,7 +32,7 @@ namespace sisl {
 template < typename T >
 class _urcu_access_ptr {
 public:
-    _urcu_access_ptr(T* p, std::unique_ptr< folly::rcu_reader > guard) :
+    _urcu_access_ptr(T* p, std::unique_ptr< std::unique_lock< folly::rcu_domain > > guard) :
             p_{p}, guard_{std::move(guard)} {}
 
     _urcu_access_ptr(const _urcu_access_ptr&) = delete;
@@ -47,7 +47,7 @@ public:
 
 private:
     T* p_;
-    std::unique_ptr< folly::rcu_reader > guard_;
+    std::unique_ptr< std::unique_lock< folly::rcu_domain > > guard_;
 };
 
 // ---------------------------------------------------------------------------
@@ -89,7 +89,7 @@ public:
 
     // Read-side: returns an accessor that holds the RCU read-side guard.
     _urcu_access_ptr< T > get() const {
-        auto guard = std::make_unique< folly::rcu_reader >();
+        auto guard = std::make_unique< std::unique_lock< folly::rcu_domain > >(folly::rcu_default_domain());
         T* p = node_.load(std::memory_order_acquire)->val.get();
         return _urcu_access_ptr< T >(p, std::move(guard));
     }
@@ -103,7 +103,7 @@ public:
     std::shared_ptr< T > make_and_exchange(Args&&... args) {
         auto* new_node = new urcu_node< T >(std::forward< Args >(args)...);
         auto* old_node = node_.exchange(new_node, std::memory_order_acq_rel);
-        folly::synchronize_rcu();
+        folly::rcu_synchronize();
         auto ret = old_node->get();
         delete old_node;
         return ret;
@@ -119,7 +119,7 @@ public:
 
     std::shared_ptr< T > exchange() {
         if (old_node_ == nullptr) { return nullptr; }
-        folly::synchronize_rcu();
+        folly::rcu_synchronize();
         auto ret = old_node_->get();
         delete old_node_;
         old_node_ = nullptr;
@@ -149,17 +149,17 @@ public:
     urcu_scoped_ptr& operator=(urcu_scoped_ptr&&) = delete;
 
     ~urcu_scoped_ptr() {
-        folly::synchronize_rcu();
+        folly::rcu_synchronize();
         delete cur_obj_.load(std::memory_order_acquire);
     }
 
     void read(const auto& cb) const {
-        auto guard = std::make_unique< folly::rcu_reader >();
+        auto guard = std::make_unique< std::unique_lock< folly::rcu_domain > >(folly::rcu_default_domain());
         cb(static_cast< const T* >(cur_obj_.load(std::memory_order_acquire)));
     }
 
     _urcu_access_ptr< T > access() const {
-        auto guard = std::make_unique< folly::rcu_reader >();
+        auto guard = std::make_unique< std::unique_lock< folly::rcu_domain > >(folly::rcu_default_domain());
         T* p = cur_obj_.load(std::memory_order_acquire);
         return _urcu_access_ptr< T >(p, std::move(guard));
     }
@@ -170,13 +170,13 @@ public:
             std::scoped_lock l(updater_mutex_);
             T* new_obj;
             {
-                folly::rcu_reader guard;
+                std::unique_lock< folly::rcu_domain > guard{folly::rcu_default_domain()};
                 new_obj = new T(*cur_obj_.load(std::memory_order_acquire));
             }
             edit_cb(new_obj);
             old_obj = cur_obj_.exchange(new_obj, std::memory_order_acq_rel);
         }
-        folly::synchronize_rcu();
+        folly::rcu_synchronize();
         if (old_obj) { delete old_obj; }
     }
 
@@ -190,7 +190,7 @@ private:
                           std::index_sequence< Is... >) {
         auto* new_obj = new T(std::get< Is >(tuple)...);
         auto* old_obj = cur_obj_.exchange(new_obj, std::memory_order_acq_rel);
-        if (sync_rcu_now) { folly::synchronize_rcu(); }
+        if (sync_rcu_now) { folly::rcu_synchronize(); }
         return old_obj;
     }
 
@@ -207,7 +207,7 @@ class urcu_ctl {
 public:
     static void register_rcu() {}   // no-op: folly manages thread registration
     static void unregister_rcu() {} // no-op
-    static void sync_rcu() { folly::synchronize_rcu(); }
+    static void sync_rcu() { folly::rcu_synchronize(); }
 };
 
 } // namespace sisl

@@ -111,6 +111,19 @@ using MetricsGroupWrapper = MetricsGroup; // backward compat alias
 
 } // namespace sisl
 
+// ── Convenience macros ────────────────────────────────────────────────
+// These expand to calls of the template-based register_counter/gauge/histogram
+// functions above.  They must be used inside a MetricsGroup subclass constructor
+// where `this` is a MetricsGroup*.
+#define REGISTER_COUNTER(name, desc, ...) sisl::register_counter< #name >(*this, desc)
+#define REGISTER_GAUGE(name, desc, ...) sisl::register_gauge< #name >(*this, desc)
+#define REGISTER_HISTOGRAM(name, desc, ...) sisl::register_histogram< #name >(*this, desc)
+
+#define COUNTER_INCREMENT(grp, name, val) sisl::counter_increment< #name >(grp, val)
+#define COUNTER_DECREMENT(grp, name, val) sisl::counter_decrement< #name >(grp, val)
+#define GAUGE_UPDATE(grp, name, val) sisl::gauge_update< #name >(grp, val)
+#define HISTOGRAM_OBSERVE(grp, name, val) sisl::histogram_observe< #name >(grp, val)
+
 ////////////////////////////////////////// MetricTag + template record/register API ///////////////////////////////
 //
 // C++20 structural NTTP — same pattern as ModuleTag in logging.
@@ -130,7 +143,8 @@ struct MetricTag {
     char name[N]{};
 
     constexpr MetricTag(const char (&str)[N]) noexcept {
-        for (std::size_t i = 0; i < N; ++i) name[i] = str[i];
+        for (std::size_t i = 0; i < N; ++i)
+            name[i] = str[i];
     }
     constexpr std::string_view view() const noexcept { return {name, N - 1}; }
     constexpr bool operator==(const MetricTag&) const noexcept = default;
@@ -152,8 +166,7 @@ struct MetricHandle {
 
 template < MetricTag Name >
 inline uint64_t register_counter(MetricsGroup& grp, const std::string& desc, const std::string& report_name = "",
-                                  const MetricLabel& label_pair = {"", ""},
-                                  PublishAs ptype = PublishAs::Counter) {
+                                 const MetricLabel& label_pair = {"", ""}, PublishAs ptype = PublishAs::Counter) {
     const auto id = grp.impl_ptr_->register_counter(std::string{Name.view()}, desc, report_name, label_pair, ptype);
     MetricHandle< Name >::instance().id = id;
     return id;
@@ -161,7 +174,7 @@ inline uint64_t register_counter(MetricsGroup& grp, const std::string& desc, con
 
 template < MetricTag Name >
 inline uint64_t register_gauge(MetricsGroup& grp, const std::string& desc, const std::string& report_name = "",
-                                const MetricLabel& label_pair = {"", ""}) {
+                               const MetricLabel& label_pair = {"", ""}) {
     const auto id = grp.impl_ptr_->register_gauge(std::string{Name.view()}, desc, report_name, label_pair);
     MetricHandle< Name >::instance().id = id;
     return id;
@@ -169,10 +182,8 @@ inline uint64_t register_gauge(MetricsGroup& grp, const std::string& desc, const
 
 template < MetricTag Name >
 inline uint64_t register_histogram(MetricsGroup& grp, const std::string& desc, const std::string& report_name = "",
-                                    const MetricLabel& label_pair = {"", ""},
-                                    PublishAs ptype = PublishAs::Histogram) {
-    const auto id =
-        grp.impl_ptr_->register_histogram(std::string{Name.view()}, desc, report_name, label_pair, ptype);
+                                   const MetricLabel& label_pair = {"", ""}, PublishAs ptype = PublishAs::Histogram) {
+    const auto id = grp.impl_ptr_->register_histogram(std::string{Name.view()}, desc, report_name, label_pair, ptype);
     MetricHandle< Name >::instance().id = id;
     return id;
 }

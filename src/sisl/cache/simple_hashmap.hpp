@@ -16,6 +16,8 @@
  *********************************************************************************/
 #pragma once
 
+#include <mutex>
+#include <shared_mutex>
 #include <boost/intrusive/slist.hpp>
 #include <boost/functional/hash.hpp>
 #include <folly/Traits.h>
@@ -156,7 +158,7 @@ public:
 
     bool insert(const BucketCtx& ctx, const K& input_key, const V& input_value, bool overwrite_ok) {
 #ifndef GLOBAL_HASHSET_LOCK
-        folly::SharedMutexWritePriority::WriteHolder holder(lock_);
+        std::unique_lock holder(lock_);
 #endif
         SingleEntryHashNode< V >* n = nullptr;
         auto it = list_.begin();
@@ -185,7 +187,7 @@ public:
 
     bool get(const BucketCtx& ctx, const K& input_key, V& out_val) {
 #ifndef GLOBAL_HASHSET_LOCK
-        folly::SharedMutexWritePriority::ReadHolder holder(lock_);
+        std::shared_lock holder(lock_);
 #endif
         for (const auto& n : list_) {
             const K k = ctx.extractor(n.value_);
@@ -205,7 +207,7 @@ public:
     // the caller's first dereference.
     std::pair< ValueEntryBase*, V* > find_and_acquire(const BucketCtx& ctx, const K& input_key) {
 #ifndef GLOBAL_HASHSET_LOCK
-        folly::SharedMutexWritePriority::ReadHolder holder(lock_);
+        std::shared_lock holder(lock_);
 #endif
         for (auto& n : list_) {
             const K k = ctx.extractor(n.value_);
@@ -222,7 +224,7 @@ public:
     // Returns nullptr if the key already exists.
     ValueEntryBase* insert_and_acquire(const BucketCtx& ctx, const K& input_key, const V& input_value) {
 #ifndef GLOBAL_HASHSET_LOCK
-        folly::SharedMutexWritePriority::WriteHolder holder(lock_);
+        std::unique_lock holder(lock_);
 #endif
         auto it = list_.begin();
         for (auto itend{list_.end()}; it != itend; ++it) {
@@ -240,7 +242,7 @@ public:
 
     bool erase(const BucketCtx& ctx, const K& input_key, V& out_val) {
 #ifndef GLOBAL_HASHSET_LOCK
-        folly::SharedMutexWritePriority::WriteHolder holder(lock_);
+        std::unique_lock holder(lock_);
 #endif
         auto it = list_.begin();
         for (auto itend{list_.end()}; it != itend; ++it) {
@@ -260,7 +262,7 @@ public:
 
     bool upsert_or_delete(const BucketCtx& ctx, const K& input_key, auto&& update_or_delete_cb) {
 #ifndef GLOBAL_HASHSET_LOCK
-        folly::SharedMutexWritePriority::WriteHolder holder(lock_);
+        std::unique_lock holder(lock_);
 #endif
         SingleEntryHashNode< V >* n = nullptr;
         auto it = list_.begin();
@@ -289,7 +291,7 @@ public:
 
     bool update(const BucketCtx& ctx, const K& input_key, auto&& update_cb) {
 #ifndef GLOBAL_HASHSET_LOCK
-        folly::SharedMutexWritePriority::WriteHolder holder(lock_);
+        std::unique_lock holder(lock_);
 #endif
         for (auto& n : list_) {
             const K k = ctx.extractor(n.value_);

@@ -108,4 +108,8 @@ constexpr bool operator==(const EmbeddedT< T >&, std::nullptr_t) noexcept { retu
 template < class T >
 constexpr bool operator!=(const EmbeddedT< T >&, std::nullptr_t) noexcept { return true; }
 
+// Legacy alias used by flatbuffers-generated code
+template < class T >
+using embedded_t = EmbeddedT< T >;
+
 } // namespace sisl

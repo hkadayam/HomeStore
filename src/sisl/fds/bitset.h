@@ -171,9 +171,9 @@ private:
         return std::shared_ptr< ByteArrayImpl >{
             new ByteArrayImpl{sz, alignment, tag}, [](ByteArrayImpl* const ptr) {
                 if (ptr) {
-                    // beginning of buffer is bitset_serialized
-                    bitset_serialized* const bitset_serialized_ptr{reinterpret_cast< bitset_serialized* >(ptr)};
-                    bitset_serialized_ptr->destroy(true);
+                    // The bitset_serialized header is at the start of the blob's buffer, not the blob object itself.
+                    bitset_serialized* const bsp{reinterpret_cast< bitset_serialized* >(ptr->bytes())};
+                    bsp->destroy(true);
                     delete ptr;
                 }
             }};
@@ -195,6 +195,12 @@ public:
     static constexpr uint8_t word_size() { return bitword_type::bits(); }
 
     static constexpr uint64_t npos{std::numeric_limits< uint64_t >::max()};
+
+    // Exact serialized byte size for a bitset of nbits, optionally rounded up to alignment.
+    static constexpr uint64_t serialized_size(uint64_t nbits, uint32_t alignment = 0) {
+        const uint64_t raw = bitset_serialized::nbytes(nbits);
+        return (alignment > 0) ? round_up(raw, alignment) : raw;
+    }
 
     ~BitsetImpl() {
         {

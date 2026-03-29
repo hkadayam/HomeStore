@@ -44,7 +44,7 @@ public:
         size_t next_id_in_thread{0};
         std::vector< std::vector< T > const* > per_thread_vectors;
 
-        iterator() = default;
+        iterator() : next_thread{std::numeric_limits< size_t >::max()} {}
         iterator(std::vector< std::vector< T > const* > v) : per_thread_vectors{std::move(v)} {
             if (per_thread_vectors.empty()) { next_thread = std::numeric_limits< size_t >::max(); }
         }
@@ -110,9 +110,8 @@ public:
     iterator begin() {
         std::vector< std::vector< T > const* > ptrs;
         ptrs.reserve(8);
-        for (auto& accessor : tl_vec_.accessAllThreads()) {
-            auto* v = accessor.get();
-            if (v && !v->empty()) { ptrs.push_back(v); }
+        for (auto& vec : tl_vec_.accessAllThreads()) {
+            if (!vec.empty()) { ptrs.push_back(&vec); }
         }
         {
             std::unique_lock lg{zombie_mutex_};
@@ -126,12 +125,9 @@ public:
     iterator end() { return iterator{}; }
 
     void foreach_entry(auto&& cb) {
-        for (auto& accessor : tl_vec_.accessAllThreads()) {
-            auto* v = accessor.get();
-            if (v) {
-                for (auto const& e : *v) {
-                    cb(e);
-                }
+        for (auto& vec : tl_vec_.accessAllThreads()) {
+            for (auto const& e : vec) {
+                cb(e);
             }
         }
         {
@@ -146,9 +142,8 @@ public:
 
     size_t size() const {
         size_t sz{0};
-        for (auto& accessor : const_cast< ConcurrentInsertVector* >(this)->tl_vec_.accessAllThreads()) {
-            auto* v = accessor.get();
-            if (v) { sz += v->size(); }
+        for (auto& vec : const_cast< ConcurrentInsertVector* >(this)->tl_vec_.accessAllThreads()) {
+            sz += vec.size();
         }
         {
             std::unique_lock lg{zombie_mutex_};
@@ -160,9 +155,8 @@ public:
     }
 
     void clear() {
-        for (auto& accessor : tl_vec_.accessAllThreads()) {
-            auto* v = accessor.get();
-            if (v) { v->clear(); }
+        for (auto& vec : tl_vec_.accessAllThreads()) {
+            vec.clear();
         }
         {
             std::unique_lock lg{zombie_mutex_};
@@ -187,7 +181,8 @@ private:
         return *v;
     }
 
-    folly::ThreadLocalPtr< std::vector< T > > tl_vec_;
+    struct Tag {};
+    folly::ThreadLocalPtr< std::vector< T >, Tag > tl_vec_;
     mutable std::mutex zombie_mutex_;
     std::vector< std::vector< T >* > zombies_;
 };

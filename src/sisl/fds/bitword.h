@@ -547,7 +547,7 @@ public:
     std::string to_string() const {
         std::ostringstream oSS{};
         const word_t e = m_bits.get();
-        for (uint8_t bit{0}; bit < bits(); ++bit) {
+        for (int bit = bits() - 1; bit >= 0; --bit) {
             oSS << (((e & bit_mask[bit]) == bit_mask[bit]) ? '1' : '0');
         }
         return oSS.str();

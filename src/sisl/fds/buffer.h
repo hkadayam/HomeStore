@@ -26,9 +26,9 @@
 #include <type_traits>
 #include <vector>
 
+#include <sys/uio.h>
 #ifdef __linux__
 #include <malloc.h>
-#include <sys/uio.h>
 #endif
 
 #include <folly/small_vector.h>

@@ -21,17 +21,17 @@ namespace sisl {
 FollyRcuMetricsGroup::~FollyRcuMetricsGroup() = default;
 
 void FollyRcuMetricsGroup::on_register() {
-    ncntrs_ = static_cast< uint32_t >(num_counters());
-    nhists_ = static_cast< uint32_t >(num_histograms());
-    // Thread-local PerThreadMetrics are created lazily on first access per thread.
+    ncntrs_ = to_u32(num_counters());
+    nhists_ = to_u32(num_histograms());
+    acc_counters_.resize(ncntrs_, 0);
+    acc_digests_.resize(nhists_, folly::TDigest{128});
 }
 
 PerThreadMetrics* FollyRcuMetricsGroup::get_or_create() {
     PerThreadMetrics* m = tl_metrics_.get();
     if (FOLLY_UNLIKELY(!m)) {
         auto* p = new PerThreadMetrics{ncntrs_, nhists_};
-        // The destructor lambda fires when the thread exits.  Rather than
-        // deleting p we push it onto the zombie list so that the next
+        // The destructor lambda fires when the thread exits.  Rather than deleting p we push it onto the zombie list so that the next
         // collect() still aggregates its data.
         tl_metrics_.reset(p, [this](PerThreadMetrics* ptr, folly::TLPDestructionMode) { push_zombie(ptr); });
         m = p;
@@ -45,73 +45,82 @@ void FollyRcuMetricsGroup::push_zombie(PerThreadMetrics* p) {
 }
 
 // ─── Record path ─────────────────────────────────────────────────────────────
+// Writers hold the RCU read-side section for the duration of the write. The collector calls rcu_synchronize() which
+// blocks until every read-side section has exited — after that, no thread is touching any per-thread data.
 
 void FollyRcuMetricsGroup::counter_increment(uint64_t index, int64_t val) {
-    PerThreadMetrics* m = get_or_create();
-    folly::rcu_reader guard;
-    m->counters_[index].fetch_add(val, std::memory_order_relaxed);
+    std::unique_lock< folly::rcu_domain > guard{folly::rcu_default_domain()};
+    get_or_create()->counters[index] += val;
 }
 
 void FollyRcuMetricsGroup::counter_decrement(uint64_t index, int64_t val) {
-    PerThreadMetrics* m = get_or_create();
-    folly::rcu_reader guard;
-    m->counters_[index].fetch_sub(val, std::memory_order_relaxed);
+    std::unique_lock< folly::rcu_domain > guard{folly::rcu_default_domain()};
+    get_or_create()->counters[index] -= val;
 }
 
 void FollyRcuMetricsGroup::histogram_observe(uint64_t index, int64_t val) {
-    get_or_create()->histograms_[index].observe(static_cast< double >(val));
+    std::unique_lock< folly::rcu_domain > guard{folly::rcu_default_domain()};
+    auto* m = get_or_create();
+    m->pending[index].push_back(to_double(val));
+    if (m->pending[index].size() >= histogram_flush_threshold) { m->flush_histogram(to_u32(index)); }
 }
 
 void FollyRcuMetricsGroup::histogram_observe(uint64_t index, int64_t val, uint64_t count) {
-    get_or_create()->histograms_[index].observe(static_cast< double >(val), count);
+    std::unique_lock< folly::rcu_domain > guard{folly::rcu_default_domain()};
+    auto* m = get_or_create();
+    for (uint64_t i = 0; i < count; ++i) {
+        m->pending[index].push_back(to_double(val));
+    }
+    if (m->pending[index].size() >= histogram_flush_threshold) { m->flush_histogram(to_u32(index)); }
 }
 
 // ─── Collect path ─────────────────────────────────────────────────────────────
 
-void FollyRcuMetricsGroup::gather_result([[maybe_unused]] bool need_latest, const CounterGatherCb& counter_cb,
-                                         const GaugeGatherCb& gauge_cb, const HistogramGatherCb& histogram_cb) {
-    // Wait for all in-flight counter increments (which hold an rcu_reader) to
-    // finish.  After this point every fetch_add that started before this call
-    // has completed and is visible via the acquire semantics of load() below.
-    folly::rcu_synchronize();
-
-    // Accumulate across all live threads.
-    std::vector< CounterValue > counters(ncntrs_);
-    std::vector< folly::TDigest > digests(nhists_, folly::TDigest{128});
-
-    auto aggregate = [&](PerThreadMetrics& tl) {
-        for (uint32_t i = 0; i < ncntrs_; ++i) {
-            counters[i].increment(tl.counters_[i].load(std::memory_order_relaxed));
-        }
-        for (uint32_t i = 0; i < nhists_; ++i) {
-            auto d = tl.histograms_[i].snapshot();
-            if (d.count() > 0) {
-                digests[i] = folly::TDigest::merge(folly::range(std::initializer_list< folly::TDigest >{digests[i], d}));
-            }
-        }
-    };
-
-    for (auto& tl : tl_metrics_.accessAllThreads()) {
-        aggregate(tl);
+void FollyRcuMetricsGroup::collect_and_reset(PerThreadMetrics& ptm) {
+    for (uint32_t i = 0; i < ncntrs_; ++i) {
+        acc_counters_[i] += ptm.counters[i];
+        ptm.counters[i] = 0;
     }
-
-    // Drain zombie list (exited threads).
-    {
-        std::unique_lock lock{zombie_mutex_};
-        for (auto& zm : zombie_list_) {
-            aggregate(*zm);
+    for (uint32_t i = 0; i < nhists_; ++i) {
+        ptm.flush_histogram(i);
+        if (ptm.digests[i].count() > 0) {
+            acc_digests_[i] = folly::TDigest::merge(
+                folly::range(std::initializer_list< folly::TDigest >{acc_digests_[i], ptm.digests[i]}));
+            ptm.digests[i] = folly::TDigest{128};
         }
-        zombie_list_.clear();
+    }
+}
+
+void FollyRcuMetricsGroup::gather_result(bool need_latest, const CounterGatherCb& counter_cb,
+                                         const GaugeGatherCb& gauge_cb, const HistogramGatherCb& histogram_cb) {
+    if (need_latest) {
+        // After this returns, every writer's read-side section has exited — no thread is touching per-thread data.
+        folly::rcu_synchronize();
+
+        for (auto& tl : tl_metrics_.accessAllThreads()) {
+            collect_and_reset(tl);
+        }
+
+        // Drain zombie list — exited threads whose data hasn't been collected yet.
+        {
+            std::unique_lock lock{zombie_mutex_};
+            for (auto& zm : zombie_list_) {
+                collect_and_reset(*zm);
+            }
+            zombie_list_.clear();
+        }
     }
 
     for (uint32_t i = 0; i < ncntrs_; ++i) {
-        counter_cb(i, counters[i]);
+        CounterValue cv;
+        cv.increment(acc_counters_[i]);
+        counter_cb(i, cv);
     }
     for (uint32_t i = 0; i < num_gauges(); ++i) {
         gauge_cb(i, gauge_values_[i]);
     }
     for (uint32_t i = 0; i < nhists_; ++i) {
-        histogram_cb(i, digests[i]);
+        histogram_cb(i, acc_digests_[i]);
     }
 }
 

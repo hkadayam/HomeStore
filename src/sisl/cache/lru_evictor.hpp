@@ -61,7 +61,7 @@ public:
 private:
     typedef list<
         ValueEntryBase,
-        member_hook< ValueEntryBase, list_member_hook< link_mode< auto_unlink > >, &ValueEntryBase::m_member_hook >,
+        member_hook< ValueEntryBase, list_member_hook< link_mode< auto_unlink > >, &ValueEntryBase::member_hook_ >,
         constant_time_size< false > >
         EvictRecordList;
 
@@ -78,8 +78,8 @@ private:
         LRUPartition() = default;
         LRUPartition(const LRUPartition&) = delete;
         LRUPartition& operator=(const LRUPartition&) = delete;
-        LRUPartition(LRUPartition&&) = default;
-        LRUPartition& operator=(LRUPartition&&) = default;
+        LRUPartition(LRUPartition&&) = delete;
+        LRUPartition& operator=(LRUPartition&&) = delete;
 
         void init(LRUEvictor* evictor, uint32_t partition_num, uint64_t max_size) {
             m_evictor = evictor;

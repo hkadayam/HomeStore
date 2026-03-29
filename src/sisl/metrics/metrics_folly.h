@@ -16,7 +16,7 @@
  *********************************************************************************/
 #pragma once
 
-#include <atomic>
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -26,7 +26,6 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 #endif
-#include <folly/MicroSpinLock.h>
 #include <folly/ThreadLocal.h>
 #include <folly/synchronization/Rcu.h>
 #include <folly/stats/TDigest.h>
@@ -38,64 +37,39 @@
 
 namespace sisl {
 
-// Per-histogram accumulator for one thread.  Hot path is a single push_back
-// under an uncontended MicroSpinLock.  The collector drains and merges the
-// pending buffer into a running TDigest snapshot under the same lock.
-struct PerHistogramData {
-    folly::MicroSpinLock spin_{};
-    std::vector< double > pending_;
-    folly::TDigest digest_;
+static constexpr uint32_t histogram_flush_threshold{256};
 
-    PerHistogramData() : digest_{128 /* max_centroids */} { spin_.init(); }
+// Per-thread metric storage for one MetricsGroup instance. Only the owning thread writes (under RCU read-side guard).
+// The collector calls rcu_synchronize() first, which guarantees no writer is active, then freely reads+resets.
+struct PerThreadMetrics {
+    std::vector< int64_t > counters;
+    std::vector< folly::TDigest > digests;
+    std::vector< std::vector< double > > pending; // bounded batch buffer flushed into digest at threshold
 
-    void observe(double value, uint64_t count = 1) {
-        folly::MSLGuard g{spin_};
-        for (uint64_t i = 0; i < count; ++i) {
-            pending_.push_back(value);
-        }
-        if (pending_.size() >= 128) { flush_locked(); }
-    }
-
-    // Called by collector: flush pending samples and return a copy of the digest.
-    folly::TDigest snapshot() {
-        folly::MSLGuard g{spin_};
-        flush_locked();
-        return digest_;
-    }
-
-private:
-    void flush_locked() {
-        if (pending_.empty()) { return; }
-        std::sort(pending_.begin(), pending_.end());
-        digest_ = digest_.merge(folly::range(pending_));
-        pending_.clear();
-    }
-};
-
-// Per-thread metric storage for one MetricsGroup instance.
-// Counters use std::atomic<int64_t> with relaxed ordering — safe because only
-// one thread writes, and the RCU barrier in the collect path provides the
-// necessary happens-before edge before the collector reads them.
-class PerThreadMetrics {
-public:
-    PerThreadMetrics(uint32_t ncntrs, uint32_t nhists) : counters_(ncntrs), histograms_(nhists) {}
+    PerThreadMetrics(uint32_t ncntrs, uint32_t nhists) :
+            counters(ncntrs, 0), digests(nhists, folly::TDigest{128}), pending(nhists) {}
 
     PerThreadMetrics(const PerThreadMetrics&) = delete;
     PerThreadMetrics& operator=(const PerThreadMetrics&) = delete;
 
-    std::vector< std::atomic< int64_t > > counters_;
-    std::vector< PerHistogramData > histograms_;
+    // Flush pending samples for histogram `idx` into its running TDigest.
+    void flush_histogram(uint32_t idx) {
+        if (pending[idx].empty()) { return; }
+        std::sort(pending[idx].begin(), pending[idx].end());
+        digests[idx] = digests[idx].merge(folly::sorted_equivalent, folly::range(pending[idx]));
+        pending[idx].clear();
+    }
 };
 
 /*
- * FollyRcuMetricsGroup
+ * FollyRcuMetricsGroup — lock-free per-thread metrics using folly RCU.
  *
- * Counter record path  : enter RCU read section → plain relaxed atomic add → exit.
- *                        Zero contention; no cache-line bouncing.
- * Histogram record path: push_back into per-thread buffer under MicroSpinLock
- *                        (uncontended 99.99% of the time).
- * Collect path         : rcu_synchronize() → iterate all thread-locals →
- *                        drain zombie list (data from exited threads).
+ * Record path (counter/histogram): enter RCU read-side section, write to per-thread data, exit. Zero contention —
+ *   only the owning thread touches its data, plain int64_t and vector operations, no atomics, no locks.
+ *
+ * Collect path: rcu_synchronize() guarantees all writers have exited their read-side sections, so the collector has
+ *   exclusive access to every thread's data. It reads+resets each thread's counters and histograms, merges into
+ *   persistent accumulators, then drains the zombie list (data from exited threads).
  *
  * Replaces WisrBufferMetricsGroup (urcu) + ThreadBufferMetricsGroup (signal).
  */
@@ -124,22 +98,30 @@ private:
     // Get or lazily create the thread-local PerThreadMetrics for this group.
     PerThreadMetrics* get_or_create();
 
-    // Called by ThreadLocalPtr destructor when a thread exits — instead of
-    // deleting, we move the data to the zombie list so the collector can still
-    // aggregate it on the next gather.
+    // Called by ThreadLocalPtr destructor when a thread exits — instead of deleting, we move the data to the zombie
+    // list so the collector can still aggregate it on the next gather.
     void push_zombie(PerThreadMetrics* p);
+
+    // Collect counters and histograms from a PerThreadMetrics into the accumulators, then reset it.
+    void collect_and_reset(PerThreadMetrics& ptm);
 
 private:
     uint32_t ncntrs_{0};
     uint32_t nhists_{0};
 
-    folly::ThreadLocalPtr< PerThreadMetrics > tl_metrics_;
+    // Accumulated results across all collection cycles. Only touched by the collector under gather's lock.
+    std::vector< int64_t > acc_counters_;
+    std::vector< folly::TDigest > acc_digests_;
 
-    // Zombie list: PerThreadMetrics instances from threads that have already
-    // exited.  Guarded by zombie_mutex_ (zombie push is rare — only on thread
-    // exit; zombie drain is periodic — only during collect).
+    // Zombie list: PerThreadMetrics from exited threads. Guarded by zombie_mutex_.
+    // IMPORTANT: zombie_mutex_ and zombie_list_ must be declared BEFORE tl_metrics_ so that tl_metrics_ is destroyed
+    // first. Its destructor fires push_zombie() which locks zombie_mutex_ — that mutex must still be alive.
     std::mutex zombie_mutex_;
     std::vector< unique< PerThreadMetrics > > zombie_list_;
+
+    // Unique tag so folly::ThreadLocalPtr allows accessAllThreads().
+    struct FollyRcuMetricsTag {};
+    folly::ThreadLocalPtr< PerThreadMetrics, FollyRcuMetricsTag > tl_metrics_;
 };
 
 } // namespace sisl

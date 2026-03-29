@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <boost/intrusive/list.hpp>
+#include "common/defs.h"
 
 using namespace boost::intrusive;
 
@@ -45,7 +46,7 @@ namespace sisl {
 // ──────────────────────────────────────────────────────────────────────────────
 class ValueEntryBase {
     // ── bit positions inside state_ ────────────────────────────────────────
-    statuc constexpr uint64_t SIZE_BITS           = 27;
+    static constexpr uint64_t SIZE_BITS           = 27;
     static constexpr uint64_t SIZE_SHIFT          = 0;
     static constexpr uint64_t SIZE_MASK           = (1ULL << 27) - 1;   // bits 0-26
 
@@ -88,21 +89,21 @@ public:
     // lock (evictor), so relaxed atomics are safe — the lock provides ordering.
     void set_size(uint32_t sz) {
         uint64_t s = state_.load(std::memory_order_relaxed);
-        s = (s & ~SIZE_MASK) | (static_cast< uint64_t >(sz) & SIZE_MASK);
+        s = (s & ~SIZE_MASK) | (to_u64(sz) & SIZE_MASK);
         state_.store(s, std::memory_order_relaxed);
     }
     uint32_t size() const {
-        return static_cast< uint32_t >(state_.load(std::memory_order_relaxed) & SIZE_MASK);
+        return to_u32(state_.load(std::memory_order_relaxed) & SIZE_MASK);
     }
 
     void set_record_family(uint32_t fid) {
         uint64_t s = state_.load(std::memory_order_relaxed);
-        s = (s & ~FAMILY_MASK) | ((static_cast< uint64_t >(fid) << FAMILY_SHIFT) & FAMILY_MASK);
+        s = (s & ~FAMILY_MASK) | ((to_u64(fid) << SIZE_BITS) & FAMILY_MASK);
         state_.store(s, std::memory_order_relaxed);
     }
     uint32_t record_family_id() const {
-        return static_cast< uint32_t >((state_.load(std::memory_order_relaxed) & FAMILY_MASK)
-                                       >> FAMILY_SHIFT);
+        return to_u32((state_.load(std::memory_order_relaxed) & FAMILY_MASK)
+                                       >> SIZE_BITS);
     }
 
     void invalidate() {

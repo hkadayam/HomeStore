@@ -15,10 +15,10 @@
  *
  *********************************************************************************/
 
-#include <sisl/cache/two_q_evictor.hpp>
+// Include logging first so that fmt/spdlog headers are parsed before
+// boost::intrusive's 'compare' template is brought into scope.
 #include <sisl/logging/logging.h>
-
-SISL_LOGGING_DECL(cache)
+#include <sisl/cache/two_q_evictor.hpp>
 
 namespace sisl {
 
@@ -96,7 +96,7 @@ void TwoQEvictor::promote_to_hot(uint64_t hash_code, CacheRecord& record) {
     // Guard against double-promotion (another thread may have raced us).
     if (record.is_in_hot_queue()) return;
     // Guard against the entry being evicted while we waited for the lock.
-    if (!record.m_member_hook.is_linked()) return;
+    if (!record.member_hook_.is_linked()) return;
 
     const int64_t sz = record.size();
 
@@ -118,7 +118,7 @@ void TwoQEvictor::remove_record(uint64_t hash_code, CacheRecord& record) {
     Partition& p = get_partition(hash_code);
     std::lock_guard lk(p.lock);
 
-    if (!record.m_member_hook.is_linked()) return;
+    if (!record.member_hook_.is_linked()) return;
 
     const int64_t sz = record.size();
 
@@ -194,7 +194,7 @@ bool TwoQEvictor::evict_cold_tail(Partition& p) {
     // Notify Cache layer: cold-evict callback first (adds key to ghost list),
     // then generic evict callback (erases from hashmap).
     if (cold_evict_fn_) cold_evict_fn_(victim);
-    evict_fn_(victim); // erases from hashmap; the call also unlinks m_member_hook
+    evict_fn_(victim); // erases from hashmap; the call also unlinks member_hook_
                        // via auto_unlink if the hashmap erase doesn't do it first.
 
     // auto_unlink removes from cold_list when the node is deleted in evict_fn_,

@@ -16,14 +16,18 @@
  *********************************************************************************/
 #pragma once
 
+#include <mutex>
+#include <shared_mutex>
+
 #include <folly/SharedMutex.h>
 #include <sisl/metrics/metrics_group_impl.h>
 #include <sisl/metrics/metrics.h>
 
 #include "bitset.h"
+#include "common/defs.h"
 
 namespace sisl {
-class StreamTrackerMetrics : public MetricsGroupWrapper {
+class StreamTrackerMetrics : public MetricsGroup {
 public:
     explicit StreamTrackerMetrics(const char* inst_name) : MetricsGroupWrapper("StreamTracker", inst_name) {
         REGISTER_COUNTER(stream_tracker_unsweeped_completions, "How many completions are unsweeped yet", "", {"", ""},
@@ -78,15 +82,14 @@ public:
     }
 
     void complete(int64_t start_idx, int64_t end_idx) {
-        folly::SharedMutexWritePriority::ReadHolder holder(lock_);
+        std::shared_lock holder(lock_);
         auto start_bit = start_idx - slot_ref_idx_;
         comp_slot_bits_.set_bits(start_bit, end_idx - start_idx + 1);
     }
 
     void rollback(int64_t new_end_idx) {
-        folly::SharedMutexWritePriority::ReadHolder holder(lock_);
-        if ((new_end_idx < slot_ref_idx_) ||
-            (new_end_idx >= (slot_ref_idx_ + int64_cast(active_slot_bits_.size())))) {
+        std::shared_lock holder(lock_);
+        if ((new_end_idx < slot_ref_idx_) || (new_end_idx >= (slot_ref_idx_ + int64_cast(active_slot_bits_.size())))) {
             throw std::out_of_range("Slot idx is not in range");
         }
 
@@ -96,11 +99,15 @@ public:
     }
 
     T& at(int64_t idx) const {
-        folly::SharedMutexWritePriority::ReadHolder holder(lock_);
-        if (idx < slot_ref_idx_) { throw std::out_of_range("Slot idx is not in range"); }
+        std::shared_lock holder(lock_);
+        if (idx < slot_ref_idx_) {
+            throw std::out_of_range("Slot idx is not in range");
+        }
 
         size_t nbit = idx - slot_ref_idx_;
-        if (!active_slot_bits_.get_bitval(nbit)) { throw std::out_of_range("Slot idx is not in range"); }
+        if (!active_slot_bits_.get_bitval(nbit)) {
+            throw std::out_of_range("Slot idx is not in range");
+        }
         return *get_slot_data(nbit);
     }
 
@@ -112,7 +119,7 @@ public:
             bool is_completed = false;
         } ret;
 
-        folly::SharedMutexWritePriority::ReadHolder holder(lock_);
+        std::shared_lock holder(lock_);
         if (idx < slot_ref_idx_) {
             ret.is_out_of_range = true;
         } else {
@@ -129,16 +136,20 @@ public:
     }
 
     size_t truncate(int64_t idx) {
-        folly::SharedMutexWritePriority::WriteHolder holder(lock_);
+        std::unique_lock holder(lock_);
         auto upto_bit = idx - slot_ref_idx_ + 1;
-        if (upto_bit <= 0) { return slot_ref_idx_ - 1; }
+        if (upto_bit <= 0) {
+            return slot_ref_idx_ - 1;
+        }
         return do_truncate(upto_bit);
     }
 
     size_t truncate() {
-        if (AutoTruncate && (cmpltd_count_since_last_truncate_.load(std::memory_order_acquire) == 0)) { return 0; }
+        if (AutoTruncate && (cmpltd_count_since_last_truncate_.load(std::memory_order_acquire) == 0)) {
+            return 0;
+        }
 
-        folly::SharedMutexWritePriority::WriteHolder holder(lock_);
+        std::unique_lock holder(lock_);
         auto first_incomplete_bit = comp_slot_bits_.get_next_reset_bit(0);
         if (first_incomplete_bit == AtomicBitset::npos) {
             first_incomplete_bit = alloced_slots_;
@@ -170,12 +181,12 @@ public:
     void foreach_all_active(int64_t start_idx, const auto& cb) { _foreach_all(start_idx, false, cb); }
 
     int64_t completed_upto(int64_t search_hint_idx = 0) const {
-        folly::SharedMutexWritePriority::ReadHolder holder(lock_);
+        std::shared_lock holder(lock_);
         return _upto(true /* completed */, search_hint_idx);
     }
 
     int64_t active_upto(int64_t search_hint_idx = 0) const {
-        folly::SharedMutexWritePriority::ReadHolder holder(lock_);
+        std::shared_lock holder(lock_);
         return _upto(false /* completed */, search_hint_idx);
     }
 
@@ -188,8 +199,7 @@ public:
         if (verbosity == 2) {
             js["alloced_count"] = alloced_slots_;
             if (AutoTruncate) {
-                js["completed_since_last_truncate"] =
-                    cmpltd_count_since_last_truncate_.load(std::memory_order_relaxed);
+                js["completed_since_last_truncate"] = cmpltd_count_since_last_truncate_.load(std::memory_order_relaxed);
             }
             js["truncate_frequency"] = truncate_on_count_;
             js["garbage_count"] = data_skip_count_;
@@ -242,17 +252,23 @@ private:
         ret = slot_ref_idx_ - 1;
         lock_.unlock_shared();
 
-        if (need_truncate) { ret = truncate(); }
+        if (need_truncate) {
+            ret = truncate();
+        }
         return ret;
     }
 
     void do_resize(size_t atleast_count) {
-        folly::SharedMutexWritePriority::WriteHolder holder(lock_);
-        if (atleast_count < alloced_slots_) { return; }
+        std::unique_lock holder(lock_);
+        if (atleast_count < alloced_slots_) {
+            return;
+        }
 
         auto new_count = std::max((alloced_slots_ * 2), atleast_count);
         auto new_slot_data = (T*)std::calloc(new_count, sizeof(T));
-        if (new_slot_data == nullptr) { throw std::bad_alloc(); }
+        if (new_slot_data == nullptr) {
+            throw std::bad_alloc();
+        }
 
         std::memmove((void*)&new_slot_data[0], (void*)&slot_data_[data_skip_count_], (sizeof(T) * alloced_slots_));
         free(slot_data_);
@@ -267,7 +283,7 @@ private:
     }
 
     int64_t _upto(bool completed, int64_t search_hint_idx) const {
-        auto search_start_bit = std::max(0l, (search_hint_idx - slot_ref_idx_));
+        auto search_start_bit = std::max(to_i64(0), (search_hint_idx - slot_ref_idx_));
         auto first_incomplete_bit = completed ? comp_slot_bits_.get_next_reset_bit(search_start_bit)
                                               : active_slot_bits_.get_next_reset_bit(search_start_bit);
         if (first_incomplete_bit == AtomicBitset::npos) {
@@ -278,22 +294,27 @@ private:
     }
 
     void _foreach_contiguous(int64_t start_idx, bool completed_only, const auto& cb) {
-        folly::SharedMutexWritePriority::ReadHolder holder(lock_);
+        std::shared_lock holder(lock_);
         auto upto = _upto(completed_only, start_idx);
         for (auto idx = start_idx; idx <= upto; ++idx) {
             auto proceed = cb(idx, upto, *(get_slot_data(idx - slot_ref_idx_)));
-            if (!proceed) break;
+            if (!proceed)
+                break;
         }
     }
 
     void _foreach_all(int64_t start_idx, bool completed_only, const auto& cb) {
-        folly::SharedMutexWritePriority::ReadHolder holder(lock_);
-        auto search_bit = std::max(0l, (start_idx - slot_ref_idx_));
+        std::shared_lock holder(lock_);
+        auto search_bit = std::max(to_i64(0), (start_idx - slot_ref_idx_));
         do {
             search_bit = completed_only ? comp_slot_bits_.get_next_set_bit(search_bit)
                                         : active_slot_bits_.get_next_set_bit(search_bit);
-            if (search_bit == AtomicBitset::npos) { break; }
-            if (!cb(search_bit + slot_ref_idx_, *(get_slot_data(search_bit)))) { break; }
+            if (search_bit == AtomicBitset::npos) {
+                break;
+            }
+            if (!cb(search_bit + slot_ref_idx_, *(get_slot_data(search_bit)))) {
+                break;
+            }
             ++search_bit;
         } while (true);
     }

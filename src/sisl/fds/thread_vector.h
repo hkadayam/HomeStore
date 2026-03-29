@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <mutex>
+#include <shared_mutex>
 #include <type_traits>
 #include <vector>
 
@@ -53,7 +54,7 @@ public:
                    std::is_convertible< typename std::decay< InputType >::type, T >::value >::type >
     void push_back(InputType&& ele) {
         // Shared lock: many threads may push concurrently; drain takes exclusive lock.
-        folly::SharedMutex::ReadHolder guard{drain_mutex_};
+        std::shared_lock< folly::SharedMutex > guard{drain_mutex_};
         local_vec().push_back(std::forward< InputType >(ele));
     }
 
@@ -62,16 +63,13 @@ public:
     Iterator begin(bool latest) {
         if (latest) {
             // Exclusive lock: no push_backs can be in-flight.
-            folly::SharedMutex::WriteHolder guard{drain_mutex_};
+            std::unique_lock< folly::SharedMutex > guard{drain_mutex_};
 
-            for (auto& accessor : tl_vec_.accessAllThreads()) {
-                auto* v = accessor.release();
-                if (v) {
-                    if (!v->empty()) {
-                        snapshot_.push_back(v);
-                    } else {
-                        delete v;
-                    }
+            for (auto& vec : tl_vec_.accessAllThreads()) {
+                if (!vec.empty()) {
+                    auto* v = new std::vector< T >(std::move(vec));
+                    snapshot_.push_back(v);
+                    vec.clear();
                 }
             }
 
@@ -106,10 +104,9 @@ public:
     void clear() {
         // Clear current per-thread vectors
         {
-            folly::SharedMutex::WriteHolder guard{drain_mutex_};
-            for (auto& accessor : tl_vec_.accessAllThreads()) {
-                auto* v = accessor.release();
-                delete v;
+            std::unique_lock< folly::SharedMutex > guard{drain_mutex_};
+            for (auto& vec : tl_vec_.accessAllThreads()) {
+                vec.clear();
             }
             {
                 std::unique_lock lg{zombie_mutex_};
@@ -128,7 +125,7 @@ public:
             sz += tvec->size();
         }
         {
-            folly::SharedMutex::ReadHolder guard{drain_mutex_};
+            std::shared_lock< folly::SharedMutex > guard{drain_mutex_};
             for (auto& accessor : tl_vec_.accessAllThreads()) {
                 auto* v = accessor.get();
                 if (v) { sz += v->size(); }
@@ -165,7 +162,8 @@ private:
         snapshot_.clear();
     }
 
-    folly::ThreadLocalPtr< std::vector< T > > tl_vec_;
+    struct ThreadVectorTag {};
+    folly::ThreadLocalPtr< std::vector< T >, ThreadVectorTag > tl_vec_;
     folly::SharedMutex drain_mutex_;
     mutable std::mutex zombie_mutex_;
     std::vector< std::vector< T >* > zombies_;

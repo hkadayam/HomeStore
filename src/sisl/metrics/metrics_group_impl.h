@@ -79,7 +79,7 @@ public:
                       const MetricLabel& label_pair = {"", ""});
 
     CounterStaticInfo(const CounterStaticInfo&) = default;
-    CounterStaticInfo(CounterStaticInfo&&) noexcept = delete;
+    CounterStaticInfo(CounterStaticInfo&&) noexcept = default;
     CounterStaticInfo& operator=(const CounterStaticInfo&) = delete;
     CounterStaticInfo& operator=(CounterStaticInfo&&) noexcept = delete;
 
@@ -103,7 +103,7 @@ public:
                        PublishAs ptype = PublishAs::Counter);
 
     CounterDynamicInfo(const CounterDynamicInfo&) = default;
-    CounterDynamicInfo(CounterDynamicInfo&&) noexcept = delete;
+    CounterDynamicInfo(CounterDynamicInfo&&) noexcept = default;
     CounterDynamicInfo& operator=(const CounterDynamicInfo&) = delete;
     CounterDynamicInfo& operator=(CounterDynamicInfo&&) noexcept = delete;
 
@@ -156,7 +156,7 @@ public:
                     const MetricLabel& label_pair = {"", ""});
 
     GaugeStaticInfo(const GaugeStaticInfo&) = default;
-    GaugeStaticInfo(GaugeStaticInfo&&) noexcept = delete;
+    GaugeStaticInfo(GaugeStaticInfo&&) noexcept = default;
     GaugeStaticInfo& operator=(const GaugeStaticInfo&) = delete;
     GaugeStaticInfo& operator=(GaugeStaticInfo&&) noexcept = delete;
 
@@ -174,7 +174,7 @@ public:
     GaugeDynamicInfo(const GaugeStaticInfo& static_info, const std::string& instance_name);
 
     GaugeDynamicInfo(const GaugeDynamicInfo&) = default;
-    GaugeDynamicInfo(GaugeDynamicInfo&&) noexcept = delete;
+    GaugeDynamicInfo(GaugeDynamicInfo&&) noexcept = default;
     GaugeDynamicInfo& operator=(const GaugeDynamicInfo&) = delete;
     GaugeDynamicInfo& operator=(GaugeDynamicInfo&&) noexcept = delete;
 
@@ -194,7 +194,7 @@ public:
                         const MetricLabel& label_pair = {"", ""});
 
     HistogramStaticInfo(const HistogramStaticInfo&) = default;
-    HistogramStaticInfo(HistogramStaticInfo&&) noexcept = delete;
+    HistogramStaticInfo(HistogramStaticInfo&&) noexcept = default;
     HistogramStaticInfo& operator=(const HistogramStaticInfo&) = delete;
     HistogramStaticInfo& operator=(HistogramStaticInfo&&) noexcept = delete;
 
@@ -220,7 +220,7 @@ public:
                          PublishAs ptype = PublishAs::Histogram);
 
     HistogramDynamicInfo(const HistogramDynamicInfo&) = default;
-    HistogramDynamicInfo(HistogramDynamicInfo&&) noexcept = delete;
+    HistogramDynamicInfo(HistogramDynamicInfo&&) noexcept = default;
     HistogramDynamicInfo& operator=(const HistogramDynamicInfo&) = delete;
     HistogramDynamicInfo& operator=(HistogramDynamicInfo&&) noexcept = delete;
 

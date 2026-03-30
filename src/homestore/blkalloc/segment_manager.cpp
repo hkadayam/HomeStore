@@ -14,8 +14,9 @@
  *********************************************************************************/
 #include <algorithm>
 
+#include <sisl/logging/logging.h>
 #include "sisl/fds/bitword.h"
-#include "common/homestore_assert.hpp"
+#include "base/homestore_assert.hpp"
 #include "segment_manager.h"
 
 namespace homestore {
@@ -47,27 +48,36 @@ std::pair< slab_idx_t, blk_count_t > SlabCache::round_down_slab(blk_count_t nblk
     return nblks_to_round_down_slab_tbl[nblks];
 }
 
-void SlabCache::free_blk(BlkId const& bid) {
+std::pair< BlkAllocStatus, BlkId > SlabCache::try_free(BlkId const& bid) {
     blk_num_t blknum = bid.blk_num();
     blk_count_t remain = bid.blk_count();
 
     while (remain > 0) {
-        const auto [slab_idx, excess] = round_down_slab(remain);
-        if (slab_idx >= NUM_SLABS)
-            break;
-        const blk_count_t slab_size = slabs_[slab_idx].slab_size_;
-        if (slabs_[slab_idx].free_blks_->writeIfNotFull(BlkId{blknum, slab_size, chunk_id_})) {
-            cached_blk_count_.fetch_add(slab_size, std::memory_order_relaxed);
+        auto [slab_idx, excess] = round_down_slab(remain);
+
+        // Clamp to the largest slab we support; re-compute excess for that slab size.
+        if (slab_idx >= NUM_SLABS) {
+            slab_idx = NUM_SLABS - 1;
+            excess = remain - slabs_[slab_idx].slab_size_;
         }
-        // Blocks that don't fit (queue full) are silently dropped.
-        // For ExpandedAlloc: inmem_bm_ sweep will recapture them on the next fill pass.
-        // For CompactAlloc: queue is sized for all blocks; this should not occur.
+
+        const blk_count_t slab_size = slabs_[slab_idx].slab_size_;
+        if (!slabs_[slab_idx].free_blks_->writeIfNotFull(BlkId{blknum, slab_size, chunk_id_})) {
+            // Queue full — return the remaining range to the caller.
+            LOGDEBUGMOD(blkalloc, "try_free chunk={}: slab[{}] queue full, blk={} remain={}", chunk_id_, slab_idx,
+                        blknum, remain);
+            return {(remain == bid.blk_count()) ? BlkAllocStatus::FAILED : BlkAllocStatus::PARTIAL,
+                    BlkId{blknum, remain, chunk_id_}};
+        }
+        cached_blk_count_.fetch_add(slab_size, std::memory_order_relaxed);
         blknum += slab_size;
         remain = excess;
     }
+
+    return {BlkAllocStatus::SUCCESS, BlkId{}};
 }
 
-BlkAllocStatus SlabCache::try_alloc_in_slab(slab_idx_t idx, blk_count_t nblks, BlkIds& out) {
+BlkAllocStatus SlabCache::try_alloc_in_slab(slab_idx_t idx, blk_count_t nblks, BlkIds& out, BlkIds& excess) {
     if (idx >= NUM_SLABS)
         return BlkAllocStatus::SPACE_FULL;
 
@@ -81,15 +91,22 @@ BlkAllocStatus SlabCache::try_alloc_in_slab(slab_idx_t idx, blk_count_t nblks, B
     // Precondition: slab_size >= nblks (ensured by callers using round-up slab index)
     out.push_back(BlkId{entry.blk_num(), nblks, chunk_id_});
     if (slab_size > nblks) {
-        // Return the trailing excess back into the cache
-        free_blk(BlkId{entry.blk_num() + nblks, slab_size - nblks, chunk_id_});
+        // Return the trailing excess back into the cache. If the slab queue is full, append the uncached
+        // remainder to excess so the caller can free it back to the bitmap.
+        auto [st, remaining] = try_free(
+            BlkId{entry.blk_num() + nblks, static_cast< blk_count_t >(slab_size - nblks), chunk_id_});
+        if (st != BlkAllocStatus::SUCCESS && remaining.blk_count() > 0) {
+            LOGDEBUGMOD(blkalloc, "try_alloc_in_slab chunk={}: break-up excess blk={} count={} could not fit back",
+                        chunk_id_, remaining.blk_num(), remaining.blk_count());
+            excess.push_back(remaining);
+        }
     }
     return BlkAllocStatus::SUCCESS;
 }
 
-BlkAllocStatus SlabCache::break_up(slab_idx_t target_idx, blk_count_t nblks, BlkIds& out) {
+BlkAllocStatus SlabCache::break_up(slab_idx_t target_idx, blk_count_t nblks, BlkIds& out, BlkIds& excess) {
     for (slab_idx_t idx = target_idx + 1; idx < NUM_SLABS; ++idx) {
-        const auto st = try_alloc_in_slab(idx, nblks, out);
+        const auto st = try_alloc_in_slab(idx, nblks, out, excess);
         if (st == BlkAllocStatus::SUCCESS) {
             return st;
         }
@@ -97,7 +114,7 @@ BlkAllocStatus SlabCache::break_up(slab_idx_t target_idx, blk_count_t nblks, Blk
     return BlkAllocStatus::SPACE_FULL;
 }
 
-BlkAllocStatus SlabCache::merge_down(slab_idx_t target_idx, blk_count_t nblks, BlkIds& out) {
+BlkAllocStatus SlabCache::merge_down(slab_idx_t target_idx, blk_count_t nblks, BlkIds& out, BlkIds& excess) {
     if (target_idx == 0)
         return BlkAllocStatus::SPACE_FULL;
 
@@ -112,7 +129,11 @@ BlkAllocStatus SlabCache::merge_down(slab_idx_t target_idx, blk_count_t nblks, B
             if (slab_size >= remain) {
                 out.push_back(BlkId{entry.blk_num(), remain, chunk_id_});
                 if (slab_size > remain) {
-                    free_blk(BlkId{entry.blk_num() + remain, slab_size - remain, chunk_id_});
+                    auto [st, remaining] = try_free(
+                        BlkId{entry.blk_num() + remain, static_cast< blk_count_t >(slab_size - remain), chunk_id_});
+                    if (st != BlkAllocStatus::SUCCESS && remaining.blk_count() > 0) {
+                        excess.push_back(remaining);
+                    }
                 }
                 remain = 0;
             } else {
@@ -129,22 +150,22 @@ BlkAllocStatus SlabCache::merge_down(slab_idx_t target_idx, blk_count_t nblks, B
     return (remain < nblks) ? BlkAllocStatus::PARTIAL : BlkAllocStatus::SPACE_FULL;
 }
 
-BlkAllocStatus SlabCache::try_alloc(blk_count_t nblks, bool is_contiguous, BlkIds& out) {
+BlkAllocStatus SlabCache::try_alloc(blk_count_t nblks, bool is_contiguous, BlkIds& out, BlkIds& excess) {
     const slab_idx_t target_idx = std::min(slab_idx_for(nblks), static_cast< slab_idx_t >(NUM_SLABS - 1));
 
     // Step 1: Exact slab hit
-    BlkAllocStatus st = try_alloc_in_slab(target_idx, nblks, out);
+    BlkAllocStatus st = try_alloc_in_slab(target_idx, nblks, out, excess);
     if (st == BlkAllocStatus::SUCCESS)
         return st;
 
     // Step 2: Break up a larger slab
-    st = break_up(target_idx, nblks, out);
+    st = break_up(target_idx, nblks, out, excess);
     if (st == BlkAllocStatus::SUCCESS)
         return st;
 
     // Step 3: Merge smaller slabs (non-contiguous only)
     if (!is_contiguous) {
-        st = merge_down(target_idx, nblks, out);
+        st = merge_down(target_idx, nblks, out, excess);
         if (st == BlkAllocStatus::SUCCESS || st == BlkAllocStatus::PARTIAL)
             return st;
     }

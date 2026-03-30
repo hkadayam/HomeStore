@@ -22,7 +22,7 @@
 #include <sisl/fds/bitword.h>
 
 #include <homestore/blk.h>
-#include "common/homestore_assert.hpp"
+#include "base/homestore_assert.hpp"
 
 namespace homestore {
 

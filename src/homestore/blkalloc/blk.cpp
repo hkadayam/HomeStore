@@ -14,7 +14,7 @@
  *
  *********************************************************************************/
 #include <homestore/blk.h>
-#include "common/homestore_assert.hpp"
+#include "base/homestore_assert.hpp"
 
 namespace homestore {
 BlkId::BlkId(uint64_t id_int) {
@@ -40,7 +40,7 @@ uint32_t BlkId::expected_serialized_size() {
 }
 
 void BlkId::deserialize(sisl::Blob const& b, bool copy) {
-    serialized* other = r_cast< serialized const* >(b.cbytes());
+    const serialized* other = r_cast< serialized const* >(b.cbytes());
     s = *other;
 }
 

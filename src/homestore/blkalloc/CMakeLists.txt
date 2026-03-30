@@ -9,8 +9,7 @@ target_sources(hs_blkalloc PRIVATE
         bitmap_blk_allocator.cpp
         slab_blk_allocator.cpp
         segment_manager.cpp
-        append_blk_allocator.cpp
-        #blkalloc_cp.cpp
       )
 target_link_libraries(hs_blkalloc ${COMMON_DEPS})
-add_dependencies(hs_blkalloc hs_common)
+
+add_subdirectory(tests)

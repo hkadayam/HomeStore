@@ -32,8 +32,8 @@
 #include <homestore/blk.h>
 #include "bitmap_blk_allocator.h"
 #include "segment_manager.h"
-#include "common/homestore_assert.hpp"
-#include "common/homestore_config.hpp"
+#include "base/homestore_assert.hpp"
+#include "base/homestore_config.hpp"
 
 namespace homestore {
 
@@ -133,8 +133,8 @@ public:
 ///
 /// Owns one SegmentManager (portion layout + per-portion slab caches + sweep cursors).
 /// Contains:
-///   inmem_bm_   — BitmapBlkAllocator(inject_slab_on_free=true): in-memory free/used state.
-///   ondisk_bm_  — BitmapBlkAllocator(inject_slab_on_free=false): durable state; null if !persistent.
+///   inmem_bm_   — BitmapBlkAllocator: in-memory free/used state. Null for CompactAlloc.
+///   ondisk_bm_  — BitmapBlkAllocator: durable state; null if !persistent.
 ///
 /// Persistence is entirely the caller's responsibility. The caller:
 ///   - constructs with a ByteArray (from the meta service) for recovery, or nullopt for a fresh start.
@@ -143,7 +143,7 @@ public:
 ///   - stores the ByteArray (via guard.buf()) through whichever meta service it chooses.
 ///
 /// Alloc path: slab_cache → fill_cache → inmem_bm_.alloc() direct scan.
-/// Free path:  inmem_bm_.free() (resets bits + slab inject) then ondisk_bm_.free() (resets ondisk bits).
+/// Free path:  CompactAlloc→slab try_free; ExpandedAlloc→slab try_free + bitmap for remainder.
 /// Commit:     ondisk_bm_.commit() — CP-safe set in the ondisk bitmap.
 ///
 class SlabBlkAllocator : public BlkAllocator {
@@ -193,7 +193,7 @@ private:
 
     SlabBlkAllocConfig cfg_;
     SegmentManager seg_mgr_;
-    unique< BitmapBlkAllocator > inmem_bm_;  // null for CompactAlloc; inject_slab_on_free = use_slab_cache_
+    unique< BitmapBlkAllocator > inmem_bm_;  // null for CompactAlloc
     unique< BitmapBlkAllocator > ondisk_bm_; // null if !persistent
     BlkAllocMetrics metrics_;
     // RCU-protected recovery flag: non-null while recovery is in progress, null after recovery_completed().

@@ -23,7 +23,7 @@
 #include <sisl/fds/thread_vector.h>
 #include <urcu.h>
 
-#include <homestore/homestore_decl.hpp>
+#include "homestore/base/homestore_decl.h"
 #include <homestore/blk.h>
 #include "blk_allocator.h"
 #include "segment_manager.h"
@@ -35,13 +35,12 @@ namespace homestore {
 /// portion layout and per-portion mutexes.
 ///
 /// alloc():           direct bitmap scan — finds free (reset) bits, sets them, returns BlkId.
-/// free():            resets bits; if inject_slab_on_free_ is true also injects the freed range
-///                    into the owning InmemPortion::slab_cache_.
-/// commit():          sets bits — CP-safe: if acquire_buffer() is active, the bid is pushed to the
-///                    pending commit list and applied by release_buffer().
-/// scan_free_blks():  acquires the portion lock, scans bm_ for reset bits in the portion's range,
-///                    sets them (marking as "in-cache"), and calls producer(bid) for each range found.
-///                    Used by SlabBlkAllocator::fill_cache_for_portion().
+/// free():            resets bits in the bitmap (portion-locked).
+/// commit():          sets bits — CP-safe: if acquire_buffer() is active, the bid is pushed to the pending commit
+///                    list and applied by release_buffer().
+/// scan_free_blks():  acquires the portion lock, scans bm_ for reset bits in the portion's range, sets them
+///                    (marking as "in-cache"), and calls producer(bid) for each range found. Used by
+///                    SlabBlkAllocator::fill_cache_for_portion().
 /// copy_from():       bulk-copy a source bitmap into bm_; used to initialise inmem_bm_ from ondisk_bm_.
 ///
 /// Thread-safety: each bitmap operation acquires the relevant InmemPortion::mtx_ via seg_mgr_.
@@ -49,8 +48,8 @@ namespace homestore {
 class BitmapBlkAllocator : public BlkAllocator {
 public:
     // buf: nullopt allocates a fresh zeroed bitset; a ByteArray deserializes from persisted bytes.
-    BitmapBlkAllocator(BlkAllocConfig const& cfg, SegmentManager& seg_mgr, bool inject_slab_on_free,
-                       chunk_num_t id, std::optional< sisl::ByteArray > buf = std::nullopt);
+    BitmapBlkAllocator(BlkAllocConfig const& cfg, SegmentManager& seg_mgr, chunk_num_t id,
+                       std::optional< sisl::ByteArray > buf = std::nullopt);
     BitmapBlkAllocator(BitmapBlkAllocator const&) = delete;
     BitmapBlkAllocator(BitmapBlkAllocator&&) noexcept = delete;
     BitmapBlkAllocator& operator=(BitmapBlkAllocator const&) = delete;
@@ -67,8 +66,10 @@ public:
     // Serialize bm_; new commits accumulate in commit_list_ until the returned BufferGuard is destroyed.
     BufferGuard acquire_buffer() override;
 
-    // Scan bm_ for free (reset) bits in portion's range, set them, call producer(bid) per range.
-    // Acquires portion.mtx_ internally. Producer returns false to stop early.
+    // Scan bm_ for free (reset) bits in portion's range. For each contiguous range found, calls
+    // producer(bid) which returns the number of blocks it successfully consumed. Only those consumed
+    // blocks have their bits SET (marking them as in-cache); unconsumed bits stay RESET.
+    // Acquires portion.mtx_ internally. A zero return from producer stops the scan.
     template < typename F >
     void scan_free_blks(InmemPortion& portion, F&& producer);
 
@@ -90,7 +91,6 @@ private:
 
     unique< sisl::Bitset > bm_;
     SegmentManager& seg_mgr_;
-    bool inject_slab_on_free_;
     // Non-null while acquire_buffer() is active; new commits are appended here.
     sisl::ThreadVector< BlkId >* commit_list_{nullptr};
     std::atomic< int64_t > alloced_blk_count_{0};
@@ -105,9 +105,12 @@ void BitmapBlkAllocator::scan_free_blks(InmemPortion& portion, F&& producer) {
     blk_num_t cursor = portion.sweep_cursor_;
     bool wrapped = false;
 
+    // Cap the contiguous range to the largest slab size so try_free can decompose without overflow.
+    static constexpr uint32_t max_slab_blks = 1u << (SlabCache::NUM_SLABS - 1);
+
     while (true) {
-        const auto bb = bm_->get_next_contiguous_n_reset_bits(cursor, static_cast< uint64_t >(portion.end_blk_), 1u,
-                                                              static_cast< uint32_t >(portion.end_blk_ - cursor));
+        const auto bb = bm_->get_next_contiguous_n_reset_bits(
+            cursor, to_u64(portion.end_blk_), 1u, max_slab_blks);
         if (bb.nbits == 0) {
             if (wrapped || cursor == portion.start_blk_) break;
             // wrap around to the start of the portion for a second pass
@@ -119,13 +122,15 @@ void BitmapBlkAllocator::scan_free_blks(InmemPortion& portion, F&& producer) {
         const blk_num_t start = static_cast< blk_num_t >(bb.start_bit);
         const blk_count_t count = static_cast< blk_count_t >(bb.nbits);
 
-        bm_->set_bits(start, count);
-        alloced_blk_count_.fetch_add(count, std::memory_order_relaxed);
-
-        const bool keep_going = producer(BlkId{start, count, chunk_id_});
+        // Let the producer consume as many blocks as it can; only SET bits for consumed blocks.
+        const blk_count_t consumed = producer(BlkId{start, count, chunk_id_});
+        if (consumed > 0) {
+            bm_->set_bits(start, consumed);
+            alloced_blk_count_.fetch_add(consumed, std::memory_order_relaxed);
+        }
         cursor = start + count;
 
-        if (!keep_going || cursor >= portion.end_blk_) break;
+        if (consumed == 0 || cursor >= portion.end_blk_) break;
     }
 
     portion.sweep_cursor_ = cursor;

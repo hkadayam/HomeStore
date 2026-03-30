@@ -20,10 +20,10 @@
 #include <sisl/fds/buffer.h>
 #include <nlohmann/json.hpp>
 
-#include <homestore/homestore_decl.hpp>
+#include "homestore/base/homestore_decl.h"
 #include <homestore/blk.h>
-#include "common/homestore_config.hpp"
-#include "common/homestore_assert.hpp"
+#include "base/homestore_config.hpp"
+#include "base/homestore_assert.hpp"
 
 namespace homestore {
 #define BLKALLOC_LOG(level, msg, ...) HS_SUBMOD_LOG(level, blkalloc, , "blkalloc", get_name(), msg, ##__VA_ARGS__)

@@ -15,13 +15,13 @@
 #include <optional>
 
 #include "bitmap_blk_allocator.h"
-#include "common/homestore_assert.hpp"
+#include "base/homestore_assert.hpp"
 
 namespace homestore {
 
-BitmapBlkAllocator::BitmapBlkAllocator(BlkAllocConfig const& cfg, SegmentManager& seg_mgr, bool inject_slab_on_free,
-                                       chunk_num_t id, std::optional< sisl::ByteArray > buf) :
-        BlkAllocator{cfg, id}, seg_mgr_{seg_mgr}, inject_slab_on_free_{inject_slab_on_free} {
+BitmapBlkAllocator::BitmapBlkAllocator(BlkAllocConfig const& cfg, SegmentManager& seg_mgr, chunk_num_t id,
+                                       std::optional< sisl::ByteArray > buf) :
+        BlkAllocator{cfg, id}, seg_mgr_{seg_mgr} {
     if (buf.has_value()) {
         bm_ = std::make_unique< sisl::Bitset >(std::move(*buf));
         alloced_blk_count_.store(to_i64(bm_->get_set_count()), std::memory_order_relaxed);
@@ -107,13 +107,9 @@ done:
 
 void BitmapBlkAllocator::free(BlkId const& bid) {
     InmemPortion& portion = seg_mgr_.blkid_to_portion(bid.blk_num());
-
     auto lock = portion.portion_lock();
     bm_->reset_bits(bid.blk_num(), bid.blk_count());
     alloced_blk_count_.fetch_sub(bid.blk_count(), std::memory_order_relaxed);
-    if (inject_slab_on_free_) {
-        portion.slab_cache_.free_blk(bid);
-    }
 }
 
 // ---- commit ----
@@ -151,7 +147,8 @@ BlkAllocator::BufferGuard BitmapBlkAllocator::acquire_buffer() {
     auto* new_list = new sisl::ThreadVector< BlkId >();
     auto* old_list = rcu_xchg_pointer(&commit_list_, new_list);
     synchronize_rcu();
-    HS_REL_ASSERT_EQ(old_list, nullptr, "acquire_buffer called while buffer already acquired");
+    HS_REL_ASSERT_EQ(static_cast< void* >(old_list), nullptr,
+                      "acquire_buffer called while buffer already acquired");
     return make_buffer_guard(bm_->serialize(align_size_), [this]() { do_release_buffer(); });
 }
 

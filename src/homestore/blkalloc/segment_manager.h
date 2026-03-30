@@ -44,7 +44,7 @@ namespace homestore {
 ///   3. Merge down      — combine entries from smaller slabs (non-contiguous only)
 ///
 /// Free: split bid into power-of-2 chunks and push each into the corresponding slab.
-/// Thread-safe: slab queues are folly::MPMCQueue — try_alloc and free_blk are lock-free.
+/// Thread-safe: slab queues are folly::MPMCQueue — try_alloc and try_free are lock-free.
 ///
 class SlabCache {
 public:
@@ -53,12 +53,13 @@ public:
     SlabCache(blk_num_t max_cached_blks, chunk_num_t chunk_id);
 
     /// Allocate nblks. Returns SUCCESS on full alloc, PARTIAL on partial (non-contiguous only),
-    /// SPACE_FULL on complete miss.
-    BlkAllocStatus try_alloc(blk_count_t nblks, bool is_contiguous, BlkIds& out);
+    /// SPACE_FULL on complete miss. Any excess blocks from break-up that couldn't be pushed back into the
+    /// slab (queue full) are appended to excess — the caller must free them back to the bitmap.
+    BlkAllocStatus try_alloc(blk_count_t nblks, bool is_contiguous, BlkIds& out, BlkIds& excess);
 
-    /// Return bid to slab cache. Splits bid into power-of-2 chunks; inserts into slabs.
-    /// Excess blocks that cannot fit (cache full) are dropped — caller already reset inmem_bm_.
-    void free_blk(BlkId const& bid);
+    /// Try to free bid into slab cache. Splits into power-of-2 chunks and pushes into slabs. Returns {SUCCESS, {}}
+    /// if fully cached. On first chunk that doesn't fit, stops and returns {PARTIAL or FAILED, remaining_bid}.
+    std::pair< BlkAllocStatus, BlkId > try_free(BlkId const& bid);
 
     bool can_cache_more() const { return cached_blk_count_.load(std::memory_order_relaxed) < max_cached_blks_; }
     bool is_full() const { return cached_blk_count_.load(std::memory_order_relaxed) >= max_cached_blks_; }
@@ -79,13 +80,13 @@ private:
 
     /// Pop from slabs_[idx]; give exactly nblks to out; put (slab_size - nblks) excess back.
     /// Precondition: slab_size >= nblks.
-    BlkAllocStatus try_alloc_in_slab(slab_idx_t idx, blk_count_t nblks, BlkIds& out);
+    BlkAllocStatus try_alloc_in_slab(slab_idx_t idx, blk_count_t nblks, BlkIds& out, BlkIds& excess);
 
     /// Search slabs_[target+1..NUM_SLABS), pop from the first non-empty one.
-    BlkAllocStatus break_up(slab_idx_t target_idx, blk_count_t nblks, BlkIds& out);
+    BlkAllocStatus break_up(slab_idx_t target_idx, blk_count_t nblks, BlkIds& out, BlkIds& excess);
 
     /// Accumulate entries from slabs_[target-1..0] until nblks is satisfied (non-contiguous).
-    BlkAllocStatus merge_down(slab_idx_t target_idx, blk_count_t nblks, BlkIds& out);
+    BlkAllocStatus merge_down(slab_idx_t target_idx, blk_count_t nblks, BlkIds& out, BlkIds& excess);
 
     std::array< Slab, NUM_SLABS > slabs_;
     std::atomic< blk_num_t > cached_blk_count_{0};
@@ -103,7 +104,7 @@ private:
 ///   estimated_free_blks_ — cached estimate of free blocks in this range
 ///
 /// Any thread may access any InmemPortion — no thread-ownership.
-/// Slab operations (slab_cache_.try_alloc, slab_cache_.free_blk) are fully lock-free (MPMC).
+/// Slab operations (slab_cache_.try_alloc, slab_cache_.try_free) are fully lock-free (MPMC).
 /// Callers must hold mtx_ (via portion_lock()) only when scanning or modifying the bitmap.
 ///
 struct InmemPortion {

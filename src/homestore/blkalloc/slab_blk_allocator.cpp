@@ -33,11 +33,14 @@ SlabBlkAllocator::SlabBlkAllocator(SlabBlkAllocConfig const& cfg, std::optional<
                                                               : cfg_.max_cache_blks_per_portion(),
                  chunk_id},
         metrics_{cfg_.unique_name_.c_str()} {
+    BLKALLOC_LOG(INFO, "creating allocator mode={} capacity={} persistent={} use_slab_cache={}",
+                 (cfg_.alloc_mode == AllocMode::CompactAlloc) ? "CompactAlloc" : "ExpandedAlloc", cfg_.capacity_,
+                 cfg_.persistent_, cfg_.use_slab_cache_);
+
     if (cfg_.alloc_mode == AllocMode::CompactAlloc) {
         if (cfg_.persistent_) {
             const bool is_recovery = buf.has_value();
-            ondisk_bm_ = std::make_unique< BitmapBlkAllocator >(cfg_, seg_mgr_, /*inject_slab_on_free=*/false,
-                                                                chunk_id, std::move(buf));
+            ondisk_bm_ = std::make_unique< BitmapBlkAllocator >(cfg_, seg_mgr_, chunk_id, std::move(buf));
             if (is_recovery) {
                 alloced_blk_count_.store(to_i64(ondisk_bm_->get_used_blks()), std::memory_order_relaxed);
             }
@@ -47,11 +50,10 @@ SlabBlkAllocator::SlabBlkAllocator(SlabBlkAllocConfig const& cfg, std::optional<
     }
 
     // ExpandedAlloc path
-    inmem_bm_ = std::make_unique< BitmapBlkAllocator >(cfg_, seg_mgr_, cfg_.use_slab_cache_, chunk_id);
+    inmem_bm_ = std::make_unique< BitmapBlkAllocator >(cfg_, seg_mgr_, chunk_id);
     if (cfg_.persistent_) {
         const bool is_recovery = buf.has_value();
-        ondisk_bm_ = std::make_unique< BitmapBlkAllocator >(cfg_, seg_mgr_, /*inject_slab_on_free=*/false, chunk_id,
-                                                            std::move(buf));
+        ondisk_bm_ = std::make_unique< BitmapBlkAllocator >(cfg_, seg_mgr_, chunk_id, std::move(buf));
         if (is_recovery) {
             alloced_blk_count_.store(to_i64(ondisk_bm_->get_used_blks()), std::memory_order_relaxed);
             inmem_bm_->copy_from(*ondisk_bm_);
@@ -81,15 +83,16 @@ SlabBlkAllocator::~SlabBlkAllocator() {
 
 void SlabBlkAllocator::load() {
     if (cfg_.alloc_mode != AllocMode::CompactAlloc) { return; }
+    BLKALLOC_LOG(INFO, "load: populating slab caches for CompactAlloc, persistent={}", cfg_.persistent_);
 
     if (cfg_.persistent_) {
         // Scan ondisk_bm_ to find which blocks are free, push only those into slab caches.
         for (auto& seg : seg_mgr_.segments()) {
             for (auto& p_ptr : seg.portions_) {
                 InmemPortion& portion = *p_ptr;
-                ondisk_bm_->scan_free_blks(portion, [&portion](BlkId const& bid) -> bool {
-                    portion.slab_cache_.free_blk(bid);
-                    return true; // keep scanning — entire portion fits in slab
+                ondisk_bm_->scan_free_blks(portion, [&portion](BlkId const& bid) -> blk_count_t {
+                    auto [status, remaining] = portion.slab_cache_.try_free(bid);
+                    return bid.blk_count() - remaining.blk_count();
                 });
             }
         }
@@ -102,7 +105,7 @@ void SlabBlkAllocator::load() {
                 for (blk_num_t b = portion.start_blk_; b < portion.end_blk_; b += max_slab_size) {
                     const blk_count_t count =
                         static_cast< blk_count_t >(std::min< blk_num_t >(max_slab_size, portion.end_blk_ - b));
-                    portion.slab_cache_.free_blk(BlkId{b, count, chunk_id_});
+                    portion.slab_cache_.try_free(BlkId{b, count, chunk_id_});
                 }
             }
         }
@@ -138,6 +141,8 @@ void SlabBlkAllocator::sweep_worker() {
             }
         }
 
+        BLKALLOC_LOG(DEBUG, "sweep: refilled total_cached_blks={}", blks_added);
+
         {
             std::unique_lock< std::mutex > lk{sweep_mutex_};
             sweep_blks_added_ = blks_added;
@@ -150,9 +155,9 @@ void SlabBlkAllocator::sweep_worker() {
 // scans inmem_bm_ for free bits, marks them as in-cache, and calls the producer lambda
 // to inject each range into the slab cache.
 void SlabBlkAllocator::fill_cache_for_portion(InmemPortion& portion) {
-    inmem_bm_->scan_free_blks(portion, [&portion](BlkId const& bid) -> bool {
-        portion.slab_cache_.free_blk(bid);
-        return !portion.slab_cache_.is_full();
+    inmem_bm_->scan_free_blks(portion, [&portion](BlkId const& bid) -> blk_count_t {
+        auto [status, remaining] = portion.slab_cache_.try_free(bid);
+        return bid.blk_count() - remaining.blk_count();
     });
 }
 
@@ -185,69 +190,141 @@ BlkAllocStatus SlabBlkAllocator::alloc_contiguous(BlkId& out_blkid) {
 BlkAllocStatus SlabBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const& hints, BlkIds& out_blkids) {
     COUNTER_INCREMENT(metrics_, num_alloc, 1);
 
-    // CompactAlloc: slab is the only allocator — no bitmap fallback.
-    if (cfg_.alloc_mode == AllocMode::CompactAlloc) {
-        SegmentManager::Segment& seg = seg_mgr_.select_segment(hints);
-        InmemPortion& portion = seg_mgr_.next_alloc_portion(seg);
-        const BlkAllocStatus status = portion.slab_cache_.try_alloc(nblks, hints.is_contiguous, out_blkids);
-        if (status == BlkAllocStatus::SUCCESS) {
-            alloced_blk_count_.fetch_add(nblks, std::memory_order_relaxed);
-        } else {
-            COUNTER_INCREMENT(metrics_, num_alloc_failure, 1);
+    // Slab cache path — used by both CompactAlloc (slab is the only source) and ExpandedAlloc with
+    // use_slab_cache_ (slab as fast cache backed by bitmap). The slab try_alloc is lock-free (MPMC).
+    // On miss the only difference is what we can refill from:
+    //   - ExpandedAlloc: fill_cache_for_portion() scans inmem_bm_ under portion lock, refills slab.
+    //   - CompactAlloc: no bitmap — retry across portions to ride out the transient gap from concurrent
+    //     break_up (pop-and-split of a large slab entry is not atomic).
+    blk_count_t slab_got{0}; // tracks blocks already obtained from slab PARTIAL results (non-contiguous)
+
+    if (cfg_.alloc_mode == AllocMode::CompactAlloc || cfg_.use_slab_cache_) {
+        const auto max_attempts = (cfg_.alloc_mode == AllocMode::CompactAlloc)
+            ? HS_DYNAMIC_CONFIG(blkallocator.max_varsize_blk_alloc_attempt)
+            : 1u;
+
+        // Excess collects blocks that couldn't be pushed back to slab during break-up / merge-down.
+        // For ExpandedAlloc these are freed back to the bitmap below.
+        BlkIds excess;
+        for (uint32_t retry{0}; retry < max_attempts; ++retry) {
+            SegmentManager::Segment& seg = seg_mgr_.select_segment(hints);
+            const auto num_portions = seg.portions_.size();
+            for (size_t p{0}; p < num_portions; ++p) {
+                InmemPortion& portion = seg_mgr_.next_alloc_portion(seg);
+                const blk_count_t remaining = nblks - slab_got;
+
+                BlkAllocStatus status =
+                    portion.slab_cache_.try_alloc(remaining, hints.is_contiguous, out_blkids, excess);
+
+                // On cache miss with a bitmap backing: refill the slab from bitmap and retry once.
+                if (status != BlkAllocStatus::SUCCESS && status != BlkAllocStatus::PARTIAL && inmem_bm_) {
+                    COUNTER_INCREMENT(metrics_, num_retries, 1);
+                    fill_cache_for_portion(portion);
+                    status = portion.slab_cache_.try_alloc(remaining, hints.is_contiguous, out_blkids, excess);
+                }
+
+                if (status == BlkAllocStatus::SUCCESS) {
+                    if (inmem_bm_ && portion.slab_cache_.needs_refill()) {
+                        request_sweep();
+                    }
+                    // Return excess blocks (from break-up that couldn't fit back into slab) to bitmap.
+                    if (inmem_bm_ && !excess.empty()) {
+                        BLKALLOC_LOG(DEBUG, "alloc nblks={}: returning {} excess blkids to bitmap", nblks,
+                                     excess.size());
+                        for (auto const& ebid : excess) { inmem_bm_->free(ebid); }
+                    }
+                    alloced_blk_count_.fetch_add(nblks, std::memory_order_relaxed);
+                    BLKALLOC_LOG(DEBUG, "alloc nblks={}: SUCCESS from slab portion=[{},{}), used_blks={}", nblks,
+                                 portion.start_blk_, portion.end_blk_, get_used_blks());
+                    return BlkAllocStatus::SUCCESS;
+                }
+
+                // PARTIAL from merge_down: keep the blocks we got and reduce the ask for the next portion.
+                if (status == BlkAllocStatus::PARTIAL) {
+                    blk_count_t got_this_round{0};
+                    for (auto const& bid : out_blkids) { got_this_round += bid.blk_count(); }
+                    slab_got = got_this_round;
+                    BLKALLOC_LOG(DEBUG, "alloc nblks={}: PARTIAL from slab, got {} so far", nblks, slab_got);
+                }
+            }
         }
-        return status;
+
+        // Return any accumulated excess back to bitmap.
+        if (inmem_bm_ && !excess.empty()) {
+            BLKALLOC_LOG(DEBUG, "alloc nblks={}: slab miss, returning {} excess blkids to bitmap", nblks,
+                         excess.size());
+            for (auto const& ebid : excess) { inmem_bm_->free(ebid); }
+        }
+
+        if (cfg_.alloc_mode == AllocMode::CompactAlloc) {
+            // CompactAlloc has no bitmap fallback. If we got partial results, free them back to slab.
+            for (auto const& bid : out_blkids) {
+                auto& portion = seg_mgr_.blkid_to_portion(bid.blk_num());
+                portion.slab_cache_.try_free(bid);
+            }
+            out_blkids.clear();
+            BLKALLOC_LOG(DEBUG, "alloc nblks={}: CompactAlloc SPACE_FULL after {} attempts", nblks, max_attempts);
+            COUNTER_INCREMENT(metrics_, num_alloc_failure, 1);
+            return BlkAllocStatus::SPACE_FULL;
+        }
     }
 
-    // ExpandedAlloc path
-    if (cfg_.use_slab_cache_) {
-        // Step 1: try the slab cache of the selected portion.
-        SegmentManager::Segment& seg = seg_mgr_.select_segment(hints);
-        InmemPortion& portion = seg_mgr_.next_alloc_portion(seg);
-
-        BlkAllocStatus status = portion.slab_cache_.try_alloc(nblks, hints.is_contiguous, out_blkids);
-
-        // Step 2: on cache miss, fill the cache inline and retry once.
-        if (status != BlkAllocStatus::SUCCESS) {
-            COUNTER_INCREMENT(metrics_, num_retries, 1);
-            fill_cache_for_portion(portion);
-            status = portion.slab_cache_.try_alloc(nblks, hints.is_contiguous, out_blkids);
-        }
+    // Direct bitmap scan for remaining blocks (nblks - slab_got).
+    const blk_count_t bitmap_need = nblks - slab_got;
+    if (bitmap_need > 0) {
+        COUNTER_INCREMENT(metrics_, num_blks_alloc_direct, 1);
+        const BlkAllocStatus status = inmem_bm_->alloc(bitmap_need, hints, out_blkids);
 
         if (status == BlkAllocStatus::SUCCESS) {
-            if (portion.slab_cache_.needs_refill()) {
-                request_sweep();
-            }
             alloced_blk_count_.fetch_add(nblks, std::memory_order_relaxed);
             return BlkAllocStatus::SUCCESS;
         }
-    }
 
-    // Direct bitmap scan across all portions via inmem_bm_->alloc().
-    COUNTER_INCREMENT(metrics_, num_blks_alloc_direct, 1);
-    const BlkAllocStatus status = inmem_bm_->alloc(nblks, hints, out_blkids);
-
-    if (status == BlkAllocStatus::SUCCESS || status == BlkAllocStatus::PARTIAL) {
-        blk_count_t got{0};
-        for (auto const& bid : out_blkids) {
-            got += bid.blk_count();
+        if (status == BlkAllocStatus::PARTIAL) {
+            // Got some from bitmap but not all — count total across slab + bitmap results.
+            blk_count_t total_got{0};
+            for (auto const& bid : out_blkids) { total_got += bid.blk_count(); }
+            alloced_blk_count_.fetch_add(total_got, std::memory_order_relaxed);
+            return BlkAllocStatus::PARTIAL;
         }
-        alloced_blk_count_.fetch_add(got, std::memory_order_relaxed);
-    } else {
+
+        // Bitmap also failed. If we have slab partial results, return those as PARTIAL.
+        if (slab_got > 0) {
+            alloced_blk_count_.fetch_add(slab_got, std::memory_order_relaxed);
+            return BlkAllocStatus::PARTIAL;
+        }
+
+        BLKALLOC_LOG(DEBUG, "alloc nblks={}: bitmap direct SPACE_FULL, used_blks={} available={}", nblks,
+                     get_used_blks(), available_blks());
         COUNTER_INCREMENT(metrics_, num_alloc_failure, 1);
+        return status;
     }
 
-    return status;
+    // slab_got == nblks: slab PARTIAL results across portions fully satisfied the request.
+    alloced_blk_count_.fetch_add(nblks, std::memory_order_relaxed);
+    return BlkAllocStatus::SUCCESS;
 }
 
 // ---- free ----
 
 void SlabBlkAllocator::free(BlkId const& bid) {
+    BLKALLOC_LOG(DEBUG, "free bid=[blk={} count={} chunk={}]", bid.blk_num(), bid.blk_count(), bid.chunk_num());
+
     if (cfg_.alloc_mode == AllocMode::CompactAlloc) {
-        // CompactAlloc: free directly into slab; update ondisk_bm_ if persistent.
+        // CompactAlloc: slab is the only source — try_free always succeeds (queues sized for all blocks).
         auto& portion = seg_mgr_.blkid_to_portion(bid.blk_num());
-        portion.slab_cache_.free_blk(bid);
+        portion.slab_cache_.try_free(bid);
+    } else if (cfg_.use_slab_cache_) {
+        // ExpandedAlloc with slab: try slab first, spill any remainder that didn't fit to bitmap.
+        auto& portion = seg_mgr_.blkid_to_portion(bid.blk_num());
+        auto [status, remaining] = portion.slab_cache_.try_free(bid);
+        if (status != BlkAllocStatus::SUCCESS) {
+            BLKALLOC_LOG(DEBUG, "free: slab try_free {}, remaining=[blk={} count={}] → bitmap", status,
+                         remaining.blk_num(), remaining.blk_count());
+            inmem_bm_->free(remaining);
+        }
     } else {
-        // ExpandedAlloc: inmem_bm_->free() resets bits and injects into slab (inject_slab_on_free=true).
+        // ExpandedAlloc without slab: straight to bitmap.
         inmem_bm_->free(bid);
     }
 

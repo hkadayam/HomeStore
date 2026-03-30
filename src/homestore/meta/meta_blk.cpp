@@ -17,62 +17,65 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "meta/meta_blk.hpp"
-#include "meta/meta_client.hpp"
-#include "device/virtual_dev.h" // VirtualDev
+#include "common/defs.h"
+#include "meta/meta_blk.h"
+#include "meta/meta_client.h"
+#include "device/virtual_dev.h"
 
 namespace homestore {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // MetaBlk Public APIs
 // ──────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< void > MetaBlk::write_data(const IOBuffer& buf, VirtualDev& vdev) {
+folly::coro::Task< void > MetaBlk::write_data(const sisl::ByteArray& data, VirtualDev& vdev) {
     const BlkId old_ovf = header().overflow_bid;
 
-    if (buf.size() <= max_inline_data_size()) {
-        std::memcpy(data_slice().data(), buf.data(), buf.size());
+    if (data->size() <= max_inline_data_size()) {
+        // Inline: copy payload into the cached block after the header.
+        std::memcpy(inline_data(), data->cbytes(), data->size());
         header().overflow_bid = BlkId{};
+        META_LOG(DEBUG, "write_data: name={} inline data_size={} blk_num={}", name(), data->size(), blkid.blk_num());
     } else {
-        // Allocate contiguous overflow blocks.
+        // Allocate contiguous overflow blocks for the data.
         const size_t blk_sz = vdev.block_size();
-        const auto n_ovf = static_cast< blk_count_t >((buf.size() + blk_sz - 1) / blk_sz);
-
+        const auto n_ovf = static_cast< blk_count_t >((data->size() + blk_sz - 1) / blk_sz);
         blk_alloc_hints hints{};
         BlkId ovf_bid{};
         BlkAllocStatus st = vdev.alloc_contiguous_blks(n_ovf, hints, ovf_bid);
         if (st != BlkAllocStatus::SUCCESS) { throw std::runtime_error{"MetaBlk::write_data: overflow alloc failed"}; }
-
-        co_await vdev.write(buf, ovf_bid);
+        co_await vdev.write(*data, ovf_bid);
         header().overflow_bid = ovf_bid;
+        META_LOG(DEBUG, "write_data: name={} overflow data_size={} ovf_blk_num={} ovf_nblks={}", name(), data->size(),
+                 ovf_bid.blk_num(), ovf_bid.blk_count());
     }
 
-    header().data_size = static_cast< uint32_t >(buf.size());
-    header().data_crc = crc32_ieee(0, buf.data(), buf.size());
+    header().data_size = to_u32(data->size());
+    header().data_crc = crc32_ieee(0, data->cbytes(), data->size());
 
-    // Write this block (header + inline data) to disk.
-    co_await vdev.write(buffer, blkid);
+    // Write the single cached block (header + inline data) to disk.
+    co_await vdev.write(*buffer, blkid);
 
     // Free the old overflow block now that new data is safely on disk.
     if (old_ovf.is_valid()) { vdev.free_blk(old_ovf); }
 }
 
-folly::coro::Task< IOBuffer > MetaBlk::read_data(VirtualDev& vdev) const {
-    const MetaBlkHeader& hdr = header();
-    const size_t data_sz = hdr.data_size;
+folly::coro::Task< sisl::ByteView > MetaBlk::read_data(VirtualDev& vdev) const {
+    const uint32_t data_sz = header().data_size;
 
-    IOBuffer out{data_sz};
-
-    if (hdr.data_size <= max_inline_data_size()) {
-        // Inline: copy directly from the cached buffer.
-        std::memcpy(out.data(), data_slice().data(), data_sz);
-    } else {
-        // Overflow: read from the overflow blocks.
-        auto [err, out2] = co_await vdev.read(std::move(out), hdr.overflow_bid);
-        if (err) { throw std::system_error{err, "MetaBlk::read_data: overflow read failed"}; }
-        co_return std::move(out2);
+    if (!header().overflow_bid.is_valid()) {
+        META_LOG(DEBUG, "read_data: name={} inline data_size={} blk_num={}", name(), data_sz, blkid.blk_num());
+        co_return sisl::ByteView{buffer, to_u32(MetaBlkHeader::SIZE), data_sz};
     }
 
-    co_return out;
+    // Overflow: read from overflow blocks on disk into a new ByteArray, then wrap as ByteView.
+    const BlkId ovf = header().overflow_bid;
+    META_LOG(DEBUG, "read_data: name={} overflow data_size={} ovf_blk_num={} ovf_nblks={}", name(), data_sz,
+             ovf.blk_num(), ovf.blk_count());
+    auto out = sisl::make_byte_array(data_sz);
+    auto err = co_await vdev.read(*out, ovf);
+    if (err) { throw std::system_error{err, "MetaBlk::read_data: overflow read failed"}; }
+    META_LOG(DEBUG, "read_data: name={} overflow read complete", name());
+    co_return sisl::ByteView{std::move(out)};
 }
 
 folly::coro::Task< void > MetaBlk::free(VirtualDev& vdev) {
@@ -86,7 +89,8 @@ folly::coro::Task< void > MetaBlk::free(VirtualDev& vdev) {
 // ──────────────────────────────────────────────────────────────────────────────
 folly::coro::Task< void > MetaBlk::update_next_bid(BlkId next, VirtualDev& vdev) {
     header().next_bid = next;
-    co_await vdev.write(buffer, blkid);
+    // Write the cached block back to disk with the updated header.
+    co_await vdev.write(*buffer, blkid);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -102,11 +106,13 @@ folly::coro::Task< MetaBlkWrapper > MetaBlkWrapper::create(shared< MetaClient > 
 }
 
 folly::coro::Task< void > MetaBlkWrapper::write(const uint8_t* data, size_t len) {
-    IOBuffer buf{len};
-    std::memcpy(buf.data(), data, len);
-    co_await client_->write_meta_blk(meta_blk_.clone(), buf);
+    auto buf = sisl::make_byte_array(to_u32(len));
+    std::memcpy(buf->bytes(), data, len);
+    co_await client_->write_meta_blk(meta_blk_, buf);
 }
 
-folly::coro::Task< IOBuffer > MetaBlkWrapper::read() { co_return co_await client_->read_meta_blk(meta_blk_); }
+folly::coro::Task< sisl::ByteView > MetaBlkWrapper::read() {
+    co_return co_await client_->read_meta_blk(meta_blk_);
+}
 
 } // namespace homestore

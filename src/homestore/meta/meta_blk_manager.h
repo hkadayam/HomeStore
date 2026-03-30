@@ -24,11 +24,11 @@
 #include <folly/coro/Task.h>
 
 #include <homestore/blk.h>              // BlkId
-#include <homestore/homestore_decl.hpp> // shared<>, unique<>
+#include "common/defs.h" // shared<>, unique<>, cshared<>
 
 #include "iomanager/drive_interface.hpp" // IOBuffer
-#include "meta/meta_client.hpp"      // MetaClient
-#include "meta/meta_client_info.hpp" // MetaClientInfo, MAX_META_CLIENTS
+#include "meta/meta_client.h"      // MetaClient
+#include "meta/meta_client_info.h" // MetaClientInfo, MAX_META_CLIENTS
 
 namespace homestore {
 
@@ -115,6 +115,7 @@ private:
 
     // ── Private helpers ───────────────────────────────────────────────────────
     folly::coro::Task< void > load_client_info_from_disk();
+    folly::coro::Mutex mgmt_mutex_;
 
     /// Find the first free slot, mark it allocated, return its index. Throws std::runtime_error if all slots are
     /// occupied.

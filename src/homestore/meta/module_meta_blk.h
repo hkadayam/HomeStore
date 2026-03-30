@@ -23,13 +23,13 @@
 #include <type_traits>
 
 #include <folly/coro/Task.h>
+#include <sisl/fds/buffer.h>
 
-#include <homestore/homestore_decl.hpp> // shared<>, unique<>
+#include "common/defs.h"
 
-#include "iomanager/drive_interface.hpp" // IOBuffer
-#include "meta/meta_blk.hpp"         // MetaBlk
-#include "managers.h"                    // meta_mgr()
-#include "meta/meta_client.hpp"      // MetaClient
+#include "meta/meta_blk.h"
+#include "managers.h"
+#include "meta/meta_client.h"
 
 namespace homestore {
 
@@ -39,7 +39,7 @@ inline std::atomic< uint64_t > g_module_counter{0};
 // ──────────────────────────────────────────────────────────────────────────────
 // ModuleMetaBlk<T>
 //
-// A typed, single-block metadata wrapper.  Analogous to the previous superblk<T> pattern but built on top of the new
+// A typed, single-block metadata wrapper. Analogous to the previous superblk<T> pattern but built on top of the new
 // MetaClient/MetaBlk layer.
 //
 // # Type requirements for T
@@ -48,8 +48,8 @@ inline std::atomic< uint64_t > g_module_counter{0};
 //   - Default-constructible           (used on fresh creation)
 //
 // # Concurrency model
-//   ModuleMetaBlk<T> itself is NOT thread-safe.  The caller must provide external synchronisation (e.g.
-//   folly::coro::Mutex) if concurrent access is needed.  The underlying MetaClient has its own internal locking that
+//   ModuleMetaBlk<T> itself is NOT thread-safe. The caller must provide external synchronisation (e.g.
+//   folly::coro::Mutex) if concurrent access is needed. The underlying MetaClient has its own internal locking that
 //   only protects its chain bookkeeping.
 //
 // # Usage
@@ -79,7 +79,7 @@ public:
     /// - If `size` is nullopt, sizeof(T) is used as the buffer size.
     /// - On first call (no existing data): T is default-constructed in the buffer; the block is allocated but NOT
     ///   written until write() is called.
-    /// - On recovery (existing data found): the recovered IOBuffer is used directly; the T it contains is accessible
+    /// - On recovery (existing data found): the recovered ByteArray is used directly; the T it contains is accessible
     ///   immediately.
     static folly::coro::Task< ModuleMetaBlk< T > > open(std::string name, std::optional< size_t > size = std::nullopt) {
         if (name.empty()) {
@@ -101,12 +101,11 @@ public:
 
     // ── Typed data access ─────────────────────────────────────────────────────
 
-    /// Direct pointer to T within the IOBuffer (read-only).
-    const T* get() const { return reinterpret_cast< const T* >(buffer_.data()); }
+    /// Direct pointer to T within the buffer (read-only).
+    const T* get() const { return reinterpret_cast< const T* >(buffer_->cbytes()); }
 
-    /// Direct pointer to T within the IOBuffer (mutable).
-    /// Modifications are in-place; call write() to persist.
-    T* get() { return reinterpret_cast< T* >(buffer_.data()); }
+    /// Direct pointer to T within the buffer (mutable). Modifications are in-place; call write() to persist.
+    T* get() { return reinterpret_cast< T* >(buffer_->bytes()); }
 
     /// Operator overloads for ergonomic field access (cfg->field instead of cfg.get()->field).
     T* operator->() { return get(); }
@@ -118,12 +117,11 @@ public:
 
     /// Persist the current contents of T to disk.
     folly::coro::Task< void > write() {
-        co_await client_.write_meta_blk(meta_blk_.clone(), buffer_);
+        co_await client_.write_meta_blk(meta_blk_, buffer_);
         is_persisted_ = true;
     }
 
-    /// Remove this module's metadata from disk.
-    /// After destroy() the object must not be used for further writes.
+    /// Remove this module's metadata from disk. After destroy() the object must not be used for further writes.
     folly::coro::Task< void > destroy() {
         if (is_persisted_) {
             co_await client_.remove_meta_blk(meta_blk_);
@@ -134,16 +132,16 @@ public:
     // ── Metadata ──────────────────────────────────────────────────────────────
 
     std::string_view name() const { return name_; }
-    size_t size() const { return buffer_.size(); }
+    size_t size() const { return buffer_->size(); }
 
     // ── Resize ────────────────────────────────────────────────────────────────
 
     /// Reallocate the buffer to new_size and reinitialise T with T{}.
     /// The caller must re-populate fields and call write() afterwards.
     T& resize(size_t new_size) {
-        buffer_ = IOBuffer{new_size};
+        buffer_ = sisl::make_byte_array(to_u32(new_size));
         T default_val{};
-        std::memcpy(buffer_.data(), &default_val, sizeof(T));
+        std::memcpy(buffer_->bytes(), &default_val, sizeof(T));
         return *get();
     }
 
@@ -157,7 +155,7 @@ public:
 private:
     MetaClient client_;
     MetaBlk meta_blk_;
-    IOBuffer buffer_;
+    sisl::ByteArray buffer_;
     std::string name_;
     bool is_persisted_{false};
 
@@ -165,22 +163,22 @@ private:
     // ── Private factory helpers ───────────────────────────────────────────────
     static folly::coro::Task< ModuleMetaBlk< T > > load_existing(MetaClient client, std::string name,
                                                                  size_t /*buf_sz*/) {
-        // Stream recovered blocks lazily; we only expect one block per module.
         ModuleMetaBlk< T > m;
         bool found = false;
 
-        co_await client.for_each_recovered_block([&m, &found](MetaBlk blk, IOBuffer data) -> folly::coro::Task< void > {
-            if (!found) {
-                if (data.size() < sizeof(T)) {
-                    throw std::runtime_error{"ModuleMetaBlk::load_existing: recovered data too small"};
+        co_await client.for_each_recovered_block(
+            [&m, &found](const MetaBlk& blk, const sisl::ByteView& data) -> folly::coro::Task< void > {
+                if (!found) {
+                    if (data.size() < sizeof(T)) {
+                        throw std::runtime_error{"ModuleMetaBlk::load_existing: recovered data too small"};
+                    }
+                    m.meta_blk_ = blk;
+                    m.buffer_ = data.extract();
+                    m.is_persisted_ = true;
+                    found = true;
                 }
-                m.meta_blk_ = std::move(blk);
-                m.buffer_ = std::move(data);
-                m.is_persisted_ = true;
-                found = true;
-            }
-            co_return;
-        });
+                co_return;
+            });
 
         if (!found) {
             throw std::runtime_error{"ModuleMetaBlk::load_existing: expected a recovered block but found none"};
@@ -193,11 +191,11 @@ private:
 
     static folly::coro::Task< ModuleMetaBlk< T > > create_new(MetaClient client, std::string name, size_t buf_sz) {
         ModuleMetaBlk< T > m;
-        m.buffer_ = IOBuffer{buf_sz};
+        m.buffer_ = sisl::make_byte_array(to_u32(buf_sz));
 
         // Placement-initialise T with its default value.
         T default_val{};
-        std::memcpy(m.buffer_.data(), &default_val, sizeof(T));
+        std::memcpy(m.buffer_->bytes(), &default_val, sizeof(T));
 
         // Pre-allocate the MetaBlk (not written to disk until write() is called).
         m.meta_blk_ = co_await client.create_meta_blk(name, buf_sz);

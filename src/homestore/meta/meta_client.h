@@ -25,11 +25,11 @@
 #include <folly/coro/Task.h>
 
 #include <homestore/blk.h>              // BlkId
-#include <homestore/homestore_decl.hpp> // shared<>, unique<>
+#include "common/defs.h" // shared<>, unique<>, cshared<>
 
 #include "iomanager/drive_interface.hpp" // IOBuffer
-#include "meta/meta_blk.hpp"         // MetaBlk
-#include "meta/meta_client_info.hpp" // MetaClientInfo
+#include "meta/meta_blk.h"         // MetaBlk
+#include "meta/meta_client_info.h" // MetaClientInfo
 
 namespace homestore {
 
@@ -84,22 +84,22 @@ public:
     /// - New block (is_fresh == true): data written, block appended to the tail, client info updated on disk,
     ///   and is_fresh set to false so subsequent calls overwrite in-place.
     /// - Existing block (is_fresh == false): data is overwritten in-place; no relinking.
-    folly::coro::Task< void > write_meta_blk(MetaBlk& blk, const IOBuffer& data);
+    folly::coro::Task< void > write_meta_blk(MetaBlk& blk, const sisl::ByteArray& data);
 
     /// Read the payload from an existing MetaBlk.
-    folly::coro::Task< IOBuffer > read_meta_blk(const MetaBlk& blk);
+    folly::coro::Task< sisl::ByteView > read_meta_blk(const MetaBlk& blk);
 
     /// Remove a MetaBlk from the chain and free all its blocks on the vdev.
     folly::coro::Task< void > remove_meta_blk(const MetaBlk& blk);
 
     // ── Recovery ──────────────────────────────────────────────────────────────
 
-    /// Iterate over all recovered blocks lazily, one IOBuffer at a time.
+    /// Iterate over all recovered blocks lazily, one block at a time.
     ///
-    /// visitor signature: folly::coro::Task<void>(MetaBlk, IOBuffer)
+    /// visitor signature: folly::coro::Task<void>(const MetaBlk&, sisl::ByteView)
     ///
-    /// Each IOBuffer is released before the next block is read, keeping peak memory at O(1) blocks.  Replaces the Rust
-    /// recovered_blocks() Stream.
+    /// For inline data the ByteView is a zero-copy window into the cached block buffer. For overflow data the ByteView
+    /// wraps a freshly read ByteArray that is released after the visitor returns.
     template < typename Visitor >
     folly::coro::Task< void > for_each_recovered_block(Visitor visitor);
 
@@ -137,20 +137,24 @@ folly::coro::Task< void > MetaClient::for_each_recovered_block(Visitor visitor) 
         }
     }
 
-    // Read and visit one block at a time (lazy — O(1) IOBuffers live at once).
-    for (const BlkId& id : blk_ids) {
+    // Read and visit one block at a time.
+    META_LOG(DEBUG, "for_each_recovered_block: {} blocks to iterate", blk_ids.size());
+    for (size_t i = 0; i < blk_ids.size(); ++i) {
+        const BlkId& id = blk_ids[i];
         MetaBlk blk_copy;
         {
             auto lock = co_await state_->mutex.co_scoped_lock();
             auto it = state_->meta_blks.find(id);
             if (it == state_->meta_blks.end()) continue; // removed concurrently
-            blk_copy = it->second.clone();
+            blk_copy = it->second; // shared_ptr refcount bump, no memcpy
         }
 
-        IOBuffer data = co_await blk_copy.read_data(*meta_vdev_);
-
-        // 'data' is released after visitor returns, before the next iteration.
-        co_await visitor(std::move(blk_copy), std::move(data));
+        META_LOG(DEBUG, "for_each_recovered_block: [{}/{}] name={} blk_num={} reading data", i, blk_ids.size(),
+                 blk_copy.name(), id.blk_num());
+        sisl::ByteView data = co_await blk_copy.read_data(*meta_vdev_);
+        META_LOG(DEBUG, "for_each_recovered_block: [{}/{}] name={} read done, calling visitor", i, blk_ids.size(),
+                 blk_copy.name());
+        co_await visitor(blk_copy, std::move(data));
     }
 }
 

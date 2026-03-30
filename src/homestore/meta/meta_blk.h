@@ -18,7 +18,6 @@
 #include <cstdint>
 #include <cstring>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 
@@ -26,11 +25,15 @@
 
 #include <homestore/blk.h>              // BlkId, BlkAllocStatus, blk_alloc_hints
 #include <homestore/crc.h>              // crc32_ieee
-#include <homestore/homestore_decl.hpp> // shared<>, unique<>
+#include "common/defs.h"                // shared<>, unique<>, to_u32
+#include "base/homestore_assert.hpp"    // HS_SUBMOD_LOG
 
 #include "iomanager/drive_interface.hpp" // IOBuffer
+#include <sisl/fds/buffer.h>            // ByteArray, make_byte_array
 
 namespace homestore {
+
+#define META_LOG(level, msg, ...) HS_SUBMOD_LOG(level, metablk, , "metablk", "meta", msg, ##__VA_ARGS__)
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Forward declarations
@@ -47,8 +50,8 @@ static constexpr size_t META_BLK_HEADER_SIZE = 64;
 // ──────────────────────────────────────────────────────────────────────────────
 // MetaBlkHeader
 //
-// Stored at byte 0 of every MetaBlk's IOBuffer. Exactly META_BLK_HEADER_SIZE
-// bytes (64) so that user data always begins at a clean, known offset.
+// On-disk header stored at byte 0 of every meta block. Exactly 64 bytes so
+// that user data always begins at a clean, known offset.
 // ──────────────────────────────────────────────────────────────────────────────
 #pragma pack(1)
 struct MetaBlkHeader {
@@ -92,37 +95,34 @@ static_assert(sizeof(MetaBlkHeader) == META_BLK_HEADER_SIZE,
 // ──────────────────────────────────────────────────────────────────────────────
 // MetaBlk
 //
-// One metadata block owned by a MetaClient. The IOBuffer holds a
-// MetaBlkHeader at offset 0 followed by inline payload, or just the header
-// with overflow_bid pointing to separately allocated overflow blocks.
+// One metadata block owned by a MetaClient. Caches exactly one disk block
+// (header + inline data) in a ByteArray (shared<IoBlobSafe>). Overflow data
+// lives in separate blocks referenced by overflow_bid — never cached here.
 //
 // prev_bid is kept in memory only (not persisted in the header) to support
 // O(1) removal from the doubly-linked chain.
 //
-// MetaBlk is move-only (IOBuffer is move-only). Use clone() for an explicit
-// deep copy.
+// Copyable via shared_ptr refcount bump — no buffer memcpy on copy.
 // ──────────────────────────────────────────────────────────────────────────────
 class MetaBlk {
 public:
-    BlkId blkid{};       // Block ID on the vdev
-    BlkId prev_bid{};    // Previous block in chain (in-memory only)
-    IOBuffer buffer;     // header (64 B) + inline data
-    bool is_fresh{true}; // true until first write into the client's chain
+    BlkId blkid{};              // Block ID on the vdev
+    BlkId prev_bid{};           // Previous block in chain (in-memory only)
+    sisl::ByteArray buffer;     // Exactly one block: header (64 B) + inline data (shared ownership)
+    bool is_fresh{true};        // true until first write into the client's chain
 
     // ── Factory ──────────────────────────────────────────────────────────────
-    static MetaBlk create(BlkId blkid, size_t estimated_size, std::string_view name) {
+    static MetaBlk create(BlkId blkid, uint32_t blk_sz, std::string_view name) {
         MetaBlk blk;
         blk.blkid = blkid;
-        blk.prev_bid = BlkId{};
-        blk.buffer = IOBuffer(estimated_size);
+        blk.buffer = sisl::make_byte_array(blk_sz);
         blk.is_fresh = true;
         MetaBlkHeader hdr = MetaBlkHeader::make(name);
-        std::memcpy(blk.buffer.data(), &hdr, MetaBlkHeader::SIZE);
+        std::memcpy(blk.buffer->bytes(), &hdr, MetaBlkHeader::SIZE);
         return blk;
     }
 
-    /// Construct a MetaBlk from an already-read disk buffer. No allocation.
-    static MetaBlk load(BlkId blkid, BlkId prev_bid, IOBuffer buf) {
+    static MetaBlk load(BlkId blkid, BlkId prev_bid, sisl::ByteArray buf) {
         MetaBlk blk;
         blk.blkid = blkid;
         blk.prev_bid = prev_bid;
@@ -132,62 +132,45 @@ public:
     }
 
     // ── Accessors ────────────────────────────────────────────────────────────
-    MetaBlkHeader& header() { return *reinterpret_cast< MetaBlkHeader* >(buffer.data()); }
-    const MetaBlkHeader& header() const { return *reinterpret_cast< const MetaBlkHeader* >(buffer.data()); }
+    MetaBlkHeader& header() { return *reinterpret_cast< MetaBlkHeader* >(buffer->bytes()); }
+    const MetaBlkHeader& header() const { return *reinterpret_cast< const MetaBlkHeader* >(buffer->cbytes()); }
 
     std::string name() const { return header().get_name(); }
 
-    /// Mutable view of the payload bytes (after the header).
-    std::span< uint8_t > data_slice() {
-        return {buffer.data() + MetaBlkHeader::SIZE, buffer.size() - MetaBlkHeader::SIZE};
-    }
-    std::span< const uint8_t > data_slice() const {
-        return {buffer.data() + MetaBlkHeader::SIZE, buffer.size() - MetaBlkHeader::SIZE};
-    }
+    /// Inline data region: everything after the header in the single cached block.
+    uint8_t* inline_data() { return buffer->bytes() + MetaBlkHeader::SIZE; }
+    const uint8_t* inline_data() const { return buffer->cbytes() + MetaBlkHeader::SIZE; }
 
-    size_t max_inline_data_size() const { return buffer.size() - MetaBlkHeader::SIZE; }
+    size_t max_inline_data_size() const { return buffer->size() - MetaBlkHeader::SIZE; }
 
     static uint32_t data_size_to_nblks(size_t data_size, size_t block_size) {
-        return static_cast< uint32_t >((data_size + MetaBlkHeader::SIZE + block_size - 1) / block_size);
+        return to_u32((data_size + MetaBlkHeader::SIZE + block_size - 1) / block_size);
     }
 
     // ── Public async I/O ─────────────────────────────────────────────────────
 
-    /// Write payload to disk. Stores inline if it fits, allocates overflow
-    /// blocks otherwise. Updates data_size/data_crc in the header, writes the
-    /// block, then frees any previous overflow block.
-    folly::coro::Task< void > write_data(const IOBuffer& data, VirtualDev& vdev);
+    /// Write payload to disk. Stores inline if it fits in one block, allocates overflow blocks otherwise. Updates
+    /// data_size/data_crc in the header, writes the block, then frees any previous overflow block.
+    folly::coro::Task< void > write_data(const sisl::ByteArray& data, VirtualDev& vdev);
 
-    /// Read the payload from disk and return it in a new IOBuffer. Reads from
-    /// overflow blocks when overflow_bid is valid.
-    folly::coro::Task< IOBuffer > read_data(VirtualDev& vdev) const;
+    /// Read the payload. Returns a ByteView into the cached buffer for inline data (zero copy, zero I/O) or reads
+    /// overflow blocks from disk into a new ByteArray and wraps it in a ByteView.
+    folly::coro::Task< sisl::ByteView > read_data(VirtualDev& vdev) const;
 
     /// Free this block (and any overflow blocks) on the vdev.
     folly::coro::Task< void > free(VirtualDev& vdev);
 
-    // ── Deep copy ────────────────────────────────────────────────────────────
-    MetaBlk clone() const {
-        MetaBlk c;
-        c.blkid = blkid;
-        c.prev_bid = prev_bid;
-        c.buffer = IOBuffer(buffer.size());
-        std::memcpy(c.buffer.data(), buffer.data(), buffer.size());
-        c.is_fresh = is_fresh;
-        return c;
-    }
-
-    // ── Move-only ────────────────────────────────────────────────────────────
+    // ── Copyable (shared_ptr refcount bump), movable ─────────────────────────
     MetaBlk() = default;
+    MetaBlk(const MetaBlk&) = default;
+    MetaBlk& operator=(const MetaBlk&) = default;
     MetaBlk(MetaBlk&&) = default;
     MetaBlk& operator=(MetaBlk&&) = default;
-    MetaBlk(const MetaBlk&) = delete;
-    MetaBlk& operator=(const MetaBlk&) = delete;
 
 private:
     friend class MetaClient;
 
-    /// Update next_bid in the on-disk header. Only MetaClient calls this when
-    /// chaining a new block onto the tail or relinking after a removal.
+    /// Update next_bid in the on-disk header and write the cached block back to disk.
     folly::coro::Task< void > update_next_bid(BlkId next, VirtualDev& vdev);
 };
 
@@ -212,7 +195,7 @@ public:
     }
 
     folly::coro::Task< void > write(const uint8_t* data, size_t len);
-    folly::coro::Task< IOBuffer > read();
+    folly::coro::Task< sisl::ByteView > read();
 
     const MetaBlk& meta_blk() const { return meta_blk_; }
     shared< MetaClient > meta_client() const { return client_; }

@@ -18,9 +18,10 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "meta/meta_client.hpp"
-#include "meta/meta_blk_manager.hpp" // META_SUPER_HEADER_SIZE
-#include "device/virtual_dev.h"      // VirtualDev
+#include "common/defs.h"
+#include "meta/meta_client.h"
+#include "meta/meta_blk_manager.h" // META_SUPER_HEADER_SIZE
+#include "device/virtual_dev.h"
 
 namespace homestore {
 
@@ -61,24 +62,36 @@ folly::coro::Task< MetaClient > MetaClient::load(MetaClientInfo info, shared< Vi
     BlkId current_bid = info.first_blkid;
     BlkId prev_bid{};
 
-    const size_t blk_sz = vdev->block_size();
+    META_LOG(DEBUG, "load: client_id={} first_blk_num={} walking chain", client_id,
+             current_bid.is_valid() ? current_bid.blk_num() : 0);
+    const uint32_t blk_sz = to_u32(vdev->block_size());
     while (current_bid.is_valid()) {
-        const size_t full_sz = static_cast< size_t >(current_bid.blk_count()) * blk_sz;
-        IOBuffer full_buf{full_sz};
-        auto [err, full_buf_out] = co_await vdev->read(std::move(full_buf), current_bid);
+        // Read only the first block of the extent — that's the header + inline data we cache.
+        BlkId first_blk{current_bid.blk_num(), 1, current_bid.chunk_num()};
+        auto one_blk = sisl::make_byte_array(blk_sz);
+        auto err = co_await vdev->read(*one_blk, first_blk);
         if (err) break;
 
-        const auto& hdr = *reinterpret_cast< const MetaBlkHeader* >(full_buf_out.data());
+        const auto& hdr = *reinterpret_cast< const MetaBlkHeader* >(one_blk->cbytes());
         if (!hdr.is_valid()) break;
 
         const BlkId next_bid = hdr.next_bid;
+        META_LOG(DEBUG, "load: client_id={} chain blk_num={} name={} data_size={} overflow={} next_valid={}", client_id,
+                 current_bid.blk_num(), hdr.get_name(), hdr.data_size, hdr.overflow_bid.is_valid(),
+                 next_bid.is_valid());
 
         tail_blkid = current_bid;
-        meta_blks.emplace(current_bid, MetaBlk::load(current_bid, prev_bid, std::move(full_buf_out)));
+
+        // Reserve the header block and any overflow blocks in the allocator so they are not reallocated.
+        vdev->commit_blk(current_bid);
+        if (hdr.overflow_bid.is_valid()) { vdev->commit_blk(hdr.overflow_bid); }
+
+        meta_blks.emplace(current_bid, MetaBlk::load(current_bid, prev_bid, std::move(one_blk)));
 
         prev_bid = current_bid;
         current_bid = next_bid;
     }
+    META_LOG(DEBUG, "load: client_id={} chain walk done, {} blocks loaded", client_id, meta_blks.size());
 
     auto state = std::make_shared< MetaClientState >();
     state->info = std::move(info);
@@ -116,30 +129,26 @@ folly::coro::Task< size_t > MetaClient::num_meta_blks() const {
 // ──────────────────────────────────────────────────────────────────────────────
 folly::coro::Task< MetaBlk > MetaClient::create_meta_blk(std::string_view name,
                                                          std::optional< size_t > estimated_data_size) {
-    const size_t blk_sz = meta_vdev_->block_size();
+    const uint32_t blk_sz = to_u32(meta_vdev_->block_size());
 
-    // Round up to whole blocks.
-    const size_t est = estimated_data_size.value_or(0);
-    const uint32_t nblks = MetaBlk::data_size_to_nblks(est, blk_sz);
-
+    // Allocate one block for the header + inline data.
     blk_alloc_hints hints{};
     BlkId out_bid{};
-    BlkAllocStatus st = meta_vdev_->alloc_contiguous_blks(static_cast< blk_count_t >(nblks), hints, out_bid);
-
+    BlkAllocStatus st = meta_vdev_->alloc_contiguous_blks(1, hints, out_bid);
     if (st != BlkAllocStatus::SUCCESS) { throw std::runtime_error{"MetaClient::create_meta_blk: alloc failed"}; }
 
-    co_return MetaBlk::create(out_bid, static_cast< size_t >(nblks) * blk_sz, name);
+    co_return MetaBlk::create(out_bid, blk_sz, name);
 }
 
 folly::coro::Task< std::optional< MetaBlk > > MetaClient::get_meta_blk(std::string_view name) {
     auto lock = co_await state_->mutex.co_scoped_lock();
     for (const auto& [id, blk] : state_->meta_blks) {
-        if (blk.header().get_name() == name) { co_return blk.clone(); }
+        if (blk.header().get_name() == name) { co_return blk; }
     }
     co_return std::nullopt;
 }
 
-folly::coro::Task< void > MetaClient::write_meta_blk(MetaBlk mblk, const IOBuffer& data) {
+folly::coro::Task< void > MetaClient::write_meta_blk(MetaBlk& mblk, const sisl::ByteArray& data) {
     // Write data to disk (inline or overflow). Done *before* acquiring state lock so I/O doesn't hold up other callers.
     co_await mblk.write_data(data, *meta_vdev_);
 
@@ -147,35 +156,34 @@ folly::coro::Task< void > MetaClient::write_meta_blk(MetaBlk mblk, const IOBuffe
     const BlkId key = mblk.blkid;
 
     // ── In-place update (block already in chain) ──────────────────────────────
-    if (state_->meta_blks.count(key)) {
+    auto it = state_->meta_blks.find(key);
+    if (it != state_->meta_blks.end()) {
         assert(state_->info.first_blkid.is_valid());
-        state_->meta_blks.insert_or_assign(key, std::move(mblk));
+        it->second = mblk;
         co_return;
     }
 
     // ── New block: append to the tail ─────────────────────────────────────────
-    const BlkId new_bid = key;
-
     if (!state_->tail_blkid.is_valid()) {
         // First block in the chain.
-        state_->info.first_blkid = new_bid;
+        state_->info.first_blkid = key;
         co_await write_client_info(state_->info);
-        state_->meta_blks.emplace(key, std::move(mblk));
-        state_->tail_blkid = new_bid;
+        state_->meta_blks.emplace(key, mblk);
+        state_->tail_blkid = key;
     } else {
         // Link current tail → new block.
         const BlkId tail_bid = state_->tail_blkid;
-        auto it = state_->meta_blks.find(tail_bid);
-        if (it != state_->meta_blks.end()) {
+        auto tail_it = state_->meta_blks.find(tail_bid);
+        if (tail_it != state_->meta_blks.end()) {
             mblk.prev_bid = tail_bid;
-            co_await it->second.update_next_bid(new_bid, *meta_vdev_);
+            co_await tail_it->second.update_next_bid(key, *meta_vdev_);
         }
-        state_->meta_blks.emplace(key, std::move(mblk));
-        state_->tail_blkid = new_bid;
+        state_->meta_blks.emplace(key, mblk);
+        state_->tail_blkid = key;
     }
 }
 
-folly::coro::Task< IOBuffer > MetaClient::read_meta_blk(const MetaBlk& mblk) {
+folly::coro::Task< sisl::ByteView > MetaClient::read_meta_blk(const MetaBlk& mblk) {
     {
         auto lock = co_await state_->mutex.co_scoped_lock();
         if (!state_->meta_blks.count(mblk.blkid)) {
@@ -244,7 +252,7 @@ BlkId MetaClient::calc_info_bid(uint8_t client_id, const VirtualDev& vdev) {
 
     const size_t info_nblks = (MetaClientInfo::SIZE + blk_sz - 1) / blk_sz;
 
-    const uint32_t blk_num = static_cast< uint32_t >(client_id * info_nblks + n_super_blks);
+    const uint32_t blk_num = to_u32(client_id * info_nblks + n_super_blks);
 
     const chunk_num_t chunk_id = vdev.get_nth_chunk(0)->chunk_id();
 
@@ -256,8 +264,8 @@ folly::coro::Task< void > MetaClient::write_client_info(const MetaClientInfo& in
     MetaClientInfo updated = info;
     updated.update_crc();
 
-    IOBuffer buf{MetaClientInfo::SIZE};
-    std::memcpy(buf.data(), &updated, MetaClientInfo::SIZE);
+    IOBuffer buf{to_u32(MetaClientInfo::SIZE)};
+    std::memcpy(buf.bytes(), &updated, MetaClientInfo::SIZE);
     co_await meta_vdev_->write(buf, info_bid_);
 }
 

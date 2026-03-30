@@ -17,8 +17,9 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "common/defs.h"
 #include "managers.h"
-#include "meta/meta_blk_manager.hpp"
+#include "meta/meta_blk_manager.h"
 #include "device/device_manager.h"
 #include "device/virtual_dev.h"
 
@@ -38,7 +39,7 @@ folly::coro::Task< void > MetaBlkManager::create(uint64_t vdev_size) {
     params.alloc_type = BlkAllocatorType::SlabExtend;
     params.chunk_sel_type = ChunkSelectorType::OnlyOne;
 
-    shared< VirtualDev > vdev = co_await device_mgr().create_vdev(params);
+    shared< VirtualDev > vdev = co_await device_mgr().create_vdev(std::move(params));
     co_await vdev->format();
 
     const size_t blk_sz = vdev->block_size();
@@ -49,20 +50,20 @@ folly::coro::Task< void > MetaBlkManager::create(uint64_t vdev_size) {
     const BlkId client_info_bid{0u, nblks, chunk_id};
     vdev->commit_blk(client_info_bid);
 
-    auto mgr = unique< MetaBlkManager >(new MetaBlkManager{});
+    auto mgr = shared< MetaBlkManager >(new MetaBlkManager{});
     mgr->meta_vdev_ = vdev;
     mgr->client_info_bid_ = client_info_bid;
     mgr->client_slots_.assign(MAX_META_CLIENTS, 0);
 
     // Write super-header + empty client-info slots in one shot.
-    IOBuffer buf{MetaBlkSuperHeader::SIZE + MetaClientInfo::SIZE * MAX_META_CLIENTS};
+    IOBuffer buf{to_u32(MetaBlkSuperHeader::SIZE + MetaClientInfo::SIZE * MAX_META_CLIENTS)};
 
     const MetaBlkSuperHeader super = MetaBlkSuperHeader::make();
-    std::memcpy(buf.data(), &super, MetaBlkSuperHeader::SIZE);
+    std::memcpy(buf.bytes(), &super, MetaBlkSuperHeader::SIZE);
 
     for (size_t slot = 0; slot < MAX_META_CLIENTS; ++slot) {
         const MetaClientInfo empty_slot = MetaClientInfo::make_free();
-        uint8_t* dest = buf.data() + MetaBlkSuperHeader::SIZE + slot * MetaClientInfo::SIZE;
+        uint8_t* dest = buf.bytes() + MetaBlkSuperHeader::SIZE + slot * MetaClientInfo::SIZE;
         std::memcpy(dest, &empty_slot, MetaClientInfo::SIZE);
     }
 
@@ -77,14 +78,18 @@ folly::coro::Task< void > MetaBlkManager::create(uint64_t vdev_size) {
 folly::coro::Task< void > MetaBlkManager::load() {
     shared< VirtualDev > vdev = device_mgr().get_vdev("meta_vdev");
 
+    // Meta vdev is non-persistent: construct fresh block allocators so alloc/commit work after reload.
+    vdev->init_blk_allocator();
+
     const size_t blk_sz = vdev->block_size();
     const size_t total_meta_sz = MetaBlkSuperHeader::SIZE + MAX_META_CLIENTS * MetaClientInfo::SIZE;
     const auto nblks = static_cast< blk_count_t >((total_meta_sz + blk_sz - 1) / blk_sz);
 
     const chunk_num_t chunk_id = vdev->get_nth_chunk(0)->chunk_id();
     const BlkId client_info_bid{0u, nblks, chunk_id};
+    vdev->commit_blk(client_info_bid);
 
-    auto mgr = unique< MetaBlkManager >(new MetaBlkManager{});
+    auto mgr = shared< MetaBlkManager >(new MetaBlkManager{});
     mgr->meta_vdev_ = vdev;
     mgr->client_info_bid_ = client_info_bid;
     mgr->client_slots_.assign(MAX_META_CLIENTS, 0);
@@ -146,8 +151,8 @@ folly::coro::Task< void > MetaBlkManager::deregister_client(const MetaClient& cl
     const BlkId info_bid{blk_num, static_cast< blk_count_t >(info_nblks), chunk_id};
 
     MetaClientInfo freed = MetaClientInfo::make_free();
-    IOBuffer buf{MetaClientInfo::SIZE};
-    std::memcpy(buf.data(), &freed, MetaClientInfo::SIZE);
+    IOBuffer buf{to_u32(MetaClientInfo::SIZE)};
+    std::memcpy(buf.bytes(), &freed, MetaClientInfo::SIZE);
     co_await meta_vdev_->write(buf, info_bid);
 }
 
@@ -157,17 +162,20 @@ folly::coro::Task< void > MetaBlkManager::deregister_client(const MetaClient& cl
 folly::coro::Task< void > MetaBlkManager::load_client_info_from_disk() {
     const size_t total_sz = MetaBlkSuperHeader::SIZE + MAX_META_CLIENTS * MetaClientInfo::SIZE;
 
-    IOBuffer buf{total_sz};
-    auto [err, buf_out] = co_await meta_vdev_->read(std::move(buf), client_info_bid_);
+    META_LOG(DEBUG, "load_client_info_from_disk: reading {} bytes from blk_num={}", total_sz,
+             client_info_bid_.blk_num());
+    IOBuffer buf{to_u32(total_sz)};
+    auto err = co_await meta_vdev_->read(buf, client_info_bid_);
     if (err) { throw std::runtime_error{"MetaBlkManager: failed to read client info area"}; }
 
     // Validate super-header.
-    const auto& super = *reinterpret_cast< const MetaBlkSuperHeader* >(buf_out.data());
+    const auto& super = *reinterpret_cast< const MetaBlkSuperHeader* >(buf.bytes());
     if (!super.is_valid()) { throw std::runtime_error{"MetaBlkManager: invalid super-header magic/version"}; }
+    META_LOG(DEBUG, "load_client_info_from_disk: super-header valid, scanning {} client slots", MAX_META_CLIENTS);
 
     // Scan all client slots.
     for (size_t slot = 0; slot < MAX_META_CLIENTS; ++slot) {
-        const uint8_t* slot_ptr = buf_out.data() + MetaBlkSuperHeader::SIZE + slot * MetaClientInfo::SIZE;
+        const uint8_t* slot_ptr = buf.bytes() + MetaBlkSuperHeader::SIZE + slot * MetaClientInfo::SIZE;
 
         MetaClientInfo info;
         std::memcpy(&info, slot_ptr, MetaClientInfo::SIZE);
@@ -176,8 +184,11 @@ folly::coro::Task< void > MetaBlkManager::load_client_info_from_disk() {
             info.client_id = static_cast< uint8_t >(slot); // Authoritative source
             client_slots_[slot] = 1;
             recovered_clients_.emplace(info.get_client_name(), info);
+            META_LOG(DEBUG, "load_client_info_from_disk: recovered client slot={} name={} first_blk_valid={}", slot,
+                     info.get_client_name(), info.first_blkid.is_valid());
         }
     }
+    META_LOG(DEBUG, "load_client_info_from_disk: {} clients recovered", recovered_clients_.size());
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

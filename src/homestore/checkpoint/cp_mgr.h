@@ -30,7 +30,7 @@
 #include <folly/io/async/Request.h>
 #include <folly/synchronization/Baton.h>
 
-#include <homestore/meta/module_meta_blk.hpp>
+#include <homestore/meta/module_meta_blk.h>
 #include <homestore/checkpoint/cp.h>
 
 namespace homestore {

@@ -29,9 +29,7 @@
 namespace homestore {
 
 // ── Global device cache ───────────────────────────────────────────────────────
-// Mirrors Rust's CACHED_OPENED_DEVS (once_cell::Lazy<AsyncMutex<HashMap<...>>>).
-// We use a plain std::mutex here because open/close are rare, cold-path operations
-// that don't need to yield.
+// We use a plain std::mutex here because open/close are rare, cold-path operations that don't need to yield.
 namespace {
 std::mutex s_dev_cache_mtx;
 std::unordered_map< std::string, shared< IoDevice > > s_dev_cache;
@@ -313,7 +311,6 @@ folly::coro::Task< shared< Chunk > > PhysicalDev::create_chunk(uint32_t vdev_id,
     std::memcpy(cinfo_buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
     co_await write_super_block(cinfo_buf, chunk_info_offset_nth(to_u32(cslot)));
 
-    // Mirrors Rust: Arc::new(Chunk::new(cinfo, cslot as u32, Arc::clone(self)))
     auto chunk = std::make_shared< Chunk >(cinfo, to_u32(cslot), shared_from_this());
 
     prov.chunks.emplace(chunk_id, chunk);
@@ -326,8 +323,8 @@ folly::coro::Task< shared< Chunk > > PhysicalDev::create_chunk(uint32_t vdev_id,
     co_return chunk;
 }
 
-folly::coro::Task< std::vector< shared< Chunk > > > PhysicalDev::create_chunks(uint32_t vdev_id, uint32_t num_chunks,
-                                                                               uint64_t size, uint64_t start_vdev_order) {
+folly::coro::Task< std::vector< shared< Chunk > > >
+PhysicalDev::create_chunks(uint32_t vdev_id, uint32_t num_chunks, uint64_t size, uint64_t start_vdev_order) {
     std::vector< shared< Chunk > > ret_chunks;
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     auto& prov = chunk_provisioner_;
@@ -611,7 +608,6 @@ void PhysicalDev::free_chunk_info_locked(ChunkProvisioner& prov, ChunkInfo& cinf
 
 ChunkInterval PhysicalDev::find_next_chunk_area_locked(const ChunkIntervalSet& data_area, uint64_t size) const {
     // Walk the occupied intervals to find the first gap of at least `size`.
-    // Mirrors Rust's find_next_chunk_area_locked().
     auto ins = ChunkInterval::right_open(data_start_offset(), data_start_offset() + size);
     for (const auto& existing : data_area) {
         if (ins.upper() <= existing.lower()) {

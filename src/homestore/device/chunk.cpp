@@ -21,21 +21,19 @@
 
 namespace homestore {
 
-// Mirrors Rust's Chunk::new(chunk_info, chunk_slot, pdev).
 Chunk::Chunk(ChunkInfo info, uint32_t chunk_slot, std::shared_ptr< PhysicalDev > pdev) :
-        chunk_info_{std::move(info)}, chunk_slot_{chunk_slot}, pdev_{std::move(pdev)} {}
+        chunk_info_{std::move(info)}, chunk_slot_{chunk_slot}, pdev_{std::move(pdev)} {
+}
 
-// Mirrors Rust's Chunk::to_string().
 // Format: "Chunk[id={}, slot={}, offset={}, size={}]"
 std::string Chunk::to_string() const {
     // Copy packed fields to local vars first to avoid UB from unaligned reads
     // (chunk_info_ is #pragma pack(1)).
-    const uint32_t id     = chunk_info_.chunk_id;
+    const uint32_t id = chunk_info_.chunk_id;
     const uint64_t offset = chunk_info_.chunk_start_offset;
-    const uint64_t sz     = chunk_info_.chunk_size;
+    const uint64_t sz = chunk_info_.chunk_size;
 
-    return fmt::format("Chunk[id={}, slot={}, offset={}, size={}]",
-                       id, chunk_slot_, offset, sz);
+    return fmt::format("Chunk[id={}, slot={}, offset={}, size={}]", id, chunk_slot_, offset, sz);
 }
 
 } // namespace homestore

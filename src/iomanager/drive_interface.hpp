@@ -32,14 +32,14 @@ using IOBuffer = sisl::IoBlobSafe;
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct IoDevice {
-    int         fd{-1};
+    int fd{-1};
     std::string dev_name;
-    bool        is_block_device{false};
+    bool is_block_device{false};
 
     IoDevice(int fd, std::string name, bool is_blk) noexcept;
     ~IoDevice();
 
-    IoDevice(const IoDevice&)            = delete;
+    IoDevice(const IoDevice&) = delete;
     IoDevice& operator=(const IoDevice&) = delete;
 };
 
@@ -50,7 +50,6 @@ struct IoDevice {
 // Non-Linux : async_read/write delegate to pread/pwrite on a CPU thread pool
 //             so the EventBase thread is never blocked.
 //
-// API mirrors the Rust glommio/tokio DriveInterface:
 //   - read/readv  : buf(s) taken by value, returned together with the result
 //   - write/writev: buf(s) passed by const-ref or value; caller must keep them
 //                   alive across the co_await (guaranteed by coroutine frame)
@@ -61,51 +60,45 @@ public:
     DriveInterface();
     ~DriveInterface();
 
-    DriveInterface(const DriveInterface&)            = delete;
+    DriveInterface(const DriveInterface&) = delete;
     DriveInterface& operator=(const DriveInterface&) = delete;
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     /// Open a file or block device. `oflags`: e.g. O_RDWR | O_DIRECT.
-    static folly::coro::Task<std::shared_ptr<IoDevice>>
-    open_dev(std::string devname, int oflags);
+    static folly::coro::Task< std::shared_ptr< IoDevice > > open_dev(std::string devname, int oflags);
 
     /// Returns device/file size in bytes.
-    static folly::coro::Task<uint64_t> get_size(const IoDevice& dev);
+    static folly::coro::Task< uint64_t > get_size(const IoDevice& dev);
 
     /// No-op kept for API symmetry; ownership is released by dropping the ptr.
-    void close_dev(std::shared_ptr<IoDevice>) noexcept {}
+    void close_dev(std::shared_ptr< IoDevice >) noexcept {}
 
     // ── Read ──────────────────────────────────────────────────────────────────
 
     /// Positioned read into buf. Caller retains ownership; buf must remain
     /// valid until the Task completes (guaranteed when caller co_awaits).
-    folly::coro::Task<std::error_code>
-    read(const IoDevice& dev, IOBuffer& buf, uint64_t offset);
+    folly::coro::Task< std::error_code > read(const IoDevice& dev, IOBuffer& buf, uint64_t offset);
 
     /// Scatter read into bufs. Same lifetime contract as read().
-    folly::coro::Task<std::error_code>
-    readv(const IoDevice& dev, std::vector<IOBuffer>& bufs, uint64_t offset);
+    folly::coro::Task< std::error_code > readv(const IoDevice& dev, std::vector< IOBuffer >& bufs, uint64_t offset);
 
     // ── Write ─────────────────────────────────────────────────────────────────
 
     /// Positioned write. `buf` must remain valid until the Task completes
     /// (guaranteed when the caller co_awaits the returned Task).
-    folly::coro::Task<std::error_code>
-    write(const IoDevice& dev, const IOBuffer& buf, uint64_t offset);
+    folly::coro::Task< std::error_code > write(const IoDevice& dev, const IOBuffer& buf, uint64_t offset);
 
     /// Gather write. Caller must std::move the vector in.
-    folly::coro::Task<std::error_code>
-    writev(const IoDevice& dev, std::vector<IOBuffer>&& bufs, uint64_t offset);
+    folly::coro::Task< std::error_code > writev(const IoDevice& dev, std::vector< IOBuffer >&& bufs, uint64_t offset);
 
     // ── Misc ──────────────────────────────────────────────────────────────────
 
     /// Zero [offset, offset+size).  Uses BLKZEROOUT on block devices (Linux).
-    folly::coro::Task<std::error_code>
-    write_zero(const IoDevice& dev, uint64_t size, uint64_t offset);
+    folly::coro::Task< std::error_code > write_zero(const IoDevice& dev, uint64_t size, uint64_t offset);
 
     /// fdatasync(2) — flush kernel buffers to backing storage.
-    folly::coro::Task<std::error_code> fsync(const IoDevice& dev);
+    folly::coro::Task< std::error_code > fsync(const IoDevice& dev);
 };
 
 } // namespace homestore

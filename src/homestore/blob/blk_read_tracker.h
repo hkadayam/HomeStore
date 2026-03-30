@@ -46,7 +46,7 @@ namespace homestore {
 
 // Waiter wraps a folly::Promise and fulfils it in its destructor.  Because multiple BlkTrackRecords may hold a
 // shared_ptr<BlkTrackWaiter> (one per aligned range), the promise is fulfilled only when the last range releases its
-// copy — exactly mirroring the Rust Arc<BlkTrackWaiter> + oneshot::Sender pattern.
+// copy.
 struct BlkTrackWaiter {
     folly::Promise< folly::Unit > promise;
     explicit BlkTrackWaiter(folly::Promise< folly::Unit > p) : promise{std::move(p)} {}

@@ -45,9 +45,7 @@ class Chunk {
 public:
     static constexpr uint32_t MAX_CHUNK_SIZE = std::numeric_limits< uint32_t >::max();
 
-    // Constructor mirrors Rust's Chunk::new(chunk_info, chunk_slot, pdev).
     Chunk(ChunkInfo info, uint32_t chunk_slot, shared< PhysicalDev > pdev);
-
     Chunk(const Chunk&) = delete;
     Chunk& operator=(const Chunk&) = delete;
     Chunk(Chunk&&) = delete;
@@ -64,7 +62,7 @@ public:
     /// Caller must hold the appropriate higher-level lock (VirtualDev's mutex).
     void update_info(const ChunkInfo& new_info) { chunk_info_ = new_info; }
 
-    // ── Getters (mirrors Rust's Chunk methods) ────────────────────────────────
+    // ── Getters ────────────────────────────────
     uint64_t start_offset() const { return chunk_info_.chunk_start_offset; }
     uint64_t size() const { return chunk_info_.chunk_size; }
     uint32_t vdev_id() const { return chunk_info_.vdev_id; }
@@ -74,7 +72,7 @@ public:
     uint32_t slot_number() const { return chunk_slot_; }
     bool is_busy() const { return chunk_info_.is_allocated(); }
 
-    // ── Alignment check (C++ extension, not in Rust) ──────────────────────────
+    // ── Alignment check  ──────────────────────────
     bool is_aligned(uint32_t align) const {
         return (chunk_info_.chunk_start_offset % align == 0) && (chunk_info_.chunk_size % align == 0);
     }
@@ -110,7 +108,6 @@ public:
     explicit ChunkPool(size_t pool_limit) : pool_limit_{pool_limit} {}
 
     // Returns true if the pool for chunk_size has room for at least one more chunk.
-    // Mirrors Rust's ChunkPool::has_room().
     bool has_room(uint64_t chunk_size) const {
         std::lock_guard lg{mutex_};
         auto it = pools_.find(chunk_size);
@@ -119,7 +116,6 @@ public:
 
     // Return a deactivated chunk to the pool.
     // Caller must have already called PhysicalDev::deactivate_chunk() first.
-    // Mirrors Rust's ChunkPool::return_chunk().
     void return_chunk(shared< Chunk > chunk) {
         const uint64_t sz = chunk->size();
         std::lock_guard lg{mutex_};
@@ -128,18 +124,18 @@ public:
 
     // Try to pop a chunk of the requested size from the pool.
     // Returns nullptr if none available.
-    // Mirrors Rust's ChunkPool::try_get_chunk().
     shared< Chunk > try_get_chunk(uint64_t chunk_size) {
         std::lock_guard lg{mutex_};
         auto it = pools_.find(chunk_size);
-        if (it == pools_.end() || it->second.empty()) { return nullptr; }
+        if (it == pools_.end() || it->second.empty()) {
+            return nullptr;
+        }
         auto chunk = std::move(it->second.back());
         it->second.pop_back();
         return chunk;
     }
 
     // Number of pooled chunks available for chunk_size.
-    // Mirrors Rust's ChunkPool::available_count().
     size_t available_count(uint64_t chunk_size) const {
         std::lock_guard lg{mutex_};
         auto it = pools_.find(chunk_size);

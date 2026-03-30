@@ -1,6 +1,6 @@
 #pragma once
 
-// ReactorLocal<T> — per-reactor storage, mirrors Rust's ReactorLocal<T>.
+// ReactorLocal<T> — per-reactor storage.
 //
 // Each reactor gets its own T, accessed by reactor_id as a plain array index.
 // No locks, no atomics on the read path — only the owning reactor thread
@@ -15,24 +15,24 @@
 
 namespace homestore {
 
-template <typename T>
+template < typename T >
 class ReactorLocal {
 public:
     // Construct with an initializer called once per reactor slot.
-    explicit ReactorLocal(std::function<T()> init) {
+    explicit ReactorLocal(std::function< T() > init) {
         size_t n = iomgr().num_reactors();
         slots_.reserve(n);
         for (size_t i = 0; i < n; ++i) {
-            slots_.emplace_back(std::make_unique<Slot>(init()));
+            slots_.emplace_back(std::make_unique< Slot >(init()));
         }
     }
 
     // Construct from a pre-built vector of values, one per reactor.
-    explicit ReactorLocal(std::vector<T> values) {
+    explicit ReactorLocal(std::vector< T > values) {
         assert(values.size() == iomgr().num_reactors());
         slots_.reserve(values.size());
         for (auto& v : values) {
-            slots_.emplace_back(std::make_unique<Slot>(std::move(v)));
+            slots_.emplace_back(std::make_unique< Slot >(std::move(v)));
         }
     }
 
@@ -72,7 +72,7 @@ private:
         T value;
     };
 
-    std::vector<std::unique_ptr<Slot>> slots_;
+    std::vector< std::unique_ptr< Slot > > slots_;
 };
 
 } // namespace homestore

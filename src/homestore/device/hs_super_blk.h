@@ -222,7 +222,7 @@ struct ChunkInfo {
     uint64_t chunk_size{0};                                  //   8: size of this chunk
     uint32_t vdev_id{0};                                     //  16: owning vdev (UINT32_MAX = free)
     uint32_t chunk_id{0};                                    //  20: system-wide unique chunk id
-    uint64_t chunk_vdev_order{0};                        //  24: sequential creation order in vdev
+    uint64_t chunk_vdev_order{0};                            //  24: sequential creation order in vdev
     uint64_t stream_id{0};                                   //  32: stream id (0 = unassigned/default)
     uint32_t checksum{0};                                    //  40: CRC32 of entire ChunkInfo
     uint8_t chunk_allocated{0x00};                           //  44: 0x01 = allocated, 0x00 = free
@@ -257,7 +257,7 @@ struct ChunkInfo {
         checksum = crc32_ieee(hs_init_crc_32, reinterpret_cast< const unsigned char* >(this), sizeof(ChunkInfo));
     }
 
-    // Raw-byte view of this struct (mirrors Rust's to_bytes()).
+    // Raw-byte view of this struct
     const uint8_t* to_bytes() const { return reinterpret_cast< const uint8_t* >(this); }
 };
 #pragma pack()

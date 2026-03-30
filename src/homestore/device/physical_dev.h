@@ -36,17 +36,14 @@
 namespace homestore {
 
 // ── Global device cache ───────────────────────────────────────────────────────
-// Mirrors Rust's CACHED_OPENED_DEVS / open_and_cache_dev / close_and_uncache_dev.
 // The cache avoids reopening the same device when both a format pass and a load
 // pass reference the same underlying file/block device.
 folly::coro::Task< shared< IoDevice > > open_and_cache_dev(const std::string& devname, int oflags);
 folly::coro::Task< void > close_and_uncache_dev(const std::string& devname);
 
 // ── ChunkProvisioner ──────────────────────────────────────────────────────────
-// Mirrors Rust's inner ChunkProvisioner struct.
 // All mutable chunk-related state is grouped here and protected by
 // PhysicalDev::chunk_mutex_ (a folly::coro::Mutex so it can be held across
-// co_await points — identical to Rust's AsyncMutex<ChunkProvisioner>).
 struct ChunkProvisioner {
     ChunkIntervalSet chunk_data_area;                       // occupied ranges
     std::unique_ptr< sisl::Bitset > chunk_info_slots;       // slot bitmap
@@ -55,16 +52,13 @@ struct ChunkProvisioner {
 };
 
 // ── PhysicalDev ───────────────────────────────────────────────────────────────
-// C++ port of Rust's PhysicalDev (physical_dev.rs).
 //
 // Design notes vs the old device/physical_dev.hpp:
 //  • Factory methods create() / load() replace the single constructor.
 //    create() is for first-time format; load() is for recovery.
-//  • All IO and chunk operations are folly coroutines (Task<>), matching Rust's
-//    async/await.
-//  • Stream concept removed — Rust dropped it; chunks are keyed by chunk_id.
+//  • All IO and chunk operations are folly coroutines (Task<>).
 //  • ChunkProvisioner bundles all chunk state behind a single coroutine mutex
-//    so the lock can be held across disk writes, just as Rust's AsyncMutex does.
+//    so the lock can be held across disk writes.
 //  • Metrics removed for now; can be re-added via a separate observer.
 //  • ChunkInfo / ChunkInterval / ChunkIntervalSet all live in chunk.h (chunk.rs).
 class PhysicalDev : public std::enable_shared_from_this< PhysicalDev > {
@@ -110,7 +104,7 @@ public:
     folly::coro::Task< void > close_device();
 
     // ── Data IO ───────────────────────────────────────────────────────────────
-    // All async; mirrors Rust's write / writev / read / readv / write_zero / fsync.
+    // All async IO methods
 
     folly::coro::Task< void > write(const IOBuffer& buf, uint64_t offset);
     folly::coro::Task< void > writev(std::vector< IOBuffer >&& bufs, uint64_t offset);
@@ -137,14 +131,12 @@ public:
                                                                       uint64_t size, uint64_t start_vdev_order = 0);
 
     /// Load all chunks from disk. Returns vdev_id → [chunks] for recovery.
-    /// Mirrors Rust's load_chunks() → HashMap<vdev_id, Vec<Arc<Chunk>>>.
     folly::coro::Task< std::unordered_map< uint32_t, std::vector< shared< Chunk > > > > load_chunks();
 
     /// Remove a single chunk (frees slot, persists bitmap).
     folly::coro::Task< void > remove_chunk(cshared< Chunk >& chunk);
 
     /// Remove a batch; batches the final bitmap write for efficiency.
-    /// Mirrors Rust's remove_chunks() which avoids one bitmap write per chunk.
     folly::coro::Task< void > remove_chunks(const std::vector< shared< Chunk > >& chunks);
 
     /// Convenience: remove all chunks belonging to vdev_id.
@@ -219,7 +211,6 @@ private:
     bool super_blk_in_footer_{false};
 
     // All mutable chunk state lives here, protected by chunk_mutex_.
-    // Mirrors Rust's AsyncMutex<ChunkProvisioner>.
     folly::coro::Mutex chunk_mutex_;
     ChunkProvisioner chunk_provisioner_;
 };

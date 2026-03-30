@@ -29,14 +29,12 @@ namespace homestore {
 class Chunk;
 
 // ── ChunkSelectorType ─────────────────────────────────────────────────────────
-// Mirrors Rust's ChunkSelectorType enum in chunk_selector.rs.
 VENUM(ChunkSelectorType, uint8_t, RoundRobin = 0, Random = 1, MostAvailableSpace = 2, OnlyOne = 3, Custom = 4);
 
 // ── IChunkSelector ────────────────────────────────────────────────────────────
 // Abstract interface for chunk selection strategies.
 // Implementations are immutable after construction; VirtualDev atomically
 // replaces the instance on expand() via std::atomic_store.
-// Mirrors Rust's ChunkSelectorInner trait.
 class IChunkSelector {
 public:
     virtual ~IChunkSelector() = default;
@@ -55,7 +53,6 @@ public:
 // ── Concrete implementations ──────────────────────────────────────────────────
 
 /// Optimisation for single-chunk vdevs (most common in homestore deployments).
-/// Mirrors Rust's OnlyOneChunkSelector.
 class OnlyOneChunkSelector final : public IChunkSelector {
 public:
     explicit OnlyOneChunkSelector(std::vector< std::shared_ptr< Chunk > > chunks) {
@@ -63,9 +60,7 @@ public:
         chunk_ = std::move(chunks[0]);
     }
 
-    std::shared_ptr< Chunk > select_chunk(blk_count_t, const blk_alloc_hints&) const override {
-        return chunk_;
-    }
+    std::shared_ptr< Chunk > select_chunk(blk_count_t, const blk_alloc_hints&) const override { return chunk_; }
     std::shared_ptr< Chunk > get_chunk_after(uint32_t) const override {
         return nullptr; // no other chunk to retry with
     }
@@ -76,14 +71,14 @@ private:
 };
 
 /// Round-robin selection across all chunks.
-/// Mirrors Rust's RoundRobinChunkSelector.
 class RoundRobinChunkSelector final : public IChunkSelector {
 public:
-    explicit RoundRobinChunkSelector(std::vector< std::shared_ptr< Chunk > > chunks)
-            : chunks_{std::move(chunks)} {}
+    explicit RoundRobinChunkSelector(std::vector< std::shared_ptr< Chunk > > chunks) : chunks_{std::move(chunks)} {}
 
     std::shared_ptr< Chunk > select_chunk(blk_count_t, const blk_alloc_hints&) const override {
-        if (chunks_.empty()) { return nullptr; }
+        if (chunks_.empty()) {
+            return nullptr;
+        }
         const size_t idx = next_idx_.fetch_add(1, std::memory_order_relaxed) % chunks_.size();
         return chunks_[idx];
     }
@@ -103,18 +98,19 @@ private:
     }
 
     std::vector< std::shared_ptr< Chunk > > chunks_;
-    mutable std::atomic< size_t >           next_idx_{0};
+    mutable std::atomic< size_t > next_idx_{0};
 };
 
 /// Uniform random selection across all chunks.
-/// Mirrors Rust's RandomChunkSelector.
 class RandomChunkSelector final : public IChunkSelector {
 public:
-    explicit RandomChunkSelector(std::vector< std::shared_ptr< Chunk > > chunks)
-            : chunks_{std::move(chunks)}, rng_{std::random_device{}()} {}
+    explicit RandomChunkSelector(std::vector< std::shared_ptr< Chunk > > chunks) :
+            chunks_{std::move(chunks)}, rng_{std::random_device{}()} {}
 
     std::shared_ptr< Chunk > select_chunk(blk_count_t, const blk_alloc_hints&) const override {
-        if (chunks_.empty()) { return nullptr; }
+        if (chunks_.empty()) {
+            return nullptr;
+        }
         std::uniform_int_distribution< size_t > dist{0, chunks_.size() - 1};
         return chunks_[dist(rng_)];
     }
@@ -134,18 +130,18 @@ private:
     }
 
     std::vector< std::shared_ptr< Chunk > > chunks_;
-    mutable std::mt19937                    rng_;
+    mutable std::mt19937 rng_;
 };
 
 /// Picks the chunk with the most available free blocks.
-/// Mirrors Rust's MostAvailableSpaceSelector.
 class MostAvailableSpaceSelector final : public IChunkSelector {
 public:
-    explicit MostAvailableSpaceSelector(std::vector< std::shared_ptr< Chunk > > chunks)
-            : chunks_{std::move(chunks)} {}
+    explicit MostAvailableSpaceSelector(std::vector< std::shared_ptr< Chunk > > chunks) : chunks_{std::move(chunks)} {}
 
     std::shared_ptr< Chunk > select_chunk(blk_count_t, const blk_alloc_hints&) const override {
-        if (chunks_.empty()) { return nullptr; }
+        if (chunks_.empty()) {
+            return nullptr;
+        }
         // TODO: use chunk->blk_allocator()->available_blks() once blkalloc ported.
         return chunks_[0];
     }

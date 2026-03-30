@@ -82,7 +82,6 @@ folly::Future< std::error_code > LogStoreService::create_vdev(uint64_t size, HSD
     // future, we can let consumer set it by then;
     auto vdev =
         hs()->device_mgr()->create_vdev(vdev_parameters{.vdev_name = "LogDev",
-                                                        .size_type = vdev_size_type_t::VDEV_SIZE_DYNAMIC,
                                                         .vdev_size = 0,
                                                         .num_chunks = 0,
                                                         .blk_size = atomic_page_size,

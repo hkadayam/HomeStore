@@ -30,12 +30,12 @@
 #include <folly/coro/Task.h>
 #include "sisl/fds/urcu_helper.h"
 
-#include "homestore/blk.h"              // BlkId, BlkIds, BlkAllocStatus, blk_alloc_hints, blk_count_t
+#include "homestore/blk.h" // BlkId, BlkIds, BlkAllocStatus, blk_alloc_hints, blk_count_t
 
 #include "iomanager/drive_interface.hpp" // IOBuffer
-#include "device/hs_super_blk.h"        // VDevInfo, ChunkInfo, HSSuperBlk
-#include "device/chunk.h"               // Chunk, ChunkPool
-#include "device/chunk_selector.h"      // IChunkSelector, ChunkSelectorType, concrete selectors
+#include "device/hs_super_blk.h"         // VDevInfo, ChunkInfo, HSSuperBlk
+#include "device/chunk.h"                // Chunk, ChunkPool
+#include "device/chunk_selector.h"       // IChunkSelector, ChunkSelectorType, concrete selectors
 
 namespace homestore {
 
@@ -54,7 +54,7 @@ ENUM(ChunkToShrink, uint8_t,
 );
 
 // ── VDevParameters ────────────────────────────────────────────────────────────
-// Creation parameters for a new VirtualDev. Mirrors Rust's VDevParameters.
+// Creation parameters for a new VirtualDev.
 struct VDevParameters {
     std::string vdev_name;
     uint64_t vdev_size{0};
@@ -78,10 +78,10 @@ struct VDevMutableState {
     VDevInfo vdev_info;
     std::unordered_set< uint32_t > pdevs;                       // pdev_ids in use
     std::unordered_map< uint32_t, shared< Chunk > > all_chunks; // chunk_id → Chunk (hot path)
-    std::vector< shared< Chunk > > chunks_by_vdev_order;    // sorted (cold path)
+    std::vector< shared< Chunk > > chunks_by_vdev_order;        // sorted (cold path)
     uint64_t total_chunk_num{0};
     uint64_t total_vdev_size{0};
-    uint64_t next_vdev_order{0};         // monotonically increasing
+    uint64_t next_vdev_order{0};             // monotonically increasing
     shared< IChunkSelector > chunk_selector; // rebuilt on every chunk-set change
 };
 
@@ -110,12 +110,11 @@ public:
     VirtualDev(VDevInfo info, std::vector< shared< PhysicalDev > > pdevs);
 
     /// First-time creation: allocates chunks across pdevs and writes superblock metadata.
-    /// Mirrors Rust's VirtualDev::create().
     static folly::coro::Task< unique< VirtualDev > > create(VDevParameters&& params, uint32_t vdev_id,
                                                             const std::vector< shared< PhysicalDev > >& pdevs);
 
     /// Recovery: constructs VDev from persisted VDevInfo. Caller should then call on_chunk_found() for each chunk
-    /// (which atomically rebuilds the selector), then load_blk_allocator(). Mirrors Rust's VirtualDev::load().
+    /// (which atomically rebuilds the selector), then load_blk_allocator().
     static unique< VirtualDev > load(VDevInfo vinfo, std::vector< shared< PhysicalDev > > pdevs);
 
     /// Destroy the entire vdev and remove all its chunks and remove the vdev info. Upon completion next load
@@ -130,7 +129,7 @@ public:
 
     /// Shrink: remove a chunk from a vdev.
     /// Pooling enabled → deactivate + park in pool; disabled → permanently remove.
-    /// Returns the removed chunk_id. Mirrors Rust's shrink().
+    /// Returns the removed chunk_id.
     folly::coro::Task< uint32_t > shrink(ChunkToShrink which, uint32_t specific_chunk_id = 0);
 
     /// Register one chunk with this vdev (recovery or post-create). Forwards to on_chunks_added().
@@ -144,7 +143,7 @@ public:
     void enable_chunk_pooling(size_t pool_limit);
 
     /// Get the nth chunk (0-indexed by vdev_order), creating it if needed.
-    /// Returns (chunk, is_newly_created). Mirrors Rust's get_or_create_nth_chunk().
+    /// Returns (chunk, is_newly_created).
     folly::coro::Task< std::pair< shared< Chunk >, bool > > get_or_create_nth_chunk(size_t n);
 
     // ──────────────────────────────────────────────────────────────────────────────
@@ -190,7 +189,6 @@ public:
     void adjust_vdev_info();
 
     /// Write VDevInfo to ALL physical devices (mirrored for redundancy).
-    /// Mirrors Rust's write_vdev_info().
     folly::coro::Task< void > write_vdev_info();
 
     // ── Block allocators ──────────────────────────────────────────────────────
@@ -213,7 +211,6 @@ private:
     // ── RCU helpers ───────────────────────────────────────────────────────────
     // Reads are lock-free (~2-5 ns): atomic load + folly::rcu_reader guard.
     // Writes clone + make_and_exchange under chunk_mgmt_mutex_ + grace period.
-    // Mirrors Rust's mutable_state.load_full() / mutable_state.store(Arc::new(s)).
     //
     // IMPORTANT: do NOT hold a load_state() result across any call to store_state()
     // (that would deadlock synchronize_rcu()). Always scope load_state() before
@@ -235,8 +232,7 @@ private:
 
     std::pair< uint64_t, shared< Chunk > > to_dev_offset(const BlkId& bid) const;
 
-    void construct_blk_allocator(cshared< Chunk >& chunk,
-                                 std::optional< sisl::ByteArray > buffer = std::nullopt);
+    void construct_blk_allocator(cshared< Chunk >& chunk, std::optional< sisl::ByteArray > buffer = std::nullopt);
 
     shared< Chunk > select_chunk_for_alloc(blk_count_t nblks, const blk_alloc_hints& hints,
                                            std::optional< uint32_t > last_failed_id) const;

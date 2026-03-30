@@ -16,6 +16,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <fcntl.h>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
@@ -33,18 +34,22 @@ namespace homestore {
 // that don't need to yield.
 namespace {
 std::mutex s_dev_cache_mtx;
-std::unordered_map< std::string, std::shared_ptr< IoDevice > > s_dev_cache;
+std::unordered_map< std::string, shared< IoDevice > > s_dev_cache;
 } // namespace
 
-folly::coro::Task< std::shared_ptr< IoDevice > > open_and_cache_dev(const std::string& devname, int oflags) {
+folly::coro::Task< shared< IoDevice > > open_and_cache_dev(const std::string& devname, int oflags) {
     {
         std::lock_guard lg{s_dev_cache_mtx};
         auto it = s_dev_cache.find(devname);
-        if (it != s_dev_cache.end()) { co_return it->second; }
+        if (it != s_dev_cache.end()) {
+            co_return it->second;
+        }
     }
 
     auto iodev = co_await DriveInterface::open_dev(devname, oflags);
-    if (!iodev) { throw std::system_error(errno, std::system_category(), "Failed to open device: " + devname); }
+    if (!iodev) {
+        throw std::system_error(errno, std::system_category(), "Failed to open device: " + devname);
+    }
 
     std::lock_guard lg{s_dev_cache_mtx};
     // Re-check after the await in case another coroutine raced us.
@@ -61,20 +66,16 @@ folly::coro::Task< void > close_and_uncache_dev(const std::string& devname) {
 
 // ── Static helpers ────────────────────────────────────────────────────────────
 
-PDevInfoHeader PhysicalDev::create_pdev_info(const dev_info& dinfo, uint32_t pdev_id) {
-    // TODO: compute data_offset properly from superblock layout constants
-    // (HSSuperBlk::total_size) once HSSuperBlk is decoupled from iomgr.
-    const uint64_t data_offset = 8192;
-
+PDevInfoHeader PhysicalDev::create_pdev_info(const DevInfo& dinfo, uint32_t pdev_id) {
     DiskAttr attr{};
-    attr.phys_page_size = 512;
-    attr.align_size = 512;
-    attr.atomic_phys_page_size = 512;
+    attr.phys_page_size = DiskAttr::DEFAULT_ALIGN_SIZE;
+    attr.align_size = DiskAttr::DEFAULT_ALIGN_SIZE;
+    attr.atomic_phys_page_size = DiskAttr::DEFAULT_ALIGN_SIZE;
     attr.num_streams = 0;
 
     PDevInfoHeader hdr;
     hdr.pdev_id = pdev_id;
-    hdr.data_offset = data_offset;
+    hdr.data_offset = HSSuperBlk::total_size(dinfo);
     hdr.size = dinfo.dev_size;
     hdr.max_pdev_chunks = 0; // populated by DeviceManager
     hdr.dev_attr = attr;
@@ -83,17 +84,54 @@ PDevInfoHeader PhysicalDev::create_pdev_info(const dev_info& dinfo, uint32_t pde
     return hdr;
 }
 
-folly::coro::Task< first_block > PhysicalDev::read_first_block(const std::string& devname, int oflags) {
+folly::coro::Task< FirstBlock > PhysicalDev::read_first_block(const std::string& devname, int oflags) {
     auto iodev = co_await open_and_cache_dev(devname, oflags);
 
     DriveInterface di{};
-    IOBuffer buf{first_block::s_io_fb_size};
-    auto [ec, rbuf] = co_await di.read(*iodev, std::move(buf), HSSuperBlk::first_block_offset());
-    if (ec) { throw std::system_error(ec, "read_first_block failed on " + devname); }
+    IOBuffer buf{FirstBlock::s_io_fb_size};
+    auto ec = co_await di.read(*iodev, buf, HSSuperBlk::first_block_offset());
+    if (ec) {
+        throw std::system_error(ec, "read_first_block failed on " + devname);
+    }
 
-    first_block fb;
-    std::memcpy(&fb, rbuf.data(), sizeof(first_block));
+    FirstBlock fb;
+    std::memcpy(&fb, buf.bytes(), sizeof(FirstBlock));
     co_return fb;
+}
+
+folly::coro::Task< void > PhysicalDev::write_first_block(const FirstBlockHeader& fbhdr) {
+    FirstBlock fb{};
+    fb.magic = FirstBlock::HOMESTORE_MAGIC;
+    fb.formatting_done = 0x0; // Not yet complete — commit_formatting() sets this to 1
+    fb.hdr = fbhdr;
+    fb.this_pdev_hdr = pdev_info_;
+
+    // Compute checksum over the atomic portion of the first block (excluding the checksum field itself).
+    fb.checksum = 0;
+    fb.checksum =
+        crc32_ieee(hs_init_crc_32, reinterpret_cast< const unsigned char* >(&fb), FirstBlock::s_atomic_fb_size);
+
+    IOBuffer buf{FirstBlock::s_io_fb_size};
+    std::memset(buf.bytes(), 0, FirstBlock::s_io_fb_size);
+    std::memcpy(buf.bytes(), &fb, sizeof(FirstBlock));
+
+    co_await write_super_block(buf, HSSuperBlk::first_block_offset());
+}
+
+folly::coro::Task< void > PhysicalDev::commit_formatting() {
+    IOBuffer buf{FirstBlock::s_io_fb_size};
+    auto ec = co_await read_super_block(buf, HSSuperBlk::first_block_offset());
+    if (ec) {
+        throw std::system_error(ec, "commit_formatting: failed to read first block on " + devname_);
+    }
+
+    auto* fb = reinterpret_cast< FirstBlock* >(buf.bytes());
+    fb->formatting_done = 0x1;
+    fb->checksum = 0;
+    fb->checksum =
+        crc32_ieee(hs_init_crc_32, reinterpret_cast< const unsigned char* >(fb), FirstBlock::s_atomic_fb_size);
+
+    co_await write_super_block(buf, HSSuperBlk::first_block_offset());
 }
 
 folly::coro::Task< uint64_t > PhysicalDev::get_dev_size(const std::string& devname) {
@@ -102,9 +140,8 @@ folly::coro::Task< uint64_t > PhysicalDev::get_dev_size(const std::string& devna
 }
 
 // ── Factory: construct (private) ─────────────────────────────────────────────
-folly::coro::Task< std::shared_ptr< PhysicalDev > > PhysicalDev::construct(dev_info dinfo, int oflags,
-                                                                           PDevInfoHeader pinfo) {
-    // Allocate via make_shared so enable_shared_from_this works immediately.
+folly::coro::Task< shared< PhysicalDev > > PhysicalDev::construct(const DevInfo& dinfo, int oflags,
+                                                                  const PDevInfoHeader& pinfo) {
     auto pdev = std::make_shared< PhysicalDev >();
 
     pdev->drive_iface_ = std::make_shared< DriveInterface >();
@@ -118,7 +155,7 @@ folly::coro::Task< std::shared_ptr< PhysicalDev > > PhysicalDev::construct(dev_i
 
     const uint64_t actual = (dinfo.dev_size == 0) ? dev_size : std::min(dev_size, dinfo.dev_size);
 
-    // Round down to physical page size (mirrors Rust's round_down).
+    // Round down to physical page size.
     const uint64_t page = pinfo.dev_attr.phys_page_size;
     const uint64_t rounded = (page > 0) ? (actual / page) * page : actual;
     if (rounded != actual) {
@@ -129,8 +166,8 @@ folly::coro::Task< std::shared_ptr< PhysicalDev > > PhysicalDev::construct(dev_i
 
     pdev->devname_ = dinfo.dev_name;
     pdev->dev_type_ = dinfo.dev_type;
-    dinfo.dev_size = actual;
-    pdev->dev_info_ = std::move(dinfo);
+    pdev->dev_info_ = dinfo;
+    pdev->dev_info_.dev_size = actual;
     pdev->pdev_info_ = pinfo;
     pdev->devsize_ = rounded;
     pdev->super_blk_in_footer_ = (pinfo.mirror_super_block != 0);
@@ -140,23 +177,37 @@ folly::coro::Task< std::shared_ptr< PhysicalDev > > PhysicalDev::construct(dev_i
 
 // ── Factory: create ───────────────────────────────────────────────────────────
 
-folly::coro::Task< std::shared_ptr< PhysicalDev > > PhysicalDev::create(dev_info dinfo, int oflags, uint32_t pdev_id) {
+folly::coro::Task< shared< PhysicalDev > > PhysicalDev::create(const DevInfo& dinfo, int oflags, uint32_t pdev_id,
+                                                               const FirstBlockHeader& fbhdr) {
     auto pinfo = create_pdev_info(dinfo, pdev_id);
-    auto pdev = co_await construct(std::move(dinfo), oflags, std::move(pinfo));
+    pinfo.system_uuid = fbhdr.system_uuid;
+    auto pdev = co_await construct(dinfo, oflags, pinfo);
+    co_await pdev->write_first_block(fbhdr);
     co_await pdev->format_chunks();
     co_return pdev;
 }
 
 // ── Factory: load ─────────────────────────────────────────────────────────────
 
-folly::coro::Task< std::shared_ptr< PhysicalDev > > PhysicalDev::load(dev_info dinfo, int oflags) {
+folly::coro::Task< shared< PhysicalDev > > PhysicalDev::load(const DevInfo& dinfo, int oflags,
+                                                             const FirstBlockHeader& fbhdr) {
     const auto fb = co_await read_first_block(dinfo.dev_name, oflags);
     if (!fb.is_valid()) {
+        LOGCRITICAL("load() is_valid failed: magic={:#x} formatting_done={} product='{}' expected='{}'", fb.magic,
+                    fb.formatting_done, fb.hdr.product_name, FirstBlockHeader::PRODUCT_NAME);
         throw std::system_error(std::make_error_code(std::errc::invalid_argument),
                                 "Invalid first block for device " + dinfo.dev_name);
     }
 
-    auto pdev = co_await construct(std::move(dinfo), oflags, fb.this_pdev_hdr);
+    // Validate that this device belongs to the same system instance.
+    if (fb.this_pdev_hdr.system_uuid != fbhdr.system_uuid) {
+        throw std::system_error(std::make_error_code(std::errc::invalid_argument),
+                                fmt::format("Device {} has system_uuid={} but expected={} — possible device swap",
+                                            dinfo.dev_name, fb.this_pdev_hdr.get_system_uuid_str(),
+                                            fbhdr.get_system_uuid_str()));
+    }
+
+    auto pdev = co_await construct(dinfo, oflags, fb.this_pdev_hdr);
     co_await pdev->load_chunks();
     co_return pdev;
 }
@@ -165,11 +216,15 @@ folly::coro::Task< std::shared_ptr< PhysicalDev > > PhysicalDev::load(dev_info d
 
 folly::coro::Task< void > PhysicalDev::write_super_block(const IOBuffer& buf, uint64_t offset) {
     auto ec = co_await drive_iface_->write(*iodev_, buf, offset);
-    if (ec) { throw std::system_error(ec, "write_super_block failed on " + devname_); }
+    if (ec) {
+        throw std::system_error(ec, "write_super_block failed on " + devname_);
+    }
     if (super_blk_in_footer_) {
         const uint64_t t_offset = data_end_offset() + offset;
         ec = co_await drive_iface_->write(*iodev_, buf, t_offset);
-        if (ec) { throw std::system_error(ec, "write_super_block (footer) failed on " + devname_); }
+        if (ec) {
+            throw std::system_error(ec, "write_super_block (footer) failed on " + devname_);
+        }
     }
 }
 
@@ -177,18 +232,24 @@ folly::coro::Task< std::error_code > PhysicalDev::read_super_block(IOBuffer& buf
     co_return co_await drive_iface_->read(*iodev_, buf, offset);
 }
 
-folly::coro::Task< void > PhysicalDev::close_device() { co_await close_and_uncache_dev(devname_); }
+folly::coro::Task< void > PhysicalDev::close_device() {
+    co_await close_and_uncache_dev(devname_);
+}
 
 // ── Data IO ───────────────────────────────────────────────────────────────────
 
 folly::coro::Task< void > PhysicalDev::write(const IOBuffer& buf, uint64_t offset) {
     auto ec = co_await drive_iface_->write(*iodev_, buf, offset);
-    if (ec) { throw std::system_error(ec, "write failed on " + devname_); }
+    if (ec) {
+        throw std::system_error(ec, "write failed on " + devname_);
+    }
 }
 
 folly::coro::Task< void > PhysicalDev::writev(std::vector< IOBuffer >&& bufs, uint64_t offset) {
     auto ec = co_await drive_iface_->writev(*iodev_, std::move(bufs), offset);
-    if (ec) { throw std::system_error(ec, "writev failed on " + devname_); }
+    if (ec) {
+        throw std::system_error(ec, "writev failed on " + devname_);
+    }
 }
 
 folly::coro::Task< std::error_code > PhysicalDev::read(IOBuffer& buf, uint64_t offset) {
@@ -201,12 +262,16 @@ folly::coro::Task< std::error_code > PhysicalDev::readv(std::vector< IOBuffer >&
 
 folly::coro::Task< void > PhysicalDev::write_zero(uint64_t size, uint64_t offset) {
     auto ec = co_await drive_iface_->write_zero(*iodev_, size, offset);
-    if (ec) { throw std::system_error(ec, "write_zero failed on " + devname_); }
+    if (ec) {
+        throw std::system_error(ec, "write_zero failed on " + devname_);
+    }
 }
 
 folly::coro::Task< void > PhysicalDev::fsync() {
     auto ec = co_await drive_iface_->fsync(*iodev_);
-    if (ec) { throw std::system_error(ec, "fsync failed on " + devname_); }
+    if (ec) {
+        throw std::system_error(ec, "fsync failed on " + devname_);
+    }
 }
 
 // ── Chunk management ─────────────────────────────────────────────────────────
@@ -223,32 +288,33 @@ folly::coro::Task< void > PhysicalDev::format_chunks() {
     chunk_provisioner_.chunk_info_slots = std::make_unique< sisl::Bitset >(std::move(bitset));
 }
 
-folly::coro::Task< std::shared_ptr< Chunk > > PhysicalDev::create_chunk(uint32_t vdev_id, uint64_t size,
-                                                                        uint32_t ordinal,
-                                                                        const uint8_t* user_private_data,
-                                                                        size_t up_size) {
+folly::coro::Task< shared< Chunk > > PhysicalDev::create_chunk(uint32_t vdev_id, uint64_t size, uint64_t vdev_order,
+                                                               const uint8_t* user_private_data, size_t up_size) {
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     auto& prov = chunk_provisioner_;
 
-    if (!prov.chunk_info_slots) { throw std::runtime_error("chunk_info_slots not initialised on " + devname_); }
+    if (!prov.chunk_info_slots) {
+        throw std::runtime_error("chunk_info_slots not initialised on " + devname_);
+    }
 
     const uint64_t cslot = prov.chunk_info_slots->get_next_reset_bit(0u);
-    if (cslot == sisl::Bitset::npos) { throw std::out_of_range("No room for additional chunk on " + devname_); }
+    if (cslot == sisl::Bitset::npos) {
+        throw std::out_of_range("No room for additional chunk on " + devname_);
+    }
     prov.chunk_info_slots->set_bit(cslot);
 
-    // chunk_id = (pdev_id + 1) * slot  — mirrors Rust's formula
-    const uint32_t chunk_id = static_cast< uint32_t >((pdev_id() + 1ULL) * cslot);
+    const uint32_t chunk_id = to_u32(pdev_id() * HSSuperBlk::MAX_CHUNKS_IN_SYSTEM + cslot);
 
     ChunkInfo cinfo{};
-    populate_chunk_info_locked(prov, cinfo, vdev_id, size, chunk_id, ordinal, user_private_data, up_size);
+    populate_chunk_info_locked(prov, cinfo, vdev_id, size, chunk_id, vdev_order, user_private_data, up_size);
 
     // Write this chunk's metadata to the superblock.
     IOBuffer cinfo_buf{ChunkInfo::SIZE};
-    std::memcpy(cinfo_buf.data(), cinfo.to_bytes(), ChunkInfo::SIZE);
-    co_await write_super_block(cinfo_buf, chunk_info_offset_nth(static_cast< uint32_t >(cslot)));
+    std::memcpy(cinfo_buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
+    co_await write_super_block(cinfo_buf, chunk_info_offset_nth(to_u32(cslot)));
 
     // Mirrors Rust: Arc::new(Chunk::new(cinfo, cslot as u32, Arc::clone(self)))
-    auto chunk = std::make_shared< Chunk >(cinfo, static_cast< uint32_t >(cslot), shared_from_this());
+    auto chunk = std::make_shared< Chunk >(cinfo, to_u32(cslot), shared_from_this());
 
     prov.chunks.emplace(chunk_id, chunk);
 
@@ -260,37 +326,41 @@ folly::coro::Task< std::shared_ptr< Chunk > > PhysicalDev::create_chunk(uint32_t
     co_return chunk;
 }
 
-folly::coro::Task< std::vector< std::shared_ptr< Chunk > > >
-PhysicalDev::create_chunks(uint32_t vdev_id, uint32_t num_chunks, uint64_t size, uint32_t start_ordinal) {
-    std::vector< std::shared_ptr< Chunk > > ret_chunks;
+folly::coro::Task< std::vector< shared< Chunk > > > PhysicalDev::create_chunks(uint32_t vdev_id, uint32_t num_chunks,
+                                                                               uint64_t size, uint64_t start_vdev_order) {
+    std::vector< shared< Chunk > > ret_chunks;
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     auto& prov = chunk_provisioner_;
 
-    if (!prov.chunk_info_slots) { throw std::runtime_error("chunk_info_slots not initialised on " + devname_); }
+    if (!prov.chunk_info_slots) {
+        throw std::runtime_error("chunk_info_slots not initialised on " + devname_);
+    }
 
     uint32_t chunks_remaining = num_chunks;
-    uint32_t cur_ordinal = start_ordinal;
+    uint64_t cur_vdev_order = start_vdev_order;
 
     while (chunks_remaining > 0) {
         // Find a contiguous run of free slots.
         auto b = prov.chunk_info_slots->get_next_contiguous_n_reset_bits(0u, std::nullopt, 1u, chunks_remaining);
-        if (b.nbits == 0) { throw std::out_of_range("No room for additional chunks on " + devname_); }
+        if (b.nbits == 0) {
+            throw std::out_of_range("No room for additional chunks on " + devname_);
+        }
 
         // Build all chunk_infos for this contiguous block.
-        IOBuffer buf{ChunkInfo::SIZE * b.nbits};
-        uint8_t* ptr = buf.data();
+        IOBuffer buf{to_u32(ChunkInfo::SIZE * b.nbits)};
+        uint8_t* ptr = buf.bytes();
 
-        std::vector< std::shared_ptr< Chunk > > batch_chunks;
+        std::vector< shared< Chunk > > batch_chunks;
         for (uint32_t i = 0; i < b.nbits; ++i, ptr += ChunkInfo::SIZE) {
             const uint64_t cslot = b.start_bit + i;
-            const uint32_t chunk_id = static_cast< uint32_t >((pdev_id() + 1ULL) * cslot);
-            const uint32_t ordinal = cur_ordinal++;
+            const uint32_t chunk_id = to_u32(pdev_id() * HSSuperBlk::MAX_CHUNKS_IN_SYSTEM + cslot);
+            const uint64_t vdev_order = cur_vdev_order++;
 
             ChunkInfo cinfo{};
-            populate_chunk_info_locked(prov, cinfo, vdev_id, size, chunk_id, ordinal, nullptr, 0);
+            populate_chunk_info_locked(prov, cinfo, vdev_id, size, chunk_id, vdev_order, nullptr, 0);
             std::memcpy(ptr, cinfo.to_bytes(), ChunkInfo::SIZE);
 
-            auto chunk = std::make_shared< Chunk >(cinfo, static_cast< uint32_t >(cslot), shared_from_this());
+            auto chunk = std::make_shared< Chunk >(cinfo, to_u32(cslot), shared_from_this());
 
             prov.chunks.emplace(chunk_id, chunk);
             batch_chunks.push_back(chunk);
@@ -300,7 +370,7 @@ PhysicalDev::create_chunks(uint32_t vdev_id, uint32_t num_chunks, uint64_t size,
         prov.chunk_info_slots->set_bits(b.start_bit, b.nbits);
 
         // Write the entire batch to disk in one call.
-        co_await write_super_block(buf, chunk_info_offset_nth(static_cast< uint32_t >(b.start_bit)));
+        co_await write_super_block(buf, chunk_info_offset_nth(to_u32(b.start_bit)));
 
         for (auto& c : batch_chunks) {
             ret_chunks.push_back(c);
@@ -315,41 +385,45 @@ PhysicalDev::create_chunks(uint32_t vdev_id, uint32_t num_chunks, uint64_t size,
     co_return ret_chunks;
 }
 
-folly::coro::Task< std::unordered_map< uint32_t, std::vector< std::shared_ptr< Chunk > > > >
-PhysicalDev::load_chunks() {
+folly::coro::Task< std::unordered_map< uint32_t, std::vector< shared< Chunk > > > > PhysicalDev::load_chunks() {
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     auto& prov = chunk_provisioner_;
 
     // Read the chunk slot bitmap from disk.
-    const size_t bm_size = chunk_info_bitmap_size();
+    const uint32_t bm_size = to_u32(chunk_info_bitmap_size());
     IOBuffer bm_buf{bm_size};
-    auto [ec, bm_rbuf] = co_await drive_iface_->read(*iodev_, std::move(bm_buf), chunk_sb_offset());
-    if (ec) { throw std::system_error(ec, "load_chunks: bitmap read failed"); }
+    auto ec = co_await drive_iface_->read(*iodev_, bm_buf, chunk_sb_offset());
+    if (ec) {
+        throw std::system_error(ec, "load_chunks: bitmap read failed");
+    }
 
-    // Deserialise bitmap (zero-copy from IOBuffer).
-    auto [bitset, _set_count] = sisl::Bitset::load(bm_rbuf.data(), bm_rbuf.size());
+    // Deserialise bitmap — wrap the IOBuffer as a ByteArray and construct directly (zero-copy).
+    sisl::Bitset bitset{sisl::make_byte_array(std::move(bm_buf))};
 
-    std::unordered_map< uint32_t, std::vector< std::shared_ptr< Chunk > > > chunks_by_vdev;
+    std::unordered_map< uint32_t, std::vector< shared< Chunk > > > chunks_by_vdev;
 
     uint64_t prev_bit = 0;
     for (;;) {
         const uint64_t b = bitset.get_next_set_bit(prev_bit);
-        if (b == sisl::Bitset::npos) { break; }
+        if (b == sisl::Bitset::npos) {
+            break;
+        }
 
         // Read the chunk_info for this slot.
         IOBuffer ci_buf{ChunkInfo::SIZE};
-        auto [ec2, ci_rbuf] =
-            co_await drive_iface_->read(*iodev_, std::move(ci_buf), chunk_info_offset_nth(static_cast< uint32_t >(b)));
-        if (ec2) { throw std::system_error(ec2, "load_chunks: chunk_info read failed"); }
+        auto ec2 = co_await drive_iface_->read(*iodev_, ci_buf, chunk_info_offset_nth(to_u32(b)));
+        if (ec2) {
+            throw std::system_error(ec2, "load_chunks: chunk_info read failed");
+        }
 
         ChunkInfo cinfo;
-        std::memcpy(&cinfo, ci_rbuf.data(), sizeof(ChunkInfo));
+        std::memcpy(&cinfo, ci_buf.bytes(), sizeof(ChunkInfo));
 
-        // Verify checksum (mirrors Rust's CRC check).
-        const uint16_t stored_crc = cinfo.checksum;
+        // Verify checksum.
+        const uint32_t stored_crc = cinfo.checksum;
         cinfo.checksum = 0;
-        const uint16_t computed_crc =
-            crc16_t10dif(hs_init_crc_16, reinterpret_cast< const unsigned char* >(&cinfo), sizeof(ChunkInfo));
+        const uint32_t computed_crc =
+            crc32_ieee(hs_init_crc_32, reinterpret_cast< const unsigned char* >(&cinfo), sizeof(ChunkInfo));
         if (computed_crc != stored_crc) {
             throw std::runtime_error("Checksum mismatch for chunk_info in slot " + std::to_string(b));
         }
@@ -358,7 +432,7 @@ PhysicalDev::load_chunks() {
         prov.chunk_data_area.insert(
             ChunkInterval::right_open(cinfo.chunk_start_offset, cinfo.chunk_start_offset + cinfo.chunk_size));
 
-        auto chunk = std::make_shared< Chunk >(cinfo, static_cast< uint32_t >(b), shared_from_this());
+        auto chunk = std::make_shared< Chunk >(cinfo, to_u32(b), shared_from_this());
 
         const uint32_t chunk_id = cinfo.chunk_id;
         const uint32_t vdev_id = cinfo.vdev_id;
@@ -372,7 +446,7 @@ PhysicalDev::load_chunks() {
     co_return chunks_by_vdev;
 }
 
-folly::coro::Task< void > PhysicalDev::remove_chunk(const std::shared_ptr< Chunk >& chunk) {
+folly::coro::Task< void > PhysicalDev::remove_chunk(cshared< Chunk >& chunk) {
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     auto& prov = chunk_provisioner_;
 
@@ -384,7 +458,7 @@ folly::coro::Task< void > PhysicalDev::remove_chunk(const std::shared_ptr< Chunk
     free_chunk_info_locked(prov, cinfo);
 
     IOBuffer freed_buf{ChunkInfo::SIZE};
-    std::memcpy(freed_buf.data(), cinfo.to_bytes(), ChunkInfo::SIZE);
+    std::memcpy(freed_buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
     co_await write_super_block(freed_buf, chunk_info_offset_nth(slot));
 
     prov.chunk_info_slots->reset_bit(slot);
@@ -395,8 +469,10 @@ folly::coro::Task< void > PhysicalDev::remove_chunk(const std::shared_ptr< Chunk
     co_return;
 }
 
-folly::coro::Task< void > PhysicalDev::remove_chunks(const std::vector< std::shared_ptr< Chunk > >& chunks) {
-    if (chunks.empty()) { co_return; }
+folly::coro::Task< void > PhysicalDev::remove_chunks(const std::vector< shared< Chunk > >& chunks) {
+    if (chunks.empty()) {
+        co_return;
+    }
 
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     auto& prov = chunk_provisioner_;
@@ -406,7 +482,7 @@ folly::coro::Task< void > PhysicalDev::remove_chunks(const std::vector< std::sha
         prov.chunks.erase(cinfo.chunk_id);
         free_chunk_info_locked(prov, cinfo);
         IOBuffer freed_buf{ChunkInfo::SIZE};
-        std::memcpy(freed_buf.data(), cinfo.to_bytes(), ChunkInfo::SIZE);
+        std::memcpy(freed_buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
         co_await write_super_block(freed_buf, chunk_info_offset_nth(chunk->slot_number()));
         prov.chunk_info_slots->reset_bit(chunk->slot_number());
     }
@@ -421,23 +497,27 @@ folly::coro::Task< void > PhysicalDev::remove_chunks(const std::vector< std::sha
 
 folly::coro::Task< void > PhysicalDev::remove_chunks_for_vdev(uint32_t vdev_id) {
     // Collect chunks for this vdev without holding the lock.
-    std::vector< std::shared_ptr< Chunk > > to_remove;
+    std::vector< shared< Chunk > > to_remove;
     {
         auto lock = co_await chunk_mutex_.co_scoped_lock();
         for (const auto& [id, c] : chunk_provisioner_.chunks) {
-            if (c->vdev_id() == vdev_id) { to_remove.push_back(c); }
+            if (c->vdev_id() == vdev_id) {
+                to_remove.push_back(c);
+            }
         }
     }
-    if (!to_remove.empty()) { co_await remove_chunks(to_remove); }
+    if (!to_remove.empty()) {
+        co_await remove_chunks(to_remove);
+    }
 }
 
-folly::coro::Task< void > PhysicalDev::deactivate_chunk(const std::shared_ptr< Chunk >& chunk) {
+folly::coro::Task< void > PhysicalDev::deactivate_chunk(cshared< Chunk >& chunk) {
     ChunkInfo cinfo = chunk->info();
     cinfo.set_free();
     cinfo.compute_checksum();
 
     IOBuffer buf{ChunkInfo::SIZE};
-    std::memcpy(buf.data(), cinfo.to_bytes(), ChunkInfo::SIZE);
+    std::memcpy(buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
     co_await write(buf, chunk_info_offset_nth(chunk->slot_number()));
 
     chunk->update_info(cinfo);
@@ -445,27 +525,26 @@ folly::coro::Task< void > PhysicalDev::deactivate_chunk(const std::shared_ptr< C
     co_return;
 }
 
-folly::coro::Task< void > PhysicalDev::reactivate_chunk(const std::shared_ptr< Chunk >& chunk,
-                                                        uint32_t new_creation_order) {
+folly::coro::Task< void > PhysicalDev::reactivate_chunk(cshared< Chunk >& chunk, uint64_t new_vdev_order) {
     ChunkInfo cinfo = chunk->info();
     cinfo.set_allocated();
-    cinfo.chunk_creation_order = new_creation_order;
+    cinfo.chunk_vdev_order = new_vdev_order;
     cinfo.compute_checksum();
 
     IOBuffer buf{ChunkInfo::SIZE};
-    std::memcpy(buf.data(), cinfo.to_bytes(), ChunkInfo::SIZE);
+    std::memcpy(buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
     co_await write(buf, chunk_info_offset_nth(chunk->slot_number()));
 
     chunk->update_info(cinfo);
-    std::cout << "Reactivated chunk " << chunk->chunk_id() << " with creation_order=" << new_creation_order << "\n";
+    std::cout << "Reactivated chunk " << chunk->chunk_id() << " with vdev_order=" << new_vdev_order << "\n";
     co_return;
 }
 
 // ── Chunk accessors ───────────────────────────────────────────────────────────
 
-folly::coro::Task< std::vector< std::shared_ptr< Chunk > > > PhysicalDev::get_all_chunks() {
+folly::coro::Task< std::vector< shared< Chunk > > > PhysicalDev::get_all_chunks() {
     auto lock = co_await chunk_mutex_.co_scoped_lock();
-    std::vector< std::shared_ptr< Chunk > > result;
+    std::vector< shared< Chunk > > result;
     result.reserve(chunk_provisioner_.chunks.size());
     for (const auto& [_, c] : chunk_provisioner_.chunks) {
         result.push_back(c);
@@ -473,17 +552,19 @@ folly::coro::Task< std::vector< std::shared_ptr< Chunk > > > PhysicalDev::get_al
     co_return result;
 }
 
-folly::coro::Task< std::shared_ptr< Chunk > > PhysicalDev::get_chunk(uint32_t chunk_id) {
+folly::coro::Task< shared< Chunk > > PhysicalDev::get_chunk(uint32_t chunk_id) {
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     auto it = chunk_provisioner_.chunks.find(chunk_id);
     co_return (it != chunk_provisioner_.chunks.end()) ? it->second : nullptr;
 }
 
-folly::coro::Task< std::vector< std::shared_ptr< Chunk > > > PhysicalDev::get_chunks_for_vdev(uint32_t vdev_id) {
+folly::coro::Task< std::vector< shared< Chunk > > > PhysicalDev::get_chunks_for_vdev(uint32_t vdev_id) {
     auto lock = co_await chunk_mutex_.co_scoped_lock();
-    std::vector< std::shared_ptr< Chunk > > result;
+    std::vector< shared< Chunk > > result;
     for (const auto& [_, c] : chunk_provisioner_.chunks) {
-        if (c->vdev_id() == vdev_id) { result.push_back(c); }
+        if (c->vdev_id() == vdev_id) {
+            result.push_back(c);
+        }
     }
     co_return result;
 }
@@ -496,7 +577,7 @@ folly::coro::Task< size_t > PhysicalDev::get_chunk_count() {
 // ── Private locked helpers ────────────────────────────────────────────────────
 
 void PhysicalDev::populate_chunk_info_locked(ChunkProvisioner& prov, ChunkInfo& cinfo, uint32_t vdev_id, uint64_t size,
-                                             uint32_t chunk_id, uint32_t ordinal, const uint8_t* private_data,
+                                             uint32_t chunk_id, uint64_t vdev_order, const uint8_t* private_data,
                                              size_t private_size) {
     const ChunkInterval ival = find_next_chunk_area_locked(prov.chunk_data_area, size);
     prov.chunk_data_area.insert(ival);
@@ -505,7 +586,7 @@ void PhysicalDev::populate_chunk_info_locked(ChunkProvisioner& prov, ChunkInfo& 
     cinfo.chunk_size = size;
     cinfo.vdev_id = vdev_id;
     cinfo.chunk_id = chunk_id;
-    cinfo.chunk_creation_order = ordinal;
+    cinfo.chunk_vdev_order = vdev_order;
     cinfo.set_allocated();
     cinfo.set_user_private(private_data, private_size);
     cinfo.compute_checksum();
@@ -533,10 +614,14 @@ ChunkInterval PhysicalDev::find_next_chunk_area_locked(const ChunkIntervalSet& d
     // Mirrors Rust's find_next_chunk_area_locked().
     auto ins = ChunkInterval::right_open(data_start_offset(), data_start_offset() + size);
     for (const auto& existing : data_area) {
-        if (ins.upper() <= existing.lower()) { break; }
+        if (ins.upper() <= existing.lower()) {
+            break;
+        }
         ins = ChunkInterval::right_open(existing.upper(), existing.upper() + size);
     }
-    if (ins.upper() > data_end_offset()) { throw std::out_of_range("Physical dev has no room for additional chunk"); }
+    if (ins.upper() > data_end_offset()) {
+        throw std::out_of_range("Physical dev has no room for additional chunk");
+    }
     return ins;
 }
 
@@ -547,16 +632,19 @@ uint64_t PhysicalDev::data_end_offset() const {
 }
 
 uint64_t PhysicalDev::chunk_info_offset_nth(uint32_t slot) const {
-    return chunk_sb_offset() + static_cast< uint64_t >(chunk_info_bitmap_size()) +
-        static_cast< uint64_t >(slot) * ChunkInfo::SIZE;
+    return chunk_sb_offset() + to_u64(chunk_info_bitmap_size()) + to_u64(slot) * ChunkInfo::SIZE;
 }
 
-uint64_t PhysicalDev::chunk_sb_offset() const { return HSSuperBlk::chunk_sb_offset(); }
+uint64_t PhysicalDev::chunk_sb_offset() const {
+    return HSSuperBlk::chunk_sb_offset();
+}
 
 size_t PhysicalDev::chunk_info_bitmap_size() const {
-    return static_cast< size_t >(HSSuperBlk::chunk_info_bitmap_size(dev_info_));
+    return to_size(HSSuperBlk::chunk_info_bitmap_size(dev_info_));
 }
 
-uint32_t PhysicalDev::max_chunks_in_pdev() const { return HSSuperBlk::max_chunks_in_pdev(dev_info_); }
+uint32_t PhysicalDev::max_chunks_in_pdev() const {
+    return HSSuperBlk::max_chunks_in_pdev(dev_info_);
+}
 
 } // namespace homestore

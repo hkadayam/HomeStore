@@ -23,7 +23,7 @@
 
 #include "sisl/logging/logging.h"
 #include "blkalloc/slab_blk_allocator.h"
-#include "device/HSSuperBlk.h"     // HSSuperBlk layout constants
+#include "device/hs_super_blk.h" // HSSuperBlk layout constants
 #include "device/physical_dev.h" // PhysicalDev
 #include "device/virtual_dev.h"
 
@@ -40,13 +40,10 @@ VirtualDev::VirtualDev(VDevInfo info, std::vector< shared< PhysicalDev > > pdevs
         hs_dev_type_{static_cast< HSDevType >(info.hs_dev_type)},
         blk_size_{info.blk_size},
         multi_pdev_choice_{static_cast< MultiPDevOpts >(info.multi_pdev_choice)},
-        size_type_{static_cast< VDevSizeType >(info.size_type)},
         allocator_type_{static_cast< BlkAllocatorType >(info.alloc_type)},
         chunk_selector_type_{static_cast< ChunkSelectorType >(info.chunk_sel_type)},
         use_slab_allocator_{info.use_slab_allocator != 0},
-        incremental_chunk_size_{(static_cast< VDevSizeType >(info.size_type) == VDevSizeType::Dynamic)
-                                    ? static_cast< uint64_t >(info.chunk_size)
-                                    : 0},
+        incremental_chunk_size_{to_u64(info.chunk_size)},
         pdevs_{std::move(pdevs)},
         mutable_state_() {
     VDevMutableState initial{};
@@ -54,7 +51,7 @@ VirtualDev::VirtualDev(VDevInfo info, std::vector< shared< PhysicalDev > > pdevs
     store_state(std::move(initial));
 }
 
-folly::coro::Task< unique< VirtualDev > > VirtualDev::create(VDevParameters params, uint32_t vdev_id,
+folly::coro::Task< unique< VirtualDev > > VirtualDev::create(VDevParameters&& params, uint32_t vdev_id,
                                                              const std::vector< shared< PhysicalDev > >& pdevs) {
     if (pdevs.empty()) {
         throw std::invalid_argument("No pdevs available; cannot create vdev " + params.vdev_name);
@@ -70,8 +67,7 @@ folly::coro::Task< unique< VirtualDev > > VirtualDev::create(VDevParameters para
     adjust_vdev_params(params); // Normalise params (no-op when num_chunks == 0).
 
     if (params.num_chunks == 0) {
-        LOGINFO("New VirtualDev={} id={} type={} (no initial chunks)", params.vdev_name, vdev_id,
-                (int)params.size_type);
+        LOGINFO("New VirtualDev={} id={} (no initial chunks)", params.vdev_name, vdev_id);
     } else {
         LOGINFO("New VirtualDev={} size={} id={} chunks={} chunk_size={}", params.vdev_name, params.vdev_size, vdev_id,
                 params.num_chunks, params.chunk_size);
@@ -80,17 +76,14 @@ folly::coro::Task< unique< VirtualDev > > VirtualDev::create(VDevParameters para
     // Build VDevInfo from (possibly adjusted) params
     VDevInfo vinfo{};
     vinfo.vdev_id = vdev_id;
-    vinfo.vdev_size = params.vdev_size;
-    vinfo.num_primary_chunks = params.num_chunks;
-    vinfo.chunk_size = static_cast< uint32_t >(params.chunk_size);
+    vinfo.chunk_size = to_u32(params.chunk_size);
     vinfo.blk_size = params.blk_size;
     vinfo.num_mirrors = params.num_mirrors;
-    vinfo.size_type = static_cast< uint8_t >(params.size_type);
     vinfo.slot_allocated = 0x01;
-    vinfo.hs_dev_type = static_cast< uint8_t >(params.dev_type);
-    vinfo.multi_pdev_choice = static_cast< uint8_t >(params.multi_pdev_opts);
-    vinfo.alloc_type = static_cast< uint8_t >(params.alloc_type);
-    vinfo.chunk_sel_type = static_cast< uint8_t >(params.chunk_sel_type);
+    vinfo.hs_dev_type = to_u8(params.dev_type);
+    vinfo.multi_pdev_choice = to_u8(params.multi_pdev_opts);
+    vinfo.alloc_type = to_u8(params.alloc_type);
+    vinfo.chunk_sel_type = to_u8(params.chunk_sel_type);
     vinfo.use_slab_allocator = params.use_slab_allocator ? 1 : 0;
     vinfo.set_name(params.vdev_name);
     vinfo.compute_checksum();
@@ -110,18 +103,18 @@ folly::coro::Task< unique< VirtualDev > > VirtualDev::create(VDevParameters para
     }();
 
     uint32_t total_created = 0;
-    for (auto& pdev : vdev->pdevs_) {
-        if (total_created >= params.num_chunks) {
-            break;
-        }
+    for (size_t pi = 0; pi < vdev->pdevs_.size(); ++pi) {
+        if (total_created >= params.num_chunks) { break; }
+        auto& pdev = vdev->pdevs_[pi];
 
-        const uint32_t n = static_cast< uint32_t >(
-            params.num_chunks * (static_cast< double >(pdev->data_size()) / static_cast< double >(total_size)));
-        if (n == 0) {
-            continue;
-        }
+        uint32_t n = to_u32(params.num_chunks * (to_double(pdev->data_size()) / to_double(total_size)));
 
-        auto chunks = co_await pdev->create_chunks(vdev_id, n, params.chunk_size, /*start_ordinal=*/0);
+        // First pdev picks up any chunks lost to rounding so that chunk IDs stay small.
+        if (n == 0 && total_created == 0) { n = 1; }
+        n = std::min(n, params.num_chunks - total_created);
+        if (n == 0) { continue; }
+
+        auto chunks = co_await pdev->create_chunks(vdev_id, n, params.chunk_size, /*start_ordinal=*/total_created);
         vdev->on_chunks_added(std::move(chunks), /*newly_created=*/true);
         total_created += n;
     }
@@ -144,24 +137,20 @@ unique< VirtualDev > VirtualDev::load(VDevInfo vinfo, std::vector< shared< Physi
 // Public APIs: Device Resizing section with chunks
 // ──────────────────────────────────────────────────────────────────────────────
 folly::coro::Task< shared< Chunk > > VirtualDev::expand(uint64_t chunk_size) {
-    if (size_type_ != VDevSizeType::Dynamic) {
-        throw std::runtime_error("Cannot expand static vdev '" + name_ + "'");
-    }
-
     shared< Chunk > chunk = nullptr;
+    uint64_t vdev_order;
     {
         std::unique_lock lk{chunk_mgmt_mutex_};
-        uint32_t creation_order;
         {
             auto cur = load_state();
-            creation_order = cur->next_creation_order;
+            vdev_order = cur->next_vdev_order;
         }
 
         if (chunk_pool_) {
             chunk = chunk_pool_->try_get_chunk(chunk_size);
             if (chunk != nullptr) {
-                LOGDEBUG("Reusing pooled chunk {} with creation_order={}", chunk->chunk_id(), creation_order);
-                co_await chunk->physical_dev()->reactivate_chunk(pooled, creation_order);
+                LOGDEBUG("Reusing pooled chunk {} with vdev_order={}", chunk->chunk_id(), vdev_order);
+                co_await chunk->physical_dev()->reactivate_chunk(chunk, vdev_order);
             }
         }
     }
@@ -177,7 +166,7 @@ folly::coro::Task< shared< Chunk > > VirtualDev::expand(uint64_t chunk_size) {
                 best_pdev = pdevs_[i];
             }
         }
-        chunk = co_await best_pdev->create_chunk(vdev_id_, chunk_size, creation_order);
+        chunk = co_await best_pdev->create_chunk(vdev_id_, chunk_size, vdev_order);
     }
 
     on_chunk_added(chunk, /*newly_created=*/true);
@@ -185,19 +174,15 @@ folly::coro::Task< shared< Chunk > > VirtualDev::expand(uint64_t chunk_size) {
 }
 
 folly::coro::Task< uint32_t > VirtualDev::shrink(ChunkToShrink which, uint32_t specific_chunk_id) {
-    if (size_type_ != VDevSizeType::Dynamic) {
-        throw std::runtime_error("Cannot shrink static vdev '" + name_ + "'");
-    }
-
     shared< Chunk > chunk;
     {
         std::lock_guard lk{chunk_mgmt_mutex_};
         auto cur = load_state();
         if (which == ChunkToShrink::Last) {
-            if (cur->chunks_by_creation_order.empty()) {
+            if (cur->chunks_by_vdev_order.empty()) {
                 throw std::out_of_range("No chunks to shrink in vdev '" + name_ + "'");
             }
-            chunk = cur->chunks_by_creation_order.back();
+            chunk = cur->chunks_by_vdev_order.back();
         } else {
             auto it = cur->all_chunks.find(specific_chunk_id);
             if (it == cur->all_chunks.end()) {
@@ -251,6 +236,8 @@ folly::coro::Task< void > VirtualDev::destroy() {
 // ──────────────────────────────────────────────────────────────────────────────
 folly::coro::Task< void > VirtualDev::write(const IOBuffer& buf, const BlkId& bid) {
     auto [dev_offset, chunk] = to_dev_offset(bid);
+    VDEV_LOG(DEBUG, name_, "write: blk_num={} nblks={} chunk={} dev_offset={} buf_size={}", bid.blk_num(),
+             bid.blk_count(), bid.chunk_num(), dev_offset, buf.size());
     co_await chunk->physical_dev()->write(buf, dev_offset);
 }
 
@@ -261,6 +248,8 @@ folly::coro::Task< void > VirtualDev::writev(std::vector< IOBuffer >&& bufs, con
 
 folly::coro::Task< std::error_code > VirtualDev::read(IOBuffer& buf, const BlkId& bid) {
     auto [dev_offset, chunk] = to_dev_offset(bid);
+    VDEV_LOG(DEBUG, name_, "read: blk_num={} nblks={} chunk={} dev_offset={} buf_size={}", bid.blk_num(),
+             bid.blk_count(), bid.chunk_num(), dev_offset, buf.size());
     co_return co_await chunk->physical_dev()->read(buf, dev_offset);
 }
 
@@ -305,7 +294,7 @@ BlkAllocStatus VirtualDev::alloc_contiguous_blks(blk_count_t nblks, const blk_al
 
 BlkAllocStatus VirtualDev::alloc_blks(blk_count_t nblks, const blk_alloc_hints& hints, BlkIds& out_blkids) {
     auto state = load_state();
-    const uint64_t max_attempts = hints.chunk_id_hint.is_valid() ? 1 : state->total_chunk_num;
+    const uint64_t max_attempts = hints.chunk_id_hint.has_value() ? 1 : state->total_chunk_num;
     std::optional< uint32_t > last_failed;
     uint64_t attempt = 0;
     blk_count_t remaining = nblks;
@@ -328,7 +317,7 @@ BlkAllocStatus VirtualDev::alloc_blks(blk_count_t nblks, const blk_alloc_hints& 
             }
             continue;
         }
-        if (!hints.can_look_for_other_chunk || hints.chunk_id_hint.is_valid()) {
+        if (!hints.can_look_for_other_chunk || hints.chunk_id_hint.has_value()) {
             return out_blkids.empty() ? st : BlkAllocStatus::PARTIAL;
         }
         if (++attempt >= max_attempts) {
@@ -347,7 +336,7 @@ void VirtualDev::free_blk(const BlkId& bid) {
         return;
     }
     if (it->second->has_blk_allocator()) {
-        it->second->blk_allocator_mutable()->free_blk(bid, nullptr);
+        it->second->blk_allocator_mutable()->free(bid);
     }
 }
 
@@ -360,10 +349,17 @@ BlkAllocStatus VirtualDev::commit_blk(const BlkId& bid) {
     if (!it->second->has_blk_allocator()) {
         return BlkAllocStatus::FAILED;
     }
-    return it->second->blk_allocator_mutable()->commit_blk(bid);
+    return it->second->blk_allocator_mutable()->commit(bid);
 }
 
-void VirtualDev::init_blk_allocator(const shared< Chunk >& chunk) {
+void VirtualDev::recovery_completed() {
+    auto state = load_state();
+    for (auto& [_, c] : state->all_chunks) {
+        if (c->has_blk_allocator()) { c->blk_allocator_mutable()->recovery_completed(); }
+    }
+}
+
+void VirtualDev::init_blk_allocator(cshared< Chunk >& chunk) {
     if (chunk) {
         construct_blk_allocator(chunk, std::nullopt);
     } else {
@@ -378,7 +374,11 @@ void VirtualDev::load_blk_allocator(const std::unordered_map< uint32_t, sisl::By
     auto state = load_state();
     for (auto& [chunk_id, c] : state->all_chunks) {
         auto it = chunk_buffers.find(chunk_id);
-        construct_blk_allocator(c, (it != chunk_buffers.end()) ? it->second : std::nullopt);
+        if (it != chunk_buffers.end()) {
+            construct_blk_allocator(c, it->second);
+        } else {
+            construct_blk_allocator(c);
+        }
     }
 }
 
@@ -405,12 +405,12 @@ std::vector< shared< Chunk > > VirtualDev::get_chunks() const {
     return result;
 }
 
-std::vector< shared< Chunk > > VirtualDev::get_chunks_by_creation_order() const {
-    return load_state()->chunks_by_creation_order;
+std::vector< shared< Chunk > > VirtualDev::get_chunks_by_vdev_order() const {
+    return load_state()->chunks_by_vdev_order;
 }
 
 shared< Chunk > VirtualDev::get_nth_chunk(size_t n) const {
-    auto& v = load_state()->chunks_by_creation_order;
+    auto& v = load_state()->chunks_by_vdev_order;
     return (n < v.size()) ? v[n] : nullptr;
 }
 
@@ -421,10 +421,10 @@ shared< Chunk > VirtualDev::get_chunk(uint32_t chunk_id) const {
 }
 
 uint64_t VirtualDev::size() const {
-    return load_state()->vdev_info.vdev_size;
+    return load_state()->total_vdev_size;
 }
 uint64_t VirtualDev::num_chunks() const {
-    return load_state()->vdev_info.num_primary_chunks;
+    return load_state()->total_chunk_num;
 }
 uint64_t VirtualDev::chunk_size_bytes() const {
     return load_state()->vdev_info.chunk_size;
@@ -449,22 +449,20 @@ void VirtualDev::adjust_vdev_params(VDevParameters& p) {
         throw std::invalid_argument("VDev size cannot be 0: " + p.vdev_name);
     }
 
-    const uint64_t max_num_chunks =
-        std::min(static_cast< uint64_t >(p.vdev_size / MIN_CHUNK_SIZE), static_cast< uint64_t >(MAX_CHUNKS_IN_SYSTEM));
+    const uint64_t max_num_chunks = std::min(to_u64(p.vdev_size / MIN_CHUNK_SIZE), to_u64(MAX_CHUNKS_IN_SYSTEM));
 
     if (p.num_chunks != 0) {
-        const uint32_t min_chunks =
-            static_cast< uint32_t >((p.vdev_size - 1) / static_cast< uint64_t >(Chunk::MAX_CHUNK_SIZE) + 1);
+        const uint32_t min_chunks = to_u32((p.vdev_size - 1) / to_u64(Chunk::MAX_CHUNK_SIZE) + 1);
         p.num_chunks = std::max(p.num_chunks, min_chunks);
-        p.num_chunks = std::min(p.num_chunks, static_cast< uint32_t >(max_num_chunks));
-        const uint64_t unit = static_cast< uint64_t >(p.num_chunks) * p.blk_size;
+        p.num_chunks = std::min(p.num_chunks, to_u32(max_num_chunks));
+        const uint64_t unit = to_u64(p.num_chunks) * p.blk_size;
         p.vdev_size = (p.vdev_size / unit) * unit;
         p.chunk_size = p.vdev_size / p.num_chunks;
     } else if (p.chunk_size != 0) {
         p.chunk_size = std::max(p.chunk_size, MIN_CHUNK_SIZE);
         p.chunk_size = ((p.chunk_size + p.blk_size - 1) / p.blk_size) * p.blk_size;
         p.vdev_size = (p.vdev_size / p.chunk_size) * p.chunk_size;
-        p.num_chunks = static_cast< uint32_t >(p.vdev_size / p.chunk_size);
+        p.num_chunks = to_u32(p.vdev_size / p.chunk_size);
     } else {
         throw std::invalid_argument("Both num_chunks and chunk_size are 0 for vdev: " + p.vdev_name);
     }
@@ -504,15 +502,15 @@ std::vector< shared< PhysicalDev > > VirtualDev::pick_pdevs(const std::vector< s
 // ──────────────────────────────────────────────────────────────────────────────
 // Private Helpers - Chunk Management methods
 // ──────────────────────────────────────────────────────────────────────────────
-void VirtualDev::on_chunk_added(const shared< Chunk >& chunk, bool newly_created) {
+void VirtualDev::on_chunk_added(cshared< Chunk >& chunk, bool newly_created) {
     on_chunks_added(std::vector< shared< Chunk > >{chunk}, newly_created);
 }
 
-void VirtualDev::on_chunks_added(std::vector< shared< Chunk > >& chunks, bool newly_created) {
+void VirtualDev::on_chunks_added(const std::vector< shared< Chunk > >& chunks, bool newly_created) {
     std::lock_guard lg{chunk_mgmt_mutex_};
     auto new_state = clone_state();
-    new_state.chunks_by_creation_order.clear();
-    new_state.chunks_by_creation_order.reserve(new_state.all_chunks.size() + chunks.size());
+    new_state.chunks_by_vdev_order.clear();
+    new_state.chunks_by_vdev_order.reserve(new_state.all_chunks.size() + chunks.size());
 
     for (auto& chunk : chunks) {
         const uint32_t chunk_id = chunk->chunk_id();
@@ -529,12 +527,11 @@ void VirtualDev::on_chunks_added(std::vector< shared< Chunk > >& chunks, bool ne
         new_state.pdevs.insert(chunk->info().vdev_id);
         new_state.all_chunks.emplace(chunk_id, chunk);
         ++new_state.total_chunk_num;
-        new_state.vdev_info.vdev_size += chunk->info().chunk_size;
-        ++new_state.vdev_info.num_primary_chunks;
+        new_state.total_vdev_size += chunk->info().chunk_size;
 
-        const uint32_t ord = chunk->creation_order();
-        if (ord + 1 > new_state.next_creation_order) {
-            new_state.next_creation_order = ord + 1;
+        const uint64_t ord = chunk->vdev_order();
+        if (ord + 1 > new_state.next_vdev_order) {
+            new_state.next_vdev_order = ord + 1;
         }
 
         // Newly created chunks need their blk allocator constructed;
@@ -544,32 +541,31 @@ void VirtualDev::on_chunks_added(std::vector< shared< Chunk > >& chunks, bool ne
     }
 
     for (auto& [_, c] : new_state.all_chunks) {
-        new_state.chunks_by_creation_order.push_back(c);
+        new_state.chunks_by_vdev_order.push_back(c);
     }
-    std::sort(new_state.chunks_by_creation_order.begin(), new_state.chunks_by_creation_order.end(),
-              [](const auto& a, const auto& b) { return a->creation_order() < b->creation_order(); });
-    new_state.chunk_selector = build_chunk_selector(chunk_selector_type_, new_state.chunks_by_creation_order);
+    std::sort(new_state.chunks_by_vdev_order.begin(), new_state.chunks_by_vdev_order.end(),
+              [](const auto& a, const auto& b) { return a->vdev_order() < b->vdev_order(); });
+    new_state.chunk_selector = build_chunk_selector(chunk_selector_type_, new_state.chunks_by_vdev_order);
     store_state(std::move(new_state));
 }
 
-void VirtualDev::on_chunk_removed(const shared< Chunk >& chunk) {
+void VirtualDev::on_chunk_removed(cshared< Chunk >& chunk) {
     std::lock_guard lg{chunk_mgmt_mutex_};
     const uint32_t chunk_id = chunk->chunk_id();
 
     auto new_state = clone_state();
     new_state.all_chunks.erase(chunk_id);
     --new_state.total_chunk_num;
-    new_state.vdev_info.vdev_size -= static_cast< uint64_t >(chunk->info().chunk_size);
-    --new_state.vdev_info.num_primary_chunks;
+    new_state.total_vdev_size -= to_u64(chunk->info().chunk_size);
 
-    new_state.chunks_by_creation_order.clear();
-    new_state.chunks_by_creation_order.reserve(new_state.all_chunks.size());
+    new_state.chunks_by_vdev_order.clear();
+    new_state.chunks_by_vdev_order.reserve(new_state.all_chunks.size());
     for (auto& [_, c] : new_state.all_chunks) {
-        new_state.chunks_by_creation_order.push_back(c);
+        new_state.chunks_by_vdev_order.push_back(c);
     }
-    std::sort(new_state.chunks_by_creation_order.begin(), new_state.chunks_by_creation_order.end(),
-              [](const auto& a, const auto& b) { return a->creation_order() < b->creation_order(); });
-    new_state.chunk_selector = build_chunk_selector(chunk_selector_type_, new_state.chunks_by_creation_order);
+    std::sort(new_state.chunks_by_vdev_order.begin(), new_state.chunks_by_vdev_order.end(),
+              [](const auto& a, const auto& b) { return a->vdev_order() < b->vdev_order(); });
+    new_state.chunk_selector = build_chunk_selector(chunk_selector_type_, new_state.chunks_by_vdev_order);
     store_state(std::move(new_state));
 }
 
@@ -602,9 +598,9 @@ folly::coro::Task< std::pair< shared< Chunk >, bool > > VirtualDev::get_or_creat
     size_t current_count;
     {
         auto state = load_state();
-        current_count = state->chunks_by_creation_order.size();
+        current_count = state->chunks_by_vdev_order.size();
         if (n < current_count) {
-            existing = state->chunks_by_creation_order[n];
+            existing = state->chunks_by_vdev_order[n];
         }
     }
 
@@ -627,9 +623,9 @@ size_t VirtualDev::num_chunks_actual() const {
 
 shared< Chunk > VirtualDev::select_chunk_for_alloc(blk_count_t nblks, const blk_alloc_hints& hints,
                                                    std::optional< uint32_t > last_failed_id) const {
-    if (hints.chunk_id_hint.is_valid()) {
+    if (hints.chunk_id_hint.has_value()) {
         auto state = load_state();
-        auto it = state->all_chunks.find(hints.chunk_id_hint.chunk_num());
+        auto it = state->all_chunks.find(hints.chunk_id_hint.value());
         return (it != state->all_chunks.end()) ? it->second : nullptr;
     }
 
@@ -651,8 +647,7 @@ std::pair< uint64_t, shared< Chunk > > VirtualDev::to_dev_offset(const BlkId& bi
     if (it == state->all_chunks.end()) {
         throw std::out_of_range("Chunk " + std::to_string(bid.chunk_num()) + " not found in vdev '" + name_ + "'");
     }
-    const uint64_t dev_offset =
-        static_cast< uint64_t >(bid.blk_num()) * static_cast< uint64_t >(blk_size_) + it->second->start_offset();
+    const uint64_t dev_offset = to_u64(bid.blk_num()) * to_u64(blk_size_) + it->second->start_offset();
     return {dev_offset, it->second};
 }
 
@@ -660,11 +655,7 @@ std::pair< uint64_t, shared< Chunk > > VirtualDev::to_dev_offset(const BlkId& bi
 // Private Helpers - VDevInfo management
 // ──────────────────────────────────────────────────────────────────────────────
 uint64_t VDevInfo::vdev_info_offset(uint32_t vdev_id) {
-    constexpr uint32_t max_vdevs = HSSuperBlk::MAX_VDEVS_IN_SYSTEM;
-    const uint64_t bitmap_raw = ((max_vdevs + 7u) / 8u) + 4096u;
-    const uint64_t bitmap_size = ((bitmap_raw + 4095u) / 4096u) * 4096u;
-    const uint64_t array_offset = HSSuperBlk::vdev_sb_offset() + bitmap_size;
-    return array_offset + static_cast< uint64_t >(vdev_id) * SIZE;
+    return HSSuperBlk::vdev_sb_offset() + HSSuperBlk::vdev_slot_bitmap_size() + (to_u64(vdev_id) * SIZE);
 }
 
 void VirtualDev::adjust_vdev_info() {
@@ -672,13 +663,13 @@ void VirtualDev::adjust_vdev_info() {
     auto new_state = clone_state();
 
     uint64_t total_size = 0;
-    uint32_t total_count = 0;
+    uint64_t total_count = 0;
     for (auto& [_, c] : new_state.all_chunks) {
         total_size += c->info().chunk_size;
-        total_count += 1;
+        ++total_count;
     }
-    new_state.vdev_info.vdev_size = total_size;
-    new_state.vdev_info.num_primary_chunks = total_count;
+    new_state.total_vdev_size = total_size;
+    new_state.total_chunk_num = total_count;
     store_state(std::move(new_state));
 
     LOGINFO("Adjusted VDev '{}' stats: size={} num_chunks={}", name_, total_size, total_count);
@@ -694,7 +685,7 @@ folly::coro::Task< void > VirtualDev::write_vdev_info() {
     vinfo.compute_checksum();
 
     IOBuffer buf{sizeof(VDevInfo)};
-    std::memcpy(buf.data(), vinfo.to_bytes(), sizeof(VDevInfo));
+    std::memcpy(buf.bytes(), vinfo.to_bytes(), sizeof(VDevInfo));
 
     const uint64_t offset = VDevInfo::vdev_info_offset(vdev_id_);
     for (auto& pdev : pdevs_) {
@@ -705,7 +696,7 @@ folly::coro::Task< void > VirtualDev::write_vdev_info() {
 // ──────────────────────────────────────────────────────────────────────────────
 // Private Helpers - Blk Allocator management
 // ──────────────────────────────────────────────────────────────────────────────
-void VirtualDev::construct_blk_allocator(const shared< Chunk >& chunk, std::optional< sisl::ByteArray > buffer) {
+void VirtualDev::construct_blk_allocator(cshared< Chunk >& chunk, std::optional< sisl::ByteArray > buffer) {
     if (allocator_type_ == BlkAllocatorType::None) {
         return;
     }
@@ -714,7 +705,8 @@ void VirtualDev::construct_blk_allocator(const shared< Chunk >& chunk, std::opti
     const std::string alloc_name = name_ + "_chunk_" + std::to_string(chunk->chunk_id());
 
     if (allocator_type_ == BlkAllocatorType::SlabCompact || allocator_type_ == BlkAllocatorType::SlabExtend) {
-        SlabBlkAllocConfig cfg{blk_size_, align_size, align_size, chunk->info().chunk_size, true, alloc_name};
+        SlabBlkAllocConfig cfg{blk_size_, align_size, align_size, chunk->info().chunk_size, buffer.has_value(),
+                               alloc_name};
         cfg.alloc_mode =
             (allocator_type_ == BlkAllocatorType::SlabCompact) ? AllocMode::CompactAlloc : AllocMode::ExpandedAlloc;
         chunk->set_block_allocator(

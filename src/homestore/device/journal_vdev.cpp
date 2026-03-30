@@ -42,15 +42,15 @@ JournalVirtualDev::JournalVirtualDev(DeviceManager& dmgr, const vdev_info& vinfo
     m_init_private_data = std::make_shared< JournalChunkPrivate >();
     m_chunk_pool = std::make_unique< ChunkPool >(
         dmgr,
-        ChunkPool::Params{
-            HS_DYNAMIC_CONFIG(generic.journal_chunk_pool_capacity),
-            [this]() {
-                m_init_private_data->created_at = get_time_since_epoch_ms();
-                m_init_private_data->end_of_chunk = m_vdev_info.chunk_size;
-                sisl::Blob private_blob{r_cast< uint8_t* >(m_init_private_data.get()), sizeof(JournalChunkPrivate)};
-                return private_blob;
-            },
-            m_vdev_info.hs_dev_type, m_vdev_info.vdev_id, m_vdev_info.chunk_size});
+        ChunkPool::Params{HS_DYNAMIC_CONFIG(generic.journal_chunk_pool_capacity),
+                          [this]() {
+                              m_init_private_data->created_at = get_time_since_epoch_ms();
+                              m_init_private_data->end_of_chunk = m_vdev_info.chunk_size;
+                              sisl::Blob private_blob{r_cast< uint8_t* >(m_init_private_data.get()),
+                                                      sizeof(JournalChunkPrivate)};
+                              return private_blob;
+                          },
+                          m_vdev_info.hs_dev_type, m_vdev_info.vdev_id, m_vdev_info.chunk_size});
 
     resource_mgr().register_journal_vdev_exceed_cb([this]([[maybe_unused]] int64_t dirty_buf_count, bool critical) {
         // either it is critical or non-critical, call cp_flush;
@@ -63,7 +63,8 @@ JournalVirtualDev::JournalVirtualDev(DeviceManager& dmgr, const vdev_info& vinfo
     });
 }
 
-JournalVirtualDev::~JournalVirtualDev() {}
+JournalVirtualDev::~JournalVirtualDev() {
+}
 
 void JournalVirtualDev::init() {
     struct HeadChunk {
@@ -119,7 +120,9 @@ void JournalVirtualDev::init() {
     // Remove chunk will affect the m_all_chunks so keep a separate list.
     std::vector< shared< Chunk > > orphan_chunks;
     for (auto& [_, chunk] : m_all_chunks) {
-        if (!visited_chunks.count(chunk->chunk_id())) { orphan_chunks.push_back(chunk); }
+        if (!visited_chunks.count(chunk->chunk_id())) {
+            orphan_chunks.push_back(chunk);
+        }
     }
 
     // Remove the orphan chunks.
@@ -259,14 +262,18 @@ off_t JournalVirtualDev::Descriptor::alloc_next_append_blk(size_t sz) {
         LOGINFOMOD(journalvdev, "No space left for size {} Creating chunk desc {}", sz, to_string());
 
 #ifdef _PRERELEASE
-        if (hs()->crash_simulator().crash_if_flip_set("abort_before_update_eof_cur_chunk")) { return tail_offset(); }
+        if (hs()->crash_simulator().crash_if_flip_set("abort_before_update_eof_cur_chunk")) {
+            return tail_offset();
+        }
 #endif
 
         // Append a chunk to m_journal_chunks list. This will increase the m_end_offset.
         append_chunk();
 
 #ifdef _PRERELEASE
-        if (hs()->crash_simulator().crash_if_flip_set("abort_after_update_eof_next_chunk")) { return tail_offset(); }
+        if (hs()->crash_simulator().crash_if_flip_set("abort_after_update_eof_next_chunk")) {
+            return tail_offset();
+        }
 #endif
 
         RELEASE_ASSERT((tail_offset() + static_cast< off_t >(sz)) < m_end_offset, "No space for append blk");
@@ -389,7 +396,9 @@ std::error_code JournalVirtualDev::Descriptor::sync_pwritev(const iovec* iov, in
 
 /////////////////////////////// Read Section //////////////////////////////////
 int64_t JournalVirtualDev::Descriptor::sync_next_read(uint8_t* buf, size_t size_rd) {
-    if (m_journal_chunks.empty()) { return -1; }
+    if (m_journal_chunks.empty()) {
+        return -1;
+    }
 
     HS_REL_ASSERT_LE(m_seek_cursor, m_end_offset, "seek_cursor {} exceeded end_offset {}", m_seek_cursor, m_end_offset);
     if (m_seek_cursor >= m_end_offset) {
@@ -421,7 +430,9 @@ int64_t JournalVirtualDev::Descriptor::sync_next_read(uint8_t* buf, size_t size_
         }
     }
 
-    if (buf == nullptr) { return size_rd; }
+    if (buf == nullptr) {
+        return size_rd;
+    }
 
     auto ec = sync_pread(buf, size_rd, m_seek_cursor);
     // TODO: Check if we can have tolerate this error and somehow start homestore without replaying or in degraded mode?
@@ -542,7 +553,9 @@ void JournalVirtualDev::Descriptor::update_data_start_offset(off_t offset) {
 
 off_t JournalVirtualDev::Descriptor::tail_offset(bool reserve_space_include) const {
     off_t tail = static_cast< off_t >(data_start_offset() + m_write_sz_in_total.load(std::memory_order_relaxed));
-    if (reserve_space_include) { tail += m_reserved_sz; }
+    if (reserve_space_include) {
+        tail += m_reserved_sz;
+    }
     HS_REL_ASSERT(static_cast< int64_t >(tail) <= m_end_offset, "tail is more than offset tail {} offset {}", tail,
                   m_end_offset);
     return tail;
@@ -697,7 +710,7 @@ uint64_t JournalVirtualDev::Descriptor::logical_to_dev_offset(off_t log_offset, 
     chunk_id = 0;
     offset_in_chunk = 0;
 
-    uint64_t off_l{static_cast< uint64_t >(log_offset)};
+    uint64_t off_l{to_u64(log_offset)};
     for (size_t d{0}; d < m_primary_pdev_chunks_list.size(); ++d) {
         for (size_t c{0}; c < m_primary_pdev_chunks_list[d].chunks_in_pdev.size(); ++c) {
             if (off_l >= m_chunk_size) {
@@ -721,7 +734,7 @@ uint64_t JournalVirtualDev::Descriptor::logical_to_dev_offset(off_t log_offset, 
 std::tuple< shared< Chunk >, uint32_t, off_t > JournalVirtualDev::Descriptor::offset_to_chunk(off_t log_offset,
                                                                                               bool check) const {
     uint64_t chunk_aligned_offset = sisl::round_down(m_data_start_offset, m_vdev.info().chunk_size);
-    uint64_t off_l{static_cast< uint64_t >(log_offset) - chunk_aligned_offset};
+    uint64_t off_l{to_u64(log_offset) - chunk_aligned_offset};
     uint32_t index = 0;
     for (auto& chunk : m_journal_chunks) {
         if (off_l >= chunk->size()) {
@@ -732,14 +745,19 @@ std::tuple< shared< Chunk >, uint32_t, off_t > JournalVirtualDev::Descriptor::of
         }
     }
 
-    if (check) { HS_DBG_ASSERT(false, "Input log_offset is invalid: {} {}", log_offset, to_string()); }
+    if (check) {
+        HS_DBG_ASSERT(false, "Input log_offset is invalid: {} {}", log_offset, to_string());
+    }
     return {nullptr, 0L, 0L};
 }
 
 bool JournalVirtualDev::Descriptor::is_offset_at_last_chunk(off_t bytes_offset) {
     auto [chunk, chunk_index, _] = offset_to_chunk(bytes_offset, false);
-    if (chunk == nullptr) return true;
-    if (chunk_index == m_journal_chunks.size() - 1) { return true; }
+    if (chunk == nullptr)
+        return true;
+    if (chunk_index == m_journal_chunks.size() - 1) {
+        return true;
+    }
     return false;
 }
 
@@ -823,7 +841,9 @@ uint64_t JournalVirtualDev::used_size() const {
     return total_size;
 }
 
-uint64_t JournalVirtualDev::available_blks() const { return (size() - used_size()) / block_size(); }
+uint64_t JournalVirtualDev::available_blks() const {
+    return (size() - used_size()) / block_size();
+}
 
 nlohmann::json JournalVirtualDev::get_status(int log_level) const {
     std::lock_guard lock{m_mutex};

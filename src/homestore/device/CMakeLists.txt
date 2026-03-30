@@ -7,6 +7,9 @@ target_sources(hs_device PRIVATE
     device_manager.cpp
     physical_dev.cpp
     virtual_dev.cpp
-    journal_vdev.cpp
 )
-target_link_libraries(hs_device hs_common ${COMMON_DEPS})
+target_link_libraries(hs_device ${COMMON_DEPS})
+
+if(NOT DEFINED BUILD_TESTING OR BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

@@ -23,12 +23,12 @@
 #include <vector>
 
 #include <folly/coro/Task.h>
-#include <sisl/fds/bitset.h>
+#include "sisl/fds/bitset.h"
 
-#include <homestore/homestore_decl.hpp> // dev_info, HSDevType, io_flag, shared, unique
-#include "device/HSSuperBlk.h"        // FirstBlockHeader, HSSuperBlk
-#include "device/physical_dev.h"    // PhysicalDev
-#include "device/virtual_dev.h"     // VirtualDev, VDevParameters, VDevInfo
+#include "device/device_decl.h"  // HSDevType, IOFlag, DevInfo
+#include "device/hs_super_blk.h" // FirstBlockHeader, HSSuperBlk
+#include "device/physical_dev.h" // PhysicalDev
+#include "device/virtual_dev.h"  // VirtualDev, VDevParameters, VDevInfo
 
 namespace homestore {
 
@@ -60,9 +60,10 @@ struct DeviceManagerState {
 //
 // Thread-safety: all public methods are safe to call from any thread.
 // Async methods that perform I/O are folly coroutines (Task<>).
-class DeviceManager {
+class DeviceManager : public std::enable_shared_from_this< DeviceManager > {
 public:
-    DeviceManager(std::vector< dev_info > devs, io_flag data_open_flags, io_flag fast_open_flags);
+    static shared< DeviceManager > create(std::vector< DevInfo >&& devs, IOFlag data_open_flags, IOFlag fast_open_flags);
+
     ~DeviceManager() = default;
     DeviceManager(const DeviceManager&) = delete;
     DeviceManager& operator=(const DeviceManager&) = delete;
@@ -73,14 +74,15 @@ public:
 
     // ── Device lifecycle ──────────────────────────────────────────────────────
     folly::coro::Task< void > format_devices();
+    folly::coro::Task< void > commit_formatting();
     folly::coro::Task< void > load_devices();
     folly::coro::Task< void > close_devices();
 
     // ── VirtualDev management ─────────────────────────────────────────────────
-    folly::coro::Task< shared< VirtualDev > > create_vdev(VDevParameters params);
+    folly::coro::Task< shared< VirtualDev > > create_vdev(VDevParameters&& params);
 
     /// Destroys the vdev on disk, removes it from the registry, frees its slot, and persists the bitmap.
-    folly::coro::Task< void > destroy_vdev(shared< VirtualDev > vdev);
+    folly::coro::Task< void > destroy_vdev(cshared< VirtualDev >& vdev);
 
     // ── PhysicalDev accessors (thread-safe, lock-protected) ───────────────────
     shared< PhysicalDev > get_pdev(uint32_t pdev_id) const;
@@ -103,32 +105,23 @@ public:
     void free_vdev_id(uint32_t vdev_id);
 
 private:
+    DeviceManager(std::vector< DevInfo >&& devs, IOFlag data_open_flags, IOFlag fast_open_flags);
+
     // ── Private async helpers ─────────────────────────────────────────────────
     folly::coro::Task< void > load_vdevs();
     folly::coro::Task< void > cleanup_stale_slot_vdevs(const std::vector< uint32_t >& stale_slot_ids);
     folly::coro::Task< void > write_vdev_slot_bitmap();
 
-    static folly::coro::Task< VDevInfo > read_vdev_info(const shared< PhysicalDev >& pdev, uint32_t vdev_id);
+    static folly::coro::Task< VDevInfo > read_vdev_info(cshared< PhysicalDev >& pdev, uint32_t vdev_id);
 
     /// Returns (start_slot, end_slot) pairs of consecutive set-bit runs in bm.
     static std::vector< std::pair< uint32_t, uint32_t > > find_consecutive_ranges(const sisl::Bitset& bm);
 
     int device_open_flags(HSDevType dtype) const;
 
-    // ── Superblock layout helpers (constexpr, no I/O) ────────────────────────
-    // The vdev area of the superblock has this layout:
-    //   [ vdev_slot_bitmap | VDevInfo[0] | VDevInfo[1] | ... | VDevInfo[N-1] ]
-    // The bitmap is page-aligned; its offset equals HSSuperBlk::vdev_sb_offset().
-
-    static constexpr uint64_t vdev_slot_bitmap_size() {
-        constexpr uint64_t raw = (HSSuperBlk::MAX_VDEVS_IN_SYSTEM + 7u) / 8u + 4096u;
-        return ((raw + 4095u) / 4096u) * 4096u;
-    }
-    static constexpr uint64_t vdev_slot_bitmap_offset() { return HSSuperBlk::vdev_sb_offset(); }
-
 private:
     // ── Immutable after construction ──────────────────────────────────────────
-    std::vector< dev_info > dev_infos_;
+    std::vector< DevInfo > dev_infos_;
     int data_open_flags_;
     int fast_open_flags_;
 

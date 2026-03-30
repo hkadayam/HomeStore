@@ -28,18 +28,19 @@
 #include "device/device_manager.h"
 #include "device/physical_dev.h"
 #include "device/virtual_dev.h"
+#include "managers.h"
 
 namespace homestore {
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
-static int io_flag_to_posix(io_flag f) {
+static int io_flag_to_posix(IOFlag f) {
     switch (f) {
-    case io_flag::BUFFERED_IO:
+    case IOFlag::BUFFERED_IO:
         return O_RDWR | O_CREAT;
-    case io_flag::READ_ONLY:
+    case IOFlag::READ_ONLY:
         return O_RDONLY;
-    case io_flag::DIRECT_IO:
+    case IOFlag::DIRECT_IO:
 #ifdef O_DIRECT
         return O_RDWR | O_CREAT | O_DIRECT;
 #else
@@ -49,10 +50,17 @@ static int io_flag_to_posix(io_flag f) {
     return O_RDWR | O_CREAT;
 }
 
-DeviceManager::DeviceManager(std::vector< dev_info > devs, io_flag data_open_flags, io_flag fast_open_flags) :
+DeviceManager::DeviceManager(std::vector< DevInfo >&& devs, IOFlag data_open_flags, IOFlag fast_open_flags) :
         dev_infos_{std::move(devs)},
         data_open_flags_{io_flag_to_posix(data_open_flags)},
         fast_open_flags_{io_flag_to_posix(fast_open_flags)} {
+}
+
+shared< DeviceManager > DeviceManager::create(std::vector< DevInfo >&& devs, IOFlag data_open_flags,
+                                              IOFlag fast_open_flags) {
+    auto mgr = shared< DeviceManager >(new DeviceManager(std::move(devs), data_open_flags, fast_open_flags));
+    Managers::init_device_mgr(mgr);
+    return mgr;
 }
 
 // ── Boot-time queries ─────────────────────────────────────────────────────────
@@ -75,7 +83,8 @@ folly::coro::Task< void > DeviceManager::format_devices() {
         auto& hdr = state_.first_blk_hdr;
         hdr.gen_number += 1;
         hdr.version = FirstBlockHeader::CURRENT_SUPERBLOCK_VERSION;
-        hdr.num_pdevs = static_cast< uint32_t >(dev_infos_.size());
+        std::strncpy(hdr.product_name, FirstBlockHeader::PRODUCT_NAME, FirstBlockHeader::s_product_name_size);
+        hdr.num_pdevs = to_u32(dev_infos_.size());
         hdr.max_vdevs = HSSuperBlk::MAX_VDEVS_IN_SYSTEM;
         hdr.max_system_chunks = HSSuperBlk::MAX_CHUNKS_IN_SYSTEM;
         hdr.system_uuid = boost::uuids::random_generator{}();
@@ -93,7 +102,7 @@ folly::coro::Task< void > DeviceManager::format_devices() {
             pdev_id = state_.cur_pdev_id++;
         }
 
-        auto pdev = co_await PhysicalDev::create(dinfo, oflags, pdev_id);
+        auto pdev = co_await PhysicalDev::create(dinfo, oflags, pdev_id, state_.first_blk_hdr);
         const uint32_t id = pdev->pdev_id();
 
         {
@@ -106,9 +115,35 @@ folly::coro::Task< void > DeviceManager::format_devices() {
     co_await write_vdev_slot_bitmap();
 }
 
-folly::coro::Task< void > DeviceManager::load_devices() {
+folly::coro::Task< void > DeviceManager::commit_formatting() {
+    std::vector< shared< PhysicalDev > > pdevs;
     {
         std::lock_guard lg{state_mutex_};
+        for (auto& [id, p] : state_.all_pdevs) {
+            pdevs.push_back(p);
+        }
+    }
+    for (auto& pdev : pdevs) {
+        co_await pdev->commit_formatting();
+    }
+    LOGINFO("HomeStore formatting committed on all {} physical devices", pdevs.size());
+}
+
+folly::coro::Task< void > DeviceManager::load_devices() {
+    // Read the first block from the first device to recover the system header (uuid, num_pdevs, etc.).
+    {
+        const auto& first_dev = dev_infos_.front();
+        const int oflags = device_open_flags(first_dev.dev_type);
+        auto fb = co_await PhysicalDev::read_first_block(first_dev.dev_name, oflags);
+        if (!fb.is_valid()) {
+            throw std::system_error(std::make_error_code(std::errc::invalid_argument),
+                                    "Invalid first block on lead device " + first_dev.dev_name);
+        }
+
+        std::lock_guard lg{state_mutex_};
+        state_.first_blk_hdr = fb.hdr;
+        state_.first_time_boot = false;
+
         const uint32_t expected = state_.first_blk_hdr.num_pdevs;
         const uint32_t actual = to_u32(dev_infos_.size());
         if (expected != actual) {
@@ -116,19 +151,12 @@ folly::coro::Task< void > DeviceManager::load_devices() {
                     actual);
             state_.boot_in_degraded_mode = true;
         }
-        state_.first_time_boot = false;
     }
 
     for (const auto& dinfo : dev_infos_) {
         const int oflags = device_open_flags(dinfo.dev_type);
 
-        uint32_t pdev_id;
-        {
-            std::lock_guard lg{state_mutex_};
-            pdev_id = state_.cur_pdev_id++;
-        }
-
-        auto pdev = co_await PhysicalDev::load(dinfo, oflags);
+        auto pdev = co_await PhysicalDev::load(dinfo, oflags, state_.first_blk_hdr);
         const uint32_t id = pdev->pdev_id();
 
         {
@@ -156,7 +184,7 @@ folly::coro::Task< void > DeviceManager::close_devices() {
 
 // ── VirtualDev management ─────────────────────────────────────────────────────
 
-folly::coro::Task< shared< VirtualDev > > DeviceManager::create_vdev(VDevParameters params) {
+folly::coro::Task< shared< VirtualDev > > DeviceManager::create_vdev(VDevParameters&& params) {
     auto pdevs = get_pdevs_by_dev_type(params.dev_type);
     if (pdevs.empty()) {
         throw std::runtime_error(fmt::format("No physical devices of type {} available", enum_name(params.dev_type)));
@@ -168,7 +196,7 @@ folly::coro::Task< shared< VirtualDev > > DeviceManager::create_vdev(VDevParamet
     }
     const uint32_t vdev_id = *vdev_id_opt;
 
-    auto vdev_unique = co_await VirtualDev::create(params, vdev_id, pdevs);
+    auto vdev_unique = co_await VirtualDev::create(std::move(params), vdev_id, pdevs);
     auto vdev = shared< VirtualDev >{std::move(vdev_unique)};
 
     {
@@ -182,7 +210,7 @@ folly::coro::Task< shared< VirtualDev > > DeviceManager::create_vdev(VDevParamet
     co_return vdev;
 }
 
-folly::coro::Task< void > DeviceManager::destroy_vdev(shared< VirtualDev > vdev) {
+folly::coro::Task< void > DeviceManager::destroy_vdev(cshared< VirtualDev >& vdev) {
     co_await vdev->destroy();
     const uint32_t vdev_id = vdev->vdev_id();
     {
@@ -204,12 +232,12 @@ shared< PhysicalDev > DeviceManager::get_pdev(uint32_t pdev_id) const {
 
 std::vector< shared< PhysicalDev > > DeviceManager::get_pdevs_by_dev_type(HSDevType dtype) const {
     std::lock_guard lg{state_mutex_};
-    auto it = state_.pdevs_by_type.find(static_cast< uint8_t >(dtype));
+    auto it = state_.pdevs_by_type.find(to_u8(dtype));
     if (it != state_.pdevs_by_type.end()) {
         return it->second;
     }
     // Fall back to Data pdevs when the requested type has no dedicated devices.
-    auto it2 = state_.pdevs_by_type.find(static_cast< uint8_t >(HSDevType::Data));
+    auto it2 = state_.pdevs_by_type.find(to_u8(HSDevType::Data));
     return (it2 != state_.pdevs_by_type.end()) ? it2->second : std::vector< shared< PhysicalDev > >{};
 }
 
@@ -234,7 +262,9 @@ shared< VirtualDev > DeviceManager::get_vdev(uint32_t vdev_id) const {
 shared< VirtualDev > DeviceManager::get_vdev(std::string_view name) const {
     std::lock_guard lg{state_mutex_};
     for (auto& [id, vdev] : state_.all_vdevs) {
-        if (vdev->name() == name) { return vdev; }
+        if (vdev->name() == name) {
+            return vdev;
+        }
     }
     return nullptr;
 }
@@ -252,7 +282,7 @@ uint64_t DeviceManager::total_capacity() const {
 
 uint64_t DeviceManager::total_capacity_by_type(HSDevType dtype) const {
     std::lock_guard lg{state_mutex_};
-    auto it = state_.pdevs_by_type.find(static_cast< uint8_t >(dtype));
+    auto it = state_.pdevs_by_type.find(to_u8(dtype));
     if (it == state_.pdevs_by_type.end()) {
         return 0;
     }
@@ -288,13 +318,13 @@ std::optional< uint32_t > DeviceManager::allocate_vdev_id() {
         return std::nullopt;
     }
     state_.vdev_slot_bm->set_bit(pos);
-    return static_cast< uint32_t >(pos);
+    return to_u32(pos);
 }
 
 void DeviceManager::free_vdev_id(uint32_t vdev_id) {
     std::lock_guard lg{state_mutex_};
     assert(state_.vdev_slot_bm);
-    state_.vdev_slot_bm->reset_bit(static_cast< uint64_t >(vdev_id));
+    state_.vdev_slot_bm->reset_bit(to_u64(vdev_id));
 }
 
 // ── Private async helpers ─────────────────────────────────────────────────────
@@ -325,8 +355,8 @@ folly::coro::Task< void > DeviceManager::load_vdevs() {
 
     // Read the vdev slot bitmap from the first pdev.
     auto& first_pdev = all_pdevs[0];
-    const uint64_t bitmap_offset = vdev_slot_bitmap_offset();
-    const uint32_t bitmap_size = vdev_slot_bitmap_size();
+    const uint64_t bitmap_offset = HSSuperBlk::vdev_sb_offset();
+    const uint32_t bitmap_size = HSSuperBlk::vdev_slot_bitmap_size();
 
     auto ba = sisl::make_byte_array(bitmap_size, first_pdev->align_size());
     if (auto ec = co_await first_pdev->read_super_block(*ba, bitmap_offset); ec) {
@@ -348,27 +378,33 @@ folly::coro::Task< void > DeviceManager::load_vdevs() {
     std::vector< uint32_t > stale_slot_vdev_ids;
     std::unordered_set< uint32_t > loaded_vdev_ids;
 
-    // Batch-read VDevInfo records for each consecutive run of active slots.
-    for (auto [range_start, range_end] : active_ranges) {
-        const uint32_t num_slots = range_end - range_start + 1;
-        const uint64_t read_off =
-            vdev_slot_bitmap_offset() + vdev_slot_bitmap_size() + static_cast< uint64_t >(range_start) * VDevInfo::SIZE;
-        const size_t read_size = static_cast< size_t >(num_slots) * VDevInfo::SIZE;
-
-        IOBuffer batch{read_size};
-        if (auto ec2 = co_await first_pdev->read_super_block(batch, read_off); ec2) {
-            throw std::system_error(ec2, "Failed to read VDevInfo batch");
+    // Build vdev_id → pdev mapping: for each vdev, pick a pdev that has its chunks. VDevInfo is written to the vdev's
+    // backing pdevs, so we must read from one of those — not from an arbitrary first_pdev.
+    std::unordered_map< uint32_t, shared< PhysicalDev > > vdev_to_pdev;
+    for (auto& [vdev_id, chunks] : all_vdev_chunks) {
+        if (!chunks.empty()) {
+            vdev_to_pdev.emplace(vdev_id, chunks.front()->physical_dev());
         }
+    }
 
-        for (uint32_t i = 0; i < num_slots; ++i) {
-            const uint32_t vdev_id = range_start + i;
-            const size_t buf_offset = static_cast< size_t >(i) * VDevInfo::SIZE;
+    // Read VDevInfo for each active slot from the appropriate pdev.
+    for (auto [range_start, range_end] : active_ranges) {
+        for (uint32_t vdev_id = range_start; vdev_id <= range_end; ++vdev_id) {
+            // Find a pdev that backs this vdev. If no chunks exist, the vdev was created but never got chunks — read
+            // from the first pdev as a fallback (the bitmap write goes to all pdevs).
+            auto pdev_it = vdev_to_pdev.find(vdev_id);
+            auto& read_pdev = (pdev_it != vdev_to_pdev.end()) ? pdev_it->second : first_pdev;
+
+            const uint64_t read_off = VDevInfo::vdev_info_offset(vdev_id);
+            IOBuffer vinfo_buf{to_u32(VDevInfo::SIZE)};
+            if (auto ec2 = co_await read_pdev->read_super_block(vinfo_buf, read_off); ec2) {
+                throw std::system_error(ec2, fmt::format("Failed to read VDevInfo for vdev_id={}", vdev_id));
+            }
 
             VDevInfo vinfo{};
-            std::memcpy(&vinfo, batch.bytes() + buf_offset, VDevInfo::SIZE);
+            std::memcpy(&vinfo, vinfo_buf.bytes(), VDevInfo::SIZE);
 
             if (!vinfo.is_allocated()) {
-                // Bitmap says slot is active but VDevInfo says it's free — this is a zombie.
                 LOGWARN("Found stale-slot VDev id={} (bitmap set but slot_allocated=0)", vdev_id);
                 stale_slot_vdev_ids.push_back(vdev_id);
                 continue;
@@ -376,18 +412,13 @@ folly::coro::Task< void > DeviceManager::load_vdevs() {
 
             LOGINFO("Loading VirtualDev id={} name={}", vdev_id, vinfo.get_name());
 
-            // Collect the pdevs that back this vdev (keyed by hs_dev_type in VDevInfo).
             auto backing_pdevs = get_pdevs_by_dev_type(static_cast< HSDevType >(vinfo.hs_dev_type));
-
-            // Create an instance of VirtualDev from the loaded VDevInfo
             auto vdev = VirtualDev::load(vinfo, std::move(backing_pdevs));
 
-            // Register all chunks for this vdev (this will build vdev with each of its chunk allocator)
             if (auto it = all_vdev_chunks.find(vdev_id); it != all_vdev_chunks.end()) {
                 vdev->on_chunks_added(std::move(it->second), /*newly_created=*/false);
             }
 
-            // Reconcile vdev_size / num_primary_chunks against loaded chunks.
             vdev->adjust_vdev_info();
 
             {
@@ -447,7 +478,7 @@ folly::coro::Task< void > DeviceManager::cleanup_stale_slot_vdevs(const std::vec
 }
 
 folly::coro::Task< void > DeviceManager::write_vdev_slot_bitmap() {
-    const uint64_t offset = vdev_slot_bitmap_offset();
+    const uint64_t offset = HSSuperBlk::vdev_sb_offset();
 
     sisl::ByteArray ba;
     std::vector< shared< PhysicalDev > > pdevs;
@@ -469,9 +500,8 @@ folly::coro::Task< void > DeviceManager::write_vdev_slot_bitmap() {
 }
 
 // static
-folly::coro::Task< VDevInfo > DeviceManager::read_vdev_info(const shared< PhysicalDev >& pdev, uint32_t vdev_id) {
-    const uint64_t offset =
-        vdev_slot_bitmap_offset() + vdev_slot_bitmap_size() + static_cast< uint64_t >(vdev_id) * VDevInfo::SIZE;
+folly::coro::Task< VDevInfo > DeviceManager::read_vdev_info(cshared< PhysicalDev >& pdev, uint32_t vdev_id) {
+    const uint64_t offset = VDevInfo::vdev_info_offset(vdev_id);
     IOBuffer buf{VDevInfo::SIZE};
     if (auto ec = co_await pdev->read_super_block(buf, offset); ec) {
         throw std::system_error(ec, "Failed to read VDevInfo");
@@ -485,7 +515,7 @@ folly::coro::Task< VDevInfo > DeviceManager::read_vdev_info(const shared< Physic
 // static
 std::vector< std::pair< uint32_t, uint32_t > > DeviceManager::find_consecutive_ranges(const sisl::Bitset& bm) {
     std::vector< std::pair< uint32_t, uint32_t > > ranges;
-    const uint64_t max_slots = std::min(bm.total_bits(), static_cast< uint64_t >(HSSuperBlk::MAX_VDEVS_IN_SYSTEM));
+    const uint64_t max_slots = std::min(bm.size(), to_u64(HSSuperBlk::MAX_VDEVS_IN_SYSTEM));
     uint64_t cur = 0;
 
     while (true) {
@@ -494,16 +524,16 @@ std::vector< std::pair< uint32_t, uint32_t > > DeviceManager::find_consecutive_r
             break;
         }
 
-        const uint32_t range_start = static_cast< uint32_t >(cur);
+        const uint32_t range_start = to_u32(cur);
 
         uint64_t next_reset = bm.get_next_reset_bit(cur + 1);
         const uint32_t range_end = (next_reset == sisl::Bitset::npos || next_reset > max_slots)
-            ? static_cast< uint32_t >(max_slots - 1)
-            : static_cast< uint32_t >(next_reset - 1);
+            ? to_u32(max_slots - 1)
+            : to_u32(next_reset - 1);
 
         ranges.emplace_back(range_start, range_end);
 
-        cur = static_cast< uint64_t >(range_end) + 1;
+        cur = to_u64(range_end) + 1;
         if (cur >= max_slots) {
             break;
         }

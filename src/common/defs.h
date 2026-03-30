@@ -19,13 +19,30 @@
 #include <cstdlib>
 #include <memory>
 
+#include <boost/intrusive_ptr.hpp>
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_io.hpp>
+
+// ── Common type aliases ─────────────────────────────────────────────────────
+
+using Uuid = boost::uuids::uuid;
+
 // ── Smart-pointer aliases ────────────────────────────────────────────────────
 
 template < typename T >
 using shared = std::shared_ptr< T >;
 
 template < typename T >
+using cshared = const std::shared_ptr< T >;
+
+template < typename T >
 using unique = std::unique_ptr< T >;
+
+template < typename T >
+using intrusive = boost::intrusive_ptr< T >;
+
+template < typename T >
+using cintrusive = const boost::intrusive_ptr< T >;
 
 // ── Cast shortcuts ───────────────────────────────────────────────────────────
 //
@@ -69,6 +86,7 @@ using unique = std::unique_ptr< T >;
 #define to_u8(v)     static_cast< uint8_t >(v)
 #define to_int(v)    static_cast< int >(v)
 #define to_size(v)   static_cast< size_t >(v)
+#define to_double(v) static_cast< double >(v)
 
 #define to_u8ptr(p)  reinterpret_cast< uint8_t* >(p)
 #define to_ccptr(p)  reinterpret_cast< const char* >(p)

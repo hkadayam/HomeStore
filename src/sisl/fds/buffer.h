@@ -439,7 +439,11 @@ public:
         view_.set_bytes(base_buf_->cbytes());
         view_.set_size(base_buf_->size());
     }
-    ByteView(ByteArray buf) : ByteView(std::move(buf), 0u, buf->size()) {}
+    ByteView(ByteArray buf) {
+        base_buf_ = std::move(buf);
+        view_.set_bytes(base_buf_->cbytes());
+        view_.set_size(base_buf_->size());
+    }
     ByteView(ByteArray buf, uint32_t offset, uint32_t sz) {
         base_buf_ = std::move(buf);
         view_.set_bytes(base_buf_->cbytes() + offset);

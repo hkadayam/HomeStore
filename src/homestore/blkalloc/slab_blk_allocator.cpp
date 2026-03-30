@@ -62,8 +62,9 @@ SlabBlkAllocator::SlabBlkAllocator(SlabBlkAllocConfig const& cfg, std::optional<
         }
     }
 
+    // Sweep thread is created here but not triggered until recovery_completed(), so that any blocks reserved via
+    // commit_blk() are marked in inmem_bm_ before the sweep scans for free blocks.
     sweep_thread_ = sisl::named_thread("blkalloc_sweep_" + name_, [this]() { sweep_worker(); });
-    request_sweep();
 }
 
 SlabBlkAllocator::~SlabBlkAllocator() {
@@ -183,6 +184,8 @@ BlkAllocStatus SlabBlkAllocator::alloc_contiguous(BlkId& out_blkid) {
     auto const status = alloc(1, hints, out_blkids);
     if (status == BlkAllocStatus::SUCCESS) {
         out_blkid = out_blkids.front();
+        BLKALLOC_LOG(DEBUG, "alloc_contiguous: blk_num={} nblks={} chunk={}", out_blkid.blk_num(),
+                     out_blkid.blk_count(), out_blkid.chunk_num());
     }
     return status;
 }
@@ -198,7 +201,10 @@ BlkAllocStatus SlabBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const&
     //     break_up (pop-and-split of a large slab entry is not atomic).
     blk_count_t slab_got{0}; // tracks blocks already obtained from slab PARTIAL results (non-contiguous)
 
-    if (cfg_.alloc_mode == AllocMode::CompactAlloc || cfg_.use_slab_cache_) {
+    static constexpr blk_count_t max_slab_blks = static_cast< blk_count_t >(1) << (SlabCache::NUM_SLABS - 1);
+    const bool slab_can_satisfy = !hints.is_contiguous || nblks <= max_slab_blks;
+
+    if (slab_can_satisfy && (cfg_.alloc_mode == AllocMode::CompactAlloc || cfg_.use_slab_cache_)) {
         const auto max_attempts = (cfg_.alloc_mode == AllocMode::CompactAlloc)
             ? HS_DYNAMIC_CONFIG(blkallocator.max_varsize_blk_alloc_attempt)
             : 1u;
@@ -338,11 +344,16 @@ void SlabBlkAllocator::free(BlkId const& bid) {
 // ---- commit / persist / recovery ----
 
 BlkAllocStatus SlabBlkAllocator::commit(BlkId const& bid) {
+    BLKALLOC_LOG(DEBUG, "commit: blk_num={} nblks={} chunk={}", bid.blk_num(), bid.blk_count(), bid.chunk_num());
     if (inmem_bm_) {
+        if (!ondisk_bm_) {
+            // Non-persistent: inmem_bm_ is the sole source of truth, always mark committed blocks.
+            return inmem_bm_->commit(bid);
+        }
         rcu_read_lock();
         const bool is_recovering = (rcu_dereference(recovering_) != nullptr);
         if (is_recovering) {
-            inmem_bm_->commit(bid); // Journal replay during recovery: mark block in both bitmaps.
+            inmem_bm_->commit(bid);
         } else {
             BLKALLOC_DBG_ASSERT(inmem_bm_->is_blk_alloced(bid, true),
                                 "commit() called on bid not already set in inmem_bm");
@@ -363,6 +374,7 @@ void SlabBlkAllocator::recovery_completed() {
     bool* old = rcu_xchg_pointer(&recovering_, nullptr);
     synchronize_rcu();
     delete old;
+    request_sweep();
 }
 
 // ---- query ----

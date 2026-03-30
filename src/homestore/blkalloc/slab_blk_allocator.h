@@ -69,8 +69,18 @@ struct SlabBlkAllocConfig : public BlkAllocConfig {
         const blk_num_t num_portions = std::max< blk_num_t >((capacity_ - 1) / blks_per_portion_ + 1, 1u);
         const float refill_pct = HS_DYNAMIC_CONFIG(blkallocator.free_blk_cache_refill_threshold_pct);
 
-        HS_REL_ASSERT_GT(HS_DYNAMIC_CONFIG(blkallocator.free_blk_slab_distribution).size(), 0,
-                         "Config does not have free blk slab distribution");
+        // Auto-populate slab distribution from defaults if not configured.
+        auto const& dist = HS_DYNAMIC_CONFIG(blkallocator.free_blk_slab_distribution);
+        if (dist.empty()) {
+            HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
+                auto& slab_pct_dist = s.blkallocator.free_blk_slab_distribution;
+                if (slab_pct_dist.empty()) {
+                    static constexpr std::array< double, 9 > defaults{15.0, 7.0, 7.0, 6.0, 10.0, 10.0, 10.0, 10.0, 25.0};
+                    slab_pct_dist.insert(slab_pct_dist.begin(), defaults.begin(), defaults.end());
+                }
+            });
+            HS_SETTINGS_FACTORY().save();
+        }
 
         slab_idx_t idx{0};
         for (auto const& pct : HS_DYNAMIC_CONFIG(blkallocator.free_blk_slab_distribution)) {

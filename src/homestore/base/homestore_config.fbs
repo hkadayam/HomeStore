@@ -1,4 +1,4 @@
-native_include "sisl/utility/non_null_ptr.hpp";
+native_include "sisl/fds/non_null_ptr.h";
 
 namespace homestorecfg;
 

@@ -28,15 +28,15 @@
 #include <boost/optional.hpp>
 #include <boost/uuid/uuid_io.hpp>
 
-#include <iomgr/iomgr.hpp>
 #include <nlohmann/json.hpp>
+#include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
 #include <sisl/settings/settings.hpp>
 #include <sisl/fds/enum.h>
 
-#include <homestore/homestore_decl.hpp>
+#include "homestore/base/homestore_decl.h"
 #include "error.h"
-#include "common/generated/homestore_config_generated.h"
+#include "base/generated/homestore_config_generated.h"
 
 SETTINGS_INIT(homestorecfg::HomeStoreSettings, homestore_config);
 
@@ -81,30 +81,9 @@ public:
         return slab_distribution;
     }
 
-    // This method sets up the default for settings factory when there is no override specified in the json
-    // file and .fbs cannot specify default because they are not scalar.
     static void init_settings_default() {
-        bool is_modified{false};
-
-        HS_SETTINGS_FACTORY().modifiable_settings([&is_modified](auto& s) {
-            // Setup slab config of blk alloc cache, if they are not set already - first time
-            auto& slab_pct_dist{s.blkallocator.free_blk_slab_distribution};
-            if (slab_pct_dist.size() == 0) {
-                LOGINFO("Free Blks Slab distribution is not initialized, possibly first boot - setting with defaults");
-
-                // Slab distribution is not initialized, defaults
-                const auto& d{default_slab_distribution()};
-                slab_pct_dist.insert(slab_pct_dist.begin(), std::cbegin(d), std::cend(d));
-                is_modified = true;
-            }
-
-            // Any more default overrides or set non-scalar entries come here
-        });
-
-        if (is_modified) {
-            LOGINFO("Some settings are defaultted or overridden explicitly in the code, saving the new settings");
-            HS_SETTINGS_FACTORY().save();
-        }
+        // Non-scalar defaults are now self-initialized by their respective subsystems (e.g. SlabBlkAllocConfig
+        // auto-populates free_blk_slab_distribution). This method is retained for any future overrides.
     }
 };
 } // namespace homestore

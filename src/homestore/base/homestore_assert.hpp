@@ -85,18 +85,18 @@
         LOG##level##MOD_FMT_USING_LOGGER(                                                                              \
             BOOST_PP_IF(BOOST_VMD_IS_EMPTY(mod), base, mod),                                                           \
             ([&](fmt::memory_buffer& buf, const char* const msgcb, auto&&... args) -> bool {                           \
-                fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}:{}] "},                                      \
-                                fmt::make_format_args(file_name(__FILE__), __LINE__));                                 \
+                fmt::format_to(fmt::appender{buf}, fmt::runtime("[{}:{}] "),                                            \
+                                file_name(__FILE__), __LINE__);                                 \
                 BOOST_PP_IF(BOOST_VMD_IS_EMPTY(submod_name), BOOST_PP_EMPTY,                                           \
-                            BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}={}] "},        \
-                                                              fmt::make_format_args(submod_name, submod_val))))        \
+                            BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("[{}={}] "),              \
+                                                              submod_name, submod_val)))        \
                 ();                                                                                                    \
                 BOOST_PP_IF(BOOST_VMD_IS_EMPTY(detail_name), BOOST_PP_EMPTY,                                           \
-                            BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}={}] "},        \
-                                                              fmt::make_format_args(detail_name, detail_val))))        \
+                            BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("[{}={}] "),              \
+                                                              detail_name, detail_val)))        \
                 ();                                                                                                    \
-                fmt::vformat_to(fmt::appender{buf}, fmt::string_view{msgcb},                                           \
-                                fmt::make_format_args(std::forward< decltype(args) >(args)...));                       \
+                fmt::format_to(fmt::appender{buf}, fmt::runtime(msgcb),                                                \
+                                std::forward< decltype(args) >(args)...);                       \
                 return true;                                                                                           \
             }),                                                                                                        \
             homestore::HomeStore::periodic_logger(), msg, ##__VA_ARGS__);                                              \
@@ -108,22 +108,22 @@
         LOG##level##MOD_FMT(                                                                                           \
             BOOST_PP_IF(BOOST_VMD_IS_EMPTY(mod), base, mod),                                                           \
             ([&](fmt::memory_buffer& buf, const char* const msgcb, auto&&... args) -> bool {                           \
-                fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}:{}] "},                                      \
-                                fmt::make_format_args(file_name(__FILE__), __LINE__));                                 \
+                fmt::format_to(fmt::appender{buf}, fmt::runtime("[{}:{}] "),                                            \
+                                file_name(__FILE__), __LINE__);                                 \
                 BOOST_PP_IF(BOOST_VMD_IS_EMPTY(submod_name), BOOST_PP_EMPTY,                                           \
-                            BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}={}] "},        \
-                                                              fmt::make_format_args(submod_name, submod_val))))        \
+                            BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("[{}={}] "),              \
+                                                              submod_name, submod_val)))        \
                 ();                                                                                                    \
                 BOOST_PP_IF(BOOST_VMD_IS_EMPTY(req), BOOST_PP_EMPTY,                                                   \
-                            BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[req_id={}] "},    \
-                                                              fmt::make_format_args(req->request_id))))                \
+                            BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("[req_id={}] "),          \
+                                                              req->request_id)))                \
                 ();                                                                                                    \
                 BOOST_PP_IF(BOOST_VMD_IS_EMPTY(detail_name), BOOST_PP_EMPTY,                                           \
-                            BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}={}] "},        \
-                                                              fmt::make_format_args(detail_name, detail_val))))        \
+                            BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("[{}={}] "),              \
+                                                              detail_name, detail_val)))        \
                 ();                                                                                                    \
-                fmt::vformat_to(fmt::appender{buf}, fmt::string_view{msgcb},                                           \
-                                fmt::make_format_args(std::forward< decltype(args) >(args)...));                       \
+                fmt::format_to(fmt::appender{buf}, fmt::runtime(msgcb),                                                \
+                                std::forward< decltype(args) >(args)...);                       \
                 return true;                                                                                           \
             }),                                                                                                        \
             msg, ##__VA_ARGS__);                                                                                       \
@@ -134,23 +134,23 @@
         LOG##level##MOD_FMT(                                                                                           \
             BOOST_PP_IF(BOOST_VMD_IS_EMPTY(mod), base, mod),                                                           \
             ([&](fmt::memory_buffer& buf, const char* const msgcb, auto&&... args) -> bool {                           \
-                fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}:{}] "},                                      \
-                                fmt::make_format_args(file_name(__FILE__), __LINE__));                                 \
+                fmt::format_to(fmt::appender{buf}, fmt::runtime("[{}:{}] "),                                            \
+                                file_name(__FILE__), __LINE__);                                 \
                 BOOST_PP_IF(BOOST_VMD_IS_EMPTY(submod_name), BOOST_PP_EMPTY,                                           \
-                            BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}={}] "},        \
-                                                              fmt::make_format_args(submod_name, submod_val))))        \
+                            BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("[{}={}] "),              \
+                                                              submod_name, submod_val)))        \
                 ();                                                                                                    \
                 BOOST_PP_IF(BOOST_VMD_IS_EMPTY(detail_name), BOOST_PP_EMPTY,                                           \
-                            BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}={}] "},        \
-                                                              fmt::make_format_args(detail_name, detail_val))))        \
+                            BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("[{}={}] "),              \
+                                                              detail_name, detail_val)))        \
                 ();                                                                                                    \
-                fmt::vformat_to(fmt::appender{buf}, fmt::string_view{msgcb},                                           \
-                                fmt::make_format_args(std::forward< decltype(args) >(args)...));                       \
+                fmt::format_to(fmt::appender{buf}, fmt::runtime(msgcb),                                                \
+                                std::forward< decltype(args) >(args)...);                       \
                 const auto count{check_logged_already(buf)};                                                           \
                 if (count % freq == 0) {                                                                               \
                     if (count) {                                                                                       \
-                        fmt::vformat_to(fmt::appender{buf}, fmt::string_view{" ...Repeated {} times in this thread"},  \
-                                        fmt::make_format_args(freq));                                                  \
+                        fmt::format_to(fmt::appender{buf}, fmt::runtime(" ...Repeated {} times in this thread"),       \
+                                        freq);                                                  \
                     }                                                                                                  \
                     return true;                                                                                       \
                 }                                                                                                      \
@@ -199,8 +199,8 @@
 // No need of metrics dump in debug build
 #ifdef DEBUG
 #define HS_ASSERT_METRICS(buf)                                                                                         \
-    fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"\n[Metrics = {}]\n"},                                        \
-                    fmt::make_format_args(sisl::MetricsFarm::getInstance().get_result_in_json().dump(4)));
+    { auto _metrics = sisl::MetricsFarm::getInstance().get_result_in_json().dump(4);                                    \
+    fmt::format_to(fmt::appender{buf}, fmt::runtime("\n[Metrics = {}]\n"), _metrics); }
 #else
 #define HS_ASSERT_METRICS(buf)
 #endif
@@ -210,20 +210,20 @@
         assert_type(                                                                                                   \
             cond, ([&](fmt::memory_buffer& buf, const char* const msgcb, auto&&... args) -> bool {                     \
                 BOOST_PP_IF(BOOST_VMD_IS_EMPTY(submod_name), BOOST_PP_EMPTY,                                           \
-                            BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"\n[{}={}] "},      \
-                                                              fmt::make_format_args(submod_name, submod_val))))        \
+                            BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("\n[{}={}] "),            \
+                                                              submod_name, submod_val)))        \
                 ();                                                                                                    \
                 BOOST_PP_IF(BOOST_VMD_IS_EMPTY(req), BOOST_PP_EMPTY,                                                   \
-                            BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"\n[request={}] "}, \
-                                                              fmt::make_format_args(req->to_string()))))               \
+                            BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("\n[request={}] "),       \
+                                                              req->to_string())))               \
                 ();                                                                                                    \
                 BOOST_PP_IF(BOOST_VMD_IS_EMPTY(detail_name), BOOST_PP_EMPTY,                                           \
-                            BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"\n[{}={}] "},      \
-                                                              fmt::make_format_args(detail_name, detail_val))))        \
+                            BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("\n[{}={}] "),            \
+                                                              detail_name, detail_val)))        \
                 ();                                                                                                    \
                 HS_ASSERT_METRICS(buf)                                                                                 \
-                fmt::vformat_to(fmt::appender{buf}, fmt::string_view{msgcb},                                           \
-                                fmt::make_format_args(std::forward< decltype(args) >(args)...));                       \
+                fmt::format_to(fmt::appender{buf}, fmt::runtime(msgcb),                                                \
+                                std::forward< decltype(args) >(args)...);                       \
                 return true;                                                                                           \
             }),                                                                                                        \
             msg, ##__VA_ARGS__);                                                                                       \
@@ -240,20 +240,20 @@
         assert_type(                                                                                                   \
             val1, cmp, val2,                                                                                           \
             [&](fmt::memory_buffer& buf, const char* const msgcb, auto&&... args) -> bool {                            \
-                fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}:{}] "},                                      \
-                                fmt::make_format_args(file_name(__FILE__), __LINE__));                                 \
+                fmt::format_to(fmt::appender{buf}, fmt::runtime("[{}:{}] "),                                            \
+                                file_name(__FILE__), __LINE__);                                 \
                 sisl::logging::default_cmp_assert_formatter(buf, msgcb, std::forward< decltype(args) >(args)...);      \
                 BOOST_PP_IF(BOOST_VMD_IS_EMPTY(submod_name), BOOST_PP_EMPTY,                                           \
-                            BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{" \n[{}={}] "},     \
-                                                              fmt::make_format_args(submod_name, submod_val))))        \
+                            BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime(" \n[{}={}] "),           \
+                                                              submod_name, submod_val)))        \
                 ();                                                                                                    \
                 BOOST_PP_IF(BOOST_VMD_IS_EMPTY(req), BOOST_PP_EMPTY,                                                   \
-                            BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"\n[request={}] "}, \
-                                                              fmt::make_format_args(req->to_string()))))               \
+                            BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("\n[request={}] "),       \
+                                                              req->to_string())))               \
                 ();                                                                                                    \
                 BOOST_PP_IF(BOOST_VMD_IS_EMPTY(detail_name), BOOST_PP_EMPTY,                                           \
-                            BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"\n[{}={}] "},      \
-                                                              fmt::make_format_args(detail_name, detail_val))))        \
+                            BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("\n[{}={}] "),            \
+                                                              detail_name, detail_val)))        \
                 ();                                                                                                    \
                 HS_ASSERT_METRICS(buf)                                                                                 \
                 return true;                                                                                           \

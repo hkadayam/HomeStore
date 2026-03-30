@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <boost/icl/split_interval_map.hpp>
 #include <boost/icl/interval_map.hpp>
-#include "common/homestore_assert.hpp"
+#include "base/homestore_assert.hpp"
 
 namespace homestore {
 class LargeIDReserver {

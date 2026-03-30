@@ -53,8 +53,8 @@ class HomestoreConan(ConanFile):
         self.requires("folly/2024.08.12.00", transitive_headers=True)
 
         # Logging
-        self.requires("spdlog/1.12.0", transitive_headers=True)
-        self.requires("fmt/10.0.0", transitive_headers=True, override=True)
+        self.requires("spdlog/1.17.0", transitive_headers=True)
+        self.requires("fmt/11.1.4", transitive_headers=True, override=True)
 
         # Data structures / utilities (formerly from sisl)
         self.requires("boost/1.85.0", transitive_headers=True)

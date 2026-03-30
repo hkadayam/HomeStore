@@ -62,49 +62,42 @@ include_directories (BEFORE ${CMAKE_CURRENT_BINARY_DIR}/homestore)
 
 add_subdirectory(sisl)
 add_subdirectory(iomanager)
+add_subdirectory(homestore/base)
 add_subdirectory(homestore/blkalloc)
 add_subdirectory(homestore/device)
-add_subdirectory(homestore/checkpoint)
-add_subdirectory(homestore/common)
-add_subdirectory(homestore/logstore)
 add_subdirectory(homestore/meta)
-add_subdirectory(homestore/index)
-add_subdirectory(homestore/blob)
-if (DEFINED REPLICATION)
-  if (${REPLICATION} STREQUAL "ON")
-    add_subdirectory(homestore/replication/)
-  endif()
-endif()
+# TODO: re-enable remaining modules once ported
+# add_subdirectory(homestore/checkpoint)
+# add_subdirectory(homestore/logstore)
+# add_subdirectory(homestore/index)
+# add_subdirectory(homestore/blob)
+# if (DEFINED REPLICATION)
+#   if (${REPLICATION} STREQUAL "ON")
+#     add_subdirectory(homestore/replication/)
+#   endif()
+# endif()
 
-if(NOT DEFINED BUILD_TESTING OR BUILD_TESTING)
-    add_subdirectory(tests)
-endif()
+# TODO: re-enable top-level tests once all modules are ported
+# if(NOT DEFINED BUILD_TESTING OR BUILD_TESTING)
+#     add_subdirectory(tests)
+# endif()
 
-set(HOMESTORE_OBJECTS
-    $<TARGET_OBJECTS:hs_common>
-    $<TARGET_OBJECTS:hs_device>
-    $<TARGET_OBJECTS:hs_blkalloc>
-    $<TARGET_OBJECTS:hs_logdev>
-    $<TARGET_OBJECTS:hs_metablk>
-    $<TARGET_OBJECTS:hs_checkpoint>
-    $<TARGET_OBJECTS:hs_index>
-    $<TARGET_OBJECTS:hs_mem_btree>
-    $<TARGET_OBJECTS:hs_cow_btree>
-    $<TARGET_OBJECTS:hs_blob>
-    homestore/homestore.cpp
-    homestore/crc.cpp
-    homestore/managers.cpp
-)
-
-if (DEFINED REPLICATION)
-  if (${REPLICATION} STREQUAL "ON")
-    list(APPEND HOMESTORE_OBJECTS $<TARGET_OBJECTS:hs_replication>)
-  endif()
-endif()
-#target_link_libraries(homestore_objs ${COMMON_DEPS})
-
-add_library(homestore STATIC 
-    ${HOMESTORE_OBJECTS} 
-)
-target_compile_definitions (homestore PRIVATE LOG_MODS_V2_SUPPORT)
-target_link_libraries(homestore PRIVATE ${COMMON_DEPS})
+# TODO: re-enable homestore aggregate library once all object targets exist
+# set(HOMESTORE_OBJECTS
+#     $<TARGET_OBJECTS:hs_common>
+#     $<TARGET_OBJECTS:hs_device>
+#     $<TARGET_OBJECTS:hs_blkalloc>
+#     $<TARGET_OBJECTS:hs_logdev>
+#     $<TARGET_OBJECTS:hs_metablk>
+#     $<TARGET_OBJECTS:hs_checkpoint>
+#     $<TARGET_OBJECTS:hs_index>
+#     $<TARGET_OBJECTS:hs_mem_btree>
+#     $<TARGET_OBJECTS:hs_cow_btree>
+#     $<TARGET_OBJECTS:hs_blob>
+#     homestore/homestore.cpp
+#     homestore/crc.cpp
+#     homestore/managers.cpp
+# )
+# add_library(homestore STATIC ${HOMESTORE_OBJECTS})
+# target_compile_definitions(homestore PRIVATE LOG_MODS_V2_SUPPORT)
+# target_link_libraries(homestore PRIVATE ${COMMON_DEPS})

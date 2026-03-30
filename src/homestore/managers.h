@@ -15,9 +15,8 @@
  ***************************************************************************/
 #pragma once
 
-#include <memory>
+#include <common/defs.h>
 #include <stdexcept>
-#include <homestore/homestore_decl.hpp> // unique<>, shared<>
 
 namespace homestore {
 
@@ -33,17 +32,24 @@ class BlobDevManager;
 // factory (create / load) calls the matching init_*() method once.  After
 // that, callers use the free-function accessors below.
 //
-// Thread-safety: init_*() are called once at start-up before any concurrent
-// access.  The accessors themselves are read-only and need no locking.
+// Uses shared<> so that the deleter is type-erased at construction time.  This means reset() and the accessors only
+// need forward declarations — a lower level test never has to #include upper level mgr headers
+//
+// Thread-safety: init_*() are called once at start-up before any concurrent access.  The accessors are read-only.
 // ─────────────────────────────────────────────────────────────────────────────
 class Managers {
 public:
-    static void init_meta_mgr(unique< MetaBlkManager > mgr);
-    static void init_device_mgr(unique< DeviceManager > mgr);
-    static void init_cp_mgr(unique< CPManager > mgr);
-    static void init_blob_dev_mgr(unique< BlobDevManager > mgr);
+    static void init_meta_mgr(shared< MetaBlkManager > mgr)     { s_meta_mgr_ = std::move(mgr); }
+    static void init_device_mgr(shared< DeviceManager > mgr)    { s_device_mgr_ = std::move(mgr); }
+    static void init_cp_mgr(shared< CPManager > mgr)            { s_cp_mgr_ = std::move(mgr); }
+    static void init_blob_dev_mgr(shared< BlobDevManager > mgr) { s_blob_dev_mgr_ = std::move(mgr); }
 
-    static void reset(); // for unit-test tear-down
+    static void reset() {
+        s_meta_mgr_.reset();
+        s_device_mgr_.reset();
+        s_cp_mgr_.reset();
+        s_blob_dev_mgr_.reset();
+    }
 
 private:
     friend MetaBlkManager& meta_mgr();
@@ -51,10 +57,10 @@ private:
     friend CPManager& cp_mgr();
     friend BlobDevManager& blob_dev_mgr();
 
-    static unique< MetaBlkManager > s_meta_mgr_;
-    static unique< DeviceManager >  s_device_mgr_;
-    static unique< CPManager >      s_cp_mgr_;
-    static unique< BlobDevManager > s_blob_dev_mgr_;
+    inline static shared< MetaBlkManager > s_meta_mgr_;
+    inline static shared< DeviceManager >  s_device_mgr_;
+    inline static shared< CPManager >      s_cp_mgr_;
+    inline static shared< BlobDevManager > s_blob_dev_mgr_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

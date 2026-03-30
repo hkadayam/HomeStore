@@ -33,7 +33,7 @@
 #include "blob/append_byte_stream.h"
 #include "device/chunk.h"
 #include "device/virtual_dev.h"
-#include "meta/meta_client.hpp"
+#include "meta/meta_client.h"
 #include "managers.h"
 
 namespace homestore {
@@ -44,7 +44,7 @@ namespace homestore {
 
 folly::coro::Task< void > BlobDevManager::create() {
     LOGINFO("BlobDevManager: first boot — creating fresh manager");
-    auto mgr = unique< BlobDevManager >{new BlobDevManager{co_await meta_mgr().register_client("BlobDevManager")}};
+    auto mgr = shared< BlobDevManager >(new BlobDevManager{co_await meta_mgr().register_client("BlobDevManager")});
     mgr->register_with_cp_mgr();
     Managers::init_blob_dev_mgr(std::move(mgr));
     LOGINFO("BlobDevManager: ready");
@@ -103,7 +103,7 @@ std::optional< ParsedMblkName > parse_mblk_name(std::string_view name) {
 
 folly::coro::Task< void > BlobDevManager::load() {
     LOGINFO("BlobDevManager: starting recovery scan");
-    auto mgr = unique< BlobDevManager >{new BlobDevManager{co_await meta_mgr().register_client("BlobDevManager")}};
+    auto mgr = shared< BlobDevManager >(new BlobDevManager{co_await meta_mgr().register_client("BlobDevManager")});
 
     // Per-device recovery accumulator, keyed by stream type.
     using ChunkMblkMap = BlobDev::ChunkMblkMap;
@@ -198,7 +198,6 @@ folly::coro::Task< shared< BlobDev > > BlobDevManager::create_blob_dev(std::stri
                                                                        VDevParameters&& params) {
     LOGINFOMOD(blob_dev, "Creating BlobDev '{}'", dev_name);
     params.vdev_name = dev_name;
-    params.size_type = VDevSizeType::Dynamic;
     auto vdev = co_await device_mgr().create_vdev(std::move(params));
     auto device = std::make_shared< BlobDev >(std::move(dev_name), std::move(vdev), meta_client_);
     {

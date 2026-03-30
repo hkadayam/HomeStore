@@ -24,7 +24,7 @@
 #include "blob/stream_base.h"
 #include "device/chunk.h"
 #include "device/virtual_dev.h"
-#include "meta/meta_client.hpp"
+#include "meta/meta_client.h"
 
 namespace homestore {
 
@@ -44,7 +44,7 @@ StreamBase::StreamBase(uint64_t stream_id, const shared< VirtualDev >& vdev, Met
         return;
     }
 
-    // Extract chunks from VDev by chunk_id and sort by creation_order.
+    // Extract chunks from VDev by chunk_id and sort by vdev_order.
     std::vector< shared< Chunk > > sorted;
     sorted.reserve(mblks.size());
     for (auto& [cid, entry] : mblks) {
@@ -57,7 +57,7 @@ StreamBase::StreamBase(uint64_t stream_id, const shared< VirtualDev >& vdev, Met
         chunk_mblks_.emplace(cid, std::move(entry.first));
     }
     std::sort(sorted.begin(), sorted.end(),
-              [](const auto& a, const auto& b) { return a->creation_order() < b->creation_order(); });
+              [](const auto& a, const auto& b) { return a->vdev_order() < b->vdev_order(); });
     chunks_ = sisl::urcu_data< std::vector< shared< Chunk > > >{std::move(sorted)};
 }
 

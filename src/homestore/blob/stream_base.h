@@ -32,7 +32,7 @@
 #include "checkpoint/cp.h"              // cp_id_t
 #include "checkpoint/cp_mgr.h"          // CPManager::max_concurent_cps
 
-#include "meta/meta_blk.hpp" // MetaBlk
+#include "meta/meta_blk.h" // MetaBlk
 
 namespace homestore {
 
@@ -59,7 +59,7 @@ protected:
     // Protected: StreamBase is intended to be subclassed; construct via a derived type.
 
     /// On fresh creation pass no mblks (default empty).  On recovery, chunks are extracted from VDev by chunk_id,
-    /// sorted by creation_order, and each MetaBlk is moved into chunk_mblks_.
+    /// sorted by vdev_order, and each MetaBlk is moved into chunk_mblks_.
     using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, IOBuffer > >;
     StreamBase(uint64_t stream_id, const shared< VirtualDev >& vdev, MetaClient& meta_client, std::string dev_name,
                uint64_t chunk_size, ChunkMblkMap&& mblks = {});

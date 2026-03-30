@@ -30,18 +30,13 @@
 namespace homestore {
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Private constructor
+// Constructor and Factory
 // ─────────────────────────────────────────────────────────────────────────────
-
 AppendBlkStream::AppendBlkStream(MetaClient& meta_client, std::string dev_name, const shared< VirtualDev >& vdev,
                                  uint64_t chunk_size, ChunkMblkMap&& mblks) :
         StreamBase{
             enum_value(StreamType::AppendBlk), vdev, meta_client, std::move(dev_name), chunk_size, std::move(mblks)} {
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// create / load
-// ─────────────────────────────────────────────────────────────────────────────
 
 folly::coro::Task< shared< AppendBlkStream > > AppendBlkStream::create(MetaClient& meta_client,
                                                                        const std::string& dev_name,
@@ -68,7 +63,7 @@ folly::coro::Task< shared< AppendBlkStream > > AppendBlkStream::load(MetaClient&
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// alloc_or_expand
+// Allocation of Blocks
 // ─────────────────────────────────────────────────────────────────────────────
 
 folly::coro::Task< BlkId > AppendBlkStream::alloc_or_expand(blk_count_t nblks, const blk_alloc_hints& hints) {
@@ -88,7 +83,7 @@ folly::coro::Task< BlkId > AppendBlkStream::alloc_or_expand(blk_count_t nblks, c
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// append
+// IO APIs
 // ─────────────────────────────────────────────────────────────────────────────
 
 folly::coro::Task< BlkId > AppendBlkStream::append(CP* cp, uint16_t segment_id, const IOBuffer& buf) {
@@ -131,7 +126,6 @@ folly::coro::Task< std::error_code > AppendBlkStream::read(IOBuffer& buf, const 
 // ─────────────────────────────────────────────────────────────────────────────
 // CP hooks
 // ─────────────────────────────────────────────────────────────────────────────
-
 void AppendBlkStream::on_cp_switchover(CP* /*cur_cp*/, CP* new_cp) {
     cp_session_[new_cp->id() % CPManager::max_concurent_cps].reset();
 }

@@ -30,7 +30,7 @@
 #include <homestore/homestore_decl.hpp> // shared<>, unique<>
 #include <homestore/checkpoint/cp.h>    // CP
 
-#include "meta/meta_blk.hpp"             // MetaBlk
+#include "meta/meta_blk.h"             // MetaBlk
 
 namespace homestore {
 

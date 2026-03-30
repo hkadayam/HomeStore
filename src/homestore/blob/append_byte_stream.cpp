@@ -67,38 +67,78 @@ folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(MetaClien
     }
 
     const uint64_t chunk_sz = vdev->chunk_size_bytes();
+    const uint32_t blk_sz = vdev->block_size();
     auto stream = shared< AppendByteStream >{
         new AppendByteStream{meta_client, std::string{dev_name}, vdev, chunk_sz, std::move(mblks)}};
     stream->tail_offset_.store(recovered_tail, std::memory_order_release);
+
+    // If the recovered tail is not block-aligned, read the partial tail block from disk so subsequent appends can
+    // continue from the exact byte offset within that block.  The cached TailBlock is consumed by the first
+    // alloc_write_unit call, which seeds a WriteUnit from it — no zero-padding gap is introduced.
+    if (recovered_tail > 0 && (recovered_tail % blk_sz) != 0) {
+        const size_t tail_chunk_idx = to_size((recovered_tail - 1) / chunk_sz);
+        const uint64_t tail_in_chunk = ((recovered_tail - 1) % chunk_sz) + 1; // bytes used in the last chunk
+        const uint32_t blk_offset = to_u32(((tail_in_chunk - 1) / blk_sz) * blk_sz);
+        const uint32_t sub_blk_used = to_u32(tail_in_chunk - blk_offset);
+
+        chunk_num_t cid{};
+        {
+            auto acc = stream->chunks();
+            cid = static_cast< chunk_num_t >((*acc)[tail_chunk_idx]->chunk_id());
+        }
+
+        // Read the partial block from disk.
+        auto [ec, rbuf] = co_await stream->read_blocks(cid, blk_offset / blk_sz, 1);
+        if (!ec) {
+            stream->tail_block_ = TailBlock{std::move(rbuf), cid, blk_offset, sub_blk_used};
+        }
+    }
+
     co_return stream;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// alloc_write_unit
+// ─────────────────────────────────────────────────────────────────────────────
+
 folly::coro::Task< AppendByteStream::WriteUnit* > AppendByteStream::alloc_write_unit(AppendByteCPSession& session,
                                                                                      cp_id_t cp_id) {
-    const uint64_t csz = chunk_size();
-    const uint32_t blk_sz = block_size();
+    // If a TailBlock is cached (from a previous CP flush or restart recovery), seed the first WriteUnit from it.  The
+    // WriteUnit's buffer already contains the partial block's data; used_bytes is set to the sub-block valid count so
+    // new appends continue from the exact byte offset.
+    if (session.all_units.empty() && tail_block_) {
+        auto tb = std::move(*tail_block_);
+        tail_block_.reset();
 
-    // On first allocation of this CP epoch, initialize write_cursor from the current tail.
+        cp_session(cp_id).mark_chunk_dirty(tb.chunk_id);
+        // write_cursor advances past this single-block WriteUnit.
+        const uint64_t tail = tail_offset_.load(std::memory_order_relaxed);
+        session.write_cursor = tail - (tail % to_u64(block_size())) + to_u64(block_size());
+
+        auto wu = std::make_unique< WriteUnit >(tb.chunk_id, tb.offset_in_chunk, std::move(tb.buf));
+        wu->used_bytes.store(tb.valid_bytes, std::memory_order_relaxed);
+        auto* ptr = wu.get();
+        session.all_units.push_back(std::move(wu));
+        co_return ptr;
+    }
+
+    // On first allocation of this CP epoch (no tail block), initialize write_cursor from the current tail.  At this
+    // point tail_offset_ is guaranteed to be block-aligned (either from create, or because the previous CP's flush
+    // saved the partial block into tail_block_ which was consumed above, or tail was already aligned).
     if (session.all_units.empty()) {
         session.write_cursor = tail_offset_.load(std::memory_order_relaxed);
     }
 
-    const size_t chunk_idx = static_cast< size_t >(session.write_cursor / csz);
-    uint64_t offset_in_chunk = session.write_cursor % csz;
-
-    // If exactly at a chunk boundary, advance to the next chunk.
-    if (offset_in_chunk == 0 && session.write_cursor > 0) {
-        // write_cursor is at the start of a new chunk; chunk_idx is already correct.
-    }
+    const size_t chunk_idx = to_size(session.write_cursor / chunk_size());
+    const uint64_t offset_in_chunk = session.write_cursor % chunk_size();
 
     // Ensure the chunk exists; expand if needed.
     co_await expand_to(chunk_idx);
 
     // Cap buffer size to not cross the chunk boundary, then round down to block alignment.
-    const uint64_t remaining_in_chunk = csz - offset_in_chunk;
-    uint32_t buf_capacity =
-        static_cast< uint32_t >(std::min(static_cast< uint64_t >(kMaxWriteUnitBytes), remaining_in_chunk));
-    buf_capacity = (buf_capacity / blk_sz) * blk_sz; // round down to block alignment
+    const uint64_t remaining_in_chunk = chunk_size() - offset_in_chunk;
+    uint32_t buf_capacity = to_u32(std::min(to_u64(kMaxWriteUnitBytes), remaining_in_chunk));
+    buf_capacity = (buf_capacity / block_size()) * block_size();
 
     // Look up the chunk_id for this chunk index.
     chunk_num_t cid{};
@@ -110,94 +150,61 @@ folly::coro::Task< AppendByteStream::WriteUnit* > AppendByteStream::alloc_write_
     cp_session(cp_id).mark_chunk_dirty(cid);
     session.write_cursor += buf_capacity;
 
-    IOBuffer buf{buf_capacity, blk_sz};
-    auto wu = std::make_unique< WriteUnit >(cid, static_cast< uint32_t >(offset_in_chunk), std::move(buf));
+    IOBuffer buf{buf_capacity, block_size()};
+    auto wu = std::make_unique< WriteUnit >(cid, to_u32(offset_in_chunk), std::move(buf));
     auto* ptr = wu.get();
     session.all_units.push_back(std::move(wu));
     co_return ptr;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// append
-// ─────────────────────────────────────────────────────────────────────────────
-
-folly::coro::Task< uint64_t > AppendByteStream::append(cp_id_t cp_id, sisl::Blob data) {
+folly::coro::Task< uint64_t > AppendByteStream::append(cp_id_t cp_id, const sisl::Blob& data) {
     const uint32_t len = data.size();
     AppendByteCPSession& session = cp_session_[cp_id % CPManager::max_concurent_cps];
 
-    // Hot path: shared lock + CAS to reserve space in the active (last) WriteUnit.
-    {
-        auto lock = co_await append_mutex_.co_scoped_lock_shared();
+    auto do_append = [&session, this](const sisl::Blob& data, uint32_t len) -> std::optional< uint64_t > {
         if (!session.all_units.empty()) {
             WriteUnit* wu = session.all_units.back().get();
             uint32_t cur = wu->used_bytes.load(std::memory_order_relaxed);
             while (cur + len <= wu->buf.size()) {
                 if (wu->used_bytes.compare_exchange_weak(cur, cur + len, std::memory_order_relaxed)) {
                     std::memcpy(wu->buf.bytes() + cur, data.cbytes(), len);
-                    co_return tail_offset_.fetch_add(len, std::memory_order_relaxed);
+                    return tail_offset_.fetch_add(len, std::memory_order_relaxed);
                 }
             }
+        }
+        return std::nullopt;
+    };
+
+    // Hot path: shared lock + CAS to reserve space in the active (last) WriteUnit.
+    {
+        auto lock = co_await append_mutex_.co_scoped_lock_shared();
+        if (auto offset = do_append(data, len)) {
+            co_return *offset;
         }
     }
 
     // Cold path: exclusive lock — allocate a new WriteUnit if the last one is still full.
     {
         auto lock = co_await append_mutex_.co_scoped_lock();
-        WriteUnit* wu = nullptr;
 
         // Re-check: another thread may have allocated a new WriteUnit while we waited for the exclusive lock.
-        if (!session.all_units.empty()) {
-            wu = session.all_units.back().get();
-            uint32_t cur = wu->used_bytes.load(std::memory_order_relaxed);
-            while (cur + len <= wu->buf.size()) {
-                if (wu->used_bytes.compare_exchange_weak(cur, cur + len, std::memory_order_relaxed)) {
-                    std::memcpy(wu->buf.bytes() + cur, data.cbytes(), len);
-                    co_return tail_offset_.fetch_add(len, std::memory_order_relaxed);
-                }
-            }
+        if (auto offset = do_append(data, len)) {
+            co_return *offset;
         }
 
-        // Still no room — allocate a new WriteUnit.
-        wu = co_await alloc_write_unit(session, cp_id);
-        wu->used_bytes.store(len, std::memory_order_relaxed);
-        std::memcpy(wu->buf.bytes(), data.cbytes(), len);
+        // Still no room — allocate a new WriteUnit.  If it was seeded from a TailBlock, used_bytes is already set to
+        // the sub-block valid count; new data appends after the existing bytes.
+        WriteUnit* wu = co_await alloc_write_unit(session, cp_id);
+        const uint32_t cur = wu->used_bytes.load(std::memory_order_relaxed);
+        wu->used_bytes.store(cur + len, std::memory_order_relaxed);
+        std::memcpy(wu->buf.bytes() + cur, data.cbytes(), len);
         co_return tail_offset_.fetch_add(len, std::memory_order_relaxed);
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// read
-// ─────────────────────────────────────────────────────────────────────────────
-
-folly::coro::Task< std::pair< std::error_code, IOBuffer > > AppendByteStream::read(IOBuffer buf, uint64_t byte_offset,
-                                                                                   size_t len) {
-    const uint32_t blk_sz = block_size();
-    const uint64_t csz = chunk_size();
-
-    const size_t chunk_idx = static_cast< size_t >(byte_offset / csz);
-    const uint64_t offset_in_chunk = byte_offset % csz;
-    const uint32_t blk_num = static_cast< uint32_t >(offset_in_chunk / blk_sz);
-    const blk_count_t nblks = static_cast< blk_count_t >((len + blk_sz - 1) / blk_sz);
-
-    chunk_num_t cid{};
-    {
-        auto acc = chunks();
-        if (chunk_idx >= acc->size()) {
-            co_return {std::make_error_code(std::errc::invalid_argument), IOBuffer{}};
-        }
-        cid = static_cast< chunk_num_t >((*acc)[chunk_idx]->chunk_id());
-    }
-
-    const BlkId bid{blk_num, nblks, cid};
-    co_return co_await vdev().read(std::move(buf), bid);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// truncate
-// ─────────────────────────────────────────────────────────────────────────────
-
 folly::coro::Task< void > AppendByteStream::truncate() {
     tail_offset_.store(0, std::memory_order_release);
+    tail_block_.reset();
     for (auto& sess : cp_session_) {
         sess.reset();
     }
@@ -214,6 +221,91 @@ folly::coro::Task< void > AppendByteStream::truncate() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// read
+// ─────────────────────────────────────────────────────────────────────────────
+
+folly::coro::Task< std::pair< std::error_code, IOBuffer > > AppendByteStream::read(uint64_t byte_offset, size_t len) {
+    const size_t chunk_idx = to_size(byte_offset / chunk_size());
+    const uint64_t offset_in_chunk = byte_offset % chunk_size();
+    const uint32_t blk_num = to_u32(offset_in_chunk / block_size());
+    const blk_count_t nblks =
+        static_cast< blk_count_t >((offset_in_chunk + len + block_size() - 1) / block_size() - to_u64(blk_num));
+
+    chunk_num_t cid{};
+    {
+        auto acc = chunks();
+        if (chunk_idx >= acc->size()) {
+            co_return {std::make_error_code(std::errc::invalid_argument), IOBuffer{}};
+        }
+        cid = static_cast< chunk_num_t >((*acc)[chunk_idx]->chunk_id());
+    }
+
+    co_return co_await read_blocks(cid, blk_num, nblks);
+}
+
+folly::coro::Task< std::pair< std::error_code, IOBuffer > >
+AppendByteStream::read_blocks(chunk_num_t cid, uint32_t blk_num, blk_count_t nblks) {
+    IOBuffer buf{to_u32(nblks) * block_size(), block_size()};
+    const BlkId bid{blk_num, nblks, cid};
+    auto ec = co_await vdev().read(buf, bid);
+    co_return {ec, std::move(buf)};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ReadCursor
+// ─────────────────────────────────────────────────────────────────────────────
+
+AppendByteStream::ReadCursor::ReadCursor(AppendByteStream& stream, uint64_t start, uint64_t end) :
+        stream_{stream}, pos_{start}, end_{end} {
+}
+
+AppendByteStream::ReadCursor AppendByteStream::open_cursor(uint64_t start_offset) const {
+    return ReadCursor{const_cast< AppendByteStream& >(*this), start_offset, tail_offset()};
+}
+
+AppendByteStream::ReadCursor AppendByteStream::open_cursor(uint64_t start_offset, uint64_t end_offset) const {
+    return ReadCursor{const_cast< AppendByteStream& >(*this), start_offset, end_offset};
+}
+
+folly::coro::Task< std::pair< IOBuffer, uint32_t > > AppendByteStream::ReadCursor::next(size_t max_bytes) {
+    if (pos_ >= end_) {
+        co_return {IOBuffer{}, 0};
+    }
+
+    const uint32_t blk_sz = stream_.block_size();
+    const uint64_t csz = stream_.chunk_size();
+
+    // Cap to remaining bytes in the stream and to the current chunk boundary.
+    const uint64_t remaining = end_ - pos_;
+    const uint64_t offset_in_chunk = pos_ % csz;
+    const uint64_t remaining_in_chunk = csz - offset_in_chunk;
+    const uint64_t read_len = std::min({to_u64(max_bytes), remaining, remaining_in_chunk});
+
+    const size_t chunk_idx = to_size(pos_ / csz);
+    const uint32_t blk_num = to_u32(offset_in_chunk / blk_sz);
+    const blk_count_t nblks =
+        static_cast< blk_count_t >((offset_in_chunk + read_len + blk_sz - 1) / blk_sz - to_u64(blk_num));
+    const uint32_t valid = to_u32(read_len);
+
+    chunk_num_t cid{};
+    {
+        auto acc = stream_.chunks();
+        if (chunk_idx >= acc->size()) {
+            co_return {IOBuffer{}, 0};
+        }
+        cid = static_cast< chunk_num_t >((*acc)[chunk_idx]->chunk_id());
+    }
+
+    auto [ec, buf] = co_await stream_.read_blocks(cid, blk_num, nblks);
+    if (ec) {
+        co_return {IOBuffer{}, 0};
+    }
+
+    pos_ += valid;
+    co_return {std::move(buf), valid};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CP hooks
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -222,7 +314,8 @@ void AppendByteStream::on_cp_switchover(CP* /*cur_cp*/, CP* new_cp) {
 }
 
 folly::coro::Task< bool > AppendByteStream::cp_flush(CP* cp) {
-    AppendByteCPSession& session = cp_session_[cp->id() % CPManager::max_concurent_cps];
+    const cp_id_t cp_id = cp->id();
+    AppendByteCPSession& session = cp_session_[cp_id % CPManager::max_concurent_cps];
     auto units = std::move(session.all_units);
 
     const uint32_t blk_sz = block_size();
@@ -240,7 +333,7 @@ folly::coro::Task< bool > AppendByteStream::cp_flush(CP* cp) {
         const blk_count_t used_nblks = static_cast< blk_count_t >((used + blk_sz - 1) / blk_sz);
 
         // Zero-pad the tail of the last used block.
-        const uint32_t blk_aligned = used_nblks * blk_sz;
+        const uint32_t blk_aligned = to_u32(used_nblks) * blk_sz;
         if (blk_aligned > used) {
             std::memset(wu->buf.bytes() + used, 0, blk_aligned - used);
         }
@@ -251,11 +344,34 @@ folly::coro::Task< bool > AppendByteStream::cp_flush(CP* cp) {
 
         // Track the high-water mark for this chunk.
         auto& hw = chunk_bytes_written[wu->chunk_id];
-        hw = std::max(hw, static_cast< uint64_t >(wu->offset_in_chunk + used));
+        hw = std::max(hw, to_u64(wu->offset_in_chunk + used));
+    }
+
+    // Cache the partial tail block for the next CP epoch.  If the last WriteUnit's used_bytes is not block-aligned,
+    // save the final partial block so the next alloc_write_unit can seed from it, keeping the stream contiguous.
+    if (!units.empty()) {
+        for (auto it = units.rbegin(); it != units.rend(); ++it) {
+            const uint32_t used = (*it)->used_bytes.load(std::memory_order_relaxed);
+            if (used == 0) {
+                continue;
+            }
+            if ((used % blk_sz) != 0) {
+                const uint32_t last_blk_in_wu = ((used - 1) / blk_sz) * blk_sz;
+                const uint32_t sub_blk_used = used - last_blk_in_wu;
+
+                IOBuffer saved{blk_sz, blk_sz};
+                std::memcpy(saved.bytes(), (*it)->buf.bytes() + last_blk_in_wu, blk_sz);
+                tail_block_ =
+                    TailBlock{std::move(saved), (*it)->chunk_id, (*it)->offset_in_chunk + last_blk_in_wu, sub_blk_used};
+            } else {
+                tail_block_.reset();
+            }
+            break;
+        }
     }
 
     // Persist bytes_written MetaBlk only for chunks dirtied during this CP epoch.
-    auto dirty = cp_session(cp->id()).gather_dirty_chunks();
+    auto dirty = cp_session(cp_id).gather_dirty_chunks();
     if (dirty.empty()) {
         co_return true;
     }

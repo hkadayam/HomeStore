@@ -28,6 +28,7 @@
 #include "common/defs.h"
 
 #include "meta/meta_blk.h"
+#include "meta/meta_blk_manager.h"
 #include "managers.h"
 #include "meta/meta_client.h"
 

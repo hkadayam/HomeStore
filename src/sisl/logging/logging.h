@@ -395,6 +395,7 @@ public:
 
     std::shared_ptr< spdlog::logger > m_logger;
     std::shared_ptr< spdlog::logger > m_critical_logger;
+    std::shared_ptr< spdlog::logger > m_periodic_logger;
     pthread_t m_thread_id;
     std::shared_ptr< LoggerThreadRegistry > m_logger_thread_registry; // Take reference to avoid singleton destruction
 
@@ -408,6 +409,7 @@ private:
 
 [[maybe_unused]] extern std::shared_ptr< spdlog::logger >& GetLogger();
 [[maybe_unused]] extern std::shared_ptr< spdlog::logger >& GetCriticalLogger();
+[[maybe_unused]] extern std::shared_ptr< spdlog::logger >& GetPeriodicLogger();
 
 } // namespace logging
 } // namespace sisl

@@ -65,6 +65,7 @@ constexpr uint64_t Mi{Ki * Ki};
 
 static std::shared_ptr< spdlog::logger > glob_spdlog_logger;
 static std::shared_ptr< spdlog::logger > glob_critical_logger;
+static std::shared_ptr< spdlog::logger > glob_periodic_logger;
 
 /****************************** LoggerThreadRegistry ******************************/
 std::shared_ptr< LoggerThreadRegistry > LoggerThreadRegistry::instance() {
@@ -115,6 +116,17 @@ std::shared_ptr< spdlog::logger >& GetCriticalLogger() {
         logger_thread_ctx.m_critical_logger = glob_critical_logger;
     }
     return logger_thread_ctx.m_critical_logger;
+}
+
+std::shared_ptr< spdlog::logger >& GetPeriodicLogger() {
+#if __cplusplus > 201703L
+    [[unlikely]] if (!(logger_thread_ctx.m_periodic_logger)) {
+#else
+    if (LOGGING_PREDICT_FALSE(!(logger_thread_ctx.m_periodic_logger))) {
+#endif
+        logger_thread_ctx.m_periodic_logger = glob_periodic_logger;
+    }
+    return logger_thread_ctx.m_periodic_logger;
 }
 
 static std::filesystem::path g_base_dir;
@@ -213,6 +225,11 @@ void set_global_logger(N const& name, S const& sinks, S const& crit_sinks) {
     glob_critical_logger->flush_on(spdlog::level::err);
     glob_critical_logger->set_level(spdlog::level::level_enum::err);
     spdlog::register_logger(glob_critical_logger);
+
+    // Create periodic logger with its own file sink (_periodic extension) and tee to stderr,
+    // exactly like CreateCustomLogger but stored globally for HS_PERIODIC_LOG macros.
+    glob_periodic_logger = CreateCustomLogger(std::string(name) + "_periodic", "_periodic",
+                                              false /* tee_to_stdout */, true /* tee_to_stderr */);
 }
 
 static void set_module_log_level(const std::string& module_name, const spdlog::level::level_enum level) {

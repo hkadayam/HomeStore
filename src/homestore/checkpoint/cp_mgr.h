@@ -22,6 +22,7 @@
 
 #include <sisl/metrics/metrics.h>
 #include <sisl/fds/enum.h>
+#include <sisl/fds/urcu_helper.h>
 #include <sisl/fds/utils.h>
 #include <folly/CancellationToken.h>
 #include <folly/coro/Task.h>
@@ -85,7 +86,10 @@ public:
     void set_cp(CP* cp);
     void reset_cp();
     void cp_watchdog_timer();
-    void stop();
+
+    /// Request the watchdog to stop and return a future that completes when the timer loop exits. The returned future
+    /// must be co_awaited (not .get()) since the timer loop runs on a reactor.
+    folly::SemiFuture< bool > stop();
 
 private:
     CP* cp_{nullptr};
@@ -96,7 +100,7 @@ private:
     uint32_t progress_pct_{0};
     std::atomic< bool > stopped_{false};
     folly::CancellationSource cancel_src_;
-    folly::Baton<> done_baton_;
+    folly::SharedPromise< bool > done_promise_;
 };
 
 static constexpr uint64_t cp_sb_magic{0xc0c0c01a};
@@ -165,10 +169,9 @@ private:
     std::unique_ptr< CPWatchdog > wd_cp_;
     ModuleMetaBlk< CPManagerSuperBlock > sb_;
 
-    // RCU consumer map: readers do a lock-free atomic_load, writers copy-and-swap (registration is rare).
-    // Values are shared_ptr so the map is cheaply copyable on write.
+    // RCU consumer map: readers do a lock-free rcu_read, writers swap via make_and_exchange (registration is rare).
     using ConsumerMap = std::unordered_map< CPConsumer, shared< CPCallbacks > >;
-    std::atomic< shared< const ConsumerMap > > consumers_{std::make_shared< ConsumerMap >()};
+    sisl::urcu_data< ConsumerMap > consumers_;
 
     // State maintanence
     bool cp_shutdown_initiated_{false};
@@ -182,6 +185,9 @@ private:
     folly::Baton<> cp_timer_done_baton_;
 
 public:
+    /// Factory: construct and self-register via Managers::init_cp_mgr(). Call start() separately after recovery.
+    static shared< CPManager > create();
+
     CPManager();
     virtual ~CPManager();
 
@@ -194,7 +200,7 @@ public:
 
     /// @brief Shutdown the checkpoint manager services. It will trigger a flush, wait for the CP to be flushed
     /// and does a clean shutdown
-    void shutdown();
+    folly::coro::Task< void > shutdown();
 
     /// @brief Register a CP consumer. The consumer is immediately notified via on_switchover_cp(nullptr, cur_cp)
     /// so it can initialize its internal per-CP state. Each registered consumer receives all future CP lifecycle
@@ -239,7 +245,7 @@ public:
 
     /// @brief Get the list of Consumers and their callbacks registered to CPManager
     /// @return Returns the list of Consumers and their callbacks registered to CPManager
-    shared< const ConsumerMap > consumers() const { return consumers_.load(); }
+    auto consumers() const { return consumers_.get(); }
 
     /// @brief Is the given cp has already finished flushing
     /// @param cp_id

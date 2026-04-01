@@ -19,14 +19,16 @@
 #include <folly/coro/WithCancellation.h>
 #include <folly/io/async/Request.h>
 
-#include <homestore/homestore.hpp>
 #include <homestore/checkpoint/cp_mgr.h>
-#include "common/homestore_assert.hpp"
-#include "common/homestore_config.hpp"
-#include "common/resource_mgr.hpp"
-#ifdef _PRERELEASE
-#include "common/crash_simulator.hpp"
-#endif
+#include "base/homestore_assert.hpp"
+#include "base/homestore_config.hpp"
+#include "managers.h"
+// TODO: re-enable once HomeStore singleton and crash_simulator are ported to new iomanager
+// #include <homestore/homestore.hpp>
+// #include "base/resource_mgr.hpp"
+// #ifdef _PRERELEASE
+// #include "base/crash_simulator.hpp"
+// #endif
 
 #include <iomanager/iomanager.h>
 
@@ -58,6 +60,12 @@ std::stack< CP* >& CPGuard::cp_stack() {
 ////////////////////////////////////////////////////////////////////////////
 // CPManager
 ////////////////////////////////////////////////////////////////////////////
+
+shared< CPManager > CPManager::create() {
+    auto mgr = shared< CPManager >(new CPManager());
+    Managers::init_cp_mgr(mgr);
+    return mgr;
+}
 
 CPManager::CPManager() : metrics_{std::make_unique< CPMgrMetrics >()}, wd_cp_{std::make_unique< CPWatchdog >(this)} {
 }
@@ -96,11 +104,16 @@ void CPManager::create_first_cp() {
     cur_cp_->cp_id_ = sb_->m_last_flushed_cp + 1;
 }
 
-void CPManager::shutdown() {
-    // Cancel the periodic timer before touching any shared CP state.
+folly::coro::Task< void > CPManager::shutdown() {
+    // Request cancellation of the periodic timer (non-blocking). The timer coroutine will exit on its own.
+    folly::SemiFuture< bool > wd_done = folly::SemiFuture< bool >::makeEmpty();
     if (cp_timer_started_) {
         cp_timer_cancel_src_.requestCancellation();
-        cp_timer_done_baton_.wait();
+    }
+
+    // Request the watchdog to stop (non-blocking). We co_await its completion after the flush.
+    if (wd_cp_) {
+        wd_done = wd_cp_->stop();
     }
 
     {
@@ -108,40 +121,48 @@ void CPManager::shutdown() {
         cp_shutdown_initiated_ = true;
     }
 
-#ifdef _PRERELEASE
-    if (!hs()->crash_simulator().is_in_crashing_phase()) {
-#endif
+    // TODO: re-enable crash_simulator guard once HomeStore singleton is ported
+    // #ifdef _PRERELEASE
+    //     if (!hs()->crash_simulator().is_in_crashing_phase()) {
+    // #endif
         LOGINFO("Trigger cp flush at CP shutdown");
-        auto success = do_trigger_cp_flush(/*force=*/true, /*flush_on_shutdown=*/true, CPTriggerReason::Timer).get();
+        auto success =
+            co_await do_trigger_cp_flush(/*force=*/true, /*flush_on_shutdown=*/true, CPTriggerReason::Timer);
         HS_REL_ASSERT_EQ(success, true, "CP Flush failed");
         LOGINFO("Trigger cp done");
-#ifdef _PRERELEASE
-    }
-#endif
+    // #ifdef _PRERELEASE
+    //     }
+    // #endif
+
+    // Wait for watchdog and timer coroutines to exit before tearing down state.
+    if (wd_done.valid()) { co_await std::move(wd_done); }
+    if (cp_timer_started_) { cp_timer_done_baton_.wait(); }
+    wd_cp_.reset();
 
     delete (cur_cp_);
     rcu_xchg_pointer(&cur_cp_, nullptr);
 
     metrics_.reset();
-    if (wd_cp_) {
-        wd_cp_->stop();
-        wd_cp_.reset();
-    }
 }
 
 void CPManager::register_consumer(CPConsumer consumer, shared< CPCallbacks > callbacks) {
     // Notify consumer of the current CP so it can initialize its own state.
     callbacks->on_switchover_cp(nullptr, cur_cp_);
 
-    // Copy-and-swap: atomically publish the updated map.
-    auto old = consumers_.load();
-    auto updated = std::make_shared< ConsumerMap >(*old);
-    updated->emplace(consumer, std::move(callbacks));
-    consumers_.store(std::move(updated));
+    // Copy-and-swap via RCU: snapshot the current map while holding the read-side guard, release the guard, then
+    // atomically publish the updated map. The guard must be released before make_and_exchange (which calls
+    // rcu_synchronize) to avoid self-deadlock.
+    ConsumerMap updated;
+    {
+        auto cur = consumers_.get();
+        updated = *cur.get();
+    }
+    updated.emplace(consumer, std::move(callbacks));
+    consumers_.make_and_exchange(std::move(updated));
 }
 
 CPCallbacks* CPManager::get_consumer(CPConsumer consumer) {
-    auto consumers = consumers_.load();
+    auto consumers = consumers_.get();
     auto it = consumers->find(consumer);
     return (it != consumers->end()) ? it->second.get() : nullptr;
 }
@@ -223,8 +244,8 @@ folly::SemiFuture< bool > CPManager::do_trigger_cp_flush(bool force, bool flush_
     new_cp->cp_id_ = cur_cp->cp_id_ + 1;
 
     CP_PERIODIC_LOG(DEBUG, new_cp->id(), "Create New CP session");
-    auto consumers = consumers_.load();
-    for (auto& [id, cb] : *consumers) {
+    auto consumers = consumers_.get();
+    for (auto& [id, cb] : *consumers.get()) {
         cb->on_switchover_cp(cur_cp.get(), new_cp);
     }
 
@@ -256,8 +277,8 @@ void CPManager::cp_start_flush(CP* cp) {
 
     spawn_detached(ReactorTarget::any(), [this, cp]() -> folly::coro::Task< void > {
         // Flush all consumers one at a time; sequential ordering is intentional.
-        auto consumers = consumers_.load();
-        for (auto& [id, cb] : *consumers) {
+        auto consumers = consumers_.get();
+        for (auto& [id, cb] : *consumers.get()) {
             co_await cb->cp_flush(cp);
         }
 
@@ -292,19 +313,20 @@ void CPManager::cp_start_flush(CP* cp) {
                 COUNTER_INCREMENT(*metrics_, back_to_back_cps, 1);
                 trigger_cp_flush(false, CPTriggerReason::Timer);
             }
-#ifdef _PRERELEASE
-            if (hs()->crash_simulator().is_in_crashing_phase()) {
-                hs()->crash_simulator().crash_now();
-            }
-#endif
+            // TODO: re-enable crash_simulator guard once HomeStore singleton is ported
+            // #ifdef _PRERELEASE
+            //             if (hs()->crash_simulator().is_in_crashing_phase()) {
+            //                 hs()->crash_simulator().crash_now();
+            //             }
+            // #endif
         }
     });
 }
 
 void CPManager::cleanup_cp(CP* cp) {
     cp->cp_status_ = cp_status_t::cp_cleaning;
-    auto consumers = consumers_.load();
-    for (auto& [id, cb] : *consumers) {
+    auto consumers = consumers_.get();
+    for (auto& [id, cb] : *consumers.get()) {
         cb->cp_cleanup(cp);
     }
 }
@@ -389,7 +411,7 @@ CPWatchdog::CPWatchdog(CPManager* cp_mgr) :
             }
             cp_watchdog_timer();
         }
-        done_baton_.post();
+        done_promise_.setValue(true);
     });
 }
 
@@ -405,12 +427,10 @@ void CPWatchdog::set_cp(CP* cp) {
     last_state_ch_time_ = Clock::now();
 }
 
-void CPWatchdog::stop() {
+folly::SemiFuture< bool > CPWatchdog::stop() {
     stopped_.store(true);
     cancel_src_.requestCancellation();
-    done_baton_.wait();
-    std::unique_lock< std::shared_mutex > lk{cp_mtx_};
-    cp_ = nullptr;
+    return done_promise_.getSemiFuture();
 }
 
 void CPWatchdog::cp_watchdog_timer() {
@@ -427,7 +447,7 @@ void CPWatchdog::cp_watchdog_timer() {
     uint32_t cum_pct{0};
     uint32_t count{0};
     auto consumer = cp_mgr_->consumers();
-    for (auto& [id, cb] : *consumer) {
+    for (auto& [id, cb] : *consumer.get()) {
         ++count;
         cum_pct += cb->cp_progress_percent();
     }
@@ -444,7 +464,7 @@ void CPWatchdog::cp_watchdog_timer() {
     uint32_t max_time_multiplier = 12;
     if (get_elapsed_time_ms(last_state_ch_time_) < max_time_multiplier * timer_sec_ * 1000) {
         uint32_t repair_attempted{0};
-        for (auto& [id, cb] : *consumer) {
+        for (auto& [id, cb] : *consumer.get()) {
             const auto pct = cb->cp_progress_percent();
             if (pct != 100) {
                 cb->repair_slow_cp();

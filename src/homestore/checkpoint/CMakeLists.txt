@@ -8,3 +8,5 @@ target_sources(hs_checkpoint PRIVATE
         cp_mgr.cpp
       )
 target_link_libraries(hs_checkpoint ${COMMON_DEPS})
+
+add_subdirectory(tests)

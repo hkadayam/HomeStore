@@ -99,7 +99,7 @@
                                 std::forward< decltype(args) >(args)...);                       \
                 return true;                                                                                           \
             }),                                                                                                        \
-            homestore::HomeStore::periodic_logger(), msg, ##__VA_ARGS__);                                              \
+            sisl::logging::GetPeriodicLogger(), msg, ##__VA_ARGS__);                                                    \
     }
 #define HS_PERIODIC_LOG(level, mod, msg, ...) HS_PERIODIC_DETAILED_LOG(level, mod, , , , , msg, ##__VA_ARGS__)
 

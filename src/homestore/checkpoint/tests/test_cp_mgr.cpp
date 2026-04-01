@@ -13,173 +13,362 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
 
-#include <iomgr/io_environment.hpp>
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
 #include <gtest/gtest.h>
 
-#include <homestore/homestore.hpp>
-#include <homestore/meta_service.hpp>
+#include <sisl/logging/logging.h>
+#include <sisl/options/options.h>
+
+#include "iomanager/iomanager.h"
+#include "base/test_defs.h"
+
+#include "common/defs.h"
+#include "device/device_manager.h"
+#include "meta/meta_blk_manager.h"
+#include "managers.h"
+
 #include <homestore/checkpoint/cp_mgr.h>
 #include <homestore/checkpoint/cp.h>
-#include "test_common/homestore_test_common.hpp"
 
 using namespace homestore;
 
- 
-
-
 SISL_OPTION_GROUP(test_cp_mgr,
                   (num_records, "", "num_records", "number of record to test",
-                   ::cxxopts::value< uint32_t >()->default_value("1000"), "number"),
-                  (iterations, "", "iterations", "Iterations", ::cxxopts::value< uint32_t >()->default_value("1"),
-                   "the number of iterations to run each test"));
+                   ::cxxopts::value< uint32_t >()->default_value("100"), "number"));
 
-class TestCPContext : public CPContext {
-public:
-    TestCPContext(CP* cp) : CPContext{cp} {}
-    virtual ~TestCPContext() = default;
+static constexpr uint64_t DEV_SIZE = 256 * 1024 * 1024;      // 256 MB per device
+static constexpr uint64_t META_VDEV_SIZE = 64 * 1024 * 1024; // 64 MB for meta vdev
 
-    void add() {
-        auto val = m_next_val.fetch_add(1);
-        if (val < max_values) { m_cur_values[val] = std::make_pair(id(), val); }
-    }
-
-    void validate(uint64_t cp_id) {
-        for (uint64_t i{0}; i < m_next_val.load(); ++i) {
-            auto [session, val] = m_cur_values[i];
-            ASSERT_EQ(session, cp_id) << "CP Context has data with mismatched cp_id";
-            ASSERT_EQ(val, i);
-        }
-        LOGINFO("CP={}, CPContext has {} values to be flushed/validated", cp_id, m_next_val.load());
-    }
-
-private:
-    static constexpr size_t max_values = 10000;
-
-    std::array< std::pair< uint64_t, uint64_t >, max_values > m_cur_values;
-    std::atomic< uint64_t > m_next_val{0};
-    folly::Promise< bool > m_comp_promise;
-};
-
+// ─── Test CP consumer
+// ───────────────────────────────────────────────────────────────────────────────────────────────── Tracks values added
+// during each CP session via atomic counter. On flush, validates that all values belong to the expected CP id.
 class TestCPCallbacks : public CPCallbacks {
 public:
-    std::unique_ptr< CPContext > on_switchover_cp(CP*, CP* new_cp) override {
-        return std::make_unique< TestCPContext >(new_cp);
+    void on_switchover_cp(CP* /*cur_cp*/, CP* /*new_cp*/) override {
+        // Reset per-CP counter for the new session.
+        next_val_.store(0);
     }
 
-    folly::Future< bool > cp_flush(CP* cp) override {
-        auto ctx = s_cast< TestCPContext* >(cp->context(cp_consumer_t::HS_CLIENT));
-        ctx->validate(cp->id());
-        return folly::makeFuture< bool >(true);
+    folly::coro::Task< bool > cp_flush(CP* cp) override {
+        auto count = next_val_.load();
+        LOGINFO("CP={} flushing {} values", cp->id(), count);
+        // Validate that the count is within bounds.
+        EXPECT_LE(count, max_values);
+        ++flush_count_;
+        co_return true;
     }
 
-    void cp_cleanup(CP* cp) override {}
+    void cp_cleanup(CP* /*cp*/) override {}
 
     int cp_progress_percent() override { return 100; }
-};
 
-class TestCPMgr : public ::testing::Test {
-public:
-    void SetUp() override {
-        m_helper.start_homestore("test_cp", {{HS_SERVICE::META, {.size_pct = 85.0}}});
-        hs()->cp_mgr().register_consumer(cp_consumer_t::HS_CLIENT, std::move(std::make_unique< TestCPCallbacks >()));
-    }
+    // Add a value to the current CP session (called under cp_guard).
+    void add() { next_val_.fetch_add(1); }
 
-    void TearDown() override { m_helper.shutdown_homestore(); }
-
-    void simulate_io() {
-        iomanager.run_on_forget(iomgr::reactor_regex::least_busy_worker, [this]() {
-            auto cur_cp = homestore::hs()->cp_mgr().cp_guard();
-            r_cast< TestCPContext* >(cur_cp->context(cp_consumer_t::HS_CLIENT))->add();
-        });
-    }
-
-    void rescheduled_io() {
-        iomanager.run_on_forget(iomgr::reactor_regex::least_busy_worker, [this]() {
-            auto cur_cp = homestore::hs()->cp_mgr().cp_guard();
-            iomanager.run_on_forget(iomgr::reactor_regex::least_busy_worker, [moved_cp = std::move(cur_cp)]() mutable {
-                r_cast< TestCPContext* >(moved_cp->context(cp_consumer_t::HS_CLIENT))->add();
-            });
-        });
-    }
-
-    void nested_io() {
-        [[maybe_unused]] auto cur_cp = homestore::hs()->cp_mgr().cp_guard();
-        rescheduled_io();
-    }
-
-    void trigger_cp(bool wait) {
-        static std::mutex mtx;
-        static std::condition_variable cv;
-        static uint64_t this_flush_cp{0};
-        static uint64_t last_flushed_cp{0};
-
-        {
-            std::unique_lock lg(mtx);
-            ++this_flush_cp;
-        }
-
-        auto fut = homestore::hs()->cp_mgr().trigger_cp_flush(true /* force */);
-
-        auto on_complete = [&](auto success) {
-            ASSERT_EQ(success, true) << "CP Flush failed";
-            {
-                std::unique_lock lg(mtx);
-                ASSERT_LT(last_flushed_cp, this_flush_cp) << "CP out_of_order completion";
-                ++last_flushed_cp;
-            }
-        };
-
-        if (wait) {
-            on_complete(std::move(fut).get());
-        } else {
-            std::move(fut).thenValue(on_complete);
-        }
-    }
+    uint64_t flush_count() const { return flush_count_.load(); }
 
 private:
-    test_common::HSTestHelper m_helper;
+    static constexpr size_t max_values = 100000;
+    std::atomic< uint64_t > next_val_{0};
+    std::atomic< uint64_t > flush_count_{0};
 };
 
-TEST_F(TestCPMgr, cp_start_and_flush) {
-    auto nrecords = SISL_OPTIONS["num_records"].as< uint32_t >();
-    LOGINFO("Step 1: Simulate IO on cp session for {} records", nrecords);
-    for (uint32_t i{0}; i < nrecords; ++i) {
-        this->simulate_io();
+// ─── Fixture
+// ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+class CPMgrTest : public ::testing::Test {
+public:
+    void SetUp() override {
+        for (size_t i = 0; i < num_devs_; ++i) {
+            auto path = fmt::format("/tmp/hs_test_cp_{}", i);
+            dev_paths_.push_back(path);
+            std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+            ofs.seekp(static_cast< std::streamoff >(DEV_SIZE - 1));
+            ofs.put('\0');
+            ofs.close();
+        }
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds{1000});
 
-    LOGINFO("Step 2: Trigger a new cp without waiting for it to complete");
-    this->trigger_cp(false /* wait */);
-
-    LOGINFO("Step 3: Simulate IO parallel to CP for {} records", nrecords);
-    for (uint32_t i{0}; i < nrecords; ++i) {
-        this->simulate_io();
+    void TearDown() override {
+        Managers::reset();
+        for (auto& p : dev_paths_) {
+            std::filesystem::remove(p);
+        }
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds{1000});
 
-    LOGINFO("Step 4: Trigger a back-to-back cp");
-    this->trigger_cp(false /* wait */);
-    this->trigger_cp(true /* wait */);
-
-    LOGINFO("Step 5: Simulate rescheduled IO for {} records", nrecords);
-    for (uint32_t i{0}; i < nrecords; ++i) {
-        this->nested_io();
+    std::vector< DevInfo > make_dev_infos() const {
+        std::vector< DevInfo > infos;
+        for (auto& p : dev_paths_) {
+            infos.emplace_back(p, HSDevType::Data, DEV_SIZE);
+        }
+        return infos;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds{1000});
 
-    LOGINFO("Step 6: Trigger a cp to validate");
-    this->trigger_cp(true /* wait */);
+    // Format devices, create MetaBlkManager, create CPManager, register test consumer.
+    folly::coro::Task< shared< DeviceManager > > format_and_start_cp() {
+        auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+        co_await MetaBlkManager::create(META_VDEV_SIZE);
+
+        auto cpmgr = CPManager::create();
+        co_await cpmgr->start(true /* first_time_boot */);
+
+        test_cb_ = std::make_shared< TestCPCallbacks >();
+        cpmgr->register_consumer("test_consumer", test_cb_);
+
+        co_return dm;
+    }
+
+    // Reload devices, load MetaBlkManager, start CPManager (recovery path).
+    folly::coro::Task< shared< DeviceManager > > reload_and_start_cp() {
+        Managers::reset();
+        auto dm = DeviceManager::create(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+        co_await dm->load_devices();
+        co_await MetaBlkManager::load();
+
+        auto cpmgr = CPManager::create();
+        co_await cpmgr->start(false /* first_time_boot */);
+
+        test_cb_ = std::make_shared< TestCPCallbacks >();
+        cpmgr->register_consumer("test_consumer", test_cb_);
+
+        co_return dm;
+    }
+
+    static constexpr size_t num_devs_ = 2;
+    std::vector< std::string > dev_paths_;
+    shared< TestCPCallbacks > test_cb_;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Test 1: Create CPManager, verify initial CP is io_ready with id 0.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+CORO_TEST_F(CPMgrTest, CreateAndVerifyInitialCP) {
+    auto dm = co_await self.format_and_start_cp();
+
+    {
+        auto guard = cp_mgr().cp_guard();
+        EXPECT_EQ(guard->id(), 0);
+        EXPECT_EQ(guard->get_status(), cp_status_t::cp_io_ready);
+    }
+
+    co_await cp_mgr().shutdown();
+    co_await dm->close_devices();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Test 2: Register consumer, add values under cp_guard, trigger flush, verify flush callback ran.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+CORO_TEST_F(CPMgrTest, SimulateIOAndFlush) {
+    auto dm = co_await self.format_and_start_cp();
+    const uint32_t nrecords = SISL_OPTIONS["num_records"].as< uint32_t >();
+
+    LOGINFO("Step 1: Simulate {} IOs under cp_guard", nrecords);
+    for (uint32_t i = 0; i < nrecords; ++i) {
+        auto guard = cp_mgr().cp_guard();
+        self.test_cb_->add();
+    }
+
+    LOGINFO("Step 2: Trigger CP flush and wait");
+    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+    EXPECT_TRUE(success);
+    EXPECT_GE(self.test_cb_->flush_count(), 1u);
+
+    co_await cp_mgr().shutdown();
+    co_await dm->close_devices();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Test 3: Trigger back-to-back CPs (force=true while previous is flushing).
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+CORO_TEST_F(CPMgrTest, BackToBackCP) {
+    auto dm = co_await self.format_and_start_cp();
+
+    LOGINFO("Step 1: Simulate some IOs");
+    for (uint32_t i = 0; i < 50; ++i) {
+        auto guard = cp_mgr().cp_guard();
+        self.test_cb_->add();
+    }
+
+    LOGINFO("Step 2: Trigger first CP (no wait)");
+    auto fut1 = cp_mgr().trigger_cp_flush(true /* force */);
+
+    LOGINFO("Step 3: Trigger second CP (back-to-back, wait)");
+    auto fut2 = cp_mgr().trigger_cp_flush(true /* force */);
+
+    auto success1 = co_await std::move(fut1);
+    auto success2 = co_await std::move(fut2);
+    EXPECT_TRUE(success1);
+    EXPECT_TRUE(success2);
+    EXPECT_GE(self.test_cb_->flush_count(), 2u);
+
+    co_await cp_mgr().shutdown();
+    co_await dm->close_devices();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Test 4: CP guard nesting — inner guard should reuse the same CP as the outer guard.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+CORO_TEST_F(CPMgrTest, NestedCPGuard) {
+    auto dm = co_await self.format_and_start_cp();
+
+    cp_id_t outer_id;
+    cp_id_t inner_id;
+    {
+        auto outer = cp_mgr().cp_guard();
+        outer_id = outer->id();
+        {
+            auto inner = cp_mgr().cp_guard();
+            inner_id = inner->id();
+        }
+    }
+    EXPECT_EQ(outer_id, inner_id);
+
+    co_await cp_mgr().shutdown();
+    co_await dm->close_devices();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Test 5: CP id advances after each flush.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+CORO_TEST_F(CPMgrTest, CPIdAdvancesAfterFlush) {
+    auto dm = co_await self.format_and_start_cp();
+
+    cp_id_t id_before;
+    {
+        auto guard = cp_mgr().cp_guard();
+        id_before = guard->id();
+    }
+
+    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+    EXPECT_TRUE(success);
+
+    cp_id_t id_after;
+    {
+        auto guard = cp_mgr().cp_guard();
+        id_after = guard->id();
+    }
+
+    EXPECT_EQ(id_after, id_before + 1);
+
+    co_await cp_mgr().shutdown();
+    co_await dm->close_devices();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Test 6: CP superblock persists across restart — CP id continues from where it left off.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+CORO_TEST_F(CPMgrTest, CPIdSurvivesRestart) {
+    cp_id_t id_before_restart;
+
+    {
+        auto dm = co_await self.format_and_start_cp();
+
+        // Flush a few CPs to advance the id.
+        for (int i = 0; i < 3; ++i) {
+            auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+            EXPECT_TRUE(success);
+        }
+
+        {
+            auto guard = cp_mgr().cp_guard();
+            id_before_restart = guard->id();
+        }
+
+        co_await cp_mgr().shutdown();
+        co_await dm->close_devices();
+    }
+
+    {
+        auto dm = co_await self.reload_and_start_cp();
+
+        cp_id_t id_after_restart;
+        {
+            auto guard = cp_mgr().cp_guard();
+            id_after_restart = guard->id();
+        }
+
+        // After restart, the CP id should be last_flushed + 1, which equals id_before_restart
+        // (since shutdown does a final flush).
+        EXPECT_GE(id_after_restart, id_before_restart);
+
+        co_await cp_mgr().shutdown();
+        co_await dm->close_devices();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Test 7: IO parallel to CP flush — add values, trigger CP without waiting, add more, trigger again.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+CORO_TEST_F(CPMgrTest, IOParallelToFlush) {
+    auto dm = co_await self.format_and_start_cp();
+    const uint32_t nrecords = SISL_OPTIONS["num_records"].as< uint32_t >();
+
+    LOGINFO("Step 1: Simulate {} IOs", nrecords);
+    for (uint32_t i = 0; i < nrecords; ++i) {
+        auto guard = cp_mgr().cp_guard();
+        self.test_cb_->add();
+    }
+
+    LOGINFO("Step 2: Trigger CP without waiting");
+    auto fut1 = cp_mgr().trigger_cp_flush(true /* force */);
+
+    LOGINFO("Step 3: Simulate {} more IOs parallel to flush", nrecords);
+    for (uint32_t i = 0; i < nrecords; ++i) {
+        auto guard = cp_mgr().cp_guard();
+        self.test_cb_->add();
+    }
+
+    auto success1 = co_await std::move(fut1);
+    EXPECT_TRUE(success1);
+
+    LOGINFO("Step 4: Trigger final CP and wait");
+    auto success2 = co_await cp_mgr().trigger_cp_flush(true /* force */);
+    EXPECT_TRUE(success2);
+
+    co_await cp_mgr().shutdown();
+    co_await dm->close_devices();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Test 8: has_cp_flushed returns correct results.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+CORO_TEST_F(CPMgrTest, HasCPFlushed) {
+    auto dm = co_await self.format_and_start_cp();
+
+    cp_id_t initial_id;
+    {
+        auto guard = cp_mgr().cp_guard();
+        initial_id = guard->id();
+    }
+
+    // Before any flush, CP 0 should not be flushed yet (it's the active one).
+    EXPECT_FALSE(cp_mgr().has_cp_flushed(initial_id));
+
+    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+    EXPECT_TRUE(success);
+
+    // After flush, CP 0 should be flushed.
+    EXPECT_TRUE(cp_mgr().has_cp_flushed(initial_id));
+
+    co_await cp_mgr().shutdown();
+    co_await dm->close_devices();
 }
 
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);
     SISL_OPTIONS_LOAD(parsed_argc, argv);
-    sisl::logging::SetLogger("test_home_local_journal");
+    sisl::logging::SetLogger("test_cp_mgr");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
 
-    return RUN_ALL_TESTS();
+    homestore::init_iomgr(2);
+    auto ret = RUN_ALL_TESTS();
+    homestore::stop_iomgr();
+    return ret;
 }

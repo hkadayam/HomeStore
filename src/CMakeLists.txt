@@ -66,8 +66,8 @@ add_subdirectory(homestore/base)
 add_subdirectory(homestore/blkalloc)
 add_subdirectory(homestore/device)
 add_subdirectory(homestore/meta)
-# TODO: re-enable remaining modules once ported
-# add_subdirectory(homestore/checkpoint)
+add_subdirectory(homestore/checkpoint)
+# TODO: re-enable remaining modules
 # add_subdirectory(homestore/logstore)
 # add_subdirectory(homestore/index)
 # add_subdirectory(homestore/blob)

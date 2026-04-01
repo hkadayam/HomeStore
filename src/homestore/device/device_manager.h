@@ -64,6 +64,11 @@ class DeviceManager : public std::enable_shared_from_this< DeviceManager > {
 public:
     static shared< DeviceManager > create(std::vector< DevInfo >&& devs, IOFlag data_open_flags, IOFlag fast_open_flags);
 
+    /// Convenience: create + format_devices + commit_formatting in one call.
+    static folly::coro::Task< shared< DeviceManager > > create_and_format(std::vector< DevInfo >&& devs,
+                                                                          IOFlag data_open_flags,
+                                                                          IOFlag fast_open_flags);
+
     ~DeviceManager() = default;
     DeviceManager(const DeviceManager&) = delete;
     DeviceManager& operator=(const DeviceManager&) = delete;

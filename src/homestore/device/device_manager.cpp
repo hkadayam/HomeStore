@@ -63,6 +63,15 @@ shared< DeviceManager > DeviceManager::create(std::vector< DevInfo >&& devs, IOF
     return mgr;
 }
 
+folly::coro::Task< shared< DeviceManager > > DeviceManager::create_and_format(std::vector< DevInfo >&& devs,
+                                                                              IOFlag data_open_flags,
+                                                                              IOFlag fast_open_flags) {
+    auto mgr = create(std::move(devs), data_open_flags, fast_open_flags);
+    co_await mgr->format_devices();
+    co_await mgr->commit_formatting();
+    co_return mgr;
+}
+
 // ── Boot-time queries ─────────────────────────────────────────────────────────
 
 bool DeviceManager::is_first_time_boot() const {

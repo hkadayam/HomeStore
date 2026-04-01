@@ -91,7 +91,7 @@ CORO_TEST_F(DevMgrTest, LoadAfterFormat) {
     {
         auto dm = self.make_dm();
         co_await dm->format_devices();
-    co_await dm->commit_formatting();
+        co_await dm->commit_formatting();
         co_await dm->close_devices();
     }
 
@@ -202,7 +202,7 @@ CORO_TEST_F(DevMgrTest, VdevPersistAcrossRestart) {
     {
         auto dm = self.make_dm();
         co_await dm->format_devices();
-    co_await dm->commit_formatting();
+        co_await dm->commit_formatting();
 
         VDevParameters p1;
         p1.vdev_name = "persist_a";
@@ -252,7 +252,7 @@ CORO_TEST_F(DevMgrTest, DynamicChunkCreation) {
     {
         auto dm = self.make_dm();
         co_await dm->format_devices();
-    co_await dm->commit_formatting();
+        co_await dm->commit_formatting();
 
         VDevParameters params;
         params.vdev_name = "dynamic_chunks";

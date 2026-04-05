@@ -26,7 +26,7 @@
 #include <folly/coro/Mutex.h>
 #include <folly/coro/Task.h>
 #include <sisl/fds/concurrent_insert_set.h>
-#include <sisl/fds/urcu_helper.h>
+#include <sisl/fds/rcu.h>
 
 #include <homestore/homestore_decl.hpp> // shared<>, unique<>
 #include "checkpoint/cp.h"              // cp_id_t
@@ -45,11 +45,11 @@ enum class ChunkToShrink : uint8_t;
 // StreamBase
 //
 // Owns an ordered list of Chunks for one stream (1 stream : N chunks). Hot-path reads (chunk lookup, offset resolution)
-// are truly lock-free via sisl::urcu_data; writes (expand, truncate, destroy) are serialised by a folly::coro::Mutex so
+// are truly lock-free via sisl::Rcu::data writes (expand, truncate, destroy) are serialised by a folly::coro::Mutex so
 // they can co_await VDev I/O safely.
 //
 // Concurrency model:
-//   - chunks() — lock-free read under RCU.  Do NOT hold the returned _urcu_access_ptr across a co_await (RCU readers
+//   - chunks() — lock-free read under RCU.  Do NOT hold the returned Rcu::access_ptr across a co_await (RCU readers
 //     must be short-lived).
 //   - expand_to() / truncate_before() / destroy() — coroutines that acquire expand_mutex_ before mutating chunk list.
 // ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -75,7 +75,7 @@ public:
 
     /// Returns an RCU accessor wrapping the current chunk vector. The accessor holds a folly::rcu_reader guard —
     /// release it (let it go out of scope) before the next co_await.
-    sisl::_urcu_access_ptr< std::vector< shared< Chunk > > > chunks() const;
+    sisl::Rcu::access_ptr< std::vector< shared< Chunk > > > chunks() const;
 
     /// Number of chunks currently in this stream (lock-free snapshot).
     size_t num_chunks() const;
@@ -148,7 +148,7 @@ private:
 
     // RCU-protected chunk list. Readers take an rcu_reader guard (~2-5 ns). Writers call make_and_exchange() under
     // expand_mutex_ which invokes folly::synchronize_rcu() to wait for any in-flight readers.
-    sisl::urcu_data< std::vector< shared< Chunk > > > chunks_;
+    sisl::Rcu::data< std::vector< shared< Chunk > > > chunks_;
 
     // Serialises all mutations. folly::coro::Mutex is safe to hold across co_await; std::mutex is not.
     folly::coro::Mutex expand_mutex_;

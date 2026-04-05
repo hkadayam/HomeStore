@@ -103,7 +103,7 @@ public:
 
 // ── CreateStaticRoundRobin ───────────────────────────────────────────────────────────────────────────────────────────
 CORO_TEST_F(VDevTest, CreateStaticRoundRobin) {
-    auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
     auto vdev = co_await dm->create_vdev(self.static_params("test_static", 4));
     CO_ASSERT_NE(vdev, nullptr);
     EXPECT_EQ(vdev->block_size(), BLK_SIZE);
@@ -114,7 +114,7 @@ CORO_TEST_F(VDevTest, CreateStaticRoundRobin) {
 
 // ── CreateDynamic ────────────────────────────────────────────────────────────────────────────────────────────────────
 CORO_TEST_F(VDevTest, CreateDynamic) {
-    auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
     auto vdev = co_await dm->create_vdev(self.dynamic_params("test_dynamic"));
     CO_ASSERT_NE(vdev, nullptr);
     EXPECT_EQ(vdev->num_chunks(), 0u);
@@ -123,12 +123,12 @@ CORO_TEST_F(VDevTest, CreateDynamic) {
 
 // ── FormatZerosData ──────────────────────────────────────────────────────────────────────────────────────────────────
 CORO_TEST_F(VDevTest, FormatZerosData) {
-    auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
     auto vdev = co_await dm->create_vdev(self.static_params("test_format", 2));
     co_await vdev->format();
 
     // Read first block from chunk 0 — should be all zeros.
-    BlkId bid{0, 1, to_u16(vdev->get_nth_chunk(0)->chunk_id())};
+    BlkId bid(0, 1, to_u16(vdev->get_nth_chunk(0)->chunk_id()));
     IOBuffer rbuf{BLK_SIZE, 512};
     auto ec = co_await vdev->read(rbuf, bid);
     CO_ASSERT_FALSE(ec);
@@ -140,7 +140,7 @@ CORO_TEST_F(VDevTest, FormatZerosData) {
 
 // ── AllocWriteReadSingleBlock ────────────────────────────────────────────────────────────────────────────────────────
 CORO_TEST_F(VDevTest, AllocWriteReadSingleBlock) {
-    auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
     auto vdev = co_await dm->create_vdev(self.static_params("test_rw", 2));
 
     BlkId blkid;
@@ -162,7 +162,7 @@ CORO_TEST_F(VDevTest, AllocWriteReadSingleBlock) {
 
 // ── AllocWriteReadMultiBlock ─────────────────────────────────────────────────────────────────────────────────────────
 CORO_TEST_F(VDevTest, AllocWriteReadMultiBlock) {
-    auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
     auto vdev = co_await dm->create_vdev(self.static_params("test_multi", 2));
 
     constexpr blk_count_t nblks = 4;
@@ -188,7 +188,7 @@ CORO_TEST_F(VDevTest, AllocWriteReadMultiBlock) {
 
 // ── WritevReadv ──────────────────────────────────────────────────────────────────────────────────────────────────────
 CORO_TEST_F(VDevTest, WritevReadv) {
-    auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
     auto vdev = co_await dm->create_vdev(self.static_params("test_writev", 2));
 
     constexpr blk_count_t nblks = 4;
@@ -230,7 +230,7 @@ CORO_TEST_F(VDevTest, WritevReadv) {
 
 // ── AllocFreeRealloc ─────────────────────────────────────────────────────────────────────────────────────────────────
 CORO_TEST_F(VDevTest, AllocFreeRealloc) {
-    auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
     auto vdev = co_await dm->create_vdev(self.static_params("test_free", 2));
 
     BlkId blkid;
@@ -250,7 +250,7 @@ CORO_TEST_F(VDevTest, AllocFreeRealloc) {
 
 // ── ExpandChunk ──────────────────────────────────────────────────────────────────────────────────────────────────────
 CORO_TEST_F(VDevTest, ExpandChunk) {
-    auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
     auto vdev = co_await dm->create_vdev(self.dynamic_params("test_expand"));
     EXPECT_EQ(vdev->num_chunks(), 0u);
 
@@ -268,7 +268,7 @@ CORO_TEST_F(VDevTest, ExpandChunk) {
 
 // ── ShrinkChunkLast ──────────────────────────────────────────────────────────────────────────────────────────────────
 CORO_TEST_F(VDevTest, ShrinkChunkLast) {
-    auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
     auto vdev = co_await dm->create_vdev(self.dynamic_params("test_shrink_last"));
 
     co_await vdev->expand(CHUNK_SIZE);
@@ -282,11 +282,12 @@ CORO_TEST_F(VDevTest, ShrinkChunkLast) {
     EXPECT_EQ(vdev->get_chunk(removed_id), nullptr);
 
     co_await dm->close_devices();
+    co_return;
 }
 
 // ── ShrinkChunkSpecific ──────────────────────────────────────────────────────────────────────────────────────────────
 CORO_TEST_F(VDevTest, ShrinkChunkSpecific) {
-    auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
     auto vdev = co_await dm->create_vdev(self.dynamic_params("test_shrink_spec"));
 
     auto c0 = co_await vdev->expand(CHUNK_SIZE);
@@ -304,11 +305,12 @@ CORO_TEST_F(VDevTest, ShrinkChunkSpecific) {
     EXPECT_NE(vdev->get_chunk(c2->chunk_id()), nullptr);
 
     co_await dm->close_devices();
+    co_return;
 }
 
 // ── ChunkPoolReuse ───────────────────────────────────────────────────────────────────────────────────────────────────
 CORO_TEST_F(VDevTest, ChunkPoolReuse) {
-    auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
     auto vdev = co_await dm->create_vdev(self.dynamic_params("test_pool"));
     vdev->enable_chunk_pooling(/*pool_limit=*/4);
 
@@ -324,6 +326,7 @@ CORO_TEST_F(VDevTest, ChunkPoolReuse) {
     EXPECT_EQ(reused->chunk_id(), original_id);
 
     co_await dm->close_devices();
+    co_return;
 }
 
 // ── LoadRecovery ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -333,7 +336,7 @@ CORO_TEST_F(VDevTest, LoadRecovery) {
 
     // Phase 1: create vdev, alloc blocks, write data.
     {
-        auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+        auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
         auto vdev = co_await dm->create_vdev(self.static_params("test_recovery", 2));
         vdev_id = vdev->vdev_id();
 
@@ -369,7 +372,7 @@ CORO_TEST_F(VDevTest, LoadRecovery) {
 
 // ── FullWorkflow ─────────────────────────────────────────────────────────────────────────────────────────────────────
 CORO_TEST_F(VDevTest, FullWorkflow) {
-    auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
     auto vdev = co_await dm->create_vdev(self.static_params("test_e2e", 2));
 
     // Format (zero data area).
@@ -404,7 +407,7 @@ CORO_TEST_F(VDevTest, FullWorkflow) {
 
 // ── MostAvailableSpaceSelector ───────────────────────────────────────────────────────────────────────────────────────
 CORO_TEST_F(VDevTest, MostAvailableSpaceSelector) {
-    auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
 
     VDevParameters p = self.static_params("test_most_avail", 4);
     p.chunk_sel_type = ChunkSelectorType::MostAvailableSpace;

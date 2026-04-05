@@ -58,7 +58,7 @@ StreamBase::StreamBase(uint64_t stream_id, const shared< VirtualDev >& vdev, Met
     }
     std::sort(sorted.begin(), sorted.end(),
               [](const auto& a, const auto& b) { return a->vdev_order() < b->vdev_order(); });
-    chunks_ = sisl::urcu_data< std::vector< shared< Chunk > > >{std::move(sorted)};
+    chunks_ = sisl::Rcu::data< std::vector< shared< Chunk > > >{std::move(sorted)};
 }
 
 folly::coro::Task< void > StreamBase::destroy() {
@@ -154,7 +154,7 @@ folly::coro::Task< void > StreamBase::truncate_before(size_t nchunks) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Read-side (lock-free)
 // ─────────────────────────────────────────────────────────────────────────────
-sisl::_urcu_access_ptr< std::vector< shared< Chunk > > > StreamBase::chunks() const {
+sisl::Rcu::access_ptr< std::vector< shared< Chunk > > > StreamBase::chunks() const {
     return chunks_.get();
 }
 

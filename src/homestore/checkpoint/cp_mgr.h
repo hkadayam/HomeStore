@@ -22,12 +22,13 @@
 
 #include <sisl/metrics/metrics.h>
 #include <sisl/fds/enum.h>
-#include <sisl/fds/urcu_helper.h>
 #include <sisl/fds/utils.h>
 #include <folly/CancellationToken.h>
+#include <folly/SharedMutex.h>
 #include <folly/coro/Task.h>
 #include <folly/futures/Future.h>
 #include <folly/futures/SharedPromise.h>
+#include <folly/io/async/AsyncTimeout.h>
 #include <folly/io/async/Request.h>
 #include <folly/synchronization/Baton.h>
 
@@ -80,18 +81,20 @@ public:
     virtual void repair_slow_cp() {}
 };
 
-class CPWatchdog {
+class CPWatchdog : private folly::AsyncTimeout {
 public:
     explicit CPWatchdog(CPManager* cp_mgr);
     void set_cp(CP* cp);
     void reset_cp();
-    void cp_watchdog_timer();
+    void watch_cp();
 
     /// Request the watchdog to stop and return a future that completes when the timer loop exits. The returned future
     /// must be co_awaited (not .get()) since the timer loop runs on a reactor.
     folly::SemiFuture< bool > stop();
 
 private:
+    void timeoutExpired() noexcept override;
+
     CP* cp_{nullptr};
     CPManager* cp_mgr_;
     std::shared_mutex cp_mtx_;
@@ -99,7 +102,7 @@ private:
     uint64_t timer_sec_{0};
     uint32_t progress_pct_{0};
     std::atomic< bool > stopped_{false};
-    folly::CancellationSource cancel_src_;
+    folly::EventBase* wd_eb_{nullptr};
     folly::SharedPromise< bool > done_promise_;
 };
 
@@ -158,6 +161,7 @@ VENUM(CPTriggerReason, uint8_t,
  */
 class CPManager {
     friend class CPGuard;
+    friend class CPWatchdog;
 
 public:
     static constexpr size_t max_concurent_cps{2};
@@ -169,9 +173,9 @@ private:
     std::unique_ptr< CPWatchdog > wd_cp_;
     ModuleMetaBlk< CPManagerSuperBlock > sb_;
 
-    // RCU consumer map: readers do a lock-free rcu_read, writers swap via make_and_exchange (registration is rare).
     using ConsumerMap = std::unordered_map< CPConsumer, shared< CPCallbacks > >;
-    sisl::urcu_data< ConsumerMap > consumers_;
+    ConsumerMap consumers_;
+    mutable folly::SharedMutex consumers_mtx_;
 
     // State maintanence
     bool cp_shutdown_initiated_{false};
@@ -207,9 +211,9 @@ public:
     /// callbacks. Consumers own their per-CP state; nothing is stored in the CP object itself.
     /// @param consumer_id Consumer identifier a string that uniquely identifies the consumer (e.g. "IndexService")
     /// @param callbacks   Consumer's callbacks implementation (shared ownership, passed as shared<CPCallbacks>)
-    void register_consumer(CPConsumer consumer_id, shared< CPCallbacks > callbacks);
+    void register_consumer(const CPConsumer& consumer_id, shared< CPCallbacks > callbacks);
 
-    CPCallbacks* get_consumer(CPConsumer consumer_id);
+    CPCallbacks* get_consumer(const CPConsumer& consumer_id);
 
     /// @brief Call this method before every IO that needs to be checkpointed. It marks the entrance of critical section
     /// of the returned CP and ensures that until it is exited, flush of the CP will not happen.
@@ -242,10 +246,6 @@ public:
     /// is successful, false otherwise (e.g. flush failed or was not triggered because another flush is in progress and
     /// force was false).
     folly::SemiFuture< bool > trigger_cp_flush(bool force = false, CPTriggerReason reason = CPTriggerReason::Unknown);
-
-    /// @brief Get the list of Consumers and their callbacks registered to CPManager
-    /// @return Returns the list of Consumers and their callbacks registered to CPManager
-    auto consumers() const { return consumers_.get(); }
 
     /// @brief Is the given cp has already finished flushing
     /// @param cp_id

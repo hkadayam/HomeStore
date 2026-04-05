@@ -28,7 +28,7 @@
 #include <vector>
 
 #include <folly/coro/Task.h>
-#include "sisl/fds/urcu_helper.h"
+#include "sisl/fds/rcu.h"
 
 #include "homestore/blk.h" // BlkId, BlkIds, BlkAllocStatus, blk_alloc_hints, blk_count_t
 
@@ -88,7 +88,7 @@ struct VDevMutableState {
 // ── VirtualDev ────────────────────────────────────────────────────────────────
 //
 // Key design:
-//  • RCU mutable state: sisl::urcu_data<VDevMutableState> — reads are truly lock-free (atomic load + folly::rcu_reader
+//  • RCU mutable state: sisl::Rcu::data<VDevMutableState> — reads are truly lock-free (atomic load + folly::rcu_reader
 //    guard, ~2-5 ns),
 //  • expand()/shrink() for adding/removing chunks at runtime.
 //  • ChunkPool integration for efficient chunk reuse.
@@ -216,7 +216,7 @@ private:
     // (that would deadlock synchronize_rcu()). Always scope load_state() before
     // calling store_state(), or use clone_state() which releases the guard immediately.
 
-    sisl::_urcu_access_ptr< VDevMutableState > load_state() const { return mutable_state_.get(); }
+    sisl::Rcu::access_ptr< VDevMutableState > load_state() const { return mutable_state_.get(); }
 
     // Copy current state; RCU guard is acquired and released inside this call.
     VDevMutableState clone_state() const {
@@ -263,10 +263,10 @@ private:
     std::vector< shared< PhysicalDev > > pdevs_; // physical devices backing this vdev
 
     // ── Mutable state (RCU) ───────────────────────────────────────────────────
-    // sisl::urcu_data<T>: reads are truly lock-free (folly::rcu_reader, ~2-5 ns).
+    // sisl::Rcu::data<T>: reads are truly lock-free (folly::rcu_reader, ~2-5 ns).
     // Writes call make_and_exchange() which waits for a grace period — cheap for
     // infrequent writes (expand/shrink/recovery), not on the I/O hot path.
-    sisl::urcu_data< VDevMutableState > mutable_state_;
+    sisl::Rcu::data< VDevMutableState > mutable_state_;
 
     // ── Chunk management mutex ────────────────────────────────────────────────
     // Serializes all writes to mutable_state_ (expand, shrink, on_chunks_added, on_chunk_removed, destroy).

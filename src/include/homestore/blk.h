@@ -48,7 +48,6 @@ static constexpr size_t max_blks_per_blkid() {
     return (1UL << (8 * sizeof(blk_count_t))) - 1;
 }
 
-#pragma pack(1)
 struct BlkId {
 private:
     struct serialized {
@@ -93,7 +92,6 @@ public:
 
     static int compare(BlkId const& one, BlkId const& two);
 };
-#pragma pack()
 
 /// A small collection of BlkIds, stack-allocated for up to 4 pieces.
 using BlkIds = folly::small_vector< BlkId, 4 >;

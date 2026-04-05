@@ -122,21 +122,19 @@ void BitmapBlkAllocator::do_set_bits(BlkId const& b) {
 }
 
 sisl::ThreadVector< BlkId >* BitmapBlkAllocator::get_commit_list() {
-    return rcu_dereference(commit_list_);
+    return sisl::Rcu::dereference(commit_list_);
 }
 
 BlkAllocStatus BitmapBlkAllocator::commit(BlkId const& bid) {
-    rcu_read_lock();
+    sisl::Rcu::read_guard guard;
     auto* list = get_commit_list();
     if (list) {
         // Buffer is currently acquired — defer the commit; release_buffer() will apply it.
         list->push_back(bid);
-        rcu_read_unlock();
         return BlkAllocStatus::SUCCESS;
     }
-    rcu_read_unlock();
-
-    // No buffer held — set bits directly.
+    // read_guard destructor handles rcu_read_unlock.
+    // No buffer held — set bits directly (guard still held, harmless).
     do_set_bits(bid);
     return BlkAllocStatus::SUCCESS;
 }
@@ -145,16 +143,16 @@ BlkAllocStatus BitmapBlkAllocator::commit(BlkId const& bid) {
 
 BlkAllocator::BufferGuard BitmapBlkAllocator::acquire_buffer() {
     auto* new_list = new sisl::ThreadVector< BlkId >();
-    auto* old_list = rcu_xchg_pointer(&commit_list_, new_list);
-    synchronize_rcu();
+    auto* old_list = sisl::Rcu::xchg_pointer(&commit_list_, new_list);
+    sisl::Rcu::synchronize();
     HS_REL_ASSERT_EQ(static_cast< void* >(old_list), nullptr,
                       "acquire_buffer called while buffer already acquired");
     return make_buffer_guard(bm_->serialize(align_size_), [this]() { do_release_buffer(); });
 }
 
 void BitmapBlkAllocator::do_release_buffer() {
-    auto* old_list = rcu_xchg_pointer(&commit_list_, nullptr);
-    synchronize_rcu();
+    auto* old_list = sisl::Rcu::xchg_pointer(&commit_list_, static_cast< sisl::ThreadVector< BlkId >* >(nullptr));
+    sisl::Rcu::synchronize();
 
     auto it = old_list->begin(true /* latest */);
     const BlkId* bid{nullptr};

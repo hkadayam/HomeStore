@@ -13,19 +13,20 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
+#include <bit>
 #include <homestore/blk.h>
 #include "base/homestore_assert.hpp"
 
 namespace homestore {
 BlkId::BlkId(uint64_t id_int) {
-    *r_cast< uint64_t* >(&s) = id_int;
+    s = std::bit_cast< serialized >(id_int);
 }
 
 BlkId::BlkId(blk_num_t blk_num, blk_count_t nblks, chunk_num_t chunk_num) : s{blk_num, nblks, chunk_num} {
 }
 
 uint64_t BlkId::to_integer() const {
-    return *r_cast< const uint64_t* >(&s);
+    return std::bit_cast< uint64_t >(s);
 }
 
 sisl::Blob BlkId::serialize() const {

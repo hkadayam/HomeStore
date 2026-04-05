@@ -33,6 +33,8 @@
 #include <sisl/fds/bitword.h>
 #include <folly/ConcurrentSkipList.h>
 #include <folly/concurrency/ConcurrentHashMap.h>
+#include <folly/init/Init.h>
+#include <folly/synchronization/Hazptr.h>
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
 
@@ -47,14 +49,33 @@ static thread_local std::random_device g_rd{};
 static thread_local std::default_random_engine g_re{g_rd()};
 static std::mutex s_print_mutex;
 
-using BlkMapT = folly::ConcurrentHashMap< blk_num_t, blk_count_t >;
+// folly::ConcurrentHashMap causes a SIGSEGV in hazptr_tc thread-local cleanup
+// on short-lived std::threads in Debug builds. Use a simple mutex-guarded map.
+struct BlkMapT {
+    explicit BlkMapT(size_t = 0) : mtx_{std::make_unique< std::mutex >()} {}
+    std::pair< std::unordered_map< blk_num_t, blk_count_t >::iterator, bool > insert(blk_num_t k, blk_count_t v) {
+        std::lock_guard< std::mutex > lk{*mtx_};
+        return map_.emplace(k, v);
+    }
+    auto find(blk_num_t k) {
+        std::lock_guard< std::mutex > lk{*mtx_};
+        return map_.find(k);
+    }
+    size_t erase(blk_num_t k) {
+        std::lock_guard< std::mutex > lk{*mtx_};
+        return map_.erase(k);
+    }
+private:
+    std::unordered_map< blk_num_t, blk_count_t > map_;
+    std::unique_ptr< std::mutex > mtx_;
+};
 using BlkListT = folly::ConcurrentSkipList< blk_num_t >;
 using BlkListAccessorT = BlkListT::Accessor;
 using size_generator_t = std::function< blk_count_t(void) >;
 
 struct AllocedBlkTracker {
     AllocedBlkTracker(const uint64_t quota) :
-            m_alloced_blk_list{BlkListT::create(8)}, m_alloced_blk_map{quota}, m_max_quota{quota} {}
+            m_alloced_blk_list{BlkListT::create(8)}, m_max_quota{quota} {}
 
     void adjust_limits(const uint8_t hi_limit_pct) {
         m_lo_limit = m_alloced_blk_list.size();
@@ -277,7 +298,7 @@ struct BlkAllocatorTest {
         }
 
         m_alloced_count.fetch_sub(n_blks, std::memory_order_acq_rel);
-        return BlkId{start_blk_num, n_blks, 0};
+        return BlkId(start_blk_num, n_blks, 0);
     }
 
     [[nodiscard]] BlkId pick_rand_pool_blks_to_free(const blk_count_t pref_nblks, const bool round_nblks,
@@ -342,7 +363,7 @@ struct BlkAllocatorTest {
                     start_blk_num, start_blk_num + n_blks - 1, blk_list(0).size(),
                     m_alloced_count.load(std::memory_order_relaxed));
 
-        return BlkId{start_blk_num, n_blks, 0};
+        return BlkId(start_blk_num, n_blks, 0);
     }
 };
 
@@ -716,7 +737,7 @@ void alloc_free_contiguous_onesize(SlabBlkAllocatorTest* const test) {
             continue;
         }
         consecutive_failures = 0;
-        test->alloced(bid, true);
+        (void)test->alloced(bid, true);
         ++alloced;
     }
     LOGINFO("Step 3: Allocated {} of {} remaining blocks", alloced, remaining);
@@ -765,7 +786,7 @@ void alloc_free_scatter_unirandsize(SlabBlkAllocatorTest* const test) {
             continue;
         }
         consecutive_failures = 0;
-        test->alloced(bid, true);
+        (void)test->alloced(bid, true);
         ++alloced;
     }
     LOGINFO("Step 3: Allocated {} of {} remaining blocks", alloced, remaining);
@@ -794,6 +815,7 @@ int main(int argc, char* argv[]) {
     SISL_OPTIONS_LOAD(argc, argv)
     sisl::logging::SetLogger("test_blkalloc");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
+    folly::Init folly_init(&argc, &argv, folly::InitOptions{}.useGFlags(false));
     const int result{RUN_ALL_TESTS()};
     return result;
 }

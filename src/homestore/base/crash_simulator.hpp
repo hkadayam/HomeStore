@@ -2,7 +2,7 @@
 
 #ifdef _PRERELEASE
 #include <functional>
-#include <sisl/fds/urcu_helper.h>
+#include <sisl/fds/rcu.h>
 #include <iomgr/iomgr_flip.hpp>
 
 namespace homestore {
@@ -48,7 +48,7 @@ public:
 private:
     std::function< void(void) > m_restart_cb{nullptr};
     std::atomic<bool> m_will_crash{false};
-    sisl::urcu_scoped_ptr< bool > m_crashed;
+    sisl::Rcu::scoped_ptr< bool > m_crashed;
 };
 } // namespace homestore
 #endif

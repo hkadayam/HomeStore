@@ -18,7 +18,7 @@
 #include <fmt/format.h>
 #include <sisl/logging/logging.h>
 #include <sisl/fds/thread_factory.h>
-#include <urcu.h>
+#include <sisl/fds/rcu.h>
 
 #include "slab_blk_allocator.h"
 
@@ -350,15 +350,14 @@ BlkAllocStatus SlabBlkAllocator::commit(BlkId const& bid) {
             // Non-persistent: inmem_bm_ is the sole source of truth, always mark committed blocks.
             return inmem_bm_->commit(bid);
         }
-        rcu_read_lock();
-        const bool is_recovering = (rcu_dereference(recovering_) != nullptr);
+        sisl::Rcu::read_guard guard;
+        const bool is_recovering = (sisl::Rcu::dereference(recovering_) != nullptr);
         if (is_recovering) {
             inmem_bm_->commit(bid);
         } else {
             BLKALLOC_DBG_ASSERT(inmem_bm_->is_blk_alloced(bid, true),
                                 "commit() called on bid not already set in inmem_bm");
         }
-        rcu_read_unlock();
     }
     return (ondisk_bm_) ? ondisk_bm_->commit(bid) : BlkAllocStatus::SUCCESS;
 }
@@ -371,8 +370,8 @@ BlkAllocator::BufferGuard SlabBlkAllocator::acquire_buffer() {
 }
 
 void SlabBlkAllocator::recovery_completed() {
-    bool* old = rcu_xchg_pointer(&recovering_, nullptr);
-    synchronize_rcu();
+    bool* old = sisl::Rcu::xchg_pointer(&recovering_, static_cast< bool* >(nullptr));
+    sisl::Rcu::synchronize();
     delete old;
     request_sweep();
 }

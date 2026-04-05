@@ -13,13 +13,13 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
-#include <urcu.h>
-
 #include <folly/coro/Sleep.h>
 #include <folly/coro/WithCancellation.h>
+#include <folly/io/async/EventBaseManager.h>
 #include <folly/io/async/Request.h>
+#include <sisl/fds/rcu.h>
 
-#include <homestore/checkpoint/cp_mgr.h>
+#include "homestore/checkpoint/cp_mgr.h"
 #include "base/homestore_assert.hpp"
 #include "base/homestore_config.hpp"
 #include "managers.h"
@@ -80,6 +80,7 @@ folly::coro::Task< void > CPManager::start(bool first_time_boot) {
     if (first_time_boot) {
         co_await sb_.write();
     }
+    co_return;
 }
 
 void CPManager::start_timer() {
@@ -136,35 +137,34 @@ folly::coro::Task< void > CPManager::shutdown() {
 
     // Wait for watchdog and timer coroutines to exit before tearing down state.
     if (wd_done.valid()) { co_await std::move(wd_done); }
-    if (cp_timer_started_) { cp_timer_done_baton_.wait(); }
-    wd_cp_.reset();
+    if (cp_timer_started_) {
+        cp_timer_done_baton_.wait();
+    }
 
-    delete (cur_cp_);
-    rcu_xchg_pointer(&cur_cp_, nullptr);
+    // Don't reset wd_cp_ here: the co_await awaiter above still holds a Future
+    // referencing done_promise_'s Core. Destroying wd_cp_ would drop the
+    // SharedPromise refcount, and the awaiter's destructor would then crash
+    // with a double-detach. Let ~CPManager handle wd_cp_ lifetime instead.
+
+    auto* old_cp = sisl::Rcu::xchg_pointer(&cur_cp_, static_cast< CP* >(nullptr));
+    sisl::Rcu::synchronize();
+    delete old_cp;
 
     metrics_.reset();
 }
 
-void CPManager::register_consumer(CPConsumer consumer, shared< CPCallbacks > callbacks) {
+void CPManager::register_consumer(const CPConsumer& consumer, shared< CPCallbacks > callbacks) {
     // Notify consumer of the current CP so it can initialize its own state.
     callbacks->on_switchover_cp(nullptr, cur_cp_);
 
-    // Copy-and-swap via RCU: snapshot the current map while holding the read-side guard, release the guard, then
-    // atomically publish the updated map. The guard must be released before make_and_exchange (which calls
-    // rcu_synchronize) to avoid self-deadlock.
-    ConsumerMap updated;
-    {
-        auto cur = consumers_.get();
-        updated = *cur.get();
-    }
-    updated.emplace(consumer, std::move(callbacks));
-    consumers_.make_and_exchange(std::move(updated));
+    std::unique_lock lk(consumers_mtx_);
+    consumers_.emplace(consumer, std::move(callbacks));
 }
 
-CPCallbacks* CPManager::get_consumer(CPConsumer consumer) {
-    auto consumers = consumers_.get();
-    auto it = consumers->find(consumer);
-    return (it != consumers->end()) ? it->second.get() : nullptr;
+CPCallbacks* CPManager::get_consumer(const CPConsumer& consumer) {
+    std::shared_lock lk(consumers_mtx_);
+    auto it = consumers_.find(consumer);
+    return (it != consumers_.end()) ? it->second.get() : nullptr;
 }
 
 [[nodiscard]] CPGuard CPManager::cp_guard() {
@@ -172,16 +172,14 @@ CPCallbacks* CPManager::get_consumer(CPConsumer consumer) {
 }
 
 CP* CPManager::cp_io_enter() {
-    rcu_read_lock();
+    sisl::Rcu::read_guard guard;
     auto cp = get_cur_cp();
 
     HS_DBG_ASSERT_NE((void*)cp, nullptr, "get_cur_cp returned null, cp_io_enter() after shutdown?");
     if (!cp) {
-        rcu_read_unlock();
         return nullptr;
     }
     cp_ref(cp);
-    rcu_read_unlock();
     return cp;
 }
 
@@ -204,8 +202,7 @@ void CPManager::cp_io_exit(CP* cp) {
 }
 
 CP* CPManager::get_cur_cp() {
-    CP* p = rcu_dereference(cur_cp_);
-    return p;
+    return sisl::Rcu::dereference(cur_cp_);
 }
 
 folly::SemiFuture< bool > CPManager::trigger_cp_flush(bool force, CPTriggerReason reason) {
@@ -244,9 +241,11 @@ folly::SemiFuture< bool > CPManager::do_trigger_cp_flush(bool force, bool flush_
     new_cp->cp_id_ = cur_cp->cp_id_ + 1;
 
     CP_PERIODIC_LOG(DEBUG, new_cp->id(), "Create New CP session");
-    auto consumers = consumers_.get();
-    for (auto& [id, cb] : *consumers.get()) {
-        cb->on_switchover_cp(cur_cp.get(), new_cp);
+    {
+        std::shared_lock lk(consumers_mtx_);
+        for (auto& [_, cb] : consumers_) {
+            cb->on_switchover_cp(cur_cp.get(), new_cp);
+        }
     }
 
     if (pending_trigger_cp_) {
@@ -260,8 +259,8 @@ folly::SemiFuture< bool > CPManager::do_trigger_cp_flush(bool force, bool flush_
 
     cur_cp->cp_status_ = cp_status_t::cp_flush_prepare;
     new_cp->cp_status_ = cp_status_t::cp_io_ready;
-    rcu_xchg_pointer(&cur_cp_, new_cp);
-    synchronize_rcu();
+    sisl::Rcu::xchg_pointer(&cur_cp_, new_cp);
+    sisl::Rcu::synchronize();
 
     // Unlock before cp_guard goes out of scope: exiting the CP critical section may trigger cp_start_flush,
     // and we must not hold the mutex at that point.
@@ -277,8 +276,15 @@ void CPManager::cp_start_flush(CP* cp) {
 
     spawn_detached(ReactorTarget::any(), [this, cp]() -> folly::coro::Task< void > {
         // Flush all consumers one at a time; sequential ordering is intentional.
-        auto consumers = consumers_.get();
-        for (auto& [id, cb] : *consumers.get()) {
+        // Snapshot callbacks under shared lock, then release before co_await.
+        std::vector< shared< CPCallbacks > > cbs;
+        {
+            std::shared_lock lk(consumers_mtx_);
+            for (auto& [_, cb] : consumers_) {
+                cbs.push_back(cb);
+            }
+        }
+        for (auto& cb : cbs) {
             co_await cb->cp_flush(cp);
         }
 
@@ -325,8 +331,8 @@ void CPManager::cp_start_flush(CP* cp) {
 
 void CPManager::cleanup_cp(CP* cp) {
     cp->cp_status_ = cp_status_t::cp_cleaning;
-    auto consumers = consumers_.get();
-    for (auto& [id, cb] : *consumers.get()) {
+    std::shared_lock lk(consumers_mtx_);
+    for (auto& [id, cb] : consumers_) {
         cb->cp_cleanup(cp);
     }
 }
@@ -364,19 +370,19 @@ CPGuard::~CPGuard() {
     }
 }
 
-CPGuard::CPGuard(const CPGuard& other) {
-    cp_ = other.cp_;
-    pushed_ = false;
+CPGuard::CPGuard(const CPGuard& other) : cp_{other.cp_}, pushed_{false} {
     if (cp_) {
         cp_->cp_mgr_->cp_ref(cp_);
     }
 }
 
 CPGuard CPGuard::operator=(const CPGuard& other) {
-    cp_ = other.cp_;
-    pushed_ = false;
-    if (cp_) {
-        cp_->cp_mgr_->cp_ref(cp_);
+    if (this != &other) {
+        cp_ = other.cp_;
+        pushed_ = false;
+        if (cp_) {
+            cp_->cp_mgr_->cp_ref(cp_);
+        }
     }
     return *this;
 }
@@ -400,19 +406,9 @@ CP* CPGuard::get() {
 CPWatchdog::CPWatchdog(CPManager* cp_mgr) :
         cp_{nullptr}, cp_mgr_{cp_mgr}, timer_sec_{HS_DYNAMIC_CONFIG(generic.cp_watchdog_timer_sec)} {
     LOGINFO("CP watchdog timer setting to : {} seconds", timer_sec_);
-    spawn_detached(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
-        while (true) {
-            try {
-                co_await folly::coro::co_withCancellation(cancel_src_.getToken(),
-                                                          folly::coro::sleep(std::chrono::seconds(timer_sec_)));
-            } catch (const folly::OperationCancelled&) { break; }
-            if (stopped_) {
-                break;
-            }
-            cp_watchdog_timer();
-        }
-        done_promise_.setValue(true);
-    });
+    wd_eb_ = iomgr().reactor_for(0);
+    attachEventBase(wd_eb_);
+    wd_eb_->runInEventBaseThread([this]() { scheduleTimeout(timer_sec_ * 1000); });
 }
 
 void CPWatchdog::reset_cp() {
@@ -429,11 +425,23 @@ void CPWatchdog::set_cp(CP* cp) {
 
 folly::SemiFuture< bool > CPWatchdog::stop() {
     stopped_.store(true);
-    cancel_src_.requestCancellation();
+    wd_eb_->runInEventBaseThread([this]() {
+        cancelTimeout();
+        done_promise_.setValue(true);
+    });
     return done_promise_.getSemiFuture();
 }
 
-void CPWatchdog::cp_watchdog_timer() {
+void CPWatchdog::timeoutExpired() noexcept {
+    if (stopped_.load()) {
+        done_promise_.setValue(true);
+        return;
+    }
+    watch_cp();
+    scheduleTimeout(timer_sec_ * 1000);
+}
+
+void CPWatchdog::watch_cp() {
     std::unique_lock< std::shared_mutex > lk{cp_mtx_};
 
     if (cp_ == nullptr) {
@@ -446,10 +454,12 @@ void CPWatchdog::cp_watchdog_timer() {
 
     uint32_t cum_pct{0};
     uint32_t count{0};
-    auto consumer = cp_mgr_->consumers();
-    for (auto& [id, cb] : *consumer.get()) {
-        ++count;
-        cum_pct += cb->cp_progress_percent();
+    {
+        std::shared_lock lk(cp_mgr_->consumers_mtx_);
+        for (auto& [id, cb] : cp_mgr_->consumers_) {
+            ++count;
+            cum_pct += cb->cp_progress_percent();
+        }
     }
     if (progress_pct_ > cum_pct / count) {
         progress_pct_ = cum_pct / count;
@@ -464,7 +474,8 @@ void CPWatchdog::cp_watchdog_timer() {
     uint32_t max_time_multiplier = 12;
     if (get_elapsed_time_ms(last_state_ch_time_) < max_time_multiplier * timer_sec_ * 1000) {
         uint32_t repair_attempted{0};
-        for (auto& [id, cb] : *consumer.get()) {
+        std::shared_lock lk2(cp_mgr_->consumers_mtx_);
+        for (auto& [id, cb] : cp_mgr_->consumers_) {
             const auto pct = cb->cp_progress_percent();
             if (pct != 100) {
                 cb->repair_slow_cp();

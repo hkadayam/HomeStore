@@ -21,7 +21,7 @@
 
 #include <sisl/fds/bitset.h>
 #include <sisl/fds/thread_vector.h>
-#include <urcu.h>
+#include <sisl/fds/rcu.h>
 
 #include "homestore/base/homestore_decl.h"
 #include <homestore/blk.h>

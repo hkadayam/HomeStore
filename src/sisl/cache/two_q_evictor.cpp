@@ -44,7 +44,10 @@ TwoQEvictor::TwoQEvictor(const Config& cfg, evict_fn_t evict_fn,
 }
 
 TwoQEvictor::~TwoQEvictor() {
-    running_.store(false, std::memory_order_relaxed);
+    {
+        std::lock_guard lk(cv_mutex_);
+        running_.store(false, std::memory_order_release);
+    }
     cv_.notify_all();
     if (evictor_thread_.joinable()) evictor_thread_.join();
 }
@@ -139,15 +142,15 @@ void TwoQEvictor::remove_record(uint64_t hash_code, CacheRecord& record) {
 // ── background evictor thread ──────────────────────────────────────────────────
 
 void TwoQEvictor::evictor_thread_fn() {
-    while (running_.load(std::memory_order_relaxed)) {
+    while (running_.load(std::memory_order_acquire)) {
         {
             std::unique_lock lk(cv_mutex_);
             cv_.wait(lk, [this] {
-                return !running_.load(std::memory_order_relaxed) ||
+                return !running_.load(std::memory_order_acquire) ||
                        total_size_.load(std::memory_order_relaxed) >= high_watermark_;
             });
         }
-        if (!running_.load(std::memory_order_relaxed)) break;
+        if (!running_.load(std::memory_order_acquire)) break;
         evict_to_low_watermark();
     }
 }

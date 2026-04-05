@@ -14,7 +14,7 @@ target_link_libraries(test_bitset PRIVATE ${FDS_TEST_DEPS})
 add_test(NAME Bitset COMMAND test_bitset)
 
 add_executable(test_atomic_status_counter test_atomic_status_counter.cpp)
-target_link_libraries(test_atomic_status_counter PRIVATE ${FDS_TEST_DEPS})
+target_link_libraries(test_atomic_status_counter PRIVATE ${FDS_TEST_DEPS} atomic)
 add_test(NAME AtomicStatusCounter COMMAND test_atomic_status_counter)
 
 add_executable(test_compact_bitset test_compact_bitset.cpp)

@@ -33,7 +33,7 @@
 
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
-#include <sisl/fds/urcu_helper.h>
+#include <sisl/fds/rcu.h>
 
 #define SETTINGS_INIT(schema_type, schema_name)                                                                        \
     extern unsigned char schema_name##_fbs[];                                                                          \
@@ -454,7 +454,7 @@ private:
     std::mutex modify_mutex_;
 
     // RCU-protected settings data; reads are wait-free.
-    urcu_data< SettingsT > rcu_data_;
+    Rcu::data< SettingsT > rcu_data_;
 };
 
 } // namespace sisl

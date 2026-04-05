@@ -27,12 +27,12 @@
 #pragma GCC diagnostic ignored "-Wpedantic"
 #endif
 #include <folly/ThreadLocal.h>
-#include <folly/synchronization/Rcu.h>
 #include <folly/stats/TDigest.h>
 #if defined __clang__ or defined __GNUC__
 #pragma GCC diagnostic pop
 #endif
 
+#include <sisl/fds/rcu.h>
 #include "metrics_group_impl.h"
 
 namespace sisl {
@@ -40,7 +40,7 @@ namespace sisl {
 static constexpr uint32_t histogram_flush_threshold{256};
 
 // Per-thread metric storage for one MetricsGroup instance. Only the owning thread writes (under RCU read-side guard).
-// The collector calls rcu_synchronize() first, which guarantees no writer is active, then freely reads+resets.
+// The collector calls Rcu::synchronize() first, which guarantees no writer is active, then freely reads+resets.
 struct PerThreadMetrics {
     std::vector< int64_t > counters;
     std::vector< folly::TDigest > digests;
@@ -62,16 +62,15 @@ struct PerThreadMetrics {
 };
 
 /*
- * FollyRcuMetricsGroup — lock-free per-thread metrics using folly RCU.
+ * FollyRcuMetricsGroup — lock-free per-thread metrics using liburcu + folly::ThreadLocalPtr.
  *
- * Record path (counter/histogram): enter RCU read-side section, write to per-thread data, exit. Zero contention —
- *   only the owning thread touches its data, plain int64_t and vector operations, no atomics, no locks.
+ * Record path (counter/histogram): enter RCU read-side section via Rcu::read_guard, write to per-thread data, exit.
+ *   Zero contention — only the owning thread touches its data, plain int64_t and vector operations, no atomics,
+ *   no locks.
  *
- * Collect path: rcu_synchronize() guarantees all writers have exited their read-side sections, so the collector has
+ * Collect path: Rcu::synchronize() guarantees all writers have exited their read-side sections, so the collector has
  *   exclusive access to every thread's data. It reads+resets each thread's counters and histograms, merges into
  *   persistent accumulators, then drains the zombie list (data from exited threads).
- *
- * Replaces WisrBufferMetricsGroup (urcu) + ThreadBufferMetricsGroup (signal).
  */
 class FollyRcuMetricsGroup : public MetricsGroupImpl {
 public:

@@ -45,28 +45,28 @@ void FollyRcuMetricsGroup::push_zombie(PerThreadMetrics* p) {
 }
 
 // ─── Record path ─────────────────────────────────────────────────────────────
-// Writers hold the RCU read-side section for the duration of the write. The collector calls rcu_synchronize() which
+// Writers hold the RCU read-side section for the duration of the write. The collector calls Rcu::synchronize() which
 // blocks until every read-side section has exited — after that, no thread is touching any per-thread data.
 
 void FollyRcuMetricsGroup::counter_increment(uint64_t index, int64_t val) {
-    std::unique_lock< folly::rcu_domain > guard{folly::rcu_default_domain()};
+    Rcu::read_guard guard;
     get_or_create()->counters[index] += val;
 }
 
 void FollyRcuMetricsGroup::counter_decrement(uint64_t index, int64_t val) {
-    std::unique_lock< folly::rcu_domain > guard{folly::rcu_default_domain()};
+    Rcu::read_guard guard;
     get_or_create()->counters[index] -= val;
 }
 
 void FollyRcuMetricsGroup::histogram_observe(uint64_t index, int64_t val) {
-    std::unique_lock< folly::rcu_domain > guard{folly::rcu_default_domain()};
+    Rcu::read_guard guard;
     auto* m = get_or_create();
     m->pending[index].push_back(to_double(val));
     if (m->pending[index].size() >= histogram_flush_threshold) { m->flush_histogram(to_u32(index)); }
 }
 
 void FollyRcuMetricsGroup::histogram_observe(uint64_t index, int64_t val, uint64_t count) {
-    std::unique_lock< folly::rcu_domain > guard{folly::rcu_default_domain()};
+    Rcu::read_guard guard;
     auto* m = get_or_create();
     for (uint64_t i = 0; i < count; ++i) {
         m->pending[index].push_back(to_double(val));
@@ -95,7 +95,7 @@ void FollyRcuMetricsGroup::gather_result(bool need_latest, const CounterGatherCb
                                          const GaugeGatherCb& gauge_cb, const HistogramGatherCb& histogram_cb) {
     if (need_latest) {
         // After this returns, every writer's read-side section has exited — no thread is touching per-thread data.
-        folly::rcu_synchronize();
+        Rcu::synchronize();
 
         for (auto& tl : tl_metrics_.accessAllThreads()) {
             collect_and_reset(tl);

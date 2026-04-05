@@ -6,11 +6,12 @@
 #include <stdexcept>
 
 #include <folly/coro/Sleep.h>
+#include <folly/init/Init.h>
 #include <folly/io/async/EventBaseManager.h>
 #include <sisl/logging/logging.h>
 
 #ifdef __linux__
-#  include <folly/io/async/IoUringBackend.h>
+#include <folly/experimental/io/IoUringBackend.h>
 #endif
 
 namespace homestore {
@@ -34,8 +35,7 @@ void IOManager::start(size_t num_reactors) {
     // (Linux) or the default epoll/kqueue backend (non-Linux).
 #ifdef __linux__
     folly::IoUringBackend::Options uring_opts;
-    uring_opts.setFlags(folly::IoUringOptions::POLL_SQ)  // kernel SQ poll: no submit syscall
-              .setCapacity(512);
+    uring_opts.setCapacity(512);
 
     ebm_ = std::make_unique<folly::EventBaseManager>(
         folly::EventBase::Options().setBackendFactory(
@@ -62,11 +62,10 @@ void IOManager::start(size_t num_reactors) {
             size_t my_id  = assigned.fetch_add(1, std::memory_order_relaxed);
             t_reactor_id_ = my_id;
 
-            // Use ebm_, not the global EventBaseManager: IOThreadPoolExecutor
-            // runs each reactor thread's loop on the EventBase obtained via ebm_,
-            // so we must store that same instance.
             auto* eb = ebm_->getEventBase();
             shard_ebs_[my_id] = eb;
+            LOGINFO("Reactor {} init: eb={} backend={} isRunning={}", my_id, fmt::ptr(eb), fmt::ptr(eb->getBackend()),
+                    eb->isRunning());
 
             // Register the loopPoll runBeforeLoop callback and store the
             // IoUringBackend* in thread-local storage for IO submission.
@@ -87,8 +86,11 @@ void IOManager::start(size_t num_reactors) {
 
 void IOManager::stop() {
     if (!pool_) return;
+    LOGINFO("IOManager::stop() — calling pool_->join()...");
     pool_->join();
+    LOGINFO("IOManager::stop() — pool_->join() returned");
     pool_.reset();
+    LOGINFO("IOManager::stop() — pool_ reset");
     shard_ebs_.clear();
     num_reactors_ = 0;
     LOGINFO("IOManager stopped");
@@ -149,6 +151,14 @@ IOManager* g_iomgr{nullptr};
 
 void init_iomgr(size_t num_reactors) {
     assert(g_iomgr == nullptr && "init_iomgr called twice");
+
+    // Initialize folly singletons (Timekeeper, etc.) exactly once. Static locals ensure the Init object outlives all
+    // user code and is constructed only on the first call.
+    static int s_argc = 0;
+    static char* s_argv[] = {nullptr};
+    static char** s_argvp = s_argv;
+    static folly::Init s_folly_init(&s_argc, &s_argvp, folly::InitOptions{}.useGFlags(false));
+
     g_iomgr = new IOManager();
     g_iomgr->start(num_reactors);
 }

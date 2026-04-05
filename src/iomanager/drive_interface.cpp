@@ -1,5 +1,6 @@
 #include "drive_interface.hpp"
 #include "iomanager.h"
+#include "common/defs.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -16,10 +17,12 @@
 #include <sys/ioctl.h>
 #include <linux/fs.h>     // BLKGETSIZE64, BLKZEROOUT
 #include <linux/falloc.h> // FALLOC_FL_ZERO_RANGE
-#include <folly/io/async/IoUringBackend.h>
+#include <folly/experimental/io/IoUringBackend.h>
 #endif
 
 namespace homestore {
+
+#define DRIVE_LOG(level, dev, msg, ...) LOGTRACEMOD(iomgr, "[dev={}] " msg, (dev).dev_name, ##__VA_ARGS__)
 
 // ── IoDevice ──────────────────────────────────────────────────────────────────
 
@@ -41,42 +44,23 @@ DriveInterface::~DriveInterface() = default;
 #ifdef __linux__
 // ── Linux: io_uring path ─────────────────────────────────────────────────────
 //
-// Loop flow per EventBase iteration (POLL_SQ only, no POLL_CQ):
+// Each reactor thread holds a DriveReactor with the IoUringBackend* and
+// EventBase*.  The IoUringBackend drives itself — eb_event_base_loop() calls
+// prepList() + processActiveEvents() every iteration.  New SQEs added by
+// completion callbacks are picked up by the POLL_SQ kernel thread on the next
+// iteration without a syscall.
 //
-//   [runBeforeLoop] DriveReactor::runLoopCallback()
-//     → loopPoll(): non-blocking CQ peek (zero syscall if ring is empty)
-//     → completions fire FileOpCallback → Promise fulfilled
-//     → coroutine continuations scheduled into loopCallbacks_
-//     → re-arms itself for the next iteration
-//
-//   EventBase checks loopCallbacks_.empty()?
-//     NO  → eb_event_base_loop(NONBLOCK) → one more non-blocking peek
-//     YES → eb_event_base_loop(BLOCK)    → io_uring_enter(wait=1) → sleep
-//           woken by: IO CQE | cross-thread notify-fd CQE | timer CQE
-//
-//   [runInLoop] coroutine continuations execute
-//     → may call queueRead/Write → new SQEs enter submitList_
-//     → POLL_SQ kernel thread picks them up without a submit syscall
-//     → loop repeats
+// Off-reactor callers hop to a reactor by re-calling the same public method
+// via spawn_waitable.  On the reactor t_dr is set, so the hop is skipped and
+// the io_uring work executes inline.
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct DriveReactor : folly::EventBase::LoopCallback {
-    folly::EventBase* eb;
+struct DriveReactor {
     folly::IoUringBackend* uring;
+    folly::EventBase* eb;
 
     explicit DriveReactor(folly::EventBase* eb_) :
-            eb(eb_), uring(static_cast< folly::IoUringBackend* >(eb_->getBackend())) {
-        eb->runBeforeLoop(this);
-    }
-
-    void runLoopCallback() noexcept override {
-        // prepList + non-blocking CQ peek + processActiveEvents.
-        // Zero syscall when the ring is empty.
-        // Any CQEs fulfilled here schedule continuations, which causes
-        // the EventBase to use DONT_WAIT this iteration instead of sleeping.
-        uring->loopPoll();
-        eb->runBeforeLoop(this); // re-arm: runBeforeLoop is one-shot
-    }
+            uring(static_cast< folly::IoUringBackend* >(eb_->getBackend())), eb(eb_) {}
 };
 
 static thread_local DriveReactor* t_dr = nullptr;
@@ -85,68 +69,18 @@ static thread_local std::unique_ptr< DriveReactor > t_dr_owner;
 void drive_interface_init_reactor(folly::EventBase* eb) {
     t_dr_owner = std::make_unique< DriveReactor >(eb);
     t_dr = t_dr_owner.get();
-}
+    LOGDEBUGMOD(iomgr, "DriveReactor init: eb={} uring={}", fmt::ptr(eb), fmt::ptr(t_dr->uring));
 
-// ── Low-level uring helpers (reactor thread only) ─────────────────────────────
-
-static folly::coro::Task< int > do_read(int fd, void* buf, size_t size, uint64_t offset) {
-    folly::Promise< int > p;
-    auto sf = p.getSemiFuture();
-    t_dr->uring->queueRead(fd, buf, (unsigned int)size, (off_t)offset,
-                           [p = std::move(p)](int res) mutable { p.setValue(res); });
-    co_return co_await std::move(sf).via(t_dr->eb);
-}
-
-static folly::coro::Task< int > do_write(int fd, const void* buf, size_t size, uint64_t offset) {
-    folly::Promise< int > p;
-    auto sf = p.getSemiFuture();
-    t_dr->uring->queueWrite(fd, buf, (unsigned int)size, (off_t)offset,
-                            [p = std::move(p)](int res) mutable { p.setValue(res); });
-    co_return co_await std::move(sf).via(t_dr->eb);
-}
-
-static folly::coro::Task< int > do_readv(int fd, const struct iovec* iovs, size_t niov, uint64_t offset) {
-    folly::Promise< int > p;
-    auto sf = p.getSemiFuture();
-    // queueReadv copies the iovecs into the IoSqe, so the caller's
-    // local iovec array only needs to survive this call, not the await.
-    t_dr->uring->queueReadv(fd, {iovs, iovs + niov}, (off_t)offset,
-                            [p = std::move(p)](int res) mutable { p.setValue(res); });
-    co_return co_await std::move(sf).via(t_dr->eb);
-}
-
-static folly::coro::Task< int > do_writev(int fd, const struct iovec* iovs, size_t niov, uint64_t offset) {
-    folly::Promise< int > p;
-    auto sf = p.getSemiFuture();
-    t_dr->uring->queueWritev(fd, {iovs, iovs + niov}, (off_t)offset,
-                             [p = std::move(p)](int res) mutable { p.setValue(res); });
-    co_return co_await std::move(sf).via(t_dr->eb);
-}
-
-static folly::coro::Task< int > do_fdatasync(int fd) {
-    folly::Promise< int > p;
-    auto sf = p.getSemiFuture();
-    t_dr->uring->queueFdatasync(fd, [p = std::move(p)](int res) mutable { p.setValue(res); });
-    co_return co_await std::move(sf).via(t_dr->eb);
-}
-
-static folly::coro::Task< int > do_fallocate(int fd, int mode, uint64_t offset, uint64_t len) {
-    folly::Promise< int > p;
-    auto sf = p.getSemiFuture();
-    t_dr->uring->queueFallocate(fd, mode, (off_t)offset, (off_t)len,
-                                [p = std::move(p)](int res) mutable { p.setValue(res); });
-    co_return co_await std::move(sf).via(t_dr->eb);
+    eb->runOnDestruction([](){
+        LOGDEBUGMOD(iomgr, "DriveReactor cleanup: clearing t_dr");
+        t_dr = nullptr;
+        t_dr_owner.reset();
+    });
 }
 
 static std::error_code to_ec(int res) {
     return res < 0 ? std::error_code(-res, std::generic_category()) : std::error_code{};
 }
-
-// If not on a reactor, hop to one and re-run the call there.
-#define ENSURE_REACTOR(hop_expr)                                                                                       \
-    if (!t_dr) {                                                                                                       \
-        co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), (hop_expr));                                   \
-    }
 
 // ── Public API — Linux ────────────────────────────────────────────────────────
 
@@ -168,88 +102,99 @@ folly::coro::Task< uint64_t > DriveInterface::get_size(const IoDevice& dev) {
     }
     struct stat st{};
     ::fstat(dev.fd, &st);
-    co_return static_cast< uint64_t >(st.st_size);
+    co_return to_u64(st.st_size);
 }
 
 folly::coro::Task< std::error_code > DriveInterface::read(const IoDevice& dev, IOBuffer& buf, uint64_t offset) {
     if (!t_dr) {
-        void* ptr = buf.bytes();
-        size_t sz = buf.size();
-        int fd = dev.fd;
-        co_return to_ec(co_await iomgr().spawn_waitable(ReactorTarget::any(), do_read(fd, ptr, sz, offset)));
+        co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), read(dev, buf, offset));
     }
-    co_return to_ec(co_await do_read(dev.fd, buf.bytes(), buf.size(), offset));
+    DRIVE_LOG(TRACE, dev, "read: size={} offset={}", buf.size(), offset);
+    folly::Promise< int > p;
+    auto sf = p.getSemiFuture();
+    t_dr->uring->queueRead(dev.fd, buf.bytes(), to_u32(buf.size()), (off_t)offset,
+                           [p = std::move(p)](int res) mutable { p.setValue(res); });
+    auto ec = to_ec(co_await std::move(sf).via(t_dr->eb));
+    DRIVE_LOG(TRACE, dev, "read: size={} offset={} completed ec={}", buf.size(), offset, ec.message());
+    co_return ec;
 }
 
 folly::coro::Task< std::error_code > DriveInterface::write(const IoDevice& dev, const IOBuffer& buf, uint64_t offset) {
     if (!t_dr) {
-        // Off-reactor: capture raw pointer — safe because the caller
-        // co_awaits this Task, keeping the IOBuffer alive throughout.
-        const void* ptr = buf.cbytes();
-        size_t sz = buf.size();
-        int fd = dev.fd;
-        co_return to_ec(co_await iomgr().spawn_waitable(ReactorTarget::any(), do_write(fd, ptr, sz, offset)));
+        co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), write(dev, buf, offset));
     }
-    co_return to_ec(co_await do_write(dev.fd, buf.cbytes(), buf.size(), offset));
+    DRIVE_LOG(TRACE, dev, "write: size={} offset={}", buf.size(), offset);
+    folly::Promise< int > p;
+    auto sf = p.getSemiFuture();
+    t_dr->uring->queueWrite(dev.fd, buf.cbytes(), to_u32(buf.size()), (off_t)offset,
+                            [p = std::move(p)](int res) mutable { p.setValue(res); });
+    auto ec = to_ec(co_await std::move(sf).via(t_dr->eb));
+    DRIVE_LOG(TRACE, dev, "write: size={} offset={} completed ec={}", buf.size(), offset, ec.message());
+    co_return ec;
 }
 
 folly::coro::Task< std::error_code > DriveInterface::readv(const IoDevice& dev, std::vector< IOBuffer >& bufs,
                                                            uint64_t offset) {
-    ENSURE_REACTOR(readv(dev, bufs, offset));
-
+    if (!t_dr) {
+        co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), readv(dev, bufs, offset));
+    }
+    folly::Promise< int > p;
+    auto sf = p.getSemiFuture();
     std::vector< struct iovec > iovs;
     iovs.reserve(bufs.size());
     for (auto& b : bufs)
         iovs.push_back({b.bytes(), b.size()});
-
-    int res = co_await do_readv(dev.fd, iovs.data(), iovs.size(), offset);
-    co_return to_ec(res);
+    // queueReadv copies iovecs into IoSqe; iovs only needs to survive this call.
+    t_dr->uring->queueReadv(dev.fd, {iovs.data(), iovs.data() + iovs.size()}, (off_t)offset,
+                            [p = std::move(p)](int res) mutable { p.setValue(res); });
+    co_return to_ec(co_await std::move(sf).via(t_dr->eb));
 }
 
 folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev, std::vector< IOBuffer >&& bufs,
                                                             uint64_t offset) {
     if (!t_dr) {
-        // Off-reactor: move bufs into the hopped Task so the kernel's
-        // iov_base pointers stay valid until the write CQE arrives.
-        int fd = dev.fd;
-        co_return to_ec(co_await iomgr().spawn_waitable(
-            ReactorTarget::any(), [fd, bufs = std::move(bufs), offset]() mutable -> folly::coro::Task< int > {
-                std::vector< struct iovec > iovs;
-                iovs.reserve(bufs.size());
-                for (auto& b : bufs)
-                    iovs.push_back({b.bytes(), b.size()});
-                co_return co_await do_writev(fd, iovs.data(), iovs.size(), offset);
-            }()));
+        co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), writev(dev, std::move(bufs), offset));
     }
-
+    folly::Promise< int > p;
+    auto sf = p.getSemiFuture();
     std::vector< struct iovec > iovs;
     iovs.reserve(bufs.size());
     for (auto& b : bufs)
         iovs.push_back({b.bytes(), b.size()});
-    co_return to_ec(co_await do_writev(dev.fd, iovs.data(), iovs.size(), offset));
+    t_dr->uring->queueWritev(dev.fd, {iovs.data(), iovs.data() + iovs.size()}, (off_t)offset,
+                             [p = std::move(p)](int res) mutable { p.setValue(res); });
+    co_return to_ec(co_await std::move(sf).via(t_dr->eb));
 }
 
 folly::coro::Task< std::error_code > DriveInterface::fsync(const IoDevice& dev) {
-    ENSURE_REACTOR(fsync(dev));
-    co_return to_ec(co_await do_fdatasync(dev.fd));
+    if (!t_dr) {
+        co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), fsync(dev));
+    }
+    folly::Promise< int > p;
+    auto sf = p.getSemiFuture();
+    t_dr->uring->queueFdatasync(dev.fd, [p = std::move(p)](int res) mutable { p.setValue(res); });
+    co_return to_ec(co_await std::move(sf).via(t_dr->eb));
 }
 
 folly::coro::Task< std::error_code > DriveInterface::write_zero(const IoDevice& dev, uint64_t size, uint64_t offset) {
-    ENSURE_REACTOR(write_zero(dev, size, offset));
+    if (!t_dr) {
+        co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), write_zero(dev, size, offset));
+    }
     int res;
     if (dev.is_block_device) {
-        // BLKZEROOUT is hardware-accelerated on NVMe (typically sub-ms).
         uint64_t range[2] = {offset, size};
         res = ::ioctl(dev.fd, BLKZEROOUT, range);
         if (res < 0)
             res = -errno;
     } else {
-        res = co_await do_fallocate(dev.fd, FALLOC_FL_ZERO_RANGE, offset, size);
+        folly::Promise< int > p;
+        auto sf = p.getSemiFuture();
+        t_dr->uring->queueFallocate(dev.fd, FALLOC_FL_ZERO_RANGE, (off_t)offset, (off_t)size,
+                                    [p = std::move(p)](int res) mutable { p.setValue(res); });
+        res = co_await std::move(sf).via(t_dr->eb);
     }
     co_return to_ec(res);
 }
-
-#undef ENSURE_REACTOR
 
 // ─────────────────────────────────────────────────────────────────────────────
 #else // !__linux__

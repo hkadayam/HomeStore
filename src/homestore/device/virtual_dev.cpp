@@ -42,7 +42,7 @@ VirtualDev::VirtualDev(VDevInfo info, std::vector< shared< PhysicalDev > > pdevs
         multi_pdev_choice_{static_cast< MultiPDevOpts >(info.multi_pdev_choice)},
         allocator_type_{static_cast< BlkAllocatorType >(info.alloc_type)},
         chunk_selector_type_{static_cast< ChunkSelectorType >(info.chunk_sel_type)},
-        use_slab_allocator_{info.use_slab_allocator != 0},
+        persist_blk_alloced_{info.persist_blk_alloced != 0},
         incremental_chunk_size_{to_u64(info.chunk_size)},
         pdevs_{std::move(pdevs)},
         mutable_state_() {
@@ -84,7 +84,7 @@ folly::coro::Task< unique< VirtualDev > > VirtualDev::create(VDevParameters&& pa
     vinfo.multi_pdev_choice = to_u8(params.multi_pdev_opts);
     vinfo.alloc_type = to_u8(params.alloc_type);
     vinfo.chunk_sel_type = to_u8(params.chunk_sel_type);
-    vinfo.use_slab_allocator = params.use_slab_allocator ? 1 : 0;
+    vinfo.persist_blk_alloced = params.persist_blk_alloced ? 1 : 0;
     vinfo.set_name(params.vdev_name);
     vinfo.compute_checksum();
 
@@ -241,9 +241,14 @@ folly::coro::Task< void > VirtualDev::write(const IOBuffer& buf, const BlkId& bi
     co_await chunk->physical_dev()->write(buf, dev_offset);
 }
 
-folly::coro::Task< void > VirtualDev::writev(std::vector< IOBuffer >&& bufs, const BlkId& bid) {
+folly::coro::Task< void > VirtualDev::writev(const std::vector< IOBuffer >& bufs, const BlkId& bid) {
     auto [dev_offset, chunk] = to_dev_offset(bid);
-    co_await chunk->physical_dev()->writev(std::move(bufs), dev_offset);
+    co_await chunk->physical_dev()->writev(bufs, dev_offset);
+}
+
+folly::coro::Task< void > VirtualDev::writev(const std::vector< sisl::ByteArray >& bufs, const BlkId& bid) {
+    auto [dev_offset, chunk] = to_dev_offset(bid);
+    co_await chunk->physical_dev()->writev(bufs, dev_offset);
 }
 
 folly::coro::Task< std::error_code > VirtualDev::read(IOBuffer& buf, const BlkId& bid) {
@@ -705,7 +710,7 @@ void VirtualDev::construct_blk_allocator(cshared< Chunk >& chunk, std::optional<
     const std::string alloc_name = name_ + "_chunk_" + std::to_string(chunk->chunk_id());
 
     if (allocator_type_ == BlkAllocatorType::SlabCompact || allocator_type_ == BlkAllocatorType::SlabExtend) {
-        SlabBlkAllocConfig cfg{blk_size_, align_size, align_size, chunk->info().chunk_size, buffer.has_value(),
+        SlabBlkAllocConfig cfg{blk_size_, align_size, align_size, chunk->info().chunk_size, persist_blk_alloced_,
                                alloc_name};
         cfg.alloc_mode =
             (allocator_type_ == BlkAllocatorType::SlabCompact) ? AllocMode::CompactAlloc : AllocMode::ExpandedAlloc;

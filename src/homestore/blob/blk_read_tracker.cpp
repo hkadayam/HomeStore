@@ -13,7 +13,7 @@
  *
  *********************************************************************************/
 #include "blob/blk_read_tracker.h"
-#include "common/homestore_assert.hpp"
+#include "base/homestore_assert.hpp"
 
 namespace homestore {
 static BlkId extract_key(const BlkTrackRecord& rec) {

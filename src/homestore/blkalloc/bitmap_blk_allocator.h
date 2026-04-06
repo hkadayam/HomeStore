@@ -38,9 +38,10 @@ namespace homestore {
 /// free():            resets bits in the bitmap (portion-locked).
 /// commit():          sets bits — CP-safe: if acquire_buffer() is active, the bid is pushed to the pending commit
 ///                    list and applied by release_buffer().
-/// scan_free_blks():  acquires the portion lock, scans bm_ for reset bits in the portion's range, sets them
-///                    (marking as "in-cache"), and calls producer(bid) for each range found. Used by
-///                    SlabBlkAllocator::fill_cache_for_portion().
+/// scan_free_blks():  acquires the portion lock, scans bm_ for reset bits in the portion's range, and calls
+///                    consumer(bid) for each contiguous free range found. Consumer returns
+///                    {keep_on_going, num_consumed}. num_consumed > 0 sets those bits in the bitmap;
+///                    num_consumed == 0 leaves the bitmap untouched. keep_on_going == false stops the scan.
 /// copy_from():       bulk-copy a source bitmap into bm_; used to initialise inmem_bm_ from ondisk_bm_.
 ///
 /// Thread-safety: each bitmap operation acquires the relevant InmemPortion::mtx_ via seg_mgr_.
@@ -66,12 +67,14 @@ public:
     // Serialize bm_; new commits accumulate in commit_list_ until the returned BufferGuard is destroyed.
     BufferGuard acquire_buffer() override;
 
-    // Scan bm_ for free (reset) bits in portion's range. For each contiguous range found, calls
-    // producer(bid) which returns the number of blocks it successfully consumed. Only those consumed
-    // blocks have their bits SET (marking them as in-cache); unconsumed bits stay RESET.
-    // Acquires portion.mtx_ internally. A zero return from producer stops the scan.
+    // Scan bm_ for free (reset) bits in portion's range. Calls consumer(bid) for each contiguous
+    // free range; consumer returns std::pair<bool, blk_count_t>{keep_on_going, num_consumed}.
+    //   num_consumed > 0 → those bits are SET in the bitmap (marked as in-cache).
+    //   num_consumed == 0 → bitmap is untouched for this range.
+    //   keep_on_going == false → scan stops after this iteration.
+    // Acquires portion.mtx_ internally.
     template < typename F >
-    void scan_free_blks(InmemPortion& portion, F&& producer);
+    void scan_free_blks(InmemPortion& portion, F&& consumer);
 
     // Copy all bits from src.bm_ into bm_ (used for load-time initialisation).
     void copy_from(BitmapBlkAllocator const& src);
@@ -99,7 +102,7 @@ private:
 // ---- template implementation ----
 
 template < typename F >
-void BitmapBlkAllocator::scan_free_blks(InmemPortion& portion, F&& producer) {
+void BitmapBlkAllocator::scan_free_blks(InmemPortion& portion, F&& consumer) {
     auto lock = portion.portion_lock();
 
     blk_num_t cursor = portion.sweep_cursor_;
@@ -122,15 +125,14 @@ void BitmapBlkAllocator::scan_free_blks(InmemPortion& portion, F&& producer) {
         const blk_num_t start = static_cast< blk_num_t >(bb.start_bit);
         const blk_count_t count = static_cast< blk_count_t >(bb.nbits);
 
-        // Let the producer consume as many blocks as it can; only SET bits for consumed blocks.
-        const blk_count_t consumed = producer(BlkId{start, count, chunk_id_});
-        if (consumed > 0) {
-            bm_->set_bits(start, consumed);
-            alloced_blk_count_.fetch_add(consumed, std::memory_order_relaxed);
+        auto [keep_on_going, num_consumed] = consumer(BlkId{start, count, chunk_id_});
+        if (num_consumed > 0) {
+            bm_->set_bits(start, num_consumed);
+            alloced_blk_count_.fetch_add(num_consumed, std::memory_order_relaxed);
         }
         cursor = start + count;
 
-        if (consumed == 0 || cursor >= portion.end_blk_) break;
+        if (!keep_on_going || cursor >= portion.end_blk_) break;
     }
 
     portion.sweep_cursor_ = cursor;

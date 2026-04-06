@@ -51,12 +51,40 @@ VirtualDev& BlobDev::vdev() const {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Stream accessors
+// ─────────────────────────────────────────────────────────────────────────────
+
+template < typename T >
+static std::vector< shared< T > > collect_streams(const folly::SharedMutex& mtx,
+                                                   const std::map< uint64_t, shared< T > >& m) {
+    std::shared_lock lk{mtx};
+    std::vector< shared< T > > out;
+    out.reserve(m.size());
+    for (auto& [_, s] : m) {
+        out.push_back(s);
+    }
+    return out;
+}
+
+std::vector< shared< RawBlkStream > > BlobDev::raw_blk_streams() const {
+    return collect_streams(streams_mutex_, raw_blk_streams_);
+}
+
+std::vector< shared< AppendBlkStream > > BlobDev::append_blk_streams() const {
+    return collect_streams(streams_mutex_, append_blk_streams_);
+}
+
+std::vector< shared< AppendByteStream > > BlobDev::append_byte_streams() const {
+    return collect_streams(streams_mutex_, append_byte_streams_);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MetaBlk name helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Format: <dev>_<type_name>_<chunk_id>
-// e.g.    "Index_rawblk_42"
-std::string BlobDev::chunk_mblk_name(StreamType type, uint32_t chunk_id) const {
+// Format: <dev>_<type_name>_<stream_id>_<chunk_id>
+// e.g.    "Index_rawblk_3_42"
+std::string BlobDev::chunk_mblk_name(StreamType type, uint64_t stream_id, uint32_t chunk_id) const {
     std::string_view type_name{};
     switch (type) {
     case StreamType::RawBlk:
@@ -69,13 +97,12 @@ std::string BlobDev::chunk_mblk_name(StreamType type, uint32_t chunk_id) const {
         type_name = kAppendByteSuffix;
         break;
     }
-    return fmt::format("{}{}{}", dev_name_, type_name, chunk_id);
+    return fmt::format("{}{}{}_{}", dev_name_, type_name, stream_id, chunk_id);
 }
 
-std::optional< std::pair< StreamType, uint32_t > > BlobDev::parse_chunk_mblk_name(std::string_view dev_name,
-                                                                                  std::string_view name) {
-    // Each name has the form: <dev_name>_<type_name>_<chunk_id>
-    // Try each known suffix.
+std::optional< BlobDev::ParsedChunkMblk > BlobDev::parse_chunk_mblk_name(const std::string_view& dev_name,
+                                                                         const std::string_view& name) {
+    // Each name has the form: <dev_name>_<type_name>_<stream_id>_<chunk_id>
     static const std::pair< std::string_view, StreamType > kPatterns[] = {
         {kRawBlkSuffix, StreamType::RawBlk},
         {kAppendBlkSuffix, StreamType::AppendBlk},
@@ -91,16 +118,29 @@ std::optional< std::pair< StreamType, uint32_t > > BlobDev::parse_chunk_mblk_nam
             continue;
         }
 
-        // Remainder is "<chunk_id>"
+        // Remainder is "<stream_id>_<chunk_id>"
         std::string_view rest = name.substr(prefix.size());
 
-        uint32_t chunk_id{};
-        auto res = std::from_chars(rest.data(), rest.data() + rest.size(), chunk_id);
-        if (res.ec != std::errc{}) {
+        // Find the underscore separating stream_id and chunk_id.
+        auto sep = rest.find('_');
+        if (sep == std::string_view::npos) {
             continue;
         }
 
-        return std::make_pair(type, chunk_id);
+        uint64_t stream_id{};
+        auto res1 = std::from_chars(rest.data(), rest.data() + sep, stream_id);
+        if (res1.ec != std::errc{}) {
+            continue;
+        }
+
+        std::string_view chunk_part = rest.substr(sep + 1);
+        uint32_t chunk_id{};
+        auto res2 = std::from_chars(chunk_part.data(), chunk_part.data() + chunk_part.size(), chunk_id);
+        if (res2.ec != std::errc{}) {
+            continue;
+        }
+
+        return ParsedChunkMblk{type, stream_id, chunk_id};
     }
     return std::nullopt;
 }
@@ -109,15 +149,20 @@ std::optional< std::pair< StreamType, uint32_t > > BlobDev::parse_chunk_mblk_nam
 // CP lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
 
-void BlobDev::on_cp_switchover(CP* cur_cp, CP* new_cp) {
-    if (raw_blk_) {
-        raw_blk_->on_cp_switchover(cur_cp, new_cp);
+folly::coro::Task< void > BlobDev::cp_flush(CP* cp) {
+    // Collect streams under shared lock, then flush outside the lock.
+    auto rbs = raw_blk_streams();
+    auto abs = append_blk_streams();
+
+    for (auto& s : rbs) {
+        if (s->is_dirty(cp->id())) {
+            co_await s->cp_flush(cp);
+        }
     }
-    if (append_blk_) {
-        append_blk_->on_cp_switchover(cur_cp, new_cp);
-    }
-    if (append_byte_) {
-        append_byte_->on_cp_switchover(cur_cp, new_cp);
+    for (auto& s : abs) {
+        if (s->is_dirty(cp->id())) {
+            co_await s->cp_flush(cp);
+        }
     }
 }
 
@@ -126,44 +171,63 @@ void BlobDev::on_cp_switchover(CP* cur_cp, CP* new_cp) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 folly::coro::Task< shared< RawBlkStream > > BlobDev::create_raw_blk_stream(uint64_t chunk_size) {
-    if (raw_blk_) {
-        co_return raw_blk_;
+    auto sid = next_stream_id();
+    auto stream = co_await RawBlkStream::create(sid, meta_client_, dev_name_, vdev_, chunk_size);
+    {
+        std::unique_lock lk{streams_mutex_};
+        raw_blk_streams_.emplace(sid, stream);
     }
-    raw_blk_ = co_await RawBlkStream::create(meta_client_, dev_name_, vdev_, chunk_size);
-    co_return raw_blk_;
+    co_return stream;
 }
 
 folly::coro::Task< shared< AppendBlkStream > > BlobDev::create_append_blk_stream(uint64_t chunk_size) {
-    if (append_blk_) {
-        co_return append_blk_;
+    auto sid = next_stream_id();
+    auto stream = co_await AppendBlkStream::create(sid, meta_client_, dev_name_, vdev_, chunk_size);
+    {
+        std::unique_lock lk{streams_mutex_};
+        append_blk_streams_.emplace(sid, stream);
     }
-    append_blk_ = co_await AppendBlkStream::create(meta_client_, dev_name_, vdev_, chunk_size);
-    co_return append_blk_;
+    co_return stream;
 }
 
 folly::coro::Task< shared< AppendByteStream > > BlobDev::create_append_byte_stream(uint64_t chunk_size) {
-    if (append_byte_) {
-        co_return append_byte_;
+    auto sid = next_stream_id();
+    auto stream = co_await AppendByteStream::create(sid, meta_client_, dev_name_, vdev_, chunk_size);
+    {
+        std::unique_lock lk{streams_mutex_};
+        append_byte_streams_.emplace(sid, stream);
     }
-    append_byte_ = co_await AppendByteStream::create(meta_client_, dev_name_, vdev_, chunk_size);
-    co_return append_byte_;
+    co_return stream;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Recovery load
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > BlobDev::load(ChunkMblkMap&& raw_blk, ChunkMblkMap&& append_blk,
-                                        ChunkMblkMap&& append_byte) {
-    if (!raw_blk.empty()) {
-        raw_blk_ = co_await RawBlkStream::load(meta_client_, dev_name_, vdev_, std::move(raw_blk));
+folly::coro::Task< void > BlobDev::load(StreamMblkMap&& raw_blk, StreamMblkMap&& append_blk,
+                                        StreamMblkMap&& append_byte) {
+    uint64_t max_sid = 0;
+
+    for (auto& [sid, mblks] : raw_blk) {
+        raw_blk_streams_[sid] = co_await RawBlkStream::load(sid, meta_client_, dev_name_, vdev_, std::move(mblks));
+        max_sid = std::max(max_sid, sid);
     }
-    if (!append_blk.empty()) {
-        append_blk_ = co_await AppendBlkStream::load(meta_client_, dev_name_, vdev_, std::move(append_blk));
+    for (auto& [sid, mblks] : append_blk) {
+        append_blk_streams_[sid] =
+            co_await AppendBlkStream::load(sid, meta_client_, dev_name_, vdev_, std::move(mblks));
+        max_sid = std::max(max_sid, sid);
     }
-    if (!append_byte.empty()) {
-        append_byte_ = co_await AppendByteStream::load(meta_client_, dev_name_, vdev_, std::move(append_byte));
+    for (auto& [sid, mblks] : append_byte) {
+        append_byte_streams_[sid] =
+            co_await AppendByteStream::load(sid, meta_client_, dev_name_, vdev_, std::move(mblks));
+        max_sid = std::max(max_sid, sid);
     }
+
+    // Set next_stream_id_ past the highest recovered stream_id.
+    if (!raw_blk.empty() || !append_blk.empty() || !append_byte.empty()) {
+        next_stream_id_.store(max_sid + 1, std::memory_order_relaxed);
+    }
+
     co_await reconcile_chunks();
 }
 
@@ -174,7 +238,7 @@ folly::coro::Task< void > BlobDev::load(ChunkMblkMap&& raw_blk, ChunkMblkMap&& a
 folly::coro::Task< void > BlobDev::reconcile_chunks() {
     // Build the set of chunk_ids claimed by all loaded streams.
     std::unordered_set< uint32_t > claimed;
-    auto collect = [&](const auto* stream) {
+    auto collect = [&](const StreamBase* stream) {
         if (!stream) {
             return;
         }
@@ -183,9 +247,15 @@ folly::coro::Task< void > BlobDev::reconcile_chunks() {
             claimed.insert(chunk->chunk_id());
         }
     };
-    collect(raw_blk_.get());
-    collect(append_blk_.get());
-    collect(append_byte_.get());
+    for (auto& [_, s] : raw_blk_streams_) {
+        collect(s.get());
+    }
+    for (auto& [_, s] : append_blk_streams_) {
+        collect(s.get());
+    }
+    for (auto& [_, s] : append_byte_streams_) {
+        collect(s.get());
+    }
 
     // Any chunk in the VDev that is not claimed is orphaned.
     auto all_chunks = vdev_->get_chunks();

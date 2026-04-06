@@ -25,8 +25,8 @@
 #include <folly/coro/Task.h>
 
 #include <homestore/blk.h>               // BlkId, BlkAllocStatus, blk_count_t, blk_alloc_hints
-#include <homestore/homestore_decl.hpp>  // shared<>, unique<>
-#include "blob/stream_base.h"            // StreamBase, CPSession, cp_id_t, CPManager::max_concurent_cps
+#include "homestore/base/homestore_decl.h" // shared<>, unique<>
+#include "blob/stream_base.h"              // StreamBase, CPSessionBase, cp_id_t, CPManager::max_concurent_cps
 #include "iomanager/drive_interface.hpp" // IOBuffer
 
 namespace homestore {
@@ -46,7 +46,7 @@ class VirtualDev;
 struct WriteUnit {
     BlkId alloc_blkid;            // full pre-allocated range
     uint32_t used_nblks{0};       // blocks actually written
-    std::vector< IOBuffer > bufs; // pending buffers in write order
+    std::vector< sisl::ByteArray > bufs; // pending buffers in write order (shared ownership)
 
     explicit WriteUnit(BlkId bid) : alloc_blkid{bid} {}
     WriteUnit(const WriteUnit&) = delete;
@@ -54,12 +54,12 @@ struct WriteUnit {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AppendBlkCPSession
+// CPSession
 //
 // Holds all append state accumulated within one CP epoch (indexed by cp_id%2).
 // Switched over atomically by on_cp_switchover(); flushed by flush(cp).
 // ─────────────────────────────────────────────────────────────────────────────
-struct AppendBlkCPSession : public StreamBase::CPSession {
+struct CPSession : public StreamBase::FlushSessionBase {
     // Active (open) WriteUnit per segment.  MAX_SEGMENTS is an upper bound on
     // the number of independent segments a caller uses concurrently.
     static constexpr uint16_t MAX_SEGMENTS = 64;
@@ -97,11 +97,13 @@ class AppendBlkStream : public StreamBase {
 public:
     // ── Factories ─────────────────────────────────────────────────────────────
 
-    static folly::coro::Task< shared< AppendBlkStream > > create(MetaClient& meta_client, const std::string& dev_name,
+    static folly::coro::Task< shared< AppendBlkStream > > create(uint64_t stream_id, MetaClient& meta_client,
+                                                                 const std::string& dev_name,
                                                                  const shared< VirtualDev >& vdev, uint64_t chunk_size);
 
-    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, IOBuffer > >;
-    static folly::coro::Task< shared< AppendBlkStream > > load(MetaClient& meta_client, const std::string& dev_name,
+    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::ByteView > >;
+    static folly::coro::Task< shared< AppendBlkStream > > load(uint64_t stream_id, MetaClient& meta_client,
+                                                               const std::string& dev_name,
                                                                const shared< VirtualDev >& vdev, ChunkMblkMap&& mblks);
 
     AppendBlkStream(const AppendBlkStream&) = delete;
@@ -113,10 +115,10 @@ public:
     // ── IO ─────────────────────────────────────────────────────────────
 
     /// Append buf into the given segment.  Returns the BlkId of the written block(s).
-    folly::coro::Task< BlkId > append(CP* cp, uint16_t segment_id, const IOBuffer& buf);
+    folly::coro::Task< BlkId > append(CP* cp, uint16_t segment_id, const sisl::ByteArray& buf);
 
     /// Invalidate (free) a previously-appended block.  Marks owning chunk dirty.
-    void invalidate(const BlkId& bid);
+    void invalidate(CP* cp, const BlkId& bid);
 
     folly::coro::Task< std::error_code > read(IOBuffer& buf, const BlkId& bid);
 
@@ -128,21 +130,26 @@ public:
     /// Finalize all WriteUnits for this CP, issue writev, write dirty bitmaps.
     folly::coro::Task< bool > cp_flush(CP* cp);
 
+    /// Returns true if any chunks were dirtied during the given CP epoch.
+    bool is_dirty(cp_id_t cp_id) { return cp_session(cp_id).has_dirty_chunks(); }
+
     // ── StreamBase hook ──────────────────────────────────────────────────────
     std::string_view stream_type_name() const override { return "appendblk"; }
 
 private:
-    AppendBlkStream(MetaClient& meta_client, std::string dev_name, const shared< VirtualDev >& vdev,
+    AppendBlkStream(uint64_t stream_id, MetaClient& meta_client, std::string dev_name, const shared< VirtualDev >& vdev,
                     uint64_t chunk_size, ChunkMblkMap&& mblks = {});
 
     /// Try to alloc nblks; expand by one chunk and retry once on failure.
     folly::coro::Task< BlkId > alloc_or_expand(blk_count_t nblks, const blk_alloc_hints& hints);
 
+    CPSession& cp_session(cp_id_t cp_id) { return cp_session_[cp_id % CPManager::max_concurent_cps]; }
+
 private:
     // Serialises all append() and on_cp_switchover() mutations. folly::coro::Mutex so it can be held across co_await
     // (e.g. alloc_or_expand).
     folly::coro::Mutex append_mutex_;
-    AppendBlkCPSession cp_session_[CPManager::max_concurent_cps];
+    CPSession cp_session_[CPManager::max_concurent_cps];
 
     // WriteUnit pre-alloc sizes (tunable; min guarantees at least one write).
     static constexpr blk_count_t kMaxWriteUnitBlks = 256;

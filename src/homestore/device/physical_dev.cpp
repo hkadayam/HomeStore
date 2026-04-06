@@ -243,8 +243,15 @@ folly::coro::Task< void > PhysicalDev::write(const IOBuffer& buf, uint64_t offse
     }
 }
 
-folly::coro::Task< void > PhysicalDev::writev(std::vector< IOBuffer >&& bufs, uint64_t offset) {
-    auto ec = co_await drive_iface_->writev(*iodev_, std::move(bufs), offset);
+folly::coro::Task< void > PhysicalDev::writev(const std::vector< IOBuffer >& bufs, uint64_t offset) {
+    auto ec = co_await drive_iface_->writev(*iodev_, bufs, offset);
+    if (ec) {
+        throw std::system_error(ec, "writev failed on " + devname_);
+    }
+}
+
+folly::coro::Task< void > PhysicalDev::writev(const std::vector< sisl::ByteArray >& bufs, uint64_t offset) {
+    auto ec = co_await drive_iface_->writev(*iodev_, bufs, offset);
     if (ec) {
         throw std::system_error(ec, "writev failed on " + devname_);
     }

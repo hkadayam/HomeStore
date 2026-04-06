@@ -20,6 +20,7 @@
 
 #include <sisl/logging/logging.h>
 #include <sisl/fds/atomic_counter.h>
+#include <sisl/fds/enum.h>
 #include <folly/futures/SharedPromise.h>
 
 #include "base/homestore_assert.hpp" // HS_SUBMOD_LOG, HS_PERIODIC_DETAILED_LOG

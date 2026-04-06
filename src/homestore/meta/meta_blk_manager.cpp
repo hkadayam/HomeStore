@@ -38,6 +38,7 @@ folly::coro::Task< void > MetaBlkManager::create(uint64_t vdev_size) {
     params.multi_pdev_opts = MultiPDevOpts::AllPDevStriped;
     params.alloc_type = BlkAllocatorType::SlabExtend;
     params.chunk_sel_type = ChunkSelectorType::OnlyOne;
+    params.persist_blk_alloced = false;
 
     shared< VirtualDev > vdev = co_await device_mgr().create_vdev(std::move(params));
     co_await vdev->format();

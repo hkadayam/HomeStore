@@ -66,12 +66,9 @@ public:
     // like CP flush where the caller wants to atomically snapshot and reset dirty state.
     std::unordered_set< T, Hash, KeyEqual > gather(bool clear_on_gather = false) {
         std::unordered_set< T, Hash, KeyEqual > result;
-        for (auto& accessor : tl_set_.accessAllThreads()) {
-            auto* s = accessor.get();
-            if (s) {
-                result.insert(s->begin(), s->end());
-                if (clear_on_gather) { s->clear(); }
-            }
+        for (auto& s : tl_set_.accessAllThreads()) {
+            result.insert(s.begin(), s.end());
+            if (clear_on_gather) { s.clear(); }
         }
         {
             std::unique_lock lg{zombie_mutex_};
@@ -86,9 +83,8 @@ public:
 
     size_t size() const {
         size_t sz{0};
-        for (auto& accessor : const_cast< ConcurrentInsertSet* >(this)->tl_set_.accessAllThreads()) {
-            auto* s = accessor.get();
-            if (s) { sz += s->size(); }
+        for (auto& s : const_cast< ConcurrentInsertSet* >(this)->tl_set_.accessAllThreads()) {
+            sz += s.size();
         }
         {
             std::unique_lock lg{zombie_mutex_};
@@ -102,9 +98,8 @@ public:
     bool empty() const { return size() == 0; }
 
     void clear() {
-        for (auto& accessor : tl_set_.accessAllThreads()) {
-            auto* s = accessor.get();
-            if (s) { s->clear(); }
+        for (auto& s : tl_set_.accessAllThreads()) {
+            s.clear();
         }
         {
             std::unique_lock lg{zombie_mutex_};
@@ -131,7 +126,9 @@ private:
         return *s;
     }
 
-    folly::ThreadLocalPtr< SetType > tl_set_;
+    // Tag with our own class so accessAllThreads() is enabled.
+    struct Tag {};
+    folly::ThreadLocalPtr< SetType, Tag > tl_set_;
     mutable std::mutex zombie_mutex_;
     std::vector< SetType* > zombies_;
 };

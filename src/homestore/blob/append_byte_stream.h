@@ -27,10 +27,10 @@
 #include <folly/coro/Task.h>
 
 #include <homestore/blk.h>              // BlkId, blk_count_t, chunk_num_t
-#include <homestore/homestore_decl.hpp> // shared<>, unique<>
+#include "homestore/base/homestore_decl.h" // shared<>, unique<>
 #include <sisl/fds/buffer.h>            // sisl::Blob
 
-#include "blob/stream_base.h"            // StreamBase, CPSession, cp_id_t, CPManager::max_concurent_cps
+#include "blob/stream_base.h"            // StreamBase, CPSession, sisl::Rcu
 #include "iomanager/drive_interface.hpp" // IOBuffer
 
 namespace homestore {
@@ -56,7 +56,7 @@ static_assert(std::is_standard_layout_v< AppendByteChunkMeta >);
 // Byte-stream append.  Callers never see block addresses; the stream tracks a logical tail_offset in bytes.  No block
 // allocator — bytes are written sequentially into chunks; when a chunk is full the stream expands to the next one.
 //
-// append(cp_id, data) — hot path takes folly::coro::SharedMutex shared lock, CAS-bumps an atomic offset on the active
+// append(data) — hot path takes folly::coro::SharedMutex shared lock, CAS-bumps an atomic offset on the active
 // WriteUnit, and memcpys caller bytes into the pre-allocated aligned IOBuffer.  When the buffer is full, the cold path
 // takes an exclusive lock, allocates a new WriteUnit, and retries.  Each WriteUnit's buffer never crosses a chunk
 // boundary.
@@ -66,9 +66,8 @@ static_assert(std::is_standard_layout_v< AppendByteChunkMeta >);
 //
 // Truncate: reset tail_offset to 0; existing chunks remain allocated for reuse.
 //
-// CP integration:
-//   on_cp_switchover(cp)  — initialize the new CP session.
-//   cp_flush(cp)          — single writer; writes used portions of WriteUnits to VDev, updates MetaBlks.
+// Not bound by CP — callers can flush at any time.  The active session is RCU-protected: append() acquires a read-side
+// guard to access the current session, while flush() atomically installs a new empty session and drains the old one.
 // ─────────────────────────────────────────────────────────────────────────────
 class AppendByteStream : public StreamBase {
 public:
@@ -100,10 +99,12 @@ public:
         uint32_t valid_bytes{};     // how many bytes in buf are real data (< blk_size)
     };
 
-    // ── AppendByteCPSession ──────────────────────────────────────────────────
-    // Per-CP-epoch state.  All WriteUnits created during this epoch are owned here.  write_cursor tracks the byte
-    // offset at which the next WriteUnit starts; initialized lazily from tail_offset on first allocation.
-    struct AppendByteCPSession : public StreamBase::CPSession {
+    // ── FlushSession ──────────────────────────────────────────────
+    // Accumulates all WriteUnits between two flush() calls.  RCU-protected: append() takes a read-side guard to access
+    // the current session, while flush() atomically installs a new empty session and drains the old one.  write_cursor
+    // tracks the byte offset at which the next WriteUnit starts; initialized lazily from tail_offset on first
+    // allocation.
+    struct FlushSession : public StreamBase::FlushSessionBase {
         std::vector< unique< WriteUnit > > all_units;
         uint64_t write_cursor{0}; // byte offset past the end of the last allocated WriteUnit's capacity
 
@@ -137,11 +138,14 @@ public:
 
     // ── Factories ─────────────────────────────────────────────────────────────
 
-    static folly::coro::Task< shared< AppendByteStream > >
-    create(MetaClient& meta_client, const std::string& dev_name, const shared< VirtualDev >& vdev, uint64_t chunk_size);
+    static folly::coro::Task< shared< AppendByteStream > > create(uint64_t stream_id, MetaClient& meta_client,
+                                                                  const std::string& dev_name,
+                                                                  const shared< VirtualDev >& vdev,
+                                                                  uint64_t chunk_size);
 
-    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, IOBuffer > >;
-    static folly::coro::Task< shared< AppendByteStream > > load(MetaClient& meta_client, const std::string& dev_name,
+    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::ByteView > >;
+    static folly::coro::Task< shared< AppendByteStream > > load(uint64_t stream_id, MetaClient& meta_client,
+                                                                const std::string& dev_name,
                                                                 const shared< VirtualDev >& vdev, ChunkMblkMap&& mblks);
 
     AppendByteStream(const AppendByteStream&) = delete;
@@ -154,7 +158,7 @@ public:
 
     /// Append data bytes into the stream.  Returns the byte offset at which the data was written.  Hot path is
     /// lock-free (shared lock + CAS); cold path (buffer full) takes exclusive lock and allocates a new WriteUnit.
-    folly::coro::Task< uint64_t > append(cp_id_t cp_id, const sisl::Blob& data);
+    folly::coro::Task< uint64_t > append(const sisl::Blob& data);
 
     /// Read len bytes starting at byte_offset.  Allocates the read buffer internally and returns it along with an error
     /// code.  The returned IOBuffer is block-aligned in size; valid data occupies the first len bytes.
@@ -166,16 +170,16 @@ public:
     /// Create a sequential read cursor for the range [start_offset, end_offset).
     ReadCursor open_cursor(uint64_t start_offset, uint64_t end_offset) const;
 
-    /// Reset tail_offset to 0.  Existing chunks are retained and reused.
-    folly::coro::Task< void > truncate();
+    /// Reset tail_offset to 0.  When release_chunks is false (default), existing chunks are retained and reused.
+    /// When release_chunks is true, all chunks are released back to VDev after resetting, freeing their storage.
+    folly::coro::Task< void > truncate(bool release_chunks = false);
 
-    // ── CP hooks (called by BlobDeviceManager) ───────────────────────────────
+    // ── Flush ─────────────────────────────────────────────────────────────────
 
-    /// Initialize the new CP session for accumulating appends.
-    void on_cp_switchover(CP* cur_cp, CP* new_cp);
-
-    /// Write used portions of all WriteUnits to VDev, update chunk MetaBlks with bytes_written.
-    folly::coro::Task< bool > cp_flush(CP* cp);
+    /// Atomically install a new empty session (so concurrent appenders switch over), then drain the old session:
+    /// write used WriteUnit portions to VDev and update chunk MetaBlks with bytes_written.  Can be called at any time,
+    /// independent of CP.
+    folly::coro::Task< bool > flush();
 
     // ── Accessors ─────────────────────────────────────────────────────────────
     uint64_t tail_offset() const { return tail_offset_.load(std::memory_order_acquire); }
@@ -184,14 +188,14 @@ public:
     std::string_view stream_type_name() const override { return "appendbyte"; }
 
 private:
-    AppendByteStream(MetaClient& meta_client, std::string dev_name, const shared< VirtualDev >& vdev,
-                     uint64_t chunk_size, ChunkMblkMap&& mblks = {});
+    AppendByteStream(uint64_t stream_id, MetaClient& meta_client, std::string dev_name,
+                     const shared< VirtualDev >& vdev, uint64_t chunk_size, ChunkMblkMap&& mblks = {});
 
-    /// Allocate a new WriteUnit at the current write_cursor position.  If a TailBlock is cached (from a previous CP
+    /// Allocate a new WriteUnit at the current write_cursor position.  If a TailBlock is cached (from a previous
     /// flush or restart recovery), the first WriteUnit is seeded from it.  Otherwise, a fresh block-aligned buffer is
     /// allocated.  Caps the buffer to not cross the chunk boundary.  Expands to a new chunk if needed.  Called under
     /// exclusive append_mutex_.
-    folly::coro::Task< WriteUnit* > alloc_write_unit(AppendByteCPSession& session, cp_id_t cp_id);
+    folly::coro::Task< WriteUnit* > alloc_write_unit(FlushSession& session);
 
     /// Internal read helper: read nblks blocks starting at blk_num in chunk cid into a freshly allocated IOBuffer.
     folly::coro::Task< std::pair< std::error_code, IOBuffer > > read_blocks(chunk_num_t cid, uint32_t blk_num,
@@ -203,7 +207,10 @@ private:
 
     // SharedMutex: shared lock for hot-path CAS+memcpy; exclusive lock for cold-path new WriteUnit allocation.
     folly::coro::SharedMutex append_mutex_;
-    AppendByteCPSession cp_session_[CPManager::max_concurent_cps];
+
+    // RCU-protected active session.  append() acquires a read-side guard (~2-5 ns) to access the current session.
+    // flush() atomically installs a new empty session and drains the old one after the RCU grace period.
+    sisl::Rcu::data< FlushSession > session_;
 
     // Cached partial tail block — bridges CP boundaries and restarts so the stream stays byte-contiguous.
     std::optional< TailBlock > tail_block_;

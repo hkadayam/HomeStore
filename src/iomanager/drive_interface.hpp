@@ -89,8 +89,9 @@ public:
     /// (guaranteed when the caller co_awaits the returned Task).
     folly::coro::Task< std::error_code > write(const IoDevice& dev, const IOBuffer& buf, uint64_t offset);
 
-    /// Gather write. Caller must std::move the vector in.
-    folly::coro::Task< std::error_code > writev(const IoDevice& dev, std::vector< IOBuffer >&& bufs, uint64_t offset);
+    /// Gather write. Buffers are read-only; caller retains ownership.
+    folly::coro::Task< std::error_code > writev(const IoDevice& dev, const std::vector< IOBuffer >& bufs, uint64_t offset);
+    folly::coro::Task< std::error_code > writev(const IoDevice& dev, const std::vector< sisl::ByteArray >& bufs, uint64_t offset);
 
     // ── Misc ──────────────────────────────────────────────────────────────────
 
@@ -99,6 +100,10 @@ public:
 
     /// fdatasync(2) — flush kernel buffers to backing storage.
     folly::coro::Task< std::error_code > fsync(const IoDevice& dev);
+
+private:
+    folly::coro::Task< std::error_code > do_writev(const IoDevice& dev, std::vector< struct iovec >&& iovs,
+                                                    uint64_t offset);
 };
 
 } // namespace homestore

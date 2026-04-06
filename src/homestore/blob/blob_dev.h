@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -25,9 +26,10 @@
 #include <utility>
 #include <vector>
 
+#include <folly/SharedMutex.h>
 #include <folly/coro/Task.h>
 
-#include <homestore/homestore_decl.hpp> // shared<>, unique<>
+#include "homestore/base/homestore_decl.h" // shared<>, unique<>
 #include <homestore/checkpoint/cp.h>    // CP
 
 #include "meta/meta_blk.h"             // MetaBlk
@@ -37,6 +39,7 @@ namespace homestore {
 class Chunk;
 class MetaClient;
 class VirtualDev;
+class StreamBase;
 class RawBlkStream;
 class AppendBlkStream;
 class AppendByteStream;
@@ -45,23 +48,30 @@ class CPManager;
 // ─────────────────────────────────────────────────────────────────────────────
 // StreamType
 //
-// Fixed stream identifier stored in ChunkInfo::stream_id. Each BlobDev has at most one instance per type.
+// Identifies the kind of stream.
 // ─────────────────────────────────────────────────────────────────────────────
 VENUM(StreamType, uint64_t, RawBlk = 1, AppendBlk = 2, AppendByte = 3);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BlobDev
 //
-// 1:1 with VirtualDev.  Holds at most one stream of each type as shared<T> (nullptr if the stream has not been
-// created).  All streams share the single MetaClient owned by BlobDevManager — accessed via reference.
+// 1:1 with VirtualDev.  Holds zero or more streams of each type, keyed by a
+// BlobDev-assigned stream_id.  All streams share the single MetaClient owned
+// by BlobDevManager — accessed via reference.
 //
 // Stream naming convention for per-chunk MetaBlks:
-//   RawBlkStream    → "<dev>_rawblk_<chunk_id>"
-//   AppendBlkStream → "<dev>_appendblk_<chunk_id>"
-//   AppendByteStream→ "<dev>_appendbyte_<chunk_id>"
+//   "<dev>_<type>_<stream_id>_<chunk_id>"
+//   e.g. "Index_rawblk_3_42"
 // ─────────────────────────────────────────────────────────────────────────────
 class BlobDev {
 public:
+    // ── Types ────────────────────────────────────────────────────────────────
+
+    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::ByteView > >;
+
+    /// Per-stream recovery data grouped by stream_id.
+    using StreamMblkMap = std::map< uint64_t, ChunkMblkMap >;
+
     // ── Creation ─────────────────────────────────────────────────────────────
 
     /// Construct a BlobDev backed by a VirtualDev, referencing the manager's MetaClient.
@@ -73,33 +83,34 @@ public:
     BlobDev& operator=(BlobDev&&) = delete;
     ~BlobDev();
 
-    // ── Per-stream create (called once per type) ──────────────────────────────
+    // ── Per-stream create (auto-assigns stream_id) ───────────────────────────
 
-    /// Create a fresh stream.
+    /// Create a fresh stream. Returns the new stream (use stream_id() to get the assigned id).
     folly::coro::Task< shared< RawBlkStream > > create_raw_blk_stream(uint64_t chunk_size);
     folly::coro::Task< shared< AppendBlkStream > > create_append_blk_stream(uint64_t chunk_size);
     folly::coro::Task< shared< AppendByteStream > > create_append_byte_stream(uint64_t chunk_size);
 
     // ── Recovery load ─────────────────────────────────────────────────────────
 
-    /// Load previously-persisted streams from recovered data (chunk_id → MetaBlk + payload).
-    /// Empty map = stream not present.
-    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, IOBuffer > >;
-    folly::coro::Task< void > load(ChunkMblkMap&& raw_blk, ChunkMblkMap&& append_blk, ChunkMblkMap&& append_byte);
+    /// Load previously-persisted streams from recovered data.
+    /// Each StreamMblkMap is keyed by stream_id → (chunk_id → MetaBlk + payload).
+    /// Empty map = no streams of that type.
+    folly::coro::Task< void > load(StreamMblkMap&& raw_blk, StreamMblkMap&& append_blk, StreamMblkMap&& append_byte);
 
     /// After all streams are loaded, remove any VDev chunks not owned by any stream (orphans left by a crash before
     /// MetaBlk was written).
     folly::coro::Task< void > reconcile_chunks();
 
-    // ── Stream accessors (nullptr if not created) ─────────────────────────────
-    shared< RawBlkStream > raw_blk_stream() const { return raw_blk_; }
-    shared< AppendBlkStream > append_blk_stream() const { return append_blk_; }
-    shared< AppendByteStream > append_byte_stream() const { return append_byte_; }
+    // ── Stream accessors (returns a snapshot under shared lock) ────────────
+
+    std::vector< shared< RawBlkStream > > raw_blk_streams() const;
+    std::vector< shared< AppendBlkStream > > append_blk_streams() const;
+    std::vector< shared< AppendByteStream > > append_byte_streams() const;
 
     // ── CP lifecycle ──────────────────────────────────────────────────────────
 
-    /// Called by BlobDevManager::on_switchover_cp.  Propagates the switchover to all present streams.
-    void on_cp_switchover(CP* cur_cp, CP* new_cp);
+    /// Flush dirty block-allocating streams (RawBlk, AppendBlk) for the given CP.
+    folly::coro::Task< void > cp_flush(CP* cp);
 
     // ── Device accessors ──────────────────────────────────────────────────────
     VirtualDev& vdev() const;
@@ -107,21 +118,31 @@ public:
 
     // ── MetaBlk name helpers (public for use by BlobDevManager) ───────────
 
-    /// Build the per-chunk MetaBlk name for the given stream type and chunk id.
-    std::string chunk_mblk_name(StreamType type, uint32_t chunk_id) const;
+    /// Build the per-chunk MetaBlk name: "<dev>_<type>_<stream_id>_<chunk_id>".
+    std::string chunk_mblk_name(StreamType type, uint64_t stream_id, uint32_t chunk_id) const;
 
-    /// Parse "<dev>_<type_name>_<chunk_id>" and return (stream_type, chunk_id). Returns nullopt if the name does not
-    /// match this device.
-    static std::optional< std::pair< StreamType, uint32_t > > parse_chunk_mblk_name(std::string_view dev_name,
-                                                                                    std::string_view name);
+    /// Parse "<dev>_<type>_<stream_id>_<chunk_id>" and return (stream_type, stream_id, chunk_id).
+    /// Returns nullopt if the name does not match this device.
+    struct ParsedChunkMblk {
+        StreamType type;
+        uint64_t stream_id;
+        uint32_t chunk_id;
+    };
+    static std::optional< ParsedChunkMblk > parse_chunk_mblk_name(const std::string_view& dev_name,
+                                                                     const std::string_view& name);
 
 private:
+    uint64_t next_stream_id() { return next_stream_id_.fetch_add(1, std::memory_order_relaxed); }
+
     std::string dev_name_;
     shared< VirtualDev > vdev_;
     MetaClient& meta_client_;
-    shared< RawBlkStream > raw_blk_;
-    shared< AppendBlkStream > append_blk_;
-    shared< AppendByteStream > append_byte_;
+    std::atomic< uint64_t > next_stream_id_{0};
+
+    mutable folly::SharedMutex streams_mutex_;
+    std::map< uint64_t, shared< RawBlkStream > > raw_blk_streams_;
+    std::map< uint64_t, shared< AppendBlkStream > > append_blk_streams_;
+    std::map< uint64_t, shared< AppendByteStream > > append_byte_streams_;
 };
 
 } // namespace homestore

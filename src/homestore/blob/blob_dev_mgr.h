@@ -25,7 +25,7 @@
 
 #include <folly/coro/Task.h>
 
-#include <homestore/homestore_decl.hpp>  // shared<>, unique<>
+#include "homestore/base/homestore_decl.h" // shared<>, unique<>
 #include <homestore/checkpoint/cp_mgr.h> // CPCallbacks
 
 namespace homestore {
@@ -43,11 +43,11 @@ struct CP;
 // all stream flush/switchover calls are routed through here.
 //
 // MetaBlk name patterns (used for recovery scan):
-//   RawBlkStream     — "<dev>_rawblk_1_<chunk_id>"
-//   AppendBlkStream  — "<dev>_appendblk_2_<chunk_id>"
-//   AppendByteStream — "<dev>_appendbyte_3_<chunk_id>"
+//   RawBlkStream     — "<dev>_rawblk_<stream_id>_<chunk_id>"
+//   AppendBlkStream  — "<dev>_appendblk_<stream_id>_<chunk_id>"
+//   AppendByteStream — "<dev>_appendbyte_<stream_id>_<chunk_id>"
 // ─────────────────────────────────────────────────────────────────────────────
-class BlobDevManager : public CPCallbacks {
+class BlobDevManager : public CPCallbacks, public std::enable_shared_from_this< BlobDevManager > {
 public:
     // ---------------------------------- Lifecycle ───────────────────────────────
 
@@ -62,6 +62,9 @@ public:
     BlobDevManager(BlobDevManager&&) = delete;
     BlobDevManager& operator=(BlobDevManager&&) = delete;
     ~BlobDevManager() override = default;
+
+    /// Shutdown: release all BlobDevs (and their VDev references) before DeviceManager is destroyed.
+    void shutdown();
 
     // -----------------------------Device Management ───────────────────────────────
 
@@ -82,8 +85,6 @@ public:
 
 private:
     explicit BlobDevManager(MetaClient meta_client) : meta_client_{std::move(meta_client)} {}
-
-    void register_with_cp_mgr();
 
     MetaClient meta_client_;
     mutable std::mutex devices_mutex_;

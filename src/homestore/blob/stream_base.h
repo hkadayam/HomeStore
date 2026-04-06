@@ -28,7 +28,7 @@
 #include <sisl/fds/concurrent_insert_set.h>
 #include <sisl/fds/rcu.h>
 
-#include <homestore/homestore_decl.hpp> // shared<>, unique<>
+#include "homestore/base/homestore_decl.h" // shared<>, unique<>
 #include "checkpoint/cp.h"              // cp_id_t
 #include "checkpoint/cp_mgr.h"          // CPManager::max_concurent_cps
 
@@ -60,7 +60,7 @@ protected:
 
     /// On fresh creation pass no mblks (default empty).  On recovery, chunks are extracted from VDev by chunk_id,
     /// sorted by vdev_order, and each MetaBlk is moved into chunk_mblks_.
-    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, IOBuffer > >;
+    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::ByteView > >;
     StreamBase(uint64_t stream_id, const shared< VirtualDev >& vdev, MetaClient& meta_client, std::string dev_name,
                uint64_t chunk_size, ChunkMblkMap&& mblks = {});
 
@@ -104,11 +104,11 @@ public:
     virtual std::string_view stream_type_name() const = 0;
 
     // ── Per-CP dirty chunk tracking ─────────────────────────────────────────
-    // Base CPSession tracks which chunks were dirtied during a CP epoch via ConcurrentInsertSet — lock-free per-thread
-    // insert, deduped gather at flush time. An atomic dirty flag provides a fast O(1) check so cp_flush can skip the
-    // gather entirely when nothing was dirtied. Subclasses can extend (e.g. RawBlkCPSession adds write buffers).
-    // Indexed by cp_id % CPManager::max_concurent_cps (double-buffered).
-    struct CPSession {
+    // Base FlushSession tracks which chunks were dirtied during a CP epoch via ConcurrentInsertSet — lock-free
+    // per-thread insert, deduped gather at flush time. An atomic dirty flag provides a fast O(1) check so cp_flush can
+    // skip the gather entirely when nothing was dirtied. Subclasses can extend (e.g. RawBlkStream::CPSession adds write
+    // buffers). Indexed by cp_id % CPManager::max_concurent_cps (double-buffered).
+    struct FlushSessionBase {
         std::atomic< bool > is_dirty{false};
         sisl::ConcurrentInsertSet< uint32_t > dirty_chunks;
 
@@ -126,10 +126,7 @@ public:
         }
     };
 
-    CPSession& cp_session(cp_id_t cp_id) { return cp_session_[cp_id % CPManager::max_concurent_cps]; }
-
 protected:
-    CPSession cp_session_[CPManager::max_concurent_cps];
     // Single MetaClient owned by BlobDevManager; one MetaBlk per chunk stored in chunk_mblks_.
     MetaClient& meta_client_;
     folly::coro::Mutex mblk_mutex_;

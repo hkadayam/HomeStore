@@ -24,7 +24,7 @@
 #include <folly/coro/Task.h>
 
 #include <homestore/blk.h>              // BlkId, BlkAllocStatus, blk_count_t, blk_alloc_hints
-#include <homestore/homestore_decl.hpp> // shared<>, unique<>
+#include "homestore/base/homestore_decl.h" // shared<>, unique<>
 #include <sisl/fds/concurrent_insert_vector.h>
 
 #include "blob/blk_read_tracker.h"
@@ -73,15 +73,16 @@ public:
     // ── Factories ─────────────────────────────────────────────────────────────
 
     /// Create a fresh stream.  Expands to one initial chunk and creates its MetaBlk.
-    static folly::coro::Task< shared< RawBlkStream > > create(MetaClient& meta_client, const std::string& dev_name,
+    static folly::coro::Task< shared< RawBlkStream > > create(uint64_t stream_id, MetaClient& meta_client,
+                                                              const std::string& dev_name,
                                                               const shared< VirtualDev >& vdev, uint64_t chunk_size);
 
     /// Recovery: restore from recovered data (chunk_id → MetaBlk + payload).
     /// Passes stored bitmaps to vdev.load_blk_allocator() to restore allocator state.
-    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, IOBuffer > >;
-    static folly::coro::Task< shared< RawBlkStream > > load(MetaClient& meta_client, const std::string& dev_name,
-                                                            const shared< VirtualDev >& vdev,
-                                                            ChunkMblkMap&& mblks);
+    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::ByteView > >;
+    static folly::coro::Task< shared< RawBlkStream > > load(uint64_t stream_id, MetaClient& meta_client,
+                                                            const std::string& dev_name,
+                                                            const shared< VirtualDev >& vdev, ChunkMblkMap&& mblks);
 
     RawBlkStream(const RawBlkStream&) = delete;
     RawBlkStream& operator=(const RawBlkStream&) = delete;
@@ -99,11 +100,11 @@ public:
     BlkAllocStatus alloc_blks(blk_count_t nblks, const blk_alloc_hints& hints, BlkIds& out_blkids);
 
     /// Commit a previously allocated block, making it durable across recovery.
-    BlkAllocStatus commit_blk(const BlkId& bid);
+    BlkAllocStatus commit_blk(CP* cp, const BlkId& bid);
 
     /// Invalidate (free) a block.  Waits for any in-flight reads on the block to complete via BlkReadTracker, then
     /// frees via vdev.
-    folly::coro::Task< void > invalidate(const BlkId& bid);
+    folly::coro::Task< void > invalidate(CP* cp, const BlkId& bid);
 
     /// Expand stream by one chunk.
     folly::coro::Task< void > expand();
@@ -116,7 +117,7 @@ public:
     folly::coro::Task< void > write(const BlkId& bid, const IOBuffer& buf, bool buffered = false);
 
     /// Scatter-gather write of multiple buffers to a contiguous block range.
-    folly::coro::Task< void > writev(std::vector< IOBuffer >&& bufs, const BlkId& bid);
+    folly::coro::Task< void > writev(const std::vector< IOBuffer >& bufs, const BlkId& bid);
 
     /// Read into buf.  Tracks the read via BlkReadTracker so invalidate() can wait for it.
     folly::coro::Task< std::error_code > read(IOBuffer& buf, const BlkId& bid);
@@ -127,32 +128,28 @@ public:
     /// Flush all physical devices backing this stream's chunks.
     folly::coro::Task< void > fsync();
 
-    // ── CP hooks (called by BlobDeviceManager, not registered directly) ───────
-
-    /// Reset dirty flag for the new CP session.
-    void on_cp_switchover(CP* cur_cp, CP* new_cp);
-
     /// Drain buffered writes for the current CP to VDev. Can be called explicitly by the caller at any time.
-    folly::coro::Task< void > flush();
+    folly::coro::Task< void > buffered_write_flush();
 
     /// CP-driven flush: drains buffered writes + persists allocator bitmaps for all chunks.
     folly::coro::Task< bool > cp_flush(CP* cp);
+
+    /// Returns true if any chunks were dirtied during the given CP epoch.
+    bool is_dirty(cp_id_t cp_id) { return cp_session(cp_id).has_dirty_chunks(); }
 
     // ── StreamBase hook ──────────────────────────────────────────────────────
     std::string_view stream_type_name() const override { return "rawblk"; }
 
 private:
-    RawBlkStream(MetaClient& meta_client, std::string dev_name, const shared< VirtualDev >& vdev, uint64_t chunk_size,
-                 ChunkMblkMap&& mblks = {});
+    RawBlkStream(uint64_t stream_id, MetaClient& meta_client, std::string dev_name, const shared< VirtualDev >& vdev,
+                 uint64_t chunk_size, ChunkMblkMap&& mblks = {});
 
-    /// Drain buffered writes for the given cp_id to VDev.
-    folly::coro::Task< void > do_flush(cp_id_t cp_id);
-
-    // Per-CP write buffer.  Extends base CPSession with a lock-free per-thread vector of pending writes.
-    struct RawBlkCPSession : CPSession {
+    // Per-CP write buffer.  Extends base FlushSessionBase with a lock-free per-thread vector of pending writes.
+    struct CPSession : StreamBase::FlushSessionBase {
         sisl::ConcurrentInsertVector< std::pair< BlkId, IOBuffer > > writes;
     };
-    RawBlkCPSession cp_session_[CPManager::max_concurent_cps];
+    CPSession cp_session_[CPManager::max_concurent_cps];
+    CPSession& cp_session(cp_id_t cp_id) { return cp_session_[cp_id % CPManager::max_concurent_cps]; }
 
     BlkReadTracker blk_read_tracker_;
 };

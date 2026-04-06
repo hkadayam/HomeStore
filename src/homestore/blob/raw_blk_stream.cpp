@@ -32,31 +32,33 @@ namespace homestore {
 // ─────────────────────────────────────────────────────────────────────────────
 //                              Factory and Constructor
 // ─────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< shared< RawBlkStream > > RawBlkStream::create(MetaClient& meta_client, const std::string& dev_name,
+folly::coro::Task< shared< RawBlkStream > > RawBlkStream::create(uint64_t stream_id, MetaClient& meta_client,
+                                                                 const std::string& dev_name,
                                                                  const shared< VirtualDev >& vdev,
                                                                  uint64_t chunk_size) {
-    auto stream = shared< RawBlkStream >{new RawBlkStream{meta_client, std::string{dev_name}, vdev, chunk_size}};
+    auto stream =
+        shared< RawBlkStream >{new RawBlkStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_size}};
     co_await stream->expand_to(0);
     co_return stream;
 }
 
-folly::coro::Task< shared< RawBlkStream > > RawBlkStream::load(MetaClient& meta_client, const std::string& dev_name,
+folly::coro::Task< shared< RawBlkStream > > RawBlkStream::load(uint64_t stream_id, MetaClient& meta_client,
+                                                               const std::string& dev_name,
                                                                const shared< VirtualDev >& vdev, ChunkMblkMap&& mblks) {
     // Load each chunk's block allocator from the recovered bitmap before the constructor consumes the map.
     for (auto& [cid, entry] : mblks) {
-        vdev->load_blk_allocator(cid, sisl::make_byte_array(std::move(entry.second)));
+        vdev->load_blk_allocator(cid, entry.second.extract());
     }
 
     const uint64_t chunk_sz = vdev->chunk_size_bytes();
-    auto stream =
-        shared< RawBlkStream >{new RawBlkStream{meta_client, std::string{dev_name}, vdev, chunk_sz, std::move(mblks)}};
+    auto stream = shared< RawBlkStream >{
+        new RawBlkStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_sz, std::move(mblks)}};
     co_return stream;
 }
 
-RawBlkStream::RawBlkStream(MetaClient& meta_client, std::string dev_name, const shared< VirtualDev >& vdev,
-                           uint64_t chunk_size, ChunkMblkMap&& mblks) :
-        StreamBase{
-            enum_value(StreamType::RawBlk), vdev, meta_client, std::move(dev_name), chunk_size, std::move(mblks)} {
+RawBlkStream::RawBlkStream(uint64_t stream_id, MetaClient& meta_client, std::string dev_name,
+                           const shared< VirtualDev >& vdev, uint64_t chunk_size, ChunkMblkMap&& mblks) :
+        StreamBase{stream_id, vdev, meta_client, std::move(dev_name), chunk_size, std::move(mblks)} {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -71,18 +73,19 @@ BlkAllocStatus RawBlkStream::alloc_blks(blk_count_t nblks, const blk_alloc_hints
     return vdev().alloc_blks(nblks, hints, out_blkids);
 }
 
-BlkAllocStatus RawBlkStream::commit_blk(const BlkId& bid) {
-    CPGuard cpg{&cp_mgr()};
-    cp_session(cpg->id()).mark_chunk_dirty(bid.chunk_num());
-    return vdev().commit_blk(bid);
+BlkAllocStatus RawBlkStream::commit_blk(CP* cp, const BlkId& bid) {
+    const auto status = vdev().commit_blk(bid);
+    if (status == BlkAllocStatus::SUCCESS) {
+        cp_session(cp->id()).mark_chunk_dirty(bid.chunk_num());
+    }
+    return status;
 }
 
-folly::coro::Task< void > RawBlkStream::invalidate(const BlkId& bid) {
-    CPGuard cpg{&cp_mgr()};
-    cp_session(cpg->id()).mark_chunk_dirty(bid.chunk_num());
+folly::coro::Task< void > RawBlkStream::invalidate(CP* cp, const BlkId& bid) {
     // Wait for any in-flight reads on this block to complete before freeing.
     co_await blk_read_tracker_.wait_on(bid);
     vdev().free_blk(bid);
+    cp_session(cp->id()).mark_chunk_dirty(bid.chunk_num());
 }
 
 folly::coro::Task< void > RawBlkStream::expand() {
@@ -94,8 +97,6 @@ folly::coro::Task< void > RawBlkStream::expand() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 folly::coro::Task< void > RawBlkStream::write(const BlkId& bid, const IOBuffer& buf, bool buffered) {
-    CPGuard cpg{&cp_mgr()};
-
     if (buffered) {
         // TODO: Impl buffered write path — read() must return buffered data for overlapping BlkIds, which requires a
         // concurrent hashmap keyed by BlkId rather than a simple vector.
@@ -105,9 +106,8 @@ folly::coro::Task< void > RawBlkStream::write(const BlkId& bid, const IOBuffer& 
     co_await vdev().write(buf, bid);
 }
 
-folly::coro::Task< void > RawBlkStream::writev(std::vector< IOBuffer >&& bufs, const BlkId& bid) {
-    CPGuard cpg{&cp_mgr()};
-    co_await vdev().writev(std::move(bufs), bid);
+folly::coro::Task< void > RawBlkStream::writev(const std::vector< IOBuffer >& bufs, const BlkId& bid) {
+    co_await vdev().writev(bufs, bid);
 }
 
 folly::coro::Task< std::error_code > RawBlkStream::read(IOBuffer& buf, const BlkId& bid) {
@@ -132,26 +132,14 @@ folly::coro::Task< void > RawBlkStream::fsync() {
 // CP hooks
 // ─────────────────────────────────────────────────────────────────────────────
 
-void RawBlkStream::on_cp_switchover(CP* /*cur_cp*/, CP* /*new_cp*/) {
-}
-
-folly::coro::Task< void > RawBlkStream::do_flush(cp_id_t cp_id) {
-    const auto idx = cp_id % CPManager::max_concurent_cps;
-    auto it = cp_session_[idx].writes.begin();
-    auto end = cp_session_[idx].writes.end();
-    for (; it != end; ++it) {
-        co_await vdev().write(it->second, it->first);
-    }
-    cp_session_[idx].writes.clear();
-}
-
-folly::coro::Task< void > RawBlkStream::flush() {
-    CPGuard guard{&cp_mgr()};
-    co_await do_flush(guard->id());
+folly::coro::Task< void > RawBlkStream::buffered_write_flush() {
+    // TODO: Buffered writes are not implemented yet (because it also needs to make sure they are readable), so its
+    // flush is marked unimplemented
+    co_return;
 }
 
 folly::coro::Task< bool > RawBlkStream::cp_flush(CP* cp) {
-    co_await do_flush(cp->id());
+    co_await buffered_write_flush();
 
     auto dirty = cp_session(cp->id()).gather_dirty_chunks();
     if (dirty.empty()) { co_return true; }
@@ -164,7 +152,7 @@ folly::coro::Task< bool > RawBlkStream::cp_flush(CP* cp) {
 
         auto chunk = vdev().get_chunk(chunk_id);
         auto buf_guard = chunk->blk_allocator_mutable()->acquire_buffer();
-        co_await meta_client_.write_meta_blk(it->second, *buf_guard.buf());
+        co_await meta_client_.write_meta_blk(it->second, buf_guard.buf());
     }
 
     co_return true;

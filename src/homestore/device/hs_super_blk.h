@@ -178,7 +178,7 @@ struct VDevInfo {
     uint16_t checksum{0};                      //  84
     uint8_t alloc_type{0};                     //  86  (BlkAllocatorType as u8)
     uint8_t chunk_sel_type{0};                 //  87  (ChunkSelectorType as u8)
-    uint8_t use_slab_allocator{0};             //  88
+    uint8_t persist_blk_alloced{1};            //  88
     uint8_t padding[167]{};                    //  89
     uint8_t user_private[USER_PRIVATE_SIZE]{}; // 256
 

@@ -67,7 +67,7 @@ struct VDevParameters {
     uint32_t num_mirrors{0};
     BlkAllocatorType alloc_type{BlkAllocatorType::SlabCompact};
     ChunkSelectorType chunk_sel_type{ChunkSelectorType::RoundRobin};
-    bool use_slab_allocator{false};
+    bool persist_blk_alloced{true}; // false only for meta vdev (non-persistent allocator)
     std::optional< size_t > chunk_pool_limit; // nullopt = no pooling; Some(n) = pool ≤ n per size
 };
 
@@ -150,7 +150,8 @@ public:
     // Public APIs: I/Os
     // ──────────────────────────────────────────────────────────────────────────────
     folly::coro::Task< void > write(const IOBuffer& buf, const BlkId& bid);
-    folly::coro::Task< void > writev(std::vector< IOBuffer >&& bufs, const BlkId& bid);
+    folly::coro::Task< void > writev(const std::vector< IOBuffer >& bufs, const BlkId& bid);
+    folly::coro::Task< void > writev(const std::vector< sisl::ByteArray >& bufs, const BlkId& bid);
     folly::coro::Task< std::error_code > read(IOBuffer& buf, const BlkId& bid);
     folly::coro::Task< std::error_code > readv(std::vector< IOBuffer >& bufs, const BlkId& bid);
     folly::coro::Task< void > format();
@@ -258,7 +259,7 @@ private:
 
     BlkAllocatorType allocator_type_;
     ChunkSelectorType chunk_selector_type_;
-    bool use_slab_allocator_;
+    bool persist_blk_alloced_;
     uint64_t incremental_chunk_size_;
     std::vector< shared< PhysicalDev > > pdevs_; // physical devices backing this vdev
 

@@ -18,9 +18,6 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "checkpoint/cp.h"     // CP, cp_id_t
-#include "checkpoint/cp_mgr.h" // CPManager
-
 #include "blob/append_byte_stream.h"
 #include "blob/blob_dev.h"
 #include "device/chunk.h"
@@ -33,27 +30,26 @@ namespace homestore {
 // Private constructor
 // ─────────────────────────────────────────────────────────────────────────────
 
-AppendByteStream::AppendByteStream(MetaClient& meta_client, std::string dev_name, const shared< VirtualDev >& vdev,
-                                   uint64_t chunk_size, ChunkMblkMap&& mblks) :
-        StreamBase{
-            enum_value(StreamType::AppendByte), vdev, meta_client, std::move(dev_name), chunk_size, std::move(mblks)} {
+AppendByteStream::AppendByteStream(uint64_t stream_id, MetaClient& meta_client, std::string dev_name,
+                                   const shared< VirtualDev >& vdev, uint64_t chunk_size, ChunkMblkMap&& mblks) :
+        StreamBase{stream_id, vdev, meta_client, std::move(dev_name), chunk_size, std::move(mblks)} {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // create / load
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< shared< AppendByteStream > > AppendByteStream::create(MetaClient& meta_client,
+folly::coro::Task< shared< AppendByteStream > > AppendByteStream::create(uint64_t stream_id, MetaClient& meta_client,
                                                                          const std::string& dev_name,
                                                                          const shared< VirtualDev >& vdev,
                                                                          uint64_t chunk_size) {
-    auto stream =
-        shared< AppendByteStream >{new AppendByteStream{meta_client, std::string{dev_name}, vdev, chunk_size}};
+    auto stream = shared< AppendByteStream >{
+        new AppendByteStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_size}};
     co_await stream->expand_to(0);
     co_return stream;
 }
 
-folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(MetaClient& meta_client,
+folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(uint64_t stream_id, MetaClient& meta_client,
                                                                        const std::string& dev_name,
                                                                        const shared< VirtualDev >& vdev,
                                                                        ChunkMblkMap&& mblks) {
@@ -61,7 +57,7 @@ folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(MetaClien
     uint64_t recovered_tail = 0;
     for (auto& [cid, entry] : mblks) {
         if (entry.second.size() >= sizeof(AppendByteChunkMeta)) {
-            const auto* meta = reinterpret_cast< const AppendByteChunkMeta* >(entry.second.cbytes());
+            const auto* meta = reinterpret_cast< const AppendByteChunkMeta* >(entry.second.bytes());
             recovered_tail += meta->bytes_written;
         }
     }
@@ -69,7 +65,7 @@ folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(MetaClien
     const uint64_t chunk_sz = vdev->chunk_size_bytes();
     const uint32_t blk_sz = vdev->block_size();
     auto stream = shared< AppendByteStream >{
-        new AppendByteStream{meta_client, std::string{dev_name}, vdev, chunk_sz, std::move(mblks)}};
+        new AppendByteStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_sz, std::move(mblks)}};
     stream->tail_offset_.store(recovered_tail, std::memory_order_release);
 
     // If the recovered tail is not block-aligned, read the partial tail block from disk so subsequent appends can
@@ -101,16 +97,15 @@ folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(MetaClien
 // alloc_write_unit
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< AppendByteStream::WriteUnit* > AppendByteStream::alloc_write_unit(AppendByteCPSession& session,
-                                                                                     cp_id_t cp_id) {
-    // If a TailBlock is cached (from a previous CP flush or restart recovery), seed the first WriteUnit from it.  The
+folly::coro::Task< AppendByteStream::WriteUnit* > AppendByteStream::alloc_write_unit(FlushSession& session) {
+    // If a TailBlock is cached (from a previous flush or restart recovery), seed the first WriteUnit from it.  The
     // WriteUnit's buffer already contains the partial block's data; used_bytes is set to the sub-block valid count so
     // new appends continue from the exact byte offset.
     if (session.all_units.empty() && tail_block_) {
         auto tb = std::move(*tail_block_);
         tail_block_.reset();
 
-        cp_session(cp_id).mark_chunk_dirty(tb.chunk_id);
+        session.mark_chunk_dirty(tb.chunk_id);
         // write_cursor advances past this single-block WriteUnit.
         const uint64_t tail = tail_offset_.load(std::memory_order_relaxed);
         session.write_cursor = tail - (tail % to_u64(block_size())) + to_u64(block_size());
@@ -122,8 +117,8 @@ folly::coro::Task< AppendByteStream::WriteUnit* > AppendByteStream::alloc_write_
         co_return ptr;
     }
 
-    // On first allocation of this CP epoch (no tail block), initialize write_cursor from the current tail.  At this
-    // point tail_offset_ is guaranteed to be block-aligned (either from create, or because the previous CP's flush
+    // On first allocation of this session (no tail block), initialize write_cursor from the current tail.  At this
+    // point tail_offset_ is guaranteed to be block-aligned (either from create, or because the previous flush
     // saved the partial block into tail_block_ which was consumed above, or tail was already aligned).
     if (session.all_units.empty()) {
         session.write_cursor = tail_offset_.load(std::memory_order_relaxed);
@@ -147,7 +142,7 @@ folly::coro::Task< AppendByteStream::WriteUnit* > AppendByteStream::alloc_write_
         cid = static_cast< chunk_num_t >((*acc)[chunk_idx]->chunk_id());
     }
 
-    cp_session(cp_id).mark_chunk_dirty(cid);
+    session.mark_chunk_dirty(cid);
     session.write_cursor += buf_capacity;
 
     IOBuffer buf{buf_capacity, block_size()};
@@ -157,13 +152,15 @@ folly::coro::Task< AppendByteStream::WriteUnit* > AppendByteStream::alloc_write_
     co_return ptr;
 }
 
-folly::coro::Task< uint64_t > AppendByteStream::append(cp_id_t cp_id, const sisl::Blob& data) {
+folly::coro::Task< uint64_t > AppendByteStream::append(const sisl::Blob& data) {
     const uint32_t len = data.size();
-    AppendByteCPSession& session = cp_session_[cp_id % CPManager::max_concurent_cps];
 
-    auto do_append = [&session, this](const sisl::Blob& data, uint32_t len) -> std::optional< uint64_t > {
-        if (!session.all_units.empty()) {
-            WriteUnit* wu = session.all_units.back().get();
+    // RCU read to get the current session.  The access_ptr holds a read-side guard that must be released before any
+    // co_await (RCU readers must be short-lived).  We dereference once and work with the raw pointer — the session
+    // remains valid for the duration of the RCU read-side critical section.
+    auto do_append = [this, &data, len](FlushSession* session) -> std::optional< uint64_t > {
+        if (!session->all_units.empty()) {
+            WriteUnit* wu = session->all_units.back().get();
             uint32_t cur = wu->used_bytes.load(std::memory_order_relaxed);
             while (cur + len <= wu->buf.size()) {
                 if (wu->used_bytes.compare_exchange_weak(cur, cur + len, std::memory_order_relaxed)) {
@@ -178,7 +175,8 @@ folly::coro::Task< uint64_t > AppendByteStream::append(cp_id_t cp_id, const sisl
     // Hot path: shared lock + CAS to reserve space in the active (last) WriteUnit.
     {
         auto lock = co_await append_mutex_.co_scoped_lock_shared();
-        if (auto offset = do_append(data, len)) {
+        auto acc = session_.get();
+        if (auto offset = do_append(acc.get())) {
             co_return *offset;
         }
     }
@@ -187,14 +185,22 @@ folly::coro::Task< uint64_t > AppendByteStream::append(cp_id_t cp_id, const sisl
     {
         auto lock = co_await append_mutex_.co_scoped_lock();
 
-        // Re-check: another thread may have allocated a new WriteUnit while we waited for the exclusive lock.
-        if (auto offset = do_append(data, len)) {
-            co_return *offset;
+        FlushSession* session;
+        {
+            auto acc = session_.get();
+            session = acc.get();
+
+            // Re-check: another thread may have allocated a new WriteUnit while we waited for the exclusive lock.
+            if (auto offset = do_append(session)) {
+                co_return *offset;
+            }
         }
+        // RCU guard released above — safe to co_await.  The session pointer remains valid because we hold the
+        // exclusive append_mutex_, which prevents flush() from swapping the session while we are allocating.
 
         // Still no room — allocate a new WriteUnit.  If it was seeded from a TailBlock, used_bytes is already set to
         // the sub-block valid count; new data appends after the existing bytes.
-        WriteUnit* wu = co_await alloc_write_unit(session, cp_id);
+        WriteUnit* wu = co_await alloc_write_unit(*session);
         const uint32_t cur = wu->used_bytes.load(std::memory_order_relaxed);
         wu->used_bytes.store(cur + len, std::memory_order_relaxed);
         std::memcpy(wu->buf.bytes() + cur, data.cbytes(), len);
@@ -202,21 +208,33 @@ folly::coro::Task< uint64_t > AppendByteStream::append(cp_id_t cp_id, const sisl
     }
 }
 
-folly::coro::Task< void > AppendByteStream::truncate() {
+folly::coro::Task< void > AppendByteStream::truncate(bool release_chunks) {
     tail_offset_.store(0, std::memory_order_release);
     tail_block_.reset();
-    for (auto& sess : cp_session_) {
-        sess.reset();
-    }
 
-    // Reset bytes_written in every chunk MetaBlk to 0.
-    AppendByteChunkMeta meta{0};
-    IOBuffer meta_buf{sizeof(AppendByteChunkMeta)};
-    std::memcpy(meta_buf.bytes(), &meta, sizeof(meta));
+    // Swap in a fresh session, discarding the old one.
+    session_.make_and_exchange();
 
-    auto lock = co_await mblk_mutex_.co_scoped_lock();
-    for (auto& [cid, mblk] : chunk_mblks_) {
-        co_await meta_client_.write_meta_blk(mblk, meta_buf);
+    if (release_chunks) {
+        // Release all chunks back to VDev (and chunk pool). Remove their MetaBlks first.
+        {
+            auto lock = co_await mblk_mutex_.co_scoped_lock();
+            for (auto& [cid, mblk] : chunk_mblks_) {
+                co_await meta_client_.remove_meta_blk(mblk);
+            }
+            chunk_mblks_.clear();
+        }
+        co_await destroy(); // Returns chunks to VDev chunk pool via shrink()
+    } else {
+        // Retain chunks for reuse, just reset bytes_written in every chunk MetaBlk to 0.
+        AppendByteChunkMeta meta{0};
+        auto meta_buf = sisl::make_byte_array(sizeof(AppendByteChunkMeta));
+        std::memcpy(meta_buf->bytes(), &meta, sizeof(meta));
+
+        auto lock = co_await mblk_mutex_.co_scoped_lock();
+        for (auto& [cid, mblk] : chunk_mblks_) {
+            co_await meta_client_.write_meta_blk(mblk, meta_buf);
+        }
     }
 }
 
@@ -305,19 +323,17 @@ folly::coro::Task< std::pair< IOBuffer, uint32_t > > AppendByteStream::ReadCurso
     co_return {std::move(buf), valid};
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CP hooks
-// ─────────────────────────────────────────────────────────────────────────────
+folly::coro::Task< bool > AppendByteStream::flush() {
+    // Atomically install a new empty session.  After make_and_exchange returns, all in-flight RCU readers have
+    // completed and no new append() call will touch the old session.  We take exclusive append_mutex_ first so that
+    // no appender is in the cold path (which holds a raw pointer to the session across co_await).
+    std::shared_ptr< FlushSession > old_session;
+    {
+        auto lock = co_await append_mutex_.co_scoped_lock();
+        old_session = session_.make_and_exchange();
+    }
 
-void AppendByteStream::on_cp_switchover(CP* /*cur_cp*/, CP* new_cp) {
-    cp_session_[new_cp->id() % CPManager::max_concurent_cps].reset();
-}
-
-folly::coro::Task< bool > AppendByteStream::cp_flush(CP* cp) {
-    const cp_id_t cp_id = cp->id();
-    AppendByteCPSession& session = cp_session_[cp_id % CPManager::max_concurent_cps];
-    auto units = std::move(session.all_units);
-
+    auto units = std::move(old_session->all_units);
     const uint32_t blk_sz = block_size();
 
     // Accumulate high-water mark (offset_in_chunk + used) per chunk for MetaBlk persistence.
@@ -347,7 +363,7 @@ folly::coro::Task< bool > AppendByteStream::cp_flush(CP* cp) {
         hw = std::max(hw, to_u64(wu->offset_in_chunk + used));
     }
 
-    // Cache the partial tail block for the next CP epoch.  If the last WriteUnit's used_bytes is not block-aligned,
+    // Cache the partial tail block for the next session.  If the last WriteUnit's used_bytes is not block-aligned,
     // save the final partial block so the next alloc_write_unit can seed from it, keeping the stream contiguous.
     if (!units.empty()) {
         for (auto it = units.rbegin(); it != units.rend(); ++it) {
@@ -370,8 +386,8 @@ folly::coro::Task< bool > AppendByteStream::cp_flush(CP* cp) {
         }
     }
 
-    // Persist bytes_written MetaBlk only for chunks dirtied during this CP epoch.
-    auto dirty = cp_session(cp_id).gather_dirty_chunks();
+    // Persist bytes_written MetaBlk only for chunks dirtied during this flush session.
+    auto dirty = old_session->gather_dirty_chunks();
     if (dirty.empty()) {
         co_return true;
     }
@@ -387,8 +403,8 @@ folly::coro::Task< bool > AppendByteStream::cp_flush(CP* cp) {
         const uint64_t bytes_in_chunk = (bw_it != chunk_bytes_written.end()) ? bw_it->second : 0;
 
         AppendByteChunkMeta meta{bytes_in_chunk};
-        IOBuffer meta_buf{sizeof(AppendByteChunkMeta)};
-        std::memcpy(meta_buf.bytes(), &meta, sizeof(meta));
+        auto meta_buf = sisl::make_byte_array(sizeof(AppendByteChunkMeta));
+        std::memcpy(meta_buf->bytes(), &meta, sizeof(meta));
         co_await meta_client_.write_meta_blk(it->second, meta_buf);
     }
 

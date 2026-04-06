@@ -87,14 +87,18 @@ void SlabBlkAllocator::load() {
     BLKALLOC_LOG(INFO, "load: populating slab caches for CompactAlloc, persistent={}", cfg_.persistent_);
 
     if (cfg_.persistent_) {
-        // Scan ondisk_bm_ to find which blocks are free, push only those into slab caches.
+        // Scan ondisk_bm_ for free blocks and load all of them into slab caches.
+        // Return num_consumed=0 so the ondisk bitmap is never modified — only commit() may set bits there.
+        // keep_on_going=true always since CompactAlloc has no inmem_bm_ fallback; all free blocks must be in slab.
         for (auto& seg : seg_mgr_.segments()) {
             for (auto& p_ptr : seg.portions_) {
                 InmemPortion& portion = *p_ptr;
-                ondisk_bm_->scan_free_blks(portion, [&portion](BlkId const& bid) -> blk_count_t {
-                    auto [status, remaining] = portion.slab_cache_.try_free(bid);
-                    return bid.blk_count() - remaining.blk_count();
-                });
+                ondisk_bm_->scan_free_blks(
+                    portion, [&portion](BlkId const& bid) -> std::pair< bool, blk_count_t > {
+                        portion.slab_cache_.try_free(bid);
+                        // Always set num_consumed to be 0, because ondisk_bm should never set bits directly.
+                        return {true, /*num_consumed=*/0};
+                    });
             }
         }
     } else {
@@ -152,14 +156,15 @@ void SlabBlkAllocator::sweep_worker() {
     }
 }
 
-// Uses BitmapBlkAllocator::scan_free_blks() which acquires the portion lock internally,
-// scans inmem_bm_ for free bits, marks them as in-cache, and calls the producer lambda
-// to inject each range into the slab cache.
+// Refill the slab cache for one portion from inmem_bm_. Consumed blocks are marked (num_consumed > 0)
+// so the bitmap tracks them as in-cache and they won't be double-allocated.
 void SlabBlkAllocator::fill_cache_for_portion(InmemPortion& portion) {
-    inmem_bm_->scan_free_blks(portion, [&portion](BlkId const& bid) -> blk_count_t {
-        auto [status, remaining] = portion.slab_cache_.try_free(bid);
-        return bid.blk_count() - remaining.blk_count();
-    });
+    inmem_bm_->scan_free_blks(
+        portion, [&portion](BlkId const& bid) -> std::pair< bool, blk_count_t > {
+            auto [status, remaining] = portion.slab_cache_.try_free(bid);
+            const blk_count_t consumed = bid.blk_count() - remaining.blk_count();
+            return {consumed > 0, consumed};
+        });
 }
 
 void SlabBlkAllocator::request_sweep(blk_count_t wait_for_blks) {

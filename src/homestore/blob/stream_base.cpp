@@ -58,7 +58,7 @@ StreamBase::StreamBase(uint64_t stream_id, const shared< VirtualDev >& vdev, Met
     }
     std::sort(sorted.begin(), sorted.end(),
               [](const auto& a, const auto& b) { return a->vdev_order() < b->vdev_order(); });
-    chunks_ = sisl::Rcu::data< std::vector< shared< Chunk > > >{std::move(sorted)};
+    chunks_.make_and_exchange(std::move(sorted));
 }
 
 folly::coro::Task< void > StreamBase::destroy() {
@@ -121,7 +121,7 @@ folly::coro::Task< void > StreamBase::expand_to(size_t n) {
 
 folly::coro::Task< void > StreamBase::init_chunk_mblk(const shared< Chunk >& chunk) {
     const uint32_t cid = chunk->chunk_id();
-    auto name = fmt::format("{}_{}_{}", dev_name_, stream_type_name(), cid);
+    auto name = fmt::format("{}_{}_{}_{}", dev_name_, stream_type_name(), stream_id_, cid);
     auto blk = co_await meta_client_.create_meta_blk(name, std::nullopt);
 
     auto lock = co_await mblk_mutex_.co_scoped_lock();

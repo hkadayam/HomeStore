@@ -32,6 +32,7 @@
 #include "blob/append_blk_stream.h"
 #include "blob/append_byte_stream.h"
 #include "device/chunk.h"
+#include "device/device_manager.h"
 #include "device/virtual_dev.h"
 #include "meta/meta_client.h"
 #include "managers.h"
@@ -45,8 +46,8 @@ namespace homestore {
 folly::coro::Task< void > BlobDevManager::create() {
     LOGINFO("BlobDevManager: first boot — creating fresh manager");
     auto mgr = shared< BlobDevManager >(new BlobDevManager{co_await meta_mgr().register_client("BlobDevManager")});
-    mgr->register_with_cp_mgr();
-    Managers::init_blob_dev_mgr(std::move(mgr));
+    Managers::init_blob_dev_mgr(mgr);
+    cp_mgr().register_consumer("BlobDevManager", mgr->shared_from_this());
     LOGINFO("BlobDevManager: ready");
 }
 
@@ -54,20 +55,21 @@ folly::coro::Task< void > BlobDevManager::create() {
 // load
 //
 // Scan all MetaBlks whose names match one of the three patterns:
-//   <dev>_rawblk_1_<chunk_id>
-//   <dev>_appendblk_2_<chunk_id>
-//   <dev>_appendbyte_3_<chunk_id>
+//   <dev>_rawblk_<stream_id>_<chunk_id>
+//   <dev>_appendblk_<stream_id>_<chunk_id>
+//   <dev>_appendbyte_<stream_id>_<chunk_id>
 //
-// Group by (dev_name, stream_type); validate each chunk exists in DeviceManager.  Then construct one BlobDev per
-// dev_name and call load() with the recovered MetaBlk maps.  Streams read payload from MetaBlk on demand.
+// Group by (dev_name, stream_type, stream_id); validate each chunk exists in DeviceManager.  Then construct one
+// BlobDev per dev_name and call load() with the recovered MetaBlk maps.  Streams read payload from MetaBlk on demand.
 // ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 namespace {
 
-// Attempt to parse a MetaBlk name of the form "<dev>_<type_name>_<chunk_id>".
+// Attempt to parse a MetaBlk name of the form "<dev>_<type_name>_<stream_id>_<chunk_id>".
 struct ParsedMblkName {
     std::string dev_name;
     StreamType stream_type;
+    uint64_t stream_id;
     uint32_t chunk_id;
 };
 
@@ -85,16 +87,28 @@ std::optional< ParsedMblkName > parse_mblk_name(std::string_view name) {
         }
 
         std::string_view dev = name.substr(0, pos);
-        // Remainder after the suffix is just "<chunk_id>".
+        // Remainder after the suffix is "<stream_id>_<chunk_id>".
         std::string_view rest = name.substr(pos + suffix.size());
 
-        uint32_t chunk_id{};
-        auto rc = std::from_chars(rest.data(), rest.data() + rest.size(), chunk_id);
-        if (rc.ec != std::errc{}) {
+        auto sep = rest.find('_');
+        if (sep == std::string_view::npos) {
             continue;
         }
 
-        return ParsedMblkName{std::string{dev}, stype, chunk_id};
+        uint64_t stream_id{};
+        auto rc1 = std::from_chars(rest.data(), rest.data() + sep, stream_id);
+        if (rc1.ec != std::errc{}) {
+            continue;
+        }
+
+        std::string_view chunk_part = rest.substr(sep + 1);
+        uint32_t chunk_id{};
+        auto rc2 = std::from_chars(chunk_part.data(), chunk_part.data() + chunk_part.size(), chunk_id);
+        if (rc2.ec != std::errc{}) {
+            continue;
+        }
+
+        return ParsedMblkName{std::string{dev}, stype, stream_id, chunk_id};
     }
     return std::nullopt;
 }
@@ -105,26 +119,27 @@ folly::coro::Task< void > BlobDevManager::load() {
     LOGINFO("BlobDevManager: starting recovery scan");
     auto mgr = shared< BlobDevManager >(new BlobDevManager{co_await meta_mgr().register_client("BlobDevManager")});
 
-    // Per-device recovery accumulator, keyed by stream type.
-    using ChunkMblkMap = BlobDev::ChunkMblkMap;
+    // Per-device recovery accumulator, keyed by (stream_type, stream_id, chunk_id).
+    using StreamMblkMap = BlobDev::StreamMblkMap;
     struct DevRecovery {
-        ChunkMblkMap raw_blk_mblks;
-        ChunkMblkMap append_blk_mblks;
-        ChunkMblkMap append_byte_mblks;
+        StreamMblkMap raw_blk_mblks;
+        StreamMblkMap append_blk_mblks;
+        StreamMblkMap append_byte_mblks;
     };
 
     std::unordered_map< std::string, DevRecovery > dev_map;
 
     co_await mgr->meta_client_.for_each_recovered_block(
-        [&dev_map](MetaBlk blk, IOBuffer data) -> folly::coro::Task< void > {
+        [&dev_map](MetaBlk blk, sisl::ByteView data) -> folly::coro::Task< void > {
             auto parsed = parse_mblk_name(blk.name());
             if (!parsed) {
                 co_return;
             }
 
-            LOGDEBUG("Recovered MetaBlk '{}' dev={} chunk_id={}", blk.name(), parsed->dev_name, parsed->chunk_id);
+            LOGDEBUG("Recovered MetaBlk '{}' dev={} stream_id={} chunk_id={}", blk.name(), parsed->dev_name,
+                     parsed->stream_id, parsed->chunk_id);
 
-            auto* vdev = device_mgr().get_vdev(parsed->dev_name);
+            auto vdev = device_mgr().get_vdev(parsed->dev_name);
             if (!vdev) {
                 LOGWARN("MetaBlk '{}' references unknown VDev '{}' — skipping", blk.name(), parsed->dev_name);
                 co_return;
@@ -141,13 +156,13 @@ folly::coro::Task< void > BlobDevManager::load() {
             auto entry = std::make_pair(std::move(blk), std::move(data));
             switch (parsed->stream_type) {
             case StreamType::RawBlk:
-                dev.raw_blk_mblks.emplace(parsed->chunk_id, std::move(entry));
+                dev.raw_blk_mblks[parsed->stream_id].emplace(parsed->chunk_id, std::move(entry));
                 break;
             case StreamType::AppendBlk:
-                dev.append_blk_mblks.emplace(parsed->chunk_id, std::move(entry));
+                dev.append_blk_mblks[parsed->stream_id].emplace(parsed->chunk_id, std::move(entry));
                 break;
             case StreamType::AppendByte:
-                dev.append_byte_mblks.emplace(parsed->chunk_id, std::move(entry));
+                dev.append_byte_mblks[parsed->stream_id].emplace(parsed->chunk_id, std::move(entry));
                 break;
             }
             co_return;
@@ -157,16 +172,16 @@ folly::coro::Task< void > BlobDevManager::load() {
 
     // Construct one BlobDev per discovered dev_name.
     for (auto& [dev_name, recovery] : dev_map) {
-        auto* vdev = device_mgr().get_vdev(dev_name);
+        auto vdev = device_mgr().get_vdev(dev_name);
         if (!vdev) {
             LOGWARN("VDev '{}' disappeared between scan and load — skipping", dev_name);
             continue;
         }
 
-        LOGINFO("loading BlobDev '{}' — raw_blk={} append_blk={} append_byte={} chunk(s)", dev_name,
+        LOGINFO("loading BlobDev '{}' — raw_blk={} append_blk={} append_byte={} stream(s)", dev_name,
                 recovery.raw_blk_mblks.size(), recovery.append_blk_mblks.size(), recovery.append_byte_mblks.size());
 
-        auto device = std::make_shared< BlobDev >(dev_name, vdev->shared_from_this(), mgr->meta_client_);
+        auto device = std::make_shared< BlobDev >(dev_name, vdev, mgr->meta_client_);
         co_await device->load(std::move(recovery.raw_blk_mblks), std::move(recovery.append_blk_mblks),
                               std::move(recovery.append_byte_mblks));
 
@@ -177,17 +192,9 @@ folly::coro::Task< void > BlobDevManager::load() {
         LOGINFO("BlobDev '{}' loaded successfully", dev_name);
     }
 
-    mgr->register_with_cp_mgr();
-    Managers::init_blob_dev_mgr(std::move(mgr));
+    Managers::init_blob_dev_mgr(mgr);
+    cp_mgr().register_consumer("BlobDevManager", mgr->shared_from_this());
     LOGINFO("BlobDevManager: recovery complete — {} BlobDev(s) active", dev_map.size());
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// register_with_cp_mgr
-// ─────────────────────────────────────────────────────────────────────────────
-
-void BlobDevManager::register_with_cp_mgr() {
-    cp_mgr().register_consumer(/*CPConsumer=*/"BlobDevManager", unique< CPCallbacks >{this});
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -220,15 +227,22 @@ shared< BlobDev > BlobDevManager::get_blob_dev(const std::string& dev_name) cons
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// shutdown
+// ─────────────────────────────────────────────────────────────────────────────
+
+void BlobDevManager::shutdown() {
+    {
+        std::lock_guard lk{devices_mutex_};
+        devices_.clear();
+    }
+    Managers::init_blob_dev_mgr(nullptr);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CPCallbacks
 // ─────────────────────────────────────────────────────────────────────────────
 
-void BlobDevManager::on_switchover_cp(CP* cur_cp, CP* new_cp) {
-    std::lock_guard lk{devices_mutex_};
-    for (auto& [_, device] : devices_) {
-        device->on_cp_switchover(cur_cp, new_cp);
-    }
-}
+void BlobDevManager::on_switchover_cp(CP* /*cur_cp*/, CP* /*new_cp*/) {}
 
 folly::coro::Task< bool > BlobDevManager::cp_flush(CP* cp) {
     std::unordered_map< std::string, shared< BlobDev > > devs;
@@ -238,15 +252,7 @@ folly::coro::Task< bool > BlobDevManager::cp_flush(CP* cp) {
     }
 
     for (auto& [_, dev] : devs) {
-        if (auto s = dev->raw_blk_stream(); s && s->is_dirty(cp->id())) {
-            co_await s->cp_flush(cp);
-        }
-        if (auto s = dev->append_blk_stream(); s && s->is_dirty(cp->id())) {
-            co_await s->cp_flush(cp);
-        }
-        if (auto s = dev->append_byte_stream(); s && s->is_dirty(cp->id())) {
-            co_await s->cp_flush(cp);
-        }
+        co_await dev->cp_flush(cp);
     }
 
     co_return true;

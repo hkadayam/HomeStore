@@ -107,7 +107,8 @@ public:
     // All async IO methods
 
     folly::coro::Task< void > write(const IOBuffer& buf, uint64_t offset);
-    folly::coro::Task< void > writev(std::vector< IOBuffer >&& bufs, uint64_t offset);
+    folly::coro::Task< void > writev(const std::vector< IOBuffer >& bufs, uint64_t offset);
+    folly::coro::Task< void > writev(const std::vector< sisl::ByteArray >& bufs, uint64_t offset);
 
     folly::coro::Task< std::error_code > read(IOBuffer& buf, uint64_t offset);
 

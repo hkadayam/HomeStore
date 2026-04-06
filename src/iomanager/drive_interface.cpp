@@ -150,20 +150,34 @@ folly::coro::Task< std::error_code > DriveInterface::readv(const IoDevice& dev, 
     co_return to_ec(co_await std::move(sf).via(t_dr->eb));
 }
 
-folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev, std::vector< IOBuffer >&& bufs,
-                                                            uint64_t offset) {
+folly::coro::Task< std::error_code > DriveInterface::do_writev(const IoDevice& dev, std::vector< struct iovec >&& iovs,
+                                                               uint64_t offset) {
     if (!t_dr) {
-        co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), writev(dev, std::move(bufs), offset));
+        co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), do_writev(dev, std::move(iovs), offset));
     }
     folly::Promise< int > p;
     auto sf = p.getSemiFuture();
-    std::vector< struct iovec > iovs;
-    iovs.reserve(bufs.size());
-    for (auto& b : bufs)
-        iovs.push_back({b.bytes(), b.size()});
     t_dr->uring->queueWritev(dev.fd, {iovs.data(), iovs.data() + iovs.size()}, (off_t)offset,
                              [p = std::move(p)](int res) mutable { p.setValue(res); });
     co_return to_ec(co_await std::move(sf).via(t_dr->eb));
+}
+
+folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev, const std::vector< IOBuffer >& bufs,
+                                                            uint64_t offset) {
+    std::vector< struct iovec > iovs;
+    iovs.reserve(bufs.size());
+    for (auto& b : bufs)
+        iovs.push_back({const_cast< uint8_t* >(b.cbytes()), b.size()});
+    co_return co_await do_writev(dev, std::move(iovs), offset);
+}
+
+folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev, const std::vector< sisl::ByteArray >& bufs,
+                                                            uint64_t offset) {
+    std::vector< struct iovec > iovs;
+    iovs.reserve(bufs.size());
+    for (auto& b : bufs)
+        iovs.push_back({b->bytes(), b->size()});
+    co_return co_await do_writev(dev, std::move(iovs), offset);
 }
 
 folly::coro::Task< std::error_code > DriveInterface::fsync(const IoDevice& dev) {
@@ -258,19 +272,37 @@ folly::coro::Task< std::error_code > DriveInterface::readv(const IoDevice& dev, 
         .scheduleOn(folly::getGlobalCPUExecutor().get());
 }
 
-folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev, std::vector< IOBuffer >&& bufs,
-                                                            uint64_t offset) {
+folly::coro::Task< std::error_code > DriveInterface::do_writev(const IoDevice& dev, std::vector< struct iovec >&& iovs,
+                                                               uint64_t offset) {
     int fd = dev.fd;
-    co_return co_await folly::coro::co_invoke([fd, bufs = std::move(bufs),
+    co_return co_await folly::coro::co_invoke([fd, iovs = std::move(iovs),
                                                offset]() mutable -> folly::coro::Task< std::error_code > {
-        for (auto& b : bufs) {
-            ssize_t n = ::pwrite(fd, b.cbytes(), b.size(), (off_t)offset);
+        for (auto& iov : iovs) {
+            ssize_t n = ::pwrite(fd, iov.iov_base, iov.iov_len, (off_t)offset);
             if (n < 0)
                 co_return std::error_code(errno, std::generic_category());
-            offset += b.size();
+            offset += iov.iov_len;
         }
         co_return std::error_code{};
     }).scheduleOn(folly::getGlobalCPUExecutor().get());
+}
+
+folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev, const std::vector< IOBuffer >& bufs,
+                                                            uint64_t offset) {
+    std::vector< struct iovec > iovs;
+    iovs.reserve(bufs.size());
+    for (auto& b : bufs)
+        iovs.push_back({const_cast< uint8_t* >(b.cbytes()), b.size()});
+    co_return co_await do_writev(dev, std::move(iovs), offset);
+}
+
+folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev, const std::vector< sisl::ByteArray >& bufs,
+                                                            uint64_t offset) {
+    std::vector< struct iovec > iovs;
+    iovs.reserve(bufs.size());
+    for (auto& b : bufs)
+        iovs.push_back({b->bytes(), b->size()});
+    co_return co_await do_writev(dev, std::move(iovs), offset);
 }
 
 folly::coro::Task< std::error_code > DriveInterface::fsync(const IoDevice& dev) {

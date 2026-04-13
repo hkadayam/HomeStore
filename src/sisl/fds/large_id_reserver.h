@@ -1,56 +1,78 @@
 #pragma once
-#include <cstdint>
-#include <boost/icl/split_interval_map.hpp>
-#include <boost/icl/interval_map.hpp>
-#include "base/homestore_assert.hpp"
 
-namespace homestore {
+#include <cassert>
+#include <cstdint>
+#include <limits>
+
+#include <boost/icl/interval_set.hpp>
+
+namespace sisl {
+
+/// LargeIDReserver — reserves unique IDs from a large sparse domain using
+/// boost::icl::interval_set.  Unlike IDReserver (which uses a dense Bitset),
+/// this is efficient when the ID space is very large but only a small fraction
+/// of IDs are active at any given time (e.g. btree node IDs).
+///
+/// Not thread-safe; callers must provide external synchronisation.
 class LargeIDReserver {
 private:
-    using IntervalSet = boost::icl::interval_set< uint32_t >;
+    using IntervalSet = boost::icl::interval_set< uint64_t >;
     using Interval = IntervalSet::interval_type;
 
-    IntervalSet m_iset;
-    uint64_t m_max;
+    IntervalSet iset_;
+    uint64_t max_;
 
 public:
-    LargeIDReserver(uint32_t max_count) : m_max{max_count} {}
+    explicit LargeIDReserver(uint64_t max_count) : max_{max_count} {}
     ~LargeIDReserver() = default;
 
+    LargeIDReserver(LargeIDReserver const&) = delete;
+    LargeIDReserver& operator=(LargeIDReserver const&) = delete;
+    LargeIDReserver(LargeIDReserver&&) noexcept = default;
+    LargeIDReserver& operator=(LargeIDReserver&&) noexcept = default;
+
     static constexpr uint64_t out_of_bounds = std::numeric_limits< uint64_t >::max();
+
+    /// Reserve the next available ID.  Returns out_of_bounds if the space is exhausted.
     uint64_t reserve() {
         uint64_t id = find_next();
-        if (id >= m_max) { return out_of_bounds; }
-        m_iset.insert(Interval::right_open(id, id + 1));
+        if (id >= max_) {
+            return out_of_bounds;
+        }
+        iset_.insert(Interval::right_open(id, id + 1));
         return id;
     }
 
-    void reserve(uint64_t id) {
-        HS_DBG_ASSERT(!is_reserved(id), "Reserving an already reserved id={}", id);
-        m_iset.insert(Interval::right_open(id, id + 1));
-    }
+    /// Explicitly reserve a specific ID.  Idempotent — safe to call on an already-reserved ID.
+    void reserve(uint64_t id) { iset_.insert(Interval::right_open(id, id + 1)); }
 
+    /// Release a previously reserved ID back into the free pool.
     void unreserve(uint64_t id) {
-        HS_DBG_ASSERT_LT(id, m_max, "Unreserving an id which was out of bounds");
-        m_iset.erase(Interval::right_open(id, id + 1));
+        assert(id < max_ && "Unreserving an id which was out of bounds");
+        iset_.erase(Interval::right_open(id, id + 1));
     }
 
-    bool is_reserved(uint64_t id) const { return (m_iset.find(id) != m_iset.end()); }
+    /// Check whether an ID is currently reserved.
+    bool is_reserved(uint64_t id) const { return (iset_.find(id) != iset_.end()); }
+
+    /// Number of currently reserved IDs.
+    uint64_t reserved_count() const { return boost::icl::length(iset_); }
+
+    /// Maximum allowed ID count.
+    uint64_t max_count() const { return max_; }
 
 private:
+    /// Find the lowest unreserved ID.  Scans from 0 upward, skipping over reserved intervals.
     uint64_t find_next() const {
         uint64_t next = 0;
-        auto it = m_iset.begin();
-        while (it != m_iset.end()) {
-            if (it->lower() != 0) {
-                next = it->lower() - 1;
+        for (auto it = iset_.begin(); it != iset_.end(); ++it) {
+            if (it->lower() != 0 && next < it->lower()) {
                 break;
-            } else {
-                next = it->upper();
-                ++it;
             }
+            next = it->upper();
         }
         return next;
     }
 };
-} // namespace homestore
+
+} // namespace sisl

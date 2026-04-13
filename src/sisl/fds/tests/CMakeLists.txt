@@ -28,3 +28,7 @@ add_test(NAME ConcurrentInsertVector COMMAND test_concurrent_insert_vector)
 add_executable(test_stream_tracker test_stream_tracker.cpp)
 target_link_libraries(test_stream_tracker PRIVATE sisl_metrics ${FDS_TEST_DEPS})
 add_test(NAME StreamTracker COMMAND test_stream_tracker)
+
+add_executable(test_large_id_reserver test_large_id_reserver.cpp)
+target_link_libraries(test_large_id_reserver PRIVATE ${FDS_TEST_DEPS})
+add_test(NAME LargeIDReserver COMMAND test_large_id_reserver)

@@ -59,7 +59,8 @@ protected:
 
 public:
     Blob() = default;
-    Blob(uint8_t* b, uint32_t s) : bytes_{b}, size_{s} {}
+    Blob(uint8_t* b, uint32_t s) : bytes_{b}, size_{s} {
+    }
     Blob(uint8_t const* b, uint32_t s) : bytes_{const_cast< uint8_t* >(b)}, size_{s} {
 #ifdef _DEBUG
         is_const_ = true;
@@ -70,8 +71,12 @@ public:
         DEBUG_ASSERT_EQ(is_const_, false, "Trying to access writeable bytes with const declaration");
         return bytes_;
     }
-    uint32_t size() const { return size_; }
-    uint8_t const* cbytes() const { return bytes_; }
+    uint32_t size() const {
+        return size_;
+    }
+    uint8_t const* cbytes() const {
+        return bytes_;
+    }
 
     void set_bytes(uint8_t* b) {
         DEBUG_ASSERT_EQ(is_const_, false, "Trying to access writeable bytes with const declaration");
@@ -83,7 +88,9 @@ public:
 #endif
         bytes_ = const_cast< uint8_t* >(b);
     }
-    void set_size(uint32_t s) { size_ = s; }
+    void set_size(uint32_t s) {
+        size_ = s;
+    }
 };
 
 // ── SgList / SgIterator ───────────────────────────────────────────────────────
@@ -330,8 +337,10 @@ public:
         buf_alloc(sz, align_size, tag);
 #endif
     }
-    IoBlob(uint8_t* bytes, uint32_t size, bool is_aligned) : Blob(bytes, size), aligned_{is_aligned} {}
-    IoBlob(uint8_t const* bytes, uint32_t size, bool is_aligned) : Blob(bytes, size), aligned_{is_aligned} {}
+    IoBlob(uint8_t* bytes, uint32_t size, bool is_aligned) : Blob(bytes, size), aligned_{is_aligned} {
+    }
+    IoBlob(uint8_t const* bytes, uint32_t size, bool is_aligned) : Blob(bytes, size), aligned_{is_aligned} {
+    }
     ~IoBlob() = default;
 
     void buf_alloc(size_t sz, uint32_t align_size = 512, Buftag tag = Buftag::common) {
@@ -364,7 +373,9 @@ public:
         Blob::bytes_ = new_buf;
     }
 
-    bool is_aligned() const { return aligned_; }
+    bool is_aligned() const {
+        return aligned_;
+    }
 
     static IoBlob from_string(const std::string& s) {
         return IoBlob{r_cast< const uint8_t* >(s.data()), uint32_cast(s.size()), false};
@@ -418,6 +429,17 @@ public:
     }
 
     void buf_alloc(size_t sz, uint32_t align_size = 512) { IoBlob::buf_alloc(sz, align_size, tag_); }
+
+    // Release ownership of the internal buffer into a shared_ptr<uint8_t>.  After this call the IoBlobSafe is empty
+    // and will NOT free the buffer on destruction.  The returned shared_ptr uses the same free path as buf_free().
+    shared< uint8_t > release_to_shared_ptr() {
+        auto* p = bytes_;
+        auto t = tag_;
+        auto a = aligned_;
+        bytes_ = nullptr;
+        size_ = 0;
+        return shared< uint8_t >(p, [t, a](uint8_t* ptr) { a ? aligned_free(ptr, t) : ::free(ptr); });
+    }
 };
 
 // ── ByteArray / ByteView ──────────────────────────────────────────────────────
@@ -429,7 +451,20 @@ inline ByteArray make_byte_array(uint32_t sz, uint32_t alignment = 0, Buftag tag
     return std::make_shared< IoBlobSafe >(sz, alignment, tag);
 }
 
-inline ByteArray make_byte_array(IoBlobSafe&& blob) { return std::make_shared< IoBlobSafe >(std::move(blob)); }
+inline ByteArray make_byte_array(IoBlobSafe&& blob) {
+    return std::make_shared< IoBlobSafe >(std::move(blob));
+}
+
+/// Zero-copy ByteArray from a shared_ptr<uint8_t>.  The IoBlobSafe wrapper is heap-allocated (~24 bytes) but the
+/// actual buffer is not copied.  The shared_ptr<uint8_t> is captured in the deleter and freed when the ByteArray
+/// refcount reaches 0.
+inline ByteArray make_byte_array(std::shared_ptr< uint8_t > owner, uint32_t size, bool is_aligned = true) {
+    auto* raw = owner.get();
+    return ByteArray(new IoBlobSafe(raw, size, is_aligned), [o = std::move(owner)](IoBlobSafe* p) {
+        p->set_bytes(nullptr);
+        delete p;
+    });
+}
 
 struct ByteView {
 public:
@@ -535,6 +570,70 @@ private:
     ByteArray buf_;
     uint32_t alignment_{0};
     uint8_t* cur_ptr_{nullptr};
+};
+
+// ── LargeBufBuilder ──────────────────────────────────────────────────────────
+// Chain of fixed-size aligned IoBlobSafe buffers.  append() memcpys into the current buffer; when full, a new one is
+// allocated — no realloc/copy of prior data.  for_each_piece() walks the chain calling cb(IoBlobSafe&) with the
+// buffer's size already set to the used byte count, ready to pass directly to I/O layers.
+
+struct LargeBufBuilder {
+public:
+    LargeBufBuilder() = default;
+    explicit LargeBufBuilder(uint32_t buf_capacity, uint32_t alignment = 512, Buftag tag = Buftag::common) :
+            buf_capacity_{buf_capacity}, alignment_{alignment}, tag_{tag} {}
+
+    void append(Blob const& data) {
+        auto const* src = data.cbytes();
+        uint32_t remaining = data.size();
+
+        while (remaining > 0) {
+            if (bufs_.empty() || last_used_ >= buf_capacity_) {
+                bufs_.emplace_back(buf_capacity_, alignment_, tag_);
+                last_used_ = 0;
+            }
+            uint32_t const space = buf_capacity_ - last_used_;
+            uint32_t const copy_len = std::min(remaining, space);
+            std::memcpy(bufs_.back().bytes() + last_used_, src, copy_len);
+            last_used_ += copy_len;
+            src += copy_len;
+            remaining -= copy_len;
+        }
+    }
+
+    // Consume the builder: moves each buffer out to cb with its size set to the used byte count.
+    // The builder is empty after this call.  cb signature: void(IoBlobSafe&&).
+    template < typename Cb >
+    void consume(Cb&& cb) {
+        for (size_t i = 0; i < bufs_.size(); ++i) {
+            uint32_t const used = (i + 1 < bufs_.size()) ? buf_capacity_ : last_used_;
+            if (used > 0) {
+                bufs_[i].set_size(used);
+                cb(std::move(bufs_[i]));
+            }
+        }
+        bufs_.clear();
+        last_used_ = 0;
+    }
+
+    uint64_t total_bytes() const {
+        if (bufs_.empty()) { return 0; }
+        return (bufs_.size() - 1) * uint64_cast(buf_capacity_) + last_used_;
+    }
+
+    bool empty() const { return bufs_.empty() || (bufs_.size() == 1 && last_used_ == 0); }
+
+    void clear() {
+        bufs_.clear();
+        last_used_ = 0;
+    }
+
+private:
+    std::vector< IoBlobSafe > bufs_;
+    uint32_t last_used_{0};
+    uint32_t buf_capacity_{256 * 4096}; // default 1 MB
+    uint32_t alignment_{512};
+    Buftag tag_{Buftag::common};
 };
 
 } // namespace sisl

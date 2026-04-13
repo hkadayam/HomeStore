@@ -56,14 +56,11 @@ public:
     // Returns an unlocked Node for the NodeCore at the given id (pointer address).
     Node read_node(bnodeid_t id) const override;
 
-    btree_status_t write_node(Node const& node, CPContext* context) override;
-    btree_status_t refresh_node(Node const& node, bool for_read_modify_write, CPContext* context) override;
-    void           remove_node(Node const& node, CPContext* context) override;
-    btree_status_t transact_nodes(NodeList const& new_nodes, NodeList const& freed_nodes,
-                                  Node const& left_child_node, Node const& parent_node,
-                                  CPContext* context) override;
-    BtreeLinkInfo  load_root_node_id() override;
-    btree_status_t on_root_changed(Node const& root, CPContext* context) override;
+    btree_status_t write_node(Node const& node) override;
+    btree_status_t prepare_for_write(Node const& node) override;
+    void remove_node(Node const& node) override;
+    NodeId load_root_node_id() override;
+    btree_status_t on_root_changed(Node const& root) override;
     uint64_t       space_occupied() const override { return 0; }
 
 private:

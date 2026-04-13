@@ -22,36 +22,17 @@ Node MemBtree::read_node(bnodeid_t id) const {
     return Node{handle, LockType::None};
 }
 
-btree_status_t MemBtree::write_node(Node const& node, CPContext*) { return btree_status_t::success; }
+btree_status_t MemBtree::write_node(Node const&) { return btree_status_t::success; }
 
-btree_status_t MemBtree::refresh_node(Node const& node, bool for_read_modify_write, CPContext*) {
-    return btree_status_t::success;
-}
+btree_status_t MemBtree::prepare_for_write(Node const&) { return btree_status_t::success; }
 
-void MemBtree::remove_node(Node const& node, CPContext*) {
-    // MemBtree owns node memory; free via alloc_node_core's reciprocal.
-    // The NodeCore was allocated by BtreeBase::alloc_node_core (placement-new into
-    // allocator-managed buffer). Destroy it the same way the allocator expects.
+void MemBtree::remove_node(Node const& node) {
+    // MemBtree owns node memory; NodeCore was allocated by BtreeBase::alloc_node_core.
     delete node.operator->();
 }
 
-btree_status_t MemBtree::transact_nodes(NodeList const& new_nodes, NodeList const& freed_nodes,
-                                        Node const& left_child_node, Node const& parent_node,
-                                        CPContext* context) {
-    for (auto const& node : new_nodes) {
-        m_base_btree.write_node(node, context);
-    }
-    m_base_btree.write_node(left_child_node, context);
-    m_base_btree.write_node(parent_node, context);
+NodeId MemBtree::load_root_node_id() { return NodeId{empty_bnodeid}; }
 
-    for (auto const& node : freed_nodes) {
-        m_base_btree.remove_node(node, context);
-    }
-    return btree_status_t::success;
-}
-
-BtreeLinkInfo MemBtree::load_root_node_id() { return BtreeLinkInfo{empty_bnodeid, 0}; }
-
-btree_status_t MemBtree::on_root_changed(Node const&, CPContext*) { return btree_status_t::success; }
+btree_status_t MemBtree::on_root_changed(Node const&) { return btree_status_t::success; }
 
 } // namespace homestore

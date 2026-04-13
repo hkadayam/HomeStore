@@ -1,80 +1,119 @@
 #pragma once
 
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <mutex>
 #include <vector>
-#include <atomic>
-#include <unordered_map>
 
-#include <sisl/cache/simple_cache.hpp>
+#include <boost/uuid/uuid.hpp>
+
+#include <folly/coro/Task.h>
+
+#include "sisl/cache/cache.h"
+#include "sisl/cache/two_q_evictor.h"
+
+#include "common/defs.h"
 #include <homestore/blk.h>
-#include <homestore/index/btree/btree_store.h>
-#include <homestore/index/btree/detail/btree_internal.h>
-#include <homestore/superblk_handler.hpp>
 #include <homestore/checkpoint/cp_mgr.h>
-#include <homestore/index_service.hpp>
-#include "common/homestore_utils.hpp"
-#include "index/cow_btree/cow_btree.h"
+#include <homestore/index/btree/detail/btree_internal.h>
+
+#include "iomanager/drive_interface.hpp" // IOBuffer
+#include "meta/meta_blk.h"
 
 namespace homestore {
-class COWBtreeCPContext;
-class VirtualDev;
+class BtreeBase;
+struct OverflowEntry;
 
-class COWBtreeStore : public BtreeStore {
-public:
+// ──────────────────────────────────────── COWBtreeSuperBlock ─────────────────────────────────────────────────────────
+// Per-btree metablk payload.  `btree_name` doubles as the BlobDev device name (one BlobDev per COWBtree).
 #pragma pack(1)
-    struct Journal : public IndexStoreSuperBlock {
-    public:
-        cp_id_t cp_id;                   // CP Id for this journal, we have one meta blk which contains journal per CP
-        uint32_t size{sizeof(Journal)};  // Total journal size
-        uint32_t num_btrees{0};          // Total number of btrees updated in this
+struct COWBtreeSuperBlock {
+    boost::uuids::uuid uuid{};
+    boost::uuids::uuid parent_uuid{};
+    uint32_t ordinal{0};
+    uint32_t node_size{0};
+    char btree_name[64]{};
+    bnodeid_t root_node_id{empty_bnodeid};
 
-        // Followed by multiple cowbtree journals
-    };
+    uint64_t node_stream_id{0};
+    uint64_t overflow_stream_id{0};
+    uint64_t incr_map_stream_id{0};
+    uint64_t full_map_stream_ids[2]{0, 0};
+    cp_id_t last_full_map_cp_id{-1};
+
+    uint32_t user_sb_size{0};
+
+    uint8_t* user_sb_data() { return r_cast< uint8_t* >(this) + sizeof(COWBtreeSuperBlock); }
+    uint8_t const* user_sb_data() const { return r_cast< uint8_t const* >(this) + sizeof(COWBtreeSuperBlock); }
+
+    void set_btree_name(std::string const& name) {
+        std::memset(btree_name, 0, sizeof(btree_name));
+        std::strncpy(btree_name, name.c_str(), sizeof(btree_name) - 1);
+    }
+};
 #pragma pack()
 
-private:
-    shared< VirtualDev > m_vdev;
-
-    shared< sisl::SimpleCache< bnodeid_t, BtreeNodePtr > > m_cache;
-
-    // List of fibers to flush (note that this could be on multiple threads)
-    std::vector< iomgr::io_fiber_t > m_cp_flush_fibers;
-
-    // All loaded journals arranged by the btree ordinals
-    std::unordered_map< uint32_t, std::vector< unique< COWBtree::Journal > > > m_journals_by_btree;
-
-    // All journals maintained (sorted) by its cp_id
-    std::vector< superblk< IndexStoreSuperBlock > > m_journals_by_cpid;
-
-    // Total number of incremental cp flushes since last full flushes
-    uint32_t m_num_incremental_flushes{0};
-
-    BtreeNode::Allocator::Token m_bufalloc_token;
-
+// ──────────────────────────────────────── COWBtreeManager ───────────────────────────────────────────────────────────
+class COWBtreeManager : public std::enable_shared_from_this< COWBtreeManager > {
 public:
-    COWBtreeStore(shared< VirtualDev > vdev, std::vector< superblk< IndexStoreSuperBlock > > store_sbs);
-    virtual ~COWBtreeStore() = default;
-    void stop() override;
+    using NodeCache = sisl::Cache< bnodeid_t, unique< NodeCore > >;
+    using OverflowCache = sisl::Cache< BlkId, OverflowEntry >;
 
-    //////////////////////// Override of IndexStore Interfaces //////////////////////////
-    std::string store_type() const override { return "COW_BTREE"; }
-    void on_recovery_completed() override;
+    // Called from HomeStore::do_start().  Registers with cp_mgr, reads persisted metablks from meta service, stashes
+    // them for the upper layer to iterate.  Registered in Managers as cow_btree_mgr().
+    // First-time boot: construct an empty manager, register with cp_mgr, install in Managers.
+    static folly::coro::Task< void > create();
 
-    ////////////////// Override Implementation of underlying store requirements //////////////////
-    unique< UnderlyingBtree > create_underlying_btree(BtreeBase& btree, bool load_existing) override;
-    folly::Future< folly::Unit > destroy_underlying_btree(BtreeBase& bt) override;
-    // void on_node_freed(BtreeNode* node) override;
-    bool is_fast_destroy_supported() const override { return true; }
-    bool is_ephemeral() const { return false; }
-    uint32_t max_node_size() const override;
-    uint32_t align_size() const;
-    uint32_t max_capacity() const;
+    // Recovery boot: same as create(), plus read all persisted COWBtree metablks and stash them for the upper layer
+    // to iterate via list_persisted_btrees().
+    static folly::coro::Task< void > load();
 
-    // Implemenations for flush
-    folly::Future< bool > async_cp_flush(COWBtreeCPContext* cp_ctx);
-    uint32_t parallel_map_flushers_count() const;
+    void shutdown();
+
+    std::vector< COWBtreeSuperBlock const* > list_persisted_btrees() const;
+
+    template < typename K, typename V >
+    folly::coro::Task< shared< BtreeBase > > create_cow_btree(BtreeConfig const& cfg, shared< BlobDev > blob_dev,
+                                                              sisl::Blob const& user_sb = {});
+
+    template < typename K, typename V >
+    shared< BtreeBase > load_cow_btree(BtreeConfig const& cfg, COWBtreeSuperBlock const& sb);
+
+    folly::coro::Task< void > destroy_cow_btree(cshared< BtreeBase >& base);
 
 private:
-    void flush_map(COWBtreeCPContext* cp_ctx);
-    void load_journal(superblk< IndexStoreSuperBlock >& store_journal);
+    COWBtreeManager();
+
+    class CPCallbacksImpl : public CPCallbacks {
+    public:
+        explicit CPCallbacksImpl(COWBtreeManager& mgr) : mgr_{mgr} {}
+        void on_switchover_cp(CP* cur_cp, CP* new_cp) override;
+        folly::coro::Task< bool > cp_flush(CP* cp) override;
+        void cp_cleanup(CP* cp) override;
+        int cp_progress_percent() override;
+
+    private:
+        COWBtreeManager& mgr_;
+    };
+
+    void track(cshared< BtreeBase >& bt);
+
+    struct PersistedBtreeInfo {
+        COWBtreeSuperBlock sb;
+        MetaBlk mblk;
+    };
+
+    shared< sisl::TwoQEvictor > evictor_;
+    shared< NodeCache > node_cache_;
+    shared< OverflowCache > overflow_cache_;
+
+    std::mutex tracking_mtx_;
+    std::vector< shared< BtreeBase > > tracked_btrees_;
+    std::vector< PersistedBtreeInfo > pending_btrees_;
+    std::atomic< uint32_t > next_ordinal_{0};
+    unique< CPCallbacksImpl > cp_callbacks_;
+    uint32_t num_incremental_flushes_{0};
 };
+
 } // namespace homestore

@@ -22,7 +22,8 @@
 #include <sisl/fds/buffer.h>
 #include <sisl/logging/logging.h>
 #include <sisl/version.h>
-#include <sisl/cache/lru_evictor.hpp>
+// LRUEvictor is being refactored — temporarily not constructed.
+// #include <sisl/cache/lru_evictor.h>
 
 #include <homestore/blkdata_service.hpp>
 #include <homestore/meta_service.hpp>
@@ -290,7 +291,10 @@ void HomeStore::do_start() {
     const auto& inp_params = HomeStoreStaticConfig::instance().input;
 
     uint64_t cache_size = resource_mgr().get_cache_size();
-    m_evictor = std::make_shared< sisl::LRUEvictor >(cache_size, HS_DYNAMIC_CONFIG(generic.cache_evictor_npartitions));
+    // LRUEvictor stubbed during cache refactor; m_evictor will be reconstructed
+    // when the new TwoQEvictor-based shared cache lands.
+    // m_evictor = std::make_shared< sisl::LRUEvictor >(cache_size, HS_DYNAMIC_CONFIG(generic.cache_evictor_npartitions));
+    (void)cache_size;
 
     if (m_before_services_starting_cb) { m_before_services_starting_cb(); }
 

@@ -18,7 +18,7 @@
 #include <vector>
 
 #include <gtest/gtest.h>
-#include <sisl/cache/lru_evictor.hpp>
+#include <sisl/cache/lru_evictor.h>
 
 // ── test helpers ────────────────────────────────────────────────────────────────
 

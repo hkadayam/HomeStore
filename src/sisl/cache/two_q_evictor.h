@@ -24,11 +24,11 @@
 #include <vector>
 
 #include <boost/intrusive/list.hpp>
-#include <sisl/cache/hash_entry_base.hpp>
+#include <sisl/cache/cache_node.h>
 
 namespace sisl {
 
-// ── TwoQEvictor ───────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────── TwoQEvictor ──────────────────────────────────────────────────────
 //
 // Eviction policy: 2Q with CLOCK approximation on the hot queue.
 //
@@ -42,7 +42,7 @@ namespace sisl {
 //       a ghost hit on the next insert causes direct hot insertion.
 //
 //   Hot queue (CLOCK approximation)
-//     - Entries that were accessed at least twice while cold, or inserted directly via CacheHint::READ_WRITE (writepath
+//     - Entries that were accessed at least twice while cold, or inserted directly via CacheHint::HOT (writepath
 //       / mutations).
 //     - Reads while in hot set the CLOCK_BIT (lock-free atomic).
 //     - Reads set the CLOCK_BIT atomically (no lock, no list movement).
@@ -64,11 +64,11 @@ namespace sisl {
 //     COLD_ACCESSED) are atomics → no lock on reads.
 //   - refcount_ is atomic → no lock on acquire/release. total_size_ is a single atomic across all partitions.
 //
-// ──────────────────────────────────────────────────────────────────────────────
 class TwoQEvictor {
 public:
-    // Called when the evictor decides to evict an entry (remove from hashmap).
+    // Called when the evictor decides to evict an entry.
     using evict_fn_t = std::function< void(CacheRecord&) >;
+
     // Called specifically when a cold-queue entry is evicted (cache adds key to ghost list).
     using cold_evict_fn_t = std::function< void(CacheRecord&) >;
 
@@ -80,30 +80,49 @@ public:
         float low_wm_pct = 0.75f;    // evictor sleeps when size < this
     };
 
-    TwoQEvictor(const Config& cfg, evict_fn_t evict_fn, cold_evict_fn_t cold_evict_fn = nullptr);
+    explicit TwoQEvictor(Config const& cfg);
     ~TwoQEvictor();
 
     TwoQEvictor(const TwoQEvictor&) = delete;
     TwoQEvictor& operator=(const TwoQEvictor&) = delete;
 
-    // ── called by Cache<K,V> ─────────────────────────────────────────────────
+    // Register/unregister a cache family.  Each Cache instance registers as a separate family so the evictor can
+    // dispatch eviction callbacks to the right Cache based on CacheRecord::record_family_id().
+    uint32_t register_family(evict_fn_t evict_fn, cold_evict_fn_t cold_evict_fn = nullptr);
+    void unregister_family(uint32_t family_id);
 
-    // Register a newly inserted entry in the cold queue.
-    void add_to_cold(uint64_t hash_code, CacheRecord& record, uint32_t entry_size);
+    // ─────────────────────────────────────────── called by Cache<K,V> ────────────────────────────────────────────────
+    //
+    // The evictor partitions records purely for concurrency sharding; the partition is derived from the record's
+    // address inside the evictor.  The cache layer must call record.set_size(...) before add_to_hot/add_to_cold so the
+    // evictor can read the size from the record itself — no entry_size parameter is passed.
+
+    // Register a newly inserted entry in the cold queue.  Caller must have set record.set_size(...) first.
+    void add_to_cold(CacheRecord& record);
 
     // Register a newly inserted entry directly in the hot queue (write path or ghost hit).
-    void add_to_hot(uint64_t hash_code, CacheRecord& record, uint32_t entry_size);
+    void add_to_hot(CacheRecord& record);
 
-    // Promote an existing cold entry to the hot queue (called after COLD_ACCESSED
-    // bit indicates second access, or on ghost hit at insert time).
-    // Caller must ensure the entry is still in the cold queue (check is_in_hot_queue()).
-    void promote_to_hot(uint64_t hash_code, CacheRecord& record);
+    // Promote an existing cold entry to the hot queue (called after COLD_ACCESSED bit indicates second access, or on
+    // ghost hit at insert time).  Caller must ensure the entry is still in the cold queue (check is_in_hot_queue()).
+    void promote_to_hot(CacheRecord& record);
 
     // Remove an entry that is being explicitly erased (no eviction callback fired).
-    void remove_record(uint64_t hash_code, CacheRecord& record);
+    void remove_record(CacheRecord& record);
 
-    // ── statistics ───────────────────────────────────────────────────────────
+    // Stop the background eviction thread.  Idempotent.  Called by Cache::~Cache before tearing down the hashmap so
+    // no callbacks fire mid-shutdown.  After stop() returns the evictor will not call evict_fn_ / cold_evict_fn_.
+    void stop();
+
+    // Drain all hot/cold lists, unlinking every record without calling any callbacks.
+    void drain_all_lists();
+
+    // Drain only records belonging to a specific family from all hot/cold lists.  Used by Cache::~Cache when the
+    // evictor is shared — other families' records stay linked.
+    void drain_family(uint32_t family_id);
+
     int64_t total_size() const { return total_size_.load(std::memory_order_relaxed); }
+    uint32_t num_partitions() const { return to_u32(partitions_.size()); }
 
 private:
     using EvictList = boost::intrusive::list<
@@ -129,7 +148,7 @@ private:
         Partition& operator=(const Partition&) = delete;
     };
 
-    // ── background thread ────────────────────────────────────────────────────
+    // ────────────────────────────────────────────── background thread ────────────────────────────────────────────────
     void evictor_thread_fn();
     void evict_to_low_watermark();
 
@@ -141,7 +160,12 @@ private:
     // Evicts the cold tail if it is evictable. Returns true on success.
     bool evict_cold_tail(Partition& p);
 
-    Partition& get_partition(uint64_t hash_code) { return *partitions_[hash_code % partitions_.size()]; }
+    // Partition selector — derives a stable partition from the record's address (allocator-managed addresses are well
+    // distributed in the relevant bits, and the record's address is stable for its lifetime in the evictor).
+    Partition& get_partition(CacheRecord const& record) {
+        auto const bits = r_cast< std::uintptr_t >(&record) >> 6; // skip cache-line alignment bits
+        return *partitions_[bits % partitions_.size()];
+    }
 
     // Use unique_ptr so Partition objects are stable in memory (no moves after construction).
     std::vector< std::unique_ptr< Partition > > partitions_;
@@ -150,8 +174,13 @@ private:
     int64_t high_watermark_;
     int64_t low_watermark_;
 
-    evict_fn_t evict_fn_;
-    cold_evict_fn_t cold_evict_fn_;
+    struct Family {
+        evict_fn_t evict_fn;
+        cold_evict_fn_t cold_evict_fn;
+        bool registered{false};
+    };
+    std::array< Family, CacheRecord::max_record_families() > families_;
+    std::mutex families_mtx_;
 
     std::thread evictor_thread_;
     std::mutex cv_mutex_;

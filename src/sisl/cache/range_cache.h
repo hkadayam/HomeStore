@@ -16,9 +16,13 @@
  *********************************************************************************/
 #pragma once
 
+// range_cache is being refactored against the new CacheRecord / HashmapTraits
+// design.  Stubbed out so the rest of the cache subsystem builds.
+#if 0
+
 #include <set>
-#include <sisl/cache/evictor.hpp>
-#include <sisl/cache/range_hashmap.hpp>
+#include <sisl/cache/evictor.h>
+#include <sisl/cache/range_hashmap.h>
 
 namespace sisl {
 
@@ -114,3 +118,5 @@ private:
 template < typename K >
 thread_local std::set< RangeKey< K > > RangeCache< K >::t_failed_keys;
 } // namespace sisl
+
+#endif // 0 — range_cache stubbed out during cache refactor

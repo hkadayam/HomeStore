@@ -16,11 +16,15 @@
  *********************************************************************************/
 #pragma once
 
+// Evictor abstract base — stubbed out during cache refactor (TwoQEvictor no
+// longer derives from this).  Restore by removing the #if 0 wrapper.
+#if 0
+
 #include <array>
 #include <mutex>
 #include <functional>
 #include <sisl/logging/logging.h>
-#include <sisl/cache/hash_entry_base.hpp>
+#include <sisl/cache/hash_entry_base.h>
 #include <spdlog/fmt/fmt.h>
 
 namespace sisl {
@@ -82,3 +86,5 @@ private:
     std::array< RecordFamily, CacheRecord::max_record_families() > m_record_families;
 };
 } // namespace sisl
+
+#endif // 0

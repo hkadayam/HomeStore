@@ -12,461 +12,336 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
+//
+// Tests for the refactored SimpleHashMap<K, V>:
+//   - non-refcounted V (plain hashmap usage; trait is no-op)
+//   - refcounted V via a custom trait specialisation
+//   - erase_if_no_reference, update_or_erase, find/insert/upsert/erase
+//
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
-#include <sisl/cache/simple_hashmap.hpp>
+#include <sisl/cache/simple_hashmap.h>
 
-// ── helpers ─────────────────────────────────────────────────────────────────────
+// ── non-refcounted V ────────────────────────────────────────────────────────
 
-struct TestValue {
-    uint64_t id{0};
+struct PlainValue {
+    uint64_t    id{0};
     std::string payload;
 };
 
-static uint64_t extract_key(const TestValue& v) { return v.id; }
+static uint64_t plain_extract_key(PlainValue const& v) { return v.id; }
 
-using TestHashMap = sisl::SimpleHashMap< uint64_t, TestValue >;
+using PlainMap = sisl::SimpleHashMap< uint64_t, PlainValue >;
 
-// Track all hash operations reported through the access callback.
-struct OpLog {
-    uint32_t creates{0};
-    uint32_t accesses{0};
-    uint32_t deletes{0};
-};
-
-static thread_local OpLog t_op_log;
-
-static void access_cb(const sisl::ValueEntryBase& /*entry*/, const uint64_t& /*key*/, const TestValue& /*value*/,
-                       const sisl::hash_op_t op) {
-    switch (op) {
-    case sisl::hash_op_t::CREATE: ++t_op_log.creates; break;
-    case sisl::hash_op_t::ACCESS: ++t_op_log.accesses; break;
-    case sisl::hash_op_t::DELETE: ++t_op_log.deletes; break;
-    default: break;
-    }
-}
-
-class SimpleHashMapTest : public ::testing::Test {
+class PlainHashMapTest : public ::testing::Test {
 protected:
     static constexpr uint32_t NUM_BUCKETS = 16;
+    std::unique_ptr< PlainMap > map_;
 
-    void SetUp() override { t_op_log = {}; }
-
-    std::unique_ptr< TestHashMap > make_map(bool with_cb = true) {
-        if (with_cb) {
-            return std::make_unique< TestHashMap >(NUM_BUCKETS, extract_key, access_cb);
-        }
-        return std::make_unique< TestHashMap >(NUM_BUCKETS, extract_key);
-    }
+    void SetUp() override { map_ = std::make_unique< PlainMap >(NUM_BUCKETS, plain_extract_key); }
+    void TearDown() override { map_.reset(); }
 };
 
-// ── basic insert / get / erase ──────────────────────────────────────────────────
+// ── basic insert / find / erase ────────────────────────────────────────────
 
-TEST_F(SimpleHashMapTest, InsertAndGet) {
-    auto map = make_map();
+TEST_F(PlainHashMapTest, InsertAndFind) {
+    auto h = map_->insert(1, PlainValue{1, "hello"});
+    ASSERT_TRUE(h);
+    EXPECT_EQ(h->id, 1u);
+    EXPECT_EQ(h->payload, "hello");
 
-    TestValue v{1, "hello"};
-    EXPECT_TRUE(map->insert(1, v));
-    EXPECT_EQ(t_op_log.creates, 1u);
+    h = {}; // release
 
-    TestValue out;
-    EXPECT_TRUE(map->get(1, out));
-    EXPECT_EQ(out.id, 1u);
-    EXPECT_EQ(out.payload, "hello");
-    EXPECT_EQ(t_op_log.accesses, 1u);
+    auto found = map_->find(1);
+    ASSERT_TRUE(found);
+    EXPECT_EQ(found->id, 1u);
+    EXPECT_EQ(found->payload, "hello");
 }
 
-TEST_F(SimpleHashMapTest, InsertDuplicate) {
-    auto map = make_map();
+TEST_F(PlainHashMapTest, InsertDuplicate) {
+    auto h1 = map_->insert(1, PlainValue{1, "first"});
+    ASSERT_TRUE(h1);
+    h1 = {};
 
-    TestValue v1{1, "first"};
-    TestValue v2{1, "second"};
-    EXPECT_TRUE(map->insert(1, v1));
-    EXPECT_FALSE(map->insert(1, v2));
+    auto h2 = map_->insert(1, PlainValue{1, "second"});
+    EXPECT_FALSE(h2);
 
-    TestValue out;
-    EXPECT_TRUE(map->get(1, out));
-    EXPECT_EQ(out.payload, "first"); // original value preserved
+    auto found = map_->find(1);
+    ASSERT_TRUE(found);
+    EXPECT_EQ(found->payload, "first"); // original preserved
 }
 
-TEST_F(SimpleHashMapTest, GetMissing) {
-    auto map = make_map();
-    TestValue out;
-    EXPECT_FALSE(map->get(42, out));
+TEST_F(PlainHashMapTest, FindMissing) {
+    auto h = map_->find(42);
+    EXPECT_FALSE(h);
 }
 
-TEST_F(SimpleHashMapTest, EraseExisting) {
-    auto map = make_map();
+TEST_F(PlainHashMapTest, EraseExisting) {
+    { map_->insert(1, PlainValue{1, "data"}); }
+    EXPECT_TRUE(map_->erase(1));
 
-    TestValue v{1, "data"};
-    map->insert(1, v);
-
-    TestValue out;
-    EXPECT_TRUE(map->erase(1, out));
-    EXPECT_EQ(out.id, 1u);
-    EXPECT_EQ(out.payload, "data");
-    EXPECT_EQ(t_op_log.deletes, 1u);
-
-    // Gone after erase
-    EXPECT_FALSE(map->get(1, out));
+    auto h = map_->find(1);
+    EXPECT_FALSE(h);
 }
 
-TEST_F(SimpleHashMapTest, EraseMissing) {
-    auto map = make_map();
-    TestValue out;
-    EXPECT_FALSE(map->erase(999, out));
+TEST_F(PlainHashMapTest, EraseMissing) { EXPECT_FALSE(map_->erase(999)); }
+
+// ── upsert ─────────────────────────────────────────────────────────────────
+
+TEST_F(PlainHashMapTest, UpsertInserts) {
+    auto h = map_->upsert(5, PlainValue{5, "five"});
+    ASSERT_TRUE(h);
+    EXPECT_EQ(h->payload, "five");
+    h = {};
+
+    auto f = map_->find(5);
+    ASSERT_TRUE(f);
+    EXPECT_EQ(f->payload, "five");
 }
 
-// ── upsert ──────────────────────────────────────────────────────────────────────
-
-TEST_F(SimpleHashMapTest, UpsertInserts) {
-    auto map = make_map();
-    TestValue v{5, "five"};
-    EXPECT_TRUE(map->upsert(5, v)); // returns true = new entry
-    EXPECT_EQ(t_op_log.creates, 1u);
-
-    TestValue out;
-    EXPECT_TRUE(map->get(5, out));
-    EXPECT_EQ(out.payload, "five");
+TEST_F(PlainHashMapTest, UpsertOverwrites) {
+    { map_->upsert(5, PlainValue{5, "five"}); }
+    auto h = map_->upsert(5, PlainValue{5, "FIVE"});
+    ASSERT_TRUE(h);
+    EXPECT_EQ(h->payload, "FIVE");
 }
 
-TEST_F(SimpleHashMapTest, UpsertOverwrites) {
-    auto map = make_map();
-    TestValue v1{5, "five"};
-    TestValue v2{5, "FIVE"};
+// ── update_or_erase ────────────────────────────────────────────────────────
 
-    map->upsert(5, v1);
-    EXPECT_FALSE(map->upsert(5, v2)); // returns false = existed
-
-    TestValue out;
-    map->get(5, out);
-    EXPECT_EQ(out.payload, "FIVE"); // overwritten
-}
-
-// ── update ──────────────────────────────────────────────────────────────────────
-
-TEST_F(SimpleHashMapTest, UpdateExisting) {
-    auto map = make_map();
-    TestValue v{10, "before"};
-    map->insert(10, v);
-
-    EXPECT_TRUE(map->update(10, [](TestValue& val) { val.payload = "after"; }));
-
-    TestValue out;
-    map->get(10, out);
-    EXPECT_EQ(out.payload, "after");
-}
-
-TEST_F(SimpleHashMapTest, UpdateMissing) {
-    auto map = make_map();
-    EXPECT_FALSE(map->update(99, [](TestValue& val) { val.payload = "x"; }));
-}
-
-// ── upsert_or_delete ────────────────────────────────────────────────────────────
-
-TEST_F(SimpleHashMapTest, UpsertOrDeleteCreates) {
-    auto map = make_map();
-    // When not found, the callback receives a default-constructed value.
-    // Return false to keep it (don't delete).
-    bool was_new = map->upsert_or_delete(20, [](TestValue& v, bool found) -> bool {
+TEST_F(PlainHashMapTest, UpdateOrEraseCreates) {
+    bool was_new = map_->update_or_erase(20, [](PlainValue& v, bool found) {
         EXPECT_FALSE(found);
-        v.id = 20;
+        v.id      = 20;
         v.payload = "created";
-        return false; // keep
+        return PlainMap::UpdateAction::Keep;
     });
     EXPECT_TRUE(was_new);
 
-    TestValue out;
-    EXPECT_TRUE(map->get(20, out));
-    EXPECT_EQ(out.payload, "created");
+    auto h = map_->find(20);
+    ASSERT_TRUE(h);
+    EXPECT_EQ(h->payload, "created");
 }
 
-TEST_F(SimpleHashMapTest, UpsertOrDeleteUpdates) {
-    auto map = make_map();
-    TestValue v{20, "original"};
-    map->insert(20, v);
+TEST_F(PlainHashMapTest, UpdateOrEraseUpdates) {
+    { map_->insert(20, PlainValue{20, "original"}); }
 
-    bool was_new = map->upsert_or_delete(20, [](TestValue& v, bool found) -> bool {
+    bool was_new = map_->update_or_erase(20, [](PlainValue& v, bool found) {
         EXPECT_TRUE(found);
         v.payload = "updated";
-        return false; // keep
+        return PlainMap::UpdateAction::Keep;
     });
     EXPECT_FALSE(was_new);
 
-    TestValue out;
-    map->get(20, out);
-    EXPECT_EQ(out.payload, "updated");
+    auto h = map_->find(20);
+    ASSERT_TRUE(h);
+    EXPECT_EQ(h->payload, "updated");
 }
 
-TEST_F(SimpleHashMapTest, UpsertOrDeleteDeletes) {
-    auto map = make_map();
-    TestValue v{20, "doomed"};
-    map->insert(20, v);
+TEST_F(PlainHashMapTest, UpdateOrEraseDeletes) {
+    { map_->insert(20, PlainValue{20, "doomed"}); }
 
-    map->upsert_or_delete(20, [](TestValue& /*v*/, bool found) -> bool {
+    map_->update_or_erase(20, [](PlainValue&, bool found) {
         EXPECT_TRUE(found);
-        return true; // delete
+        return PlainMap::UpdateAction::Erase;
     });
 
-    TestValue out;
-    EXPECT_FALSE(map->get(20, out));
+    auto h = map_->find(20);
+    EXPECT_FALSE(h);
 }
 
-// ── find_and_acquire / insert_and_acquire ────────────────────────────────────────
+// ── erase_if_no_reference (non-refcounted V → always succeeds) ─────────────
 
-TEST_F(SimpleHashMapTest, FindAndAcquireHit) {
-    auto map = make_map();
-    TestValue v{7, "seven"};
-    map->insert(7, v);
+TEST_F(PlainHashMapTest, EraseIfNoReferenceAlwaysSucceedsNonRefcounted) {
+    { map_->insert(7, PlainValue{7, "seven"}); }
+    EXPECT_TRUE(map_->erase_if_no_reference(7));
 
-    size_t hash = TestHashMap::compute_hash(7);
-    auto [entry, val_ptr] = map->find_and_acquire(hash, 7);
-    ASSERT_NE(entry, nullptr);
-    ASSERT_NE(val_ptr, nullptr);
-    EXPECT_EQ(val_ptr->id, 7u);
-    EXPECT_EQ(val_ptr->payload, "seven");
-
-    // Entry's refcount should be non-zero (not evictable)
-    EXPECT_FALSE(entry->is_evictable());
-
-    // Release restores evictability
-    entry->release();
-    EXPECT_TRUE(entry->is_evictable());
+    auto h = map_->find(7);
+    EXPECT_FALSE(h);
 }
 
-TEST_F(SimpleHashMapTest, FindAndAcquireMiss) {
-    auto map = make_map();
-    size_t hash = TestHashMap::compute_hash(42);
-    auto [entry, val_ptr] = map->find_and_acquire(hash, 42);
-    EXPECT_EQ(entry, nullptr);
-    EXPECT_EQ(val_ptr, nullptr);
-}
+// ── bulk operations ───────────────────────────────────────────────────────
 
-TEST_F(SimpleHashMapTest, InsertAndAcquireNew) {
-    auto map = make_map();
-    TestValue v{8, "eight"};
-    size_t hash = TestHashMap::compute_hash(8);
-
-    auto* entry = map->insert_and_acquire(hash, 8, v);
-    ASSERT_NE(entry, nullptr);
-    EXPECT_FALSE(entry->is_evictable()); // refcount > 0
-
-    entry->release();
-    EXPECT_TRUE(entry->is_evictable());
-}
-
-TEST_F(SimpleHashMapTest, InsertAndAcquireDuplicate) {
-    auto map = make_map();
-    TestValue v{8, "eight"};
-    map->insert(8, v);
-
-    size_t hash = TestHashMap::compute_hash(8);
-    auto* entry = map->insert_and_acquire(hash, 8, v);
-    EXPECT_EQ(entry, nullptr); // duplicate
-}
-
-// ── bulk operations ─────────────────────────────────────────────────────────────
-
-TEST_F(SimpleHashMapTest, BulkInsertGetErase) {
-    auto map = make_map(false /* no access_cb */);
+TEST_F(PlainHashMapTest, BulkInsertFindErase) {
     constexpr uint32_t N = 1000;
 
     for (uint32_t i = 0; i < N; ++i) {
-        TestValue v{i, std::to_string(i)};
-        EXPECT_TRUE(map->insert(i, v));
+        auto h = map_->insert(i, PlainValue{i, std::to_string(i)});
+        EXPECT_TRUE(h);
     }
 
-    // Verify all present
     for (uint32_t i = 0; i < N; ++i) {
-        TestValue out;
-        EXPECT_TRUE(map->get(i, out));
-        EXPECT_EQ(out.id, i);
+        auto h = map_->find(i);
+        ASSERT_TRUE(h);
+        EXPECT_EQ(h->id, i);
     }
 
     // Erase even keys
     for (uint32_t i = 0; i < N; i += 2) {
-        TestValue out;
-        EXPECT_TRUE(map->erase(i, out));
+        EXPECT_TRUE(map_->erase(i));
     }
 
-    // Verify odds remain, evens gone
     for (uint32_t i = 0; i < N; ++i) {
-        TestValue out;
+        auto h = map_->find(i);
         if (i % 2 == 0) {
-            EXPECT_FALSE(map->get(i, out));
+            EXPECT_FALSE(h);
         } else {
-            EXPECT_TRUE(map->get(i, out));
-            EXPECT_EQ(out.id, i);
+            ASSERT_TRUE(h);
+            EXPECT_EQ(h->id, i);
         }
     }
 }
 
-// ── access callback tracking ────────────────────────────────────────────────────
+// ── concurrent operations ─────────────────────────────────────────────────
 
-TEST_F(SimpleHashMapTest, AccessCallbackCounts) {
-    auto map = make_map();
-    constexpr uint32_t N = 50;
-
-    for (uint32_t i = 0; i < N; ++i) {
-        TestValue v{i, ""};
-        map->insert(i, v);
-    }
-    EXPECT_EQ(t_op_log.creates, N);
-
-    // Read all entries
-    for (uint32_t i = 0; i < N; ++i) {
-        TestValue out;
-        map->get(i, out);
-    }
-    EXPECT_EQ(t_op_log.accesses, N);
-
-    // Delete all entries
-    for (uint32_t i = 0; i < N; ++i) {
-        TestValue out;
-        map->erase(i, out);
-    }
-    EXPECT_EQ(t_op_log.deletes, N);
-}
-
-// ── no-callback constructor ─────────────────────────────────────────────────────
-
-TEST_F(SimpleHashMapTest, NullAccessCallback) {
-    auto map = make_map(false);
-    TestValue v{1, "x"};
-    EXPECT_TRUE(map->insert(1, v));
-
-    TestValue out;
-    EXPECT_TRUE(map->get(1, out));
-    EXPECT_TRUE(map->erase(1, out));
-    // Just verifying no crash with null callback
-}
-
-// ── concurrent insert/get ───────────────────────────────────────────────────────
-
-TEST_F(SimpleHashMapTest, ConcurrentInsertGet) {
-    auto map = make_map(false);
+TEST_F(PlainHashMapTest, ConcurrentInsertFind) {
     constexpr uint32_t KEYS_PER_THREAD = 500;
-    constexpr uint32_t NUM_THREADS = 4;
+    constexpr uint32_t NUM_THREADS     = 4;
 
     std::vector< std::thread > threads;
     for (uint32_t t = 0; t < NUM_THREADS; ++t) {
-        threads.emplace_back([&map, t]() {
+        threads.emplace_back([this, t]() {
             uint64_t base = t * KEYS_PER_THREAD;
-            // Insert this thread's key range
             for (uint32_t i = 0; i < KEYS_PER_THREAD; ++i) {
-                TestValue v{base + i, std::to_string(base + i)};
-                map->insert(base + i, v);
+                map_->insert(base + i, PlainValue{base + i, std::to_string(base + i)});
             }
-            // Read back and verify
             for (uint32_t i = 0; i < KEYS_PER_THREAD; ++i) {
-                TestValue out;
-                EXPECT_TRUE(map->get(base + i, out));
-                EXPECT_EQ(out.id, base + i);
+                auto h = map_->find(base + i);
+                EXPECT_TRUE(h);
+                if (h) { EXPECT_EQ(h->id, base + i); }
             }
         });
     }
-    for (auto& th : threads) {
-        th.join();
-    }
+    for (auto& th : threads) th.join();
 
-    // Verify all keys from all threads are present
     for (uint32_t t = 0; t < NUM_THREADS; ++t) {
         uint64_t base = t * KEYS_PER_THREAD;
         for (uint32_t i = 0; i < KEYS_PER_THREAD; ++i) {
-            TestValue out;
-            EXPECT_TRUE(map->get(base + i, out));
+            auto h = map_->find(base + i);
+            EXPECT_TRUE(h);
         }
     }
 }
 
-// ── concurrent insert/erase ─────────────────────────────────────────────────────
-
-TEST_F(SimpleHashMapTest, ConcurrentInsertErase) {
-    auto map = make_map(false);
+TEST_F(PlainHashMapTest, ConcurrentInsertErase) {
     constexpr uint32_t N = 200;
 
-    // Thread 0 inserts 0..N-1, thread 1 erases 0..N-1 concurrently.
-    // Some erases will miss (not yet inserted) — that's expected.
-    // After both finish, every key is either absent or present (no corruption).
-
-    // Pre-insert all so erase has something to find
     for (uint32_t i = 0; i < N; ++i) {
-        TestValue v{i, ""};
-        map->insert(i, v);
+        map_->insert(i, PlainValue{i, ""});
     }
 
     std::thread inserter([&]() {
         for (uint32_t i = 0; i < N; ++i) {
-            TestValue v{i + N, "new"};
-            map->insert(i + N, v);
+            map_->insert(i + N, PlainValue{i + N, "new"});
         }
     });
 
     std::thread eraser([&]() {
         for (uint32_t i = 0; i < N; ++i) {
-            TestValue out;
-            map->erase(i, out); // may or may not find it
+            map_->erase(i);
         }
     });
 
     inserter.join();
     eraser.join();
 
-    // Original keys (0..N-1) should all be erased
     for (uint32_t i = 0; i < N; ++i) {
-        TestValue out;
-        EXPECT_FALSE(map->get(i, out));
+        EXPECT_FALSE(map_->find(i));
     }
-    // New keys (N..2N-1) should all be present
     for (uint32_t i = N; i < 2 * N; ++i) {
-        TestValue out;
-        EXPECT_TRUE(map->get(i, out));
+        EXPECT_TRUE(map_->find(i));
     }
 }
 
-// ── ValueEntryBase state tests (embedded in hashmap context) ────────────────────
+// ── refcounted V via custom trait specialisation ───────────────────────────
+// Defines a value type that exposes a refcount and specialises HashmapTraits
+// to drive it.  Verifies that erase_if_no_reference honours the refcount.
 
-TEST_F(SimpleHashMapTest, EntryStateAfterInsert) {
-    auto map = make_map();
-    TestValue v{100, "state_test"};
-    size_t hash = TestHashMap::compute_hash(100);
+struct RefcountedValue {
+    uint64_t                       id{0};
+    mutable std::atomic< uint32_t > refcount{0};
 
-    auto* entry = map->insert_and_acquire(hash, 100, v);
-    ASSERT_NE(entry, nullptr);
+    RefcountedValue() = default;
+    explicit RefcountedValue(uint64_t i) : id{i} {}
+    RefcountedValue(RefcountedValue const&)            = delete;
+    RefcountedValue& operator=(RefcountedValue const&) = delete;
+    RefcountedValue(RefcountedValue&& o) noexcept : id{o.id} {
+        refcount.store(o.refcount.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+    RefcountedValue& operator=(RefcountedValue&& o) noexcept {
+        id = o.id;
+        refcount.store(o.refcount.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        return *this;
+    }
+};
 
-    // Entry should not be invalidated
-    EXPECT_FALSE(entry->is_invalidated());
+namespace sisl {
+template <>
+struct HashmapTraits< RefcountedValue > {
+    static constexpr bool refcounted = true;
+    static void           acquire(RefcountedValue& v) { v.refcount.fetch_add(1, std::memory_order_relaxed); }
+    static void           release(RefcountedValue& v) { v.refcount.fetch_sub(1, std::memory_order_release); }
+    // No-handles iff refcount == 0.  Map membership is NOT a reference.
+    static bool           is_unreferenced(RefcountedValue const& v) {
+        return v.refcount.load(std::memory_order_acquire) == 0;
+    }
+};
+} // namespace sisl
 
-    // Acquire again (refcount = 2)
-    entry->acquire();
-    EXPECT_FALSE(entry->is_evictable());
+static uint64_t refcounted_extract_key(RefcountedValue const& v) { return v.id; }
 
-    // Release once (refcount = 1, still not evictable)
-    entry->release();
-    EXPECT_FALSE(entry->is_evictable());
+using RefcountedMap = sisl::SimpleHashMap< uint64_t, RefcountedValue >;
 
-    // Release again (refcount = 0, evictable)
-    entry->release();
-    EXPECT_TRUE(entry->is_evictable());
+TEST(RefcountedHashMapTest, AcquireOnInsertAndFind) {
+    RefcountedMap map{16, refcounted_extract_key};
+
+    {
+        auto h = map.insert(1, RefcountedValue{1});
+        ASSERT_TRUE(h);
+        // Refcount counts only outstanding handles → 1 handle = refcount 1.
+        EXPECT_EQ(h->refcount.load(), 1u);
+    }
+    // Handle released → refcount back to 0 (entry still in map).
+
+    {
+        auto h = map.find(1);
+        ASSERT_TRUE(h);
+        EXPECT_EQ(h->refcount.load(), 1u);
+    }
 }
 
-TEST_F(SimpleHashMapTest, EntryInvalidation) {
-    auto map = make_map();
-    TestValue v{200, "inv_test"};
-    size_t hash = TestHashMap::compute_hash(200);
+TEST(RefcountedHashMapTest, EraseIfNoReferenceWithLiveHandleFails) {
+    RefcountedMap map{16, refcounted_extract_key};
+    auto          h = map.insert(1, RefcountedValue{1});
+    ASSERT_TRUE(h);
 
-    auto* entry = map->insert_and_acquire(hash, 200, v);
-    ASSERT_NE(entry, nullptr);
+    // Handle is alive → refcount = 1 → erase_if_no_reference must fail
+    EXPECT_FALSE(map.erase_if_no_reference(1));
 
-    EXPECT_FALSE(entry->is_invalidated());
-    entry->invalidate();
-    EXPECT_TRUE(entry->is_invalidated());
+    auto found = map.find(1);
+    EXPECT_TRUE(found);
+}
 
-    entry->release();
+TEST(RefcountedHashMapTest, EraseIfNoReferenceWithoutHandleSucceeds) {
+    RefcountedMap map{16, refcounted_extract_key};
+    { map.insert(1, RefcountedValue{1}); }
+    // Handle dropped → only map's ref left → erase_if_no_reference succeeds
+    EXPECT_TRUE(map.erase_if_no_reference(1));
+
+    auto found = map.find(1);
+    EXPECT_FALSE(found);
+}
+
+TEST(RefcountedHashMapTest, EraseDropsMapRef) {
+    RefcountedMap map{16, refcounted_extract_key};
+    { map.insert(1, RefcountedValue{1}); }
+
+    EXPECT_TRUE(map.erase(1));
+    EXPECT_FALSE(map.find(1));
 }
 
 int main(int argc, char** argv) {

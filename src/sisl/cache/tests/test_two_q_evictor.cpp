@@ -20,18 +20,22 @@
 #include <vector>
 
 #include <gtest/gtest.h>
-#include <sisl/cache/two_q_evictor.hpp>
+#include <sisl/cache/two_q_evictor.h>
 
 // ── test helpers ────────────────────────────────────────────────────────────────
 
-// Each TestEntry owns a CacheRecord (ValueEntryBase). Must have a stable address while
-// it is registered in the evictor (intrusive list hooks).
+// Each TestEntry owns a sisl::CacheRecord. Must have a stable address while it is registered in the evictor
+// (intrusive list hooks).
+//
+// Convention: refcount==0 means "no live handles, evictable".  Test entries
+// start with refcount==0 (which is the natural default) and tests bump it via
+// acquire() to pin entries against eviction.
 struct TestEntry {
     sisl::CacheRecord record;
-    uint64_t key{0};
-    uint32_t size{0};
-    uint64_t hash{0};
-    bool evicted{false};
+    uint64_t          key{0};
+    uint32_t          size{0};
+    uint64_t          hash{0};
+    bool              evicted{false};
 
     TestEntry(uint64_t k, uint32_t sz, uint64_t h) : key(k), size(sz), hash(h) {}
 };
@@ -58,8 +62,8 @@ protected:
             .low_wm_pct     = LOW_WM,
         };
 
-        evictor_ = std::make_unique< sisl::TwoQEvictor >(
-            cfg,
+        evictor_ = std::make_unique< sisl::TwoQEvictor >(cfg);
+        evictor_->register_family(
             [this](sisl::CacheRecord& rec) {
                 // Mark entry as evicted. We find it by scanning entries_ (fine for tests).
                 for (auto& e : entries_) {
@@ -76,11 +80,11 @@ protected:
     }
 
     void TearDown() override {
-        // Remove all non-evicted entries before destroying the evictor, so the intrusive
-        // list hooks are properly unlinked.
+        // Remove all non-evicted entries before destroying the evictor, so the intrusive list hooks are properly
+        // unlinked.
         for (auto& e : entries_) {
             if (!e->evicted && e->record.member_hook_.is_linked()) {
-                evictor_->remove_record(e->hash, e->record);
+                evictor_->remove_record(e->record);
             }
         }
         evictor_.reset();
@@ -88,7 +92,8 @@ protected:
 
     TestEntry& add_cold(uint64_t key, uint32_t size, uint64_t hash = 0) {
         auto e = std::make_unique< TestEntry >(key, size, hash);
-        evictor_->add_to_cold(hash, e->record, size);
+        e->record.set_size(size);
+        evictor_->add_to_cold(e->record);
         auto& ref = *e;
         entries_.push_back(std::move(e));
         return ref;
@@ -96,7 +101,8 @@ protected:
 
     TestEntry& add_hot(uint64_t key, uint32_t size, uint64_t hash = 0) {
         auto e = std::make_unique< TestEntry >(key, size, hash);
-        evictor_->add_to_hot(hash, e->record, size);
+        e->record.set_size(size);
+        evictor_->add_to_hot(e->record);
         auto& ref = *e;
         entries_.push_back(std::move(e));
         return ref;
@@ -126,14 +132,14 @@ TEST_F(TwoQEvictorTest, MultipleColdEntries) {
 
 TEST_F(TwoQEvictorTest, RemoveColdEntry) {
     auto& e = add_cold(1, 128);
-    evictor_->remove_record(e.hash, e.record);
+    evictor_->remove_record(e.record);
     e.evicted = true; // so TearDown doesn't try again
     EXPECT_EQ(evictor_->total_size(), 0);
 }
 
 TEST_F(TwoQEvictorTest, RemoveHotEntry) {
     auto& e = add_hot(1, 128);
-    evictor_->remove_record(e.hash, e.record);
+    evictor_->remove_record(e.record);
     e.evicted = true;
     EXPECT_EQ(evictor_->total_size(), 0);
 }
@@ -144,7 +150,7 @@ TEST_F(TwoQEvictorTest, PromoteColdToHot) {
     auto& e = add_cold(1, 128);
     EXPECT_FALSE(e.record.is_in_hot_queue());
 
-    evictor_->promote_to_hot(e.hash, e.record);
+    evictor_->promote_to_hot(e.record);
     EXPECT_TRUE(e.record.is_in_hot_queue());
 
     // total_size unchanged — entry just moved queues
@@ -153,11 +159,11 @@ TEST_F(TwoQEvictorTest, PromoteColdToHot) {
 
 TEST_F(TwoQEvictorTest, DoublePromoteIsNoop) {
     auto& e = add_cold(1, 128);
-    evictor_->promote_to_hot(e.hash, e.record);
+    evictor_->promote_to_hot(e.record);
     EXPECT_TRUE(e.record.is_in_hot_queue());
 
     // Promoting again should be a no-op
-    evictor_->promote_to_hot(e.hash, e.record);
+    evictor_->promote_to_hot(e.record);
     EXPECT_TRUE(e.record.is_in_hot_queue());
     EXPECT_EQ(evictor_->total_size(), 128);
 }
@@ -214,26 +220,26 @@ TEST_F(TwoQEvictorTest, ColdAccessedBitSecondAccess) {
 
 TEST_F(TwoQEvictorTest, AcquireBlocksEviction) {
     auto& e = add_cold(1, 64);
-    EXPECT_TRUE(e.record.is_evictable());
+    EXPECT_TRUE(e.record.is_unreferenced());
 
     e.record.acquire();
-    EXPECT_FALSE(e.record.is_evictable());
+    EXPECT_FALSE(e.record.is_unreferenced());
 
     e.record.release();
-    EXPECT_TRUE(e.record.is_evictable());
+    EXPECT_TRUE(e.record.is_unreferenced());
 }
 
 TEST_F(TwoQEvictorTest, MultipleAcquireRequiresMultipleRelease) {
     auto& e = add_cold(1, 64);
     e.record.acquire();
     e.record.acquire();
-    EXPECT_FALSE(e.record.is_evictable());
+    EXPECT_FALSE(e.record.is_unreferenced());
 
     e.record.release();
-    EXPECT_FALSE(e.record.is_evictable());
+    EXPECT_FALSE(e.record.is_unreferenced());
 
     e.record.release();
-    EXPECT_TRUE(e.record.is_evictable());
+    EXPECT_TRUE(e.record.is_unreferenced());
 }
 
 // ── background eviction ─────────────────────────────────────────────────────────
@@ -351,12 +357,13 @@ TEST_F(TwoQEvictorTest, ConcurrentAddRemove) {
             auto& my_entries = per_thread[t];
             for (uint32_t i = 0; i < OPS; ++i) {
                 auto e = std::make_unique< TestEntry >(t * OPS + i, 8, (t * OPS + i) % NUM_PARTITIONS);
-                evictor_->add_to_cold(e->hash, e->record, e->size);
+                e->record.set_size(e->size);
+                evictor_->add_to_cold(e->record);
                 my_entries.push_back(std::move(e));
             }
             // Remove all
             for (auto& e : my_entries) {
-                evictor_->remove_record(e->hash, e->record);
+                evictor_->remove_record(e->record);
                 e->evicted = true;
             }
         });
@@ -381,7 +388,7 @@ TEST_F(TwoQEvictorTest, ConcurrentPromote) {
     for (uint32_t t = 0; t < 4; ++t) {
         threads.emplace_back([this]() {
             for (auto& e : entries_) {
-                evictor_->promote_to_hot(e->hash, e->record);
+                evictor_->promote_to_hot(e->record);
             }
         });
     }

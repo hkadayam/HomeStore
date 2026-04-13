@@ -16,6 +16,10 @@
  *********************************************************************************/
 #pragma once
 
+// range_hashmap is being refactored against the new CacheRecord / HashmapTraits
+// design.  Stubbed out so the rest of the cache subsystem builds.
+#if 0
+
 #include <boost/intrusive/slist.hpp>
 #include <vector>
 #include <string>
@@ -34,7 +38,7 @@
 #include <sisl/fds/buffer.h>
 #include <sisl/fds/utils.h>
 #include <sisl/fds/enum.h>
-#include <sisl/cache/hash_entry_base.hpp>
+#include <sisl/cache/hash_entry_base.h>
 
 namespace sisl {
 
@@ -683,3 +687,5 @@ HashBucket< K >& RangeHashMap< K >::get_bucket(size_t hash_code) const {
 }
 
 } // namespace sisl
+
+#endif // 0 — range_hashmap stubbed out during cache refactor

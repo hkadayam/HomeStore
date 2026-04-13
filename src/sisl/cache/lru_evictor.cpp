@@ -15,7 +15,10 @@
  *the License.
  *
  *********************************************************************************/
-#include <sisl/cache/lru_evictor.hpp>
+#include <sisl/cache/lru_evictor.h>
+
+// Stubbed out during cache refactor — see lru_evictor.h.
+#if 0
 
 namespace sisl {
 
@@ -106,3 +109,5 @@ bool LRUEvictor::LRUPartition::find_evict_candidates(uint32_t record_fid, uint32
     return true;
 }
 } // namespace sisl
+
+#endif // 0

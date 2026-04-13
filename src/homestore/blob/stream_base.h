@@ -62,7 +62,7 @@ protected:
     /// sorted by vdev_order, and each MetaBlk is moved into chunk_mblks_.
     using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::ByteView > >;
     StreamBase(uint64_t stream_id, const shared< VirtualDev >& vdev, MetaClient& meta_client, std::string dev_name,
-               uint64_t chunk_size, ChunkMblkMap&& mblks = {});
+               uint64_t chunk_size, uint32_t stream_blk_size = 0, ChunkMblkMap&& mblks = {});
 
 public:
     StreamBase(const StreamBase&) = delete;
@@ -96,6 +96,7 @@ public:
     uint64_t stream_id() const { return stream_id_; }
     uint64_t chunk_size() const { return chunk_size_; }
     uint32_t block_size() const { return blk_size_; }
+    uint32_t blk_multiplier() const { return blk_multiplier_; }
     VirtualDev& vdev() const { return *vdev_; }
     const std::string& dev_name() const { return dev_name_; }
 
@@ -141,7 +142,8 @@ private:
     shared< VirtualDev > vdev_;
     std::string dev_name_;
     uint64_t chunk_size_;
-    uint32_t blk_size_;
+    uint32_t blk_size_;         // stream's effective block size (may be a multiple of vdev's block size)
+    uint32_t blk_multiplier_;   // blk_size_ / vdev_->block_size()
 
     // RCU-protected chunk list. Readers take an rcu_reader guard (~2-5 ns). Writers call make_and_exchange() under
     // expand_mutex_ which invokes folly::synchronize_rcu() to wait for any in-flight readers.

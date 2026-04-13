@@ -15,22 +15,21 @@
  ***************************************************************************/
 #pragma once
 
-#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include <folly/coro/SharedMutex.h>
 #include <folly/coro/Task.h>
 
 #include <homestore/blk.h>              // BlkId, blk_count_t, chunk_num_t
 #include "homestore/base/homestore_decl.h" // shared<>, unique<>
-#include <sisl/fds/buffer.h>            // sisl::Blob
+#include <sisl/fds/buffer.h>            // sisl::Blob, sisl::BufBuilder
 
-#include "blob/stream_base.h"            // StreamBase, CPSession, sisl::Rcu
+#include "blob/stream_base.h"            // StreamBase, FlushSessionBase, sisl::Rcu
 #include "iomanager/drive_interface.hpp" // IOBuffer
 
 namespace homestore {
@@ -53,75 +52,47 @@ static_assert(std::is_standard_layout_v< AppendByteChunkMeta >);
 // ─────────────────────────────────────────────────────────────────────────────
 // AppendByteStream : StreamBase
 //
-// Byte-stream append.  Callers never see block addresses; the stream tracks a logical tail_offset in bytes.  No block
-// allocator — bytes are written sequentially into chunks; when a chunk is full the stream expands to the next one.
+// Byte-stream append.  Callers never see block addresses; the stream tracks a logical tail_offset in bytes.
 //
-// append(data) — hot path takes folly::coro::SharedMutex shared lock, CAS-bumps an atomic offset on the active
-// WriteUnit, and memcpys caller bytes into the pre-allocated aligned IOBuffer.  When the buffer is full, the cold path
-// takes an exclusive lock, allocates a new WriteUnit, and retries.  Each WriteUnit's buffer never crosses a chunk
-// boundary.
+// append(data) — synchronous.  Memcpys caller bytes into a growable in-memory buffer.  If concurrent_safe is true
+// (default), a mutex serialises appends; otherwise the caller must guarantee single-threaded access.
+//
+// flush() — async.  Swaps the buffer, expands chunks as needed, writes to disk, updates chunk MetaBlks.
 //
 // Chunk MetaBlk payload: AppendByteChunkMeta (bytes_written per chunk).
-// Recovery: sum bytes_written across all chunks (ordered by vdev_order).
+// Recovery: sum bytes_written across all chunks (ordered by vdev_order) to reconstruct tail_offset.
 //
 // Truncate: reset tail_offset to 0; existing chunks remain allocated for reuse.
-//
-// Not bound by CP — callers can flush at any time.  The active session is RCU-protected: append() acquires a read-side
-// guard to access the current session, while flush() atomically installs a new empty session and drains the old one.
 // ─────────────────────────────────────────────────────────────────────────────
 class AppendByteStream : public StreamBase {
 public:
-    // ── WriteUnit ────────────────────────────────────────────────────────────
-    // A pre-allocated block-aligned IOBuffer positioned at a fixed offset within one chunk.  Multiple appenders reserve
-    // space concurrently via CAS on used_bytes; each then memcpys into their reserved slot.  The buffer never crosses a
-    // chunk boundary.  offset_in_chunk is always block-aligned.
-    struct WriteUnit {
-        chunk_num_t chunk_id;                  // which chunk this unit writes into
-        uint32_t offset_in_chunk;              // starting byte offset within the chunk (block-aligned)
-        IOBuffer buf;                          // pre-allocated, block-aligned
-        std::atomic< uint32_t > used_bytes{0}; // CAS bump allocator
+    // ── FlushBuffer ─────────────────────────────────────────────────────────
+    // Accumulates appended bytes between flushes using LargeBufBuilder (chain of aligned IOBuffers).
+    struct FlushBuffer {
+        sisl::LargeBufBuilder builder;
+        uint64_t start_offset{0}; // stream byte offset at which the builder's first byte corresponds
 
-        WriteUnit(chunk_num_t cid, uint32_t offset, IOBuffer io_buf) :
-                chunk_id{cid}, offset_in_chunk{offset}, buf{std::move(io_buf)} {}
-        WriteUnit(const WriteUnit&) = delete;
-        WriteUnit& operator=(const WriteUnit&) = delete;
+        void reset() {
+            builder.clear();
+            start_offset = 0;
+        }
     };
 
     // ── TailBlock ────────────────────────────────────────────────────────────
-    // Cached copy of the last partial (non-block-aligned) block, carried across CP boundaries and restarts.  At flush
-    // time, if the last WriteUnit's used_bytes is not block-aligned, the final partial block is saved here.  At restart,
+    // Cached copy of the last partial (non-block-aligned) block, carried across flush boundaries and restarts.
+    // At flush time, if the buffer tail is not block-aligned, the final partial block is saved here.  At restart,
     // if per-chunk bytes_written is not block-aligned, the tail block is read from disk into this cache.  The next
-    // alloc_write_unit seeds a WriteUnit from this cache so the stream remains byte-contiguous with no zero-padding gaps.
+    // append seeds the new FlushBuffer from this cache so the stream remains byte-contiguous.
     struct TailBlock {
         IOBuffer buf;               // one block of data (block-aligned allocation, blk_size bytes)
-        chunk_num_t chunk_id{};     // which chunk it belongs to
+        size_t chunk_idx{};         // which chunk (by index); resolved to chunk_id at flush
         uint32_t offset_in_chunk{}; // block-aligned byte offset within the chunk
         uint32_t valid_bytes{};     // how many bytes in buf are real data (< blk_size)
     };
 
-    // ── FlushSession ──────────────────────────────────────────────
-    // Accumulates all WriteUnits between two flush() calls.  RCU-protected: append() takes a read-side guard to access
-    // the current session, while flush() atomically installs a new empty session and drains the old one.  write_cursor
-    // tracks the byte offset at which the next WriteUnit starts; initialized lazily from tail_offset on first
-    // allocation.
-    struct FlushSession : public StreamBase::FlushSessionBase {
-        std::vector< unique< WriteUnit > > all_units;
-        uint64_t write_cursor{0}; // byte offset past the end of the last allocated WriteUnit's capacity
-
-        void reset() {
-            all_units.clear();
-            write_cursor = 0;
-        }
-    };
-
     // ── ReadCursor ───────────────────────────────────────────────────────────
-    // Sequential iterator over stream contents.  Created via open_cursor().  Each next() call reads up to max_bytes
-    // from disk and returns the buffer plus the count of valid bytes within it (the last read may be shorter than the
-    // buffer due to block-alignment padding at the stream tail).
     class ReadCursor {
     public:
-        /// Read the next chunk of stream data.  Returns (buffer, valid_bytes).  valid_bytes <= buf.size(); the caller
-        /// should only consume buf.bytes()[0..valid_bytes).  Returns an empty IOBuffer when the stream is exhausted.
         folly::coro::Task< std::pair< IOBuffer, uint32_t > > next(size_t max_bytes);
 
         bool has_more() const { return pos_ < end_; }
@@ -141,12 +112,14 @@ public:
     static folly::coro::Task< shared< AppendByteStream > > create(uint64_t stream_id, MetaClient& meta_client,
                                                                   const std::string& dev_name,
                                                                   const shared< VirtualDev >& vdev,
-                                                                  uint64_t chunk_size);
+                                                                  uint64_t chunk_size,
+                                                                  bool concurrent_safe = true);
 
     using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::ByteView > >;
     static folly::coro::Task< shared< AppendByteStream > > load(uint64_t stream_id, MetaClient& meta_client,
                                                                 const std::string& dev_name,
-                                                                const shared< VirtualDev >& vdev, ChunkMblkMap&& mblks);
+                                                                const shared< VirtualDev >& vdev, ChunkMblkMap&& mblks,
+                                                                bool concurrent_safe = true);
 
     AppendByteStream(const AppendByteStream&) = delete;
     AppendByteStream& operator=(const AppendByteStream&) = delete;
@@ -156,67 +129,51 @@ public:
 
     // ── IO ───────────────────────────────────────────────────────────────────
 
-    /// Append data bytes into the stream.  Returns the byte offset at which the data was written.  Hot path is
-    /// lock-free (shared lock + CAS); cold path (buffer full) takes exclusive lock and allocates a new WriteUnit.
-    folly::coro::Task< uint64_t > append(const sisl::Blob& data);
+    /// Synchronous append.  Copies data into the in-memory buffer.  No disk I/O — flush() writes to disk.
+    /// If concurrent_safe_ is true, a mutex serialises appends; otherwise caller must be single-threaded.
+    uint64_t append(const sisl::Blob& data);
 
-    /// Read len bytes starting at byte_offset.  Allocates the read buffer internally and returns it along with an error
-    /// code.  The returned IOBuffer is block-aligned in size; valid data occupies the first len bytes.
+    /// Read len bytes starting at byte_offset.
     folly::coro::Task< std::pair< std::error_code, IOBuffer > > read(uint64_t byte_offset, size_t len);
 
-    /// Create a sequential read cursor starting at start_offset, reading up to tail_offset().
     ReadCursor open_cursor(uint64_t start_offset = 0) const;
-
-    /// Create a sequential read cursor for the range [start_offset, end_offset).
     ReadCursor open_cursor(uint64_t start_offset, uint64_t end_offset) const;
 
-    /// Reset tail_offset to 0.  When release_chunks is false (default), existing chunks are retained and reused.
-    /// When release_chunks is true, all chunks are released back to VDev after resetting, freeing their storage.
     folly::coro::Task< void > truncate(bool release_chunks = false);
 
     // ── Flush ─────────────────────────────────────────────────────────────────
 
-    /// Atomically install a new empty session (so concurrent appenders switch over), then drain the old session:
-    /// write used WriteUnit portions to VDev and update chunk MetaBlks with bytes_written.  Can be called at any time,
-    /// independent of CP.
+    /// Swap the buffer, expand chunks as needed, write to disk, update MetaBlks.
     folly::coro::Task< bool > flush();
 
     // ── Accessors ─────────────────────────────────────────────────────────────
-    uint64_t tail_offset() const { return tail_offset_.load(std::memory_order_acquire); }
+    uint64_t tail_offset() const { return tail_offset_; }
+    void set_concurrent_safe(bool v) { concurrent_safe_ = v; }
 
     // ── StreamBase hook ──────────────────────────────────────────────────────
     std::string_view stream_type_name() const override { return "appendbyte"; }
 
 private:
     AppendByteStream(uint64_t stream_id, MetaClient& meta_client, std::string dev_name,
-                     const shared< VirtualDev >& vdev, uint64_t chunk_size, ChunkMblkMap&& mblks = {});
+                     const shared< VirtualDev >& vdev, uint64_t chunk_size, bool concurrent_safe,
+                     ChunkMblkMap&& mblks = {});
 
-    /// Allocate a new WriteUnit at the current write_cursor position.  If a TailBlock is cached (from a previous
-    /// flush or restart recovery), the first WriteUnit is seeded from it.  Otherwise, a fresh block-aligned buffer is
-    /// allocated.  Caps the buffer to not cross the chunk boundary.  Expands to a new chunk if needed.  Called under
-    /// exclusive append_mutex_.
-    folly::coro::Task< WriteUnit* > alloc_write_unit(FlushSession& session);
+    /// Core append logic (no locking).  Seeds from tail_block_ on first call, then memcpys into buf.
+    uint64_t do_append(const sisl::Blob& data);
 
-    /// Internal read helper: read nblks blocks starting at blk_num in chunk cid into a freshly allocated IOBuffer.
+    /// Internal read helper.
     folly::coro::Task< std::pair< std::error_code, IOBuffer > > read_blocks(chunk_num_t cid, uint32_t blk_num,
                                                                             blk_count_t nblks);
 
 private:
-    // Logical byte tail.  Updated atomically by append() after each successful CAS reservation.
-    std::atomic< uint64_t > tail_offset_{0};
+    uint64_t tail_offset_{0};
+    bool concurrent_safe_;
+    std::mutex append_mutex_;  // used only when concurrent_safe_ is true; protects tail_offset_, flush_buf_, tail_block_
 
-    // SharedMutex: shared lock for hot-path CAS+memcpy; exclusive lock for cold-path new WriteUnit allocation.
-    folly::coro::SharedMutex append_mutex_;
+    FlushBuffer flush_buf_;
 
-    // RCU-protected active session.  append() acquires a read-side guard (~2-5 ns) to access the current session.
-    // flush() atomically installs a new empty session and drains the old one after the RCU grace period.
-    sisl::Rcu::data< FlushSession > session_;
-
-    // Cached partial tail block — bridges CP boundaries and restarts so the stream stays byte-contiguous.
+    // Cached partial tail block — bridges flush boundaries and restarts.
     std::optional< TailBlock > tail_block_;
-
-    // Maximum buffer size per WriteUnit (in bytes).  Actual size may be smaller near chunk boundaries.
-    static constexpr uint32_t kMaxWriteUnitBytes = 256 * 4096; // 1 MB
 };
 
 } // namespace homestore

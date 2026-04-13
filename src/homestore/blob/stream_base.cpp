@@ -33,13 +33,14 @@ namespace homestore {
 // ─────────────────────────────────────────────────────────────────────────────
 
 StreamBase::StreamBase(uint64_t stream_id, const shared< VirtualDev >& vdev, MetaClient& meta_client,
-                       std::string dev_name, uint64_t chunk_size, ChunkMblkMap&& mblks) :
+                       std::string dev_name, uint64_t chunk_size, uint32_t stream_blk_size, ChunkMblkMap&& mblks) :
         meta_client_{meta_client},
         stream_id_{stream_id},
         vdev_{vdev},
         dev_name_{std::move(dev_name)},
         chunk_size_{chunk_size},
-        blk_size_{vdev_->block_size()} {
+        blk_size_{(stream_blk_size == 0) ? vdev_->block_size() : stream_blk_size},
+        blk_multiplier_{blk_size_ / vdev_->block_size()} {
     if (mblks.empty()) {
         return;
     }
@@ -121,7 +122,7 @@ folly::coro::Task< void > StreamBase::expand_to(size_t n) {
 
 folly::coro::Task< void > StreamBase::init_chunk_mblk(const shared< Chunk >& chunk) {
     const uint32_t cid = chunk->chunk_id();
-    auto name = fmt::format("{}_{}_{}_{}", dev_name_, stream_type_name(), stream_id_, cid);
+    auto name = fmt::format("{}_{}_{}_{}_{}", dev_name_, stream_type_name(), stream_id_, cid, blk_size_);
     auto blk = co_await meta_client_.create_meta_blk(name, std::nullopt);
 
     auto lock = co_await mblk_mutex_.co_scoped_lock();

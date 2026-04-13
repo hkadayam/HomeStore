@@ -20,7 +20,7 @@ static BlkId extract_key(const BlkTrackRecord& rec) {
     return rec.key;
 }
 
-BlkReadTracker::BlkReadTracker() : pending_reads_map_(kExpectedNumRecords, extract_key, nullptr /* access_cb */) {
+BlkReadTracker::BlkReadTracker() : pending_reads_map_(kExpectedNumRecords, extract_key) {
 }
 
 void BlkReadTracker::merge(const BlkId& blkid, int64_t new_ref_count, const shared< BlkTrackWaiter >& waiter) {
@@ -35,31 +35,34 @@ void BlkReadTracker::merge(const BlkId& blkid, int64_t new_ref_count, const shar
     while (cur_base_blk_num <= last_base_blk_num) {
         BlkId base_blkid{cur_base_blk_num, entries_per_record(), blkid.chunk_num()};
 
+        using UA = sisl::SimpleHashMap< BlkId, BlkTrackRecord >::UpdateAction;
         if (new_ref_count > 0) {
             // This is an insert operation
-            pending_reads_map_.upsert_or_delete(base_blkid,
-                                                [&base_blkid, new_ref_count](BlkTrackRecord& rec, bool existing) {
-                                                    if (!existing) {
-                                                        rec.key = base_blkid;
-                                                    }
-                                                    rec.ref_cnt += new_ref_count;
-                                                    return false;
-                                                });
+            pending_reads_map_.update_or_erase(base_blkid,
+                                               [&base_blkid, new_ref_count](BlkTrackRecord& rec, bool found) {
+                                                   if (!found) { rec.key = base_blkid; }
+                                                   rec.ref_cnt += new_ref_count;
+                                                   return UA::Keep;
+                                               });
         } else if (new_ref_count < 0) {
             // This is a remove operation
-            pending_reads_map_.upsert_or_delete(
-                base_blkid, [new_ref_count, &base_blkid](BlkTrackRecord& rec, bool existing) {
-                    HS_DBG_ASSERT_EQ(existing, true, "Decrement a ref count (blk: {}) which does not exist in map",
+            pending_reads_map_.update_or_erase(
+                base_blkid, [new_ref_count, &base_blkid](BlkTrackRecord& rec, bool found) {
+                    HS_DBG_ASSERT_EQ(found, true, "Decrement a ref count (blk: {}) which does not exist in map",
                                      base_blkid.to_string());
                     rec.ref_cnt += new_ref_count;
-                    return (rec.ref_cnt == 0);
+                    return (rec.ref_cnt == 0) ? UA::Erase : UA::Keep;
                 });
         } else {
-            // this is wait_on operation
-            pending_reads_map_.update(base_blkid, [&waiter_rescheduled, &waiter](BlkTrackRecord& rec) {
-                rec.waiters.push_back(waiter);
-                waiter_rescheduled = true;
-            });
+            // this is wait_on operation — only update if the record exists (found=true)
+            pending_reads_map_.update_or_erase(
+                base_blkid, [&waiter_rescheduled, &waiter](BlkTrackRecord& rec, bool found) {
+                    if (found) {
+                        rec.waiters.push_back(waiter);
+                        waiter_rescheduled = true;
+                    }
+                    return found ? UA::Keep : UA::Erase;
+                });
         }
 
         cur_base_blk_num += entries_per_record();

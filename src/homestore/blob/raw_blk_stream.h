@@ -75,14 +75,16 @@ public:
     /// Create a fresh stream.  Expands to one initial chunk and creates its MetaBlk.
     static folly::coro::Task< shared< RawBlkStream > > create(uint64_t stream_id, MetaClient& meta_client,
                                                               const std::string& dev_name,
-                                                              const shared< VirtualDev >& vdev, uint64_t chunk_size);
+                                                              const shared< VirtualDev >& vdev, uint64_t chunk_size,
+                                                              uint32_t blk_size = 0);
 
     /// Recovery: restore from recovered data (chunk_id → MetaBlk + payload).
     /// Passes stored bitmaps to vdev.load_blk_allocator() to restore allocator state.
     using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::ByteView > >;
     static folly::coro::Task< shared< RawBlkStream > > load(uint64_t stream_id, MetaClient& meta_client,
                                                             const std::string& dev_name,
-                                                            const shared< VirtualDev >& vdev, ChunkMblkMap&& mblks);
+                                                            const shared< VirtualDev >& vdev, uint32_t blk_size,
+                                                            ChunkMblkMap&& mblks);
 
     RawBlkStream(const RawBlkStream&) = delete;
     RawBlkStream& operator=(const RawBlkStream&) = delete;
@@ -142,7 +144,7 @@ public:
 
 private:
     RawBlkStream(uint64_t stream_id, MetaClient& meta_client, std::string dev_name, const shared< VirtualDev >& vdev,
-                 uint64_t chunk_size, ChunkMblkMap&& mblks = {});
+                 uint64_t chunk_size, uint32_t blk_size = 0, ChunkMblkMap&& mblks = {});
 
     // Per-CP write buffer.  Extends base FlushSessionBase with a lock-free per-thread vector of pending writes.
     struct CPSession : StreamBase::FlushSessionBase {

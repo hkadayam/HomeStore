@@ -909,6 +909,129 @@ CORO_TEST_F(RawBlkStreamTest, DoubleRestart) {
     co_await self.shutdown();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 19: Create a stream with a block-size multiplier (2x vdev blk_size) and verify I/O works at that granularity.
+// ─────────────────────────────────────────────────────────────────────────────
+CORO_TEST_F(RawBlkStreamTest, BlockSizeMultiplier) {
+    co_await self.bootstrap();
+
+    static constexpr uint32_t STREAM_BLK_SIZE = BLK_SIZE * 2; // 8192 when vdev is 4096
+
+    auto stream = co_await self.blob_dev_->create_raw_blk_stream(CHUNK_SIZE, STREAM_BLK_SIZE);
+    CO_ASSERT_NE(stream, nullptr);
+    EXPECT_EQ(stream->block_size(), STREAM_BLK_SIZE);
+    EXPECT_EQ(stream->blk_multiplier(), 2u);
+
+    // Allocate 1 stream-level block (= 2 vdev blocks).
+    BlkId bid;
+    blk_alloc_hints hints;
+    auto status = stream->alloc_blk(1, hints, bid);
+    CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
+    EXPECT_EQ(bid.blk_count(), 1u);
+
+    {
+        auto guard = cp_mgr().cp_guard();
+        auto cstatus = stream->commit_blk(guard.get(), bid);
+        EXPECT_EQ(cstatus, BlkAllocStatus::SUCCESS);
+    }
+
+    // Write at the stream's block size.
+    IOBuffer wbuf(STREAM_BLK_SIZE, 512);
+    self.fill_buf(wbuf.bytes(), STREAM_BLK_SIZE, 0xB1C2);
+    co_await stream->write(bid, wbuf);
+
+    // Read back and verify.
+    IOBuffer rbuf(STREAM_BLK_SIZE, 512);
+    auto ec = co_await stream->read(rbuf, bid);
+    CO_ASSERT_FALSE(ec);
+    EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), STREAM_BLK_SIZE, 0xB1C2));
+
+    // Allocate multi-block (3 stream blocks = 6 vdev blocks).
+    BlkId bid2;
+    blk_alloc_hints hints2{.is_contiguous = true};
+    status = stream->alloc_blk(3, hints2, bid2);
+    CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
+    EXPECT_EQ(bid2.blk_count(), 3u);
+
+    {
+        auto guard = cp_mgr().cp_guard();
+        stream->commit_blk(guard.get(), bid2);
+    }
+
+    const uint32_t multi_size = 3 * STREAM_BLK_SIZE;
+    IOBuffer wbuf2(multi_size, 512);
+    self.fill_buf(wbuf2.bytes(), multi_size, 0xD3E4);
+    co_await stream->write(bid2, wbuf2);
+
+    IOBuffer rbuf2(multi_size, 512);
+    ec = co_await stream->read(rbuf2, bid2);
+    CO_ASSERT_FALSE(ec);
+    EXPECT_TRUE(self.verify_buf(rbuf2.cbytes(), multi_size, 0xD3E4));
+
+    // CP flush and verify data survives.
+    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+    EXPECT_TRUE(success);
+
+    IOBuffer rbuf3(STREAM_BLK_SIZE, 512);
+    ec = co_await stream->read(rbuf3, bid);
+    CO_ASSERT_FALSE(ec);
+    EXPECT_TRUE(self.verify_buf(rbuf3.cbytes(), STREAM_BLK_SIZE, 0xB1C2));
+
+    co_await self.shutdown();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 20: Block-size multiplier survives restart recovery.
+// ─────────────────────────────────────────────────────────────────────────────
+CORO_TEST_F(RawBlkStreamTest, BlockSizeMultiplierRestart) {
+    co_await self.bootstrap();
+
+    static constexpr uint32_t STREAM_BLK_SIZE = BLK_SIZE * 4; // 16384 when vdev is 4096
+
+    auto stream = co_await self.blob_dev_->create_raw_blk_stream(CHUNK_SIZE, STREAM_BLK_SIZE);
+    EXPECT_EQ(stream->block_size(), STREAM_BLK_SIZE);
+    EXPECT_EQ(stream->blk_multiplier(), 4u);
+
+    BlkId bid;
+    blk_alloc_hints hints;
+    auto status = stream->alloc_blk(1, hints, bid);
+    CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
+
+    {
+        auto guard = cp_mgr().cp_guard();
+        stream->commit_blk(guard.get(), bid);
+    }
+
+    IOBuffer wbuf(STREAM_BLK_SIZE, 512);
+    self.fill_buf(wbuf.bytes(), STREAM_BLK_SIZE, 0xABCD04);
+    co_await stream->write(bid, wbuf);
+
+    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+    CO_ASSERT_TRUE(success);
+
+    // ── Reload ──
+    auto sid = stream->stream_id();
+    stream.reset();
+    co_await self.reload();
+
+    auto streams = self.blob_dev_->raw_blk_streams();
+    CO_ASSERT_EQ(streams.size(), 1u);
+    auto recovered = streams[0];
+    EXPECT_EQ(recovered->stream_id(), sid);
+
+    // After recovery the block_size and multiplier should be preserved.
+    EXPECT_EQ(recovered->block_size(), STREAM_BLK_SIZE);
+    EXPECT_EQ(recovered->blk_multiplier(), 4u);
+
+    // Read back the data.
+    IOBuffer rbuf(STREAM_BLK_SIZE, 512);
+    auto ec = co_await recovered->read(rbuf, bid);
+    CO_ASSERT_FALSE(ec);
+    EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), STREAM_BLK_SIZE, 0xABCD04));
+
+    co_await self.shutdown();
+}
+
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);

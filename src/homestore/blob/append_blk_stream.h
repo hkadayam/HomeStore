@@ -17,6 +17,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -80,12 +82,13 @@ struct CPSession : public StreamBase::FlushSessionBase {
 // Append-only block stream.  Callers supply a segment_id and a buffer; the
 // stream internally allocates BlkIds and returns them for future reference.
 //
-// append(segment_id, buf) — acquires folly::coro::Mutex, tries the active WriteUnit for the segment. If the unit is
-// full or missing, allocates a new WriteUnit via VDev::alloc_contiguous_blks(), expanding the stream by one chunk if
-// allocation fails.
+// Two append paths:
+//   quick_append() — synchronous, takes mu_, tries the active WriteUnit.
+//   append()       — async (coro::Task), flushes filled WriteUnits to disk,
+//                    allocates a new WriteUnit if needed, then appends.
 //
 // Persistence:
-//   Per chunk: one ModuleMetaBlk<uint8_t> storing the full allocator bitmap.
+//   Per chunk: one MetaBlk storing the full allocator bitmap.
 //   On flush: finalize all WriteUnits → writev → commit_blk; then write
 //   modified-chunk bitmaps to their MetaBlks.
 //
@@ -99,12 +102,14 @@ public:
 
     static folly::coro::Task< shared< AppendBlkStream > > create(uint64_t stream_id, MetaClient& meta_client,
                                                                  const std::string& dev_name,
-                                                                 const shared< VirtualDev >& vdev, uint64_t chunk_size);
+                                                                 const shared< VirtualDev >& vdev, uint64_t chunk_size,
+                                                                 uint32_t blk_size = 0);
 
     using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::ByteView > >;
     static folly::coro::Task< shared< AppendBlkStream > > load(uint64_t stream_id, MetaClient& meta_client,
                                                                const std::string& dev_name,
-                                                               const shared< VirtualDev >& vdev, ChunkMblkMap&& mblks);
+                                                               const shared< VirtualDev >& vdev, uint32_t blk_size,
+                                                               ChunkMblkMap&& mblks);
 
     AppendBlkStream(const AppendBlkStream&) = delete;
     AppendBlkStream& operator=(const AppendBlkStream&) = delete;
@@ -114,8 +119,18 @@ public:
 
     // ── IO ─────────────────────────────────────────────────────────────
 
-    /// Append buf into the given segment.  Returns the BlkId of the written block(s).
-    folly::coro::Task< BlkId > append(CP* cp, uint16_t segment_id, const sisl::ByteArray& buf);
+    /// Synchronous fast-path: locks mu_, tries the active WriteUnit for the segment.  On success, moves buf out and
+    /// returns the BlkId.  On failure (no active unit or unit full), returns std::nullopt and leaves buf untouched —
+    /// caller should fall back to append().
+    std::optional< BlkId > quick_append(CP* cp, uint16_t segment_id, sisl::ByteArray& buf);
+
+    /// Async append: allocates a new WriteUnit (possibly expanding the stream), installs it, and appends buf.
+    /// No disk I/O — caller must call flush() separately to write filled WriteUnits to disk.
+    folly::coro::Task< BlkId > append(CP* cp, uint16_t segment_id, sisl::ByteArray&& buf);
+
+    /// Grab all filled WriteUnits and write them to disk (writev + commit + free excess).
+    /// Caller can fire on an executor and collectAll later to overlap I/O with CPU work.
+    folly::coro::Task< void > flush(CP* cp);
 
     /// Invalidate (free) a previously-appended block.  Marks owning chunk dirty.
     void invalidate(CP* cp, const BlkId& bid);
@@ -127,7 +142,7 @@ public:
     /// Initialize the new CP session for accumulating appends.
     void on_cp_switchover(CP* cur_cp, CP* new_cp);
 
-    /// Finalize all WriteUnits for this CP, issue writev, write dirty bitmaps.
+    /// Finalize all remaining WriteUnits for this CP, issue writev, write dirty bitmaps.
     folly::coro::Task< bool > cp_flush(CP* cp);
 
     /// Returns true if any chunks were dirtied during the given CP epoch.
@@ -138,7 +153,18 @@ public:
 
 private:
     AppendBlkStream(uint64_t stream_id, MetaClient& meta_client, std::string dev_name, const shared< VirtualDev >& vdev,
-                    uint64_t chunk_size, ChunkMblkMap&& mblks = {});
+                    uint64_t chunk_size, uint32_t blk_size = 0, ChunkMblkMap&& mblks = {});
+
+    /// Core append logic (called under mu_).  If new_wu is provided, installs it into the session first.  Then tries
+    /// the active WriteUnit for the segment — on success moves buf and returns BlkId, else returns nullopt.
+    std::optional< BlkId > do_quick_append(CPSession& session, uint16_t segment_id, unique< WriteUnit > new_wu,
+                                           sisl::ByteArray& buf);
+
+    /// Swap out all WriteUnits from the session (under mu_).  Clears active and all_units.
+    std::vector< unique< WriteUnit > > grab_write_units(CPSession& session);
+
+    /// Flush a batch of WriteUnits to disk: writev used portions, commit used blocks, free excess.
+    folly::coro::Task< void > flush_write_units(const std::vector< unique< WriteUnit > >& units);
 
     /// Try to alloc nblks; expand by one chunk and retry once on failure.
     folly::coro::Task< BlkId > alloc_or_expand(blk_count_t nblks, const blk_alloc_hints& hints);
@@ -146,9 +172,8 @@ private:
     CPSession& cp_session(cp_id_t cp_id) { return cp_session_[cp_id % CPManager::max_concurent_cps]; }
 
 private:
-    // Serialises all append() and on_cp_switchover() mutations. folly::coro::Mutex so it can be held across co_await
-    // (e.g. alloc_or_expand).
-    folly::coro::Mutex append_mutex_;
+    std::mutex mu_;                // protects do_append / grab_write_units (session mutation)
+    folly::coro::Mutex flush_mu_; // serialises async path (flush + alloc + append) and cp_flush
     CPSession cp_session_[CPManager::max_concurent_cps];
 
     // WriteUnit pre-alloc sizes (tunable; min guarantees at least one write).

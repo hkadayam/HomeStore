@@ -71,6 +71,7 @@ struct ParsedMblkName {
     StreamType stream_type;
     uint64_t stream_id;
     uint32_t chunk_id;
+    uint32_t blk_size{0}; // 0 means use vdev default (backward compat with old names)
 };
 
 std::optional< ParsedMblkName > parse_mblk_name(std::string_view name) {
@@ -101,14 +102,20 @@ std::optional< ParsedMblkName > parse_mblk_name(std::string_view name) {
             continue;
         }
 
-        std::string_view chunk_part = rest.substr(sep + 1);
-        uint32_t chunk_id{};
-        auto rc2 = std::from_chars(chunk_part.data(), chunk_part.data() + chunk_part.size(), chunk_id);
-        if (rc2.ec != std::errc{}) {
-            continue;
-        }
+        std::string_view after_sid = rest.substr(sep + 1);
+        auto sep2 = after_sid.find('_');
+        if (sep2 == std::string_view::npos) { continue; }
 
-        return ParsedMblkName{std::string{dev}, stype, stream_id, chunk_id};
+        uint32_t chunk_id{};
+        auto rc2 = std::from_chars(after_sid.data(), after_sid.data() + sep2, chunk_id);
+        if (rc2.ec != std::errc{}) { continue; }
+
+        std::string_view bs_part = after_sid.substr(sep2 + 1);
+        uint32_t blk_size{0};
+        auto rc3 = std::from_chars(bs_part.data(), bs_part.data() + bs_part.size(), blk_size);
+        if (rc3.ec != std::errc{}) { continue; }
+
+        return ParsedMblkName{std::string{dev}, stype, stream_id, chunk_id, blk_size};
     }
     return std::nullopt;
 }
@@ -154,15 +161,20 @@ folly::coro::Task< void > BlobDevManager::load() {
 
             DevRecovery& dev = dev_map[parsed->dev_name];
             auto entry = std::make_pair(std::move(blk), std::move(data));
+            auto populate = [&](StreamMblkMap& m) {
+                auto& info = m[parsed->stream_id];
+                info.blk_size = parsed->blk_size;
+                info.chunk_mblks.emplace(parsed->chunk_id, std::move(entry));
+            };
             switch (parsed->stream_type) {
             case StreamType::RawBlk:
-                dev.raw_blk_mblks[parsed->stream_id].emplace(parsed->chunk_id, std::move(entry));
+                populate(dev.raw_blk_mblks);
                 break;
             case StreamType::AppendBlk:
-                dev.append_blk_mblks[parsed->stream_id].emplace(parsed->chunk_id, std::move(entry));
+                populate(dev.append_blk_mblks);
                 break;
             case StreamType::AppendByte:
-                dev.append_byte_mblks[parsed->stream_id].emplace(parsed->chunk_id, std::move(entry));
+                populate(dev.append_byte_mblks);
                 break;
             }
             co_return;

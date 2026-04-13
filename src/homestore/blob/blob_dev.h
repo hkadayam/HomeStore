@@ -69,8 +69,13 @@ public:
 
     using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::ByteView > >;
 
+    struct StreamRecoveryInfo {
+        uint32_t blk_size{0}; // 0 = use vdev default
+        ChunkMblkMap chunk_mblks;
+    };
+
     /// Per-stream recovery data grouped by stream_id.
-    using StreamMblkMap = std::map< uint64_t, ChunkMblkMap >;
+    using StreamMblkMap = std::map< uint64_t, StreamRecoveryInfo >;
 
     // ── Creation ─────────────────────────────────────────────────────────────
 
@@ -86,9 +91,10 @@ public:
     // ── Per-stream create (auto-assigns stream_id) ───────────────────────────
 
     /// Create a fresh stream. Returns the new stream (use stream_id() to get the assigned id).
-    folly::coro::Task< shared< RawBlkStream > > create_raw_blk_stream(uint64_t chunk_size);
-    folly::coro::Task< shared< AppendBlkStream > > create_append_blk_stream(uint64_t chunk_size);
-    folly::coro::Task< shared< AppendByteStream > > create_append_byte_stream(uint64_t chunk_size);
+    folly::coro::Task< shared< RawBlkStream > > create_raw_blk_stream(uint64_t chunk_size, uint32_t blk_size = 0);
+    folly::coro::Task< shared< AppendBlkStream > > create_append_blk_stream(uint64_t chunk_size, uint32_t blk_size = 0);
+    folly::coro::Task< shared< AppendByteStream > > create_append_byte_stream(uint64_t chunk_size,
+                                                                                bool concurrent_safe = true);
 
     // ── Recovery load ─────────────────────────────────────────────────────────
 
@@ -106,6 +112,10 @@ public:
     std::vector< shared< RawBlkStream > > raw_blk_streams() const;
     std::vector< shared< AppendBlkStream > > append_blk_streams() const;
     std::vector< shared< AppendByteStream > > append_byte_streams() const;
+
+    shared< RawBlkStream > get_raw_blk_stream(uint64_t stream_id) const;
+    shared< AppendBlkStream > get_append_blk_stream(uint64_t stream_id) const;
+    shared< AppendByteStream > get_append_byte_stream(uint64_t stream_id) const;
 
     // ── CP lifecycle ──────────────────────────────────────────────────────────
 
@@ -127,6 +137,7 @@ public:
         StreamType type;
         uint64_t stream_id;
         uint32_t chunk_id;
+        uint32_t blk_size;
     };
     static std::optional< ParsedChunkMblk > parse_chunk_mblk_name(const std::string_view& dev_name,
                                                                      const std::string_view& name);

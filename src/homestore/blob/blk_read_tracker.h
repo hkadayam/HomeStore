@@ -22,7 +22,7 @@
 #include <folly/futures/Future.h>
 #include <folly/futures/Promise.h>
 #include <folly/small_vector.h>
-#include <sisl/cache/simple_hashmap.hpp>
+#include <sisl/cache/simple_hashmap.h>
 #include <sisl/fds/utils.h>
 
 #include <homestore/blk.h> // BlkId, blk_num_t, blk_count_t, chunk_num_t

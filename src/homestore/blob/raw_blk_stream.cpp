@@ -35,16 +35,17 @@ namespace homestore {
 folly::coro::Task< shared< RawBlkStream > > RawBlkStream::create(uint64_t stream_id, MetaClient& meta_client,
                                                                  const std::string& dev_name,
                                                                  const shared< VirtualDev >& vdev,
-                                                                 uint64_t chunk_size) {
+                                                                 uint64_t chunk_size, uint32_t blk_size) {
     auto stream =
-        shared< RawBlkStream >{new RawBlkStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_size}};
+        shared< RawBlkStream >{new RawBlkStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_size, blk_size}};
     co_await stream->expand_to(0);
     co_return stream;
 }
 
 folly::coro::Task< shared< RawBlkStream > > RawBlkStream::load(uint64_t stream_id, MetaClient& meta_client,
                                                                const std::string& dev_name,
-                                                               const shared< VirtualDev >& vdev, ChunkMblkMap&& mblks) {
+                                                               const shared< VirtualDev >& vdev, uint32_t blk_size,
+                                                               ChunkMblkMap&& mblks) {
     // Load each chunk's block allocator from the recovered bitmap before the constructor consumes the map.
     for (auto& [cid, entry] : mblks) {
         vdev->load_blk_allocator(cid, entry.second.extract());
@@ -52,13 +53,14 @@ folly::coro::Task< shared< RawBlkStream > > RawBlkStream::load(uint64_t stream_i
 
     const uint64_t chunk_sz = vdev->chunk_size_bytes();
     auto stream = shared< RawBlkStream >{
-        new RawBlkStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_sz, std::move(mblks)}};
+        new RawBlkStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_sz, blk_size, std::move(mblks)}};
     co_return stream;
 }
 
 RawBlkStream::RawBlkStream(uint64_t stream_id, MetaClient& meta_client, std::string dev_name,
-                           const shared< VirtualDev >& vdev, uint64_t chunk_size, ChunkMblkMap&& mblks) :
-        StreamBase{stream_id, vdev, meta_client, std::move(dev_name), chunk_size, std::move(mblks)} {
+                           const shared< VirtualDev >& vdev, uint64_t chunk_size, uint32_t blk_size,
+                           ChunkMblkMap&& mblks) :
+        StreamBase{stream_id, vdev, meta_client, std::move(dev_name), chunk_size, blk_size, std::move(mblks)} {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

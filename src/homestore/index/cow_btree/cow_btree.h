@@ -104,7 +104,7 @@ public:
 
     virtual ~COWBtree() = default;
 
-    void attach_to(BtreeBase* base) { base_btree_ = base; }
+    void bind_to(BtreeBase* base) override { base_btree_ = base; }
     COWBtreeSuperBlock const& super_blk() const;
 
 private:
@@ -115,17 +115,17 @@ private:
 public:
     // ── UnderlyingBtree interface ─────────────────────────────
     Node create_node(bool is_leaf) override;
-    folly::coro::Task< Node > read_node(bnodeid_t id, LockType lock_type) const override;
-    btree_status_t write_node(Node const& node) override;
-    btree_status_t prepare_for_write(Node const& node) override;
-    void remove_node(Node const& node) override;
-    btree_status_t on_root_changed(Node const& root) override;
+    BtreeResult< Node > read_node(bnodeid_t id, LockType lock_type) const override;
+    void write_node(const Node& node) override;
+    BtreeStatus prepare_for_write(const Node& node) override;
+    void remove_node(const Node& node) override;
+    void on_root_changed(const Node& root) override;
     uint64_t space_occupied() const override;
 
     // ── Overflow support ─────────────────────────────────────────────────────
-    btree_status_t write_overflow(const sisl::ByteArray& buf, BlkId& out_blkid);
-    folly::coro::Task< btree_status_t > read_overflow(const BlkId& blkid, sisl::ByteArray& out_buf) const;
-    btree_status_t delete_overflow(const BlkId& blkid);
+    BtreeStatus write_overflow(const sisl::ByteArray& buf, BlkId& out_blkid) override;
+    folly::coro::Task< BtreeStatus > read_overflow(const BlkId& blkid, sisl::ByteArray& out_buf) const override;
+    BtreeStatus delete_overflow(const BlkId& blkid) override;
 
     // ── COWBtree-specific ─────────────────────────────────────────────────────
     bnodeid_t generate_node_id(bool is_overflow = false);
@@ -298,7 +298,7 @@ public:
     friend folly::coro::Task< void > flush_overflow_nodes(COWBtree&, CP*);
 
 private:
-    BtreeBase* base_btree_{nullptr}; // set via attach_to() after Btree<K,V> construction
+    BtreeBase* base_btree_{nullptr}; // set via bind_to() from Btree<K,V> constructor
     shared< BlobDev > blob_dev_;
     shared< NodeCache > node_cache_;
     shared< OverflowCache > overflow_cache_;

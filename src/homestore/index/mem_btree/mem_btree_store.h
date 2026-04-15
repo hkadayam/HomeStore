@@ -16,7 +16,7 @@ public:
     explicit MemNodeHandle(NodeCore* p) noexcept : ptr_{p} {}
 
     NodeCore* get() override { return ptr_; }
-    bool      valid() const override { return ptr_ != nullptr; }
+    bool valid() const override { return ptr_ != nullptr; }
 
     void move_to(void* dest) noexcept override {
         new (dest) MemNodeHandle(ptr_);
@@ -48,23 +48,23 @@ public:
 
 class MemBtree : public UnderlyingBtree {
 public:
-    MemBtree(BtreeBase& btree);
+    MemBtree() = default;
 
-    // Returns an unlocked Node wrapping a freshly-allocated NodeCore.
+    void bind_to(BtreeBase* base) override { base_btree_ = base; }
+
     Node create_node(bool is_leaf) override;
 
     // Returns an unlocked Node for the NodeCore at the given id (pointer address).
-    Node read_node(bnodeid_t id) const override;
+    BtreeResult< Node > read_node(bnodeid_t id, LockType lock_type) const override;
 
-    btree_status_t write_node(Node const& node) override;
-    btree_status_t prepare_for_write(Node const& node) override;
-    void remove_node(Node const& node) override;
-    NodeId load_root_node_id() override;
-    btree_status_t on_root_changed(Node const& root) override;
-    uint64_t       space_occupied() const override { return 0; }
+    void write_node(const Node& node) override;
+    BtreeStatus prepare_for_write(const Node& node) override;
+    void remove_node(const Node& node) override;
+    void on_root_changed(const Node& root) override;
+    uint64_t space_occupied() const override { return 0; }
 
 private:
-    BtreeBase& m_base_btree;
+    BtreeBase* base_btree_{nullptr};
 };
 
 } // namespace homestore

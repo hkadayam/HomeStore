@@ -29,12 +29,12 @@ namespace homestore {
 template < typename K, typename V >
 class FixedPrefixNode : public VariantNode< K, V > {
 public:
-    using BtreeNode::get_nth_key_internal;
     using BtreeNode::get_nth_key_size;
     using BtreeNode::get_nth_obj_size;
     using BtreeNode::get_nth_value;
     using BtreeNode::get_nth_value_size;
     using BtreeNode::occupied_size;
+    using BtreeNode::read_nth_key;
     using BtreeNode::to_string;
     using VariantNode< K, V >::get_nth_value;
 
@@ -151,7 +151,7 @@ public:
     FixedPrefixNode(bnodeid_t id, bool is_leaf, uint32_t node_size, BtreeNode::Allocator::Token token) :
             VariantNode< K, V >(id, is_leaf, node_size, token),
             prefix_bitset_{sisl::Blob{bitset_area(), reqd_bitset_size(this->node_data_size())}, /*init=*/true} {
-        this->set_node_type(btree_node_type::FIXED_PREFIX);
+        this->set_node_type(BtreeNodeType::FIXED_PREFIX);
         this->m_variant_private_data = reqd_bitset_size(this->node_data_size());
         new (this->node_data_area()) prefix_node_header();
     }
@@ -159,7 +159,7 @@ public:
     FixedPrefixNode(uint8_t* node_buf, bnodeid_t id, BtreeNode::Allocator::Token token) :
             VariantNode< K, V >(node_buf, id, token),
             prefix_bitset_{sisl::Blob{bitset_area(), reqd_bitset_size(this->node_data_size())}, /*init=*/false} {
-        DEBUG_ASSERT_EQ(this->get_node_type(), btree_node_type::FIXED_PREFIX);
+        DEBUG_ASSERT_EQ(this->get_node_type(), BtreeNodeType::FIXED_PREFIX);
         this->m_variant_private_data = reqd_bitset_size(this->node_data_size());
     }
 
@@ -183,9 +183,9 @@ public:
     /// @return An optional key that was not upserted due to lack of space in the node.
     ///         If all keys were upserted successfully, the method returns std::nullopt.
     ///         If the method ran out of space in the node, the method returns the key that was last upserted
-    btree_status_t multi_put(BtreeKeyRange< K > const& keys, BtreeKey const& first_input_key, BtreeValue const& val,
-                             btree_put_type put_type, K* last_failed_key,
-                             put_filter_cb_t const& filter_cb = nullptr) override {
+    BtreeStatus multi_put(BtreeKeyRange< K > const& keys, BtreeKey const& first_input_key, BtreeValue const& val,
+                          BtreePutType put_type, K* last_failed_key,
+                          put_filter_cb_t const& filter_cb = nullptr) override {
         DEBUG_ASSERT_EQ(this->is_leaf(), true, "Multi put entries on node are supported only for leaf nodes");
         if constexpr (std::is_base_of_v< BtreeIntervalKey, K > && std::is_base_of_v< BtreeIntervalValue, V >) {
             uint32_t modified{0};
@@ -193,8 +193,12 @@ public:
             uint16_t prefix_slot{std::numeric_limits< uint16_t >::max()};
             K cur_key = keys.start_key();
 
-            if (!keys.is_start_inclusive()) { cur_key.shift(1); }
-            if (!has_room(1u)) { return btree_status_t::space_not_avail; }
+            if (!keys.is_start_inclusive()) {
+                cur_key.shift(1);
+            }
+            if (!has_room(1u)) {
+                return BtreeStatus::space_not_avail;
+            }
             bool upserted_all{false};
 
             auto [found, idx] = this->find(cur_key, nullptr, false);
@@ -207,7 +211,7 @@ public:
 
                 put_filter_decision decision{put_filter_decision::replace};
                 if (found) {
-                    if (put_type == btree_put_type::INSERT) { // Insert operation should skip existing entries
+                    if (put_type == BtreePutType::INSERT) { // Insert operation should skip existing entries
                         decision = put_filter_decision::keep;
                     } else if (filter_cb) {
                         decision = filter_cb(cur_key, get_nth_value(idx, false), val);
@@ -223,7 +227,7 @@ public:
                         deref_remove_prefix(get_suffix_entry_c(idx)->prefix_slot);
                     }
                 } else {
-                    if (put_type == btree_put_type::UPDATE) { // Update would need existing entries found
+                    if (put_type == BtreePutType::UPDATE) { // Update would need existing entries found
                         decision = put_filter_decision::keep;
                     } else {
                         std::memmove(get_suffix_entry(idx + 1), get_suffix_entry(idx),
@@ -242,25 +246,33 @@ public:
                 }
 
                 cur_key.shift(1);
-                if (!has_room(1u)) { break; }
+                if (!has_room(1u)) {
+                    break;
+                }
 
-                if (decision != put_filter_decision::remove) { ++idx; }
+                if (decision != put_filter_decision::remove) {
+                    ++idx;
+                }
                 found =
                     (idx < this->total_entries() && (BtreeNode::get_nth_key< K >(idx, false).compare(cur_key) == 0));
             } while (true);
 
-            if (modified) { this->inc_gen(); }
+            if (modified) {
+                this->inc_gen();
+            }
 #ifndef NDEBUG
             validate_sanity();
 #endif
             if (!upserted_all) {
-                if (last_failed_key) { *last_failed_key = cur_key; }
-                return btree_status_t::has_more;
+                if (last_failed_key) {
+                    *last_failed_key = cur_key;
+                }
+                return BtreeStatus::has_more;
             } else {
-                return btree_status_t::success;
+                return BtreeStatus::success;
             }
         } else {
-            return btree_status_t::not_supported;
+            return BtreeStatus::not_supported;
         }
     }
 
@@ -282,14 +294,18 @@ public:
         DEBUG_ASSERT_EQ(this->is_leaf(), true, "remove_batch api is supported only for leaf node");
         if constexpr (std::is_base_of_v< BtreeIntervalKey, K > && std::is_base_of_v< BtreeIntervalValue, V >) {
             K cur_key = keys.start_key();
-            if (!keys.is_start_inclusive()) { cur_key.shift(1); }
+            if (!keys.is_start_inclusive()) {
+                cur_key.shift(1);
+            }
             uint32_t num_removed{0};
 
             auto [_, idx] = this->find(cur_key, nullptr, false);
             while (idx < this->total_entries()) {
                 cur_key = BtreeNode::get_nth_key< K >(idx, false);
                 auto x = cur_key.compare(keys.end_key());
-                if ((x > 0) || ((x == 0) && !keys.is_end_inclusive())) { break; }
+                if ((x > 0) || ((x == 0) && !keys.is_end_inclusive())) {
+                    break;
+                }
 
                 bool remove{true};
                 if (!filter_cb || filter_cb(cur_key, get_nth_value(idx, false))) {
@@ -303,7 +319,9 @@ public:
                     ++idx;
                 }
             }
-            if (num_removed) { this->inc_gen(); }
+            if (num_removed) {
+                this->inc_gen();
+            }
 
 #ifndef NDEBUG
             validate_sanity();
@@ -315,7 +333,7 @@ public:
     }
 
     ///////////////////////////// All overrides of BtreeNode ///////////////////////////////////
-    void get_nth_key_internal(uint32_t idx, BtreeKey& out_key, bool) const override {
+    void read_nth_key(uint32_t idx, BtreeKey& out_key, bool) const override {
         DEBUG_ASSERT_LT(idx, this->total_entries(), "node={}", to_string());
         suffix_entry const* sentry = get_suffix_entry_c(idx);
         prefix_entry const* pentry = get_prefix_entry_c(sentry->prefix_slot);
@@ -324,7 +342,7 @@ public:
         s_cast< BtreeIntervalKey& >(out_key).deserialize(pentry->key_buf(), sentry->key_buf(), true);
     }
 
-    void get_nth_value(uint32_t idx, BtreeValue* out_val, bool) const override {
+    void get_nth_value(uint32_t idx, BtreeValue& out_val, bool) const override {
         if (idx == this->total_entries()) {
             DEBUG_ASSERT_EQ(this->is_leaf(), false, "get_nth_value out-of-bound");
             DEBUG_ASSERT_EQ(this->has_valid_edge(), true, "get_nth_value out-of-bound");
@@ -338,7 +356,9 @@ public:
         }
     }
 
-    uint16_t get_nth_suffix_slot_num(uint32_t idx) const { return get_suffix_entry_c(idx)->prefix_slot; }
+    uint16_t get_nth_suffix_slot_num(uint32_t idx) const {
+        return get_suffix_entry_c(idx)->prefix_slot;
+    }
 
     uint16_t get_nth_prefix_ref_count(uint32_t idx) const {
         return get_prefix_entry_c(get_suffix_entry_c(idx)->prefix_slot)->ref_count;
@@ -353,11 +373,17 @@ public:
         }
     }
 
-    bool has_room_for_put(btree_put_type, uint32_t, uint32_t) const override { return has_room(1u); }
+    bool has_room_for_put(BtreePutType, uint32_t, uint32_t) const override {
+        return has_room(1u);
+    }
 
-    uint32_t get_nth_key_size(uint32_t) const override { return dummy_key< K >.serialized_size(); }
+    uint32_t get_nth_key_size(uint32_t) const override {
+        return dummy_key< K >.serialized_size();
+    }
 
-    uint32_t get_nth_value_size(uint32_t) const override { return dummy_value< V >.serialized_size(); }
+    uint32_t get_nth_value_size(uint32_t) const override {
+        return dummy_value< V >.serialized_size();
+    }
 
     uint32_t move_out_to_right_by_size(BtreeNode& on, uint32_t size_to_move) override {
         return move_out_to_right_internal(on, true /* by_size*/, size_to_move);
@@ -374,7 +400,9 @@ public:
         uint32_t num_moved{0};
 
         // Nothing to move
-        if (this->total_entries() == 0) { return by_size ? 0 : dst_node_size; }
+        if (this->total_entries() == 0) {
+            return by_size ? 0 : dst_node_size;
+        }
 
         // Step 1: Walk through from last idx towards first and map the current node prefix slot to new prefix slot.
         // This map is used both to map the prefix slot as well as presence of if the prefix slot is used for multiple
@@ -384,9 +412,13 @@ public:
         uint16_t idx = this->total_entries() - 1;
         do {
             if (by_size) {
-                if (dst_node_size > limit) { break; }
+                if (dst_node_size > limit) {
+                    break;
+                }
             } else {
-                if (num_moved == limit) { break; }
+                if (num_moved == limit) {
+                    break;
+                }
             }
             suffix_entry* this_sentry = get_suffix_entry(idx);
 
@@ -440,7 +472,9 @@ public:
 
         // Step 4: Use this oppurtunity to compact the source node if it needs. Destination node is written in
         // compacted state anyways
-        if (is_compaction_suggested()) { compact(); }
+        if (is_compaction_suggested()) {
+            compact();
+        }
 
 #ifndef NDEBUG
         validate_sanity();
@@ -449,8 +483,10 @@ public:
         return num_moved;
     }
 
-    btree_status_t insert(uint32_t idx, BtreeKey const& key, BtreeValue const& val) override {
-        if (!has_room(1u)) { return btree_status_t::space_not_avail; }
+    BtreeStatus insert(uint32_t idx, BtreeKey const& key, BtreeValue const& val) override {
+        if (!has_room(1u)) {
+            return BtreeStatus::space_not_avail;
+        }
 
         std::memmove(get_suffix_entry(idx + 1), get_suffix_entry(idx),
                      (this->total_entries() - idx) * suffix_entry::size());
@@ -462,7 +498,7 @@ public:
 #ifndef NDEBUG
         validate_sanity();
 #endif
-        return btree_status_t::success;
+        return BtreeStatus::success;
     }
 
     void update(uint32_t idx, BtreeValue const& val) override {
@@ -534,7 +570,9 @@ public:
 #endif
     }
 
-    uint32_t get_nth_obj_size(uint32_t) const override { return get_key_size() + get_value_size(); }
+    uint32_t get_nth_obj_size(uint32_t) const override {
+        return get_key_size() + get_value_size();
+    }
 
 #if 0
     uint32_t num_entries_by_size(uint32_t start_idx, uint32_t size) const {
@@ -574,18 +612,26 @@ public:
                                   bool copy_only_if_fits) override {
         // Make all calculations for fit based on that we will do compaction
         auto const filled_size = this->node_data_size() - available_size_with_compaction();
-        if (filled_size >= upto_size) { return false; } // Already filled beyond whats asked for
-        if (o.total_entries() == 0) { return true; }    // No entries
-        auto const room = upto_size - filled_size;      // This much we have actual room for
+        if (filled_size >= upto_size) {
+            return false;
+        } // Already filled beyond whats asked for
+        if (o.total_entries() == 0) {
+            return true;
+        }                                          // No entries
+        auto const room = upto_size - filled_size; // This much we have actual room for
 
         auto const bringin_size = o.get_entries_size(other_cursor, o.total_entries());
         if (copy_only_if_fits) {
-            if (bringin_size > room) { return false; }
+            if (bringin_size > room) {
+                return false;
+            }
         }
 
         // We made size calculations based on if we need compaction or not, however if we can fit all of other node
         // without compaction, we try to avoid it.
-        if (bringin_size > available_size_without_compaction()) { compact(); }
+        if (bringin_size > available_size_without_compaction()) {
+            compact();
+        }
         auto const ncopied = copy_internal(o, other_cursor, true /* by_size*/, room);
         other_cursor += ncopied;
 
@@ -613,7 +659,9 @@ public:
         uint32_t num_copied{0};
 
         while ((src_idx < src_node.total_entries()) && has_room(1u)) {
-            if (!by_size && num_copied >= limit) { break; }
+            if (!by_size && num_copied >= limit) {
+                break;
+            }
 
             suffix_entry const* src_sentry = src_node.get_suffix_entry_c(src_idx);
             auto const src_prefix_slot = src_sentry->prefix_slot;
@@ -624,7 +672,9 @@ public:
             auto const it = src_to_my_prefix.find(src_prefix_slot);
             if (it == src_to_my_prefix.cend()) {
                 copied_size += prefix_entry::size() + suffix_entry::size();
-                if (by_size && (copied_size > limit)) { break; }
+                if (by_size && (copied_size > limit)) {
+                    break;
+                }
 
                 my_prefix_slot = alloc_prefix();
                 prefix_entry* my_pentry = get_prefix_entry(my_prefix_slot);
@@ -635,7 +685,9 @@ public:
                 src_to_my_prefix.insert(std::pair(src_prefix_slot, my_prefix_slot));
             } else {
                 copied_size += suffix_entry::size();
-                if (by_size && (copied_size > limit)) { break; }
+                if (by_size && (copied_size > limit)) {
+                    break;
+                }
 
                 my_prefix_slot = it->second;
                 prefix_entry* my_pentry = get_prefix_entry(it->second);
@@ -688,7 +740,9 @@ public:
         return str;
     }
 
-    std::string to_dot_keys() const override { return "NOT Supported"; }
+    std::string to_dot_keys() const override {
+        return "NOT Supported";
+    }
 
 private:
     uint16_t add_prefix(BtreeKey const& key, BtreeValue const& val) {
@@ -712,14 +766,18 @@ private:
 
         auto phdr = prefix_header();
         ++phdr->used_slots;
-        if (s_cast< uint16_t >(slot_num) >= phdr->tail_slot) { phdr->tail_slot = slot_num + 1; }
+        if (s_cast< uint16_t >(slot_num) >= phdr->tail_slot) {
+            phdr->tail_slot = slot_num + 1;
+        }
 
         DEBUG_ASSERT_LE(phdr->used_slots, phdr->tail_slot, "Prefix slot number {} is not less than tail slot number {}",
                         slot_num, phdr->tail_slot);
         return slot_num;
     }
 
-    void ref_prefix(uint16_t slot_num) { ++(get_prefix_entry(slot_num)->ref_count); }
+    void ref_prefix(uint16_t slot_num) {
+        ++(get_prefix_entry(slot_num)->ref_count);
+    }
 
     void deref_remove_prefix(uint16_t slot_num) {
         auto phdr = prefix_header();
@@ -776,7 +834,9 @@ private:
         return (phdr->tail_slot - phdr->used_slots);
     }
 
-    bool is_compaction_suggested() const { return (num_prefix_holes() > prefix_node_header::min_holes_to_compact); }
+    bool is_compaction_suggested() const {
+        return (num_prefix_holes() > prefix_node_header::min_holes_to_compact);
+    }
 
     void compact() {
         // Build reverse map from prefix to suffix
@@ -792,7 +852,9 @@ private:
         uint16_t to_slot{0};
         while (true) {
             from_slot = prefix_bitset_.get_next_set_bit(cbitset_blob(), from_slot);
-            if (from_slot == std::numeric_limits< uint16_t >::max()) { break; }
+            if (from_slot == std::numeric_limits< uint16_t >::max()) {
+                break;
+            }
 
             auto const to_slot = prefix_bitset_.get_next_reset_bit(cbitset_blob(), 0u);
             DEBUG_ASSERT_NE(to_slot, std::numeric_limits< uint16_t >::max(),
@@ -844,19 +906,35 @@ private:
                               sisl::CompactBitSet::size_multiples());
     }
 
-    prefix_node_header* prefix_header() { return r_cast< prefix_node_header* >(this->node_data_area()); }
+    prefix_node_header* prefix_header() {
+        return r_cast< prefix_node_header* >(this->node_data_area());
+    }
     prefix_node_header const* cprefix_header() const {
         return r_cast< prefix_node_header const* >(this->node_data_area_const());
     }
 
-    uint8_t* bitset_area() { return this->node_data_area() + sizeof(prefix_node_header); }
-    uint8_t const* cbitset_area() const { return this->node_data_area_const() + sizeof(prefix_node_header); }
-    uint16_t bitset_size() const { return this->m_variant_private_data; }
-    sisl::Blob bitset_blob() { return sisl::Blob{bitset_area(), uint32_cast(bitset_size())}; }
-    sisl::Blob cbitset_blob() const { return sisl::Blob{cbitset_area(), uint32_cast(bitset_size())}; }
+    uint8_t* bitset_area() {
+        return this->node_data_area() + sizeof(prefix_node_header);
+    }
+    uint8_t const* cbitset_area() const {
+        return this->node_data_area_const() + sizeof(prefix_node_header);
+    }
+    uint16_t bitset_size() const {
+        return this->m_variant_private_data;
+    }
+    sisl::Blob bitset_blob() {
+        return sisl::Blob{bitset_area(), uint32_cast(bitset_size())};
+    }
+    sisl::Blob cbitset_blob() const {
+        return sisl::Blob{cbitset_area(), uint32_cast(bitset_size())};
+    }
 
-    uint8_t* suffix_kv_area() { return bitset_area() + bitset_size(); }
-    uint8_t const* csuffix_kv_area() const { return cbitset_area() + bitset_size(); }
+    uint8_t* suffix_kv_area() {
+        return bitset_area() + bitset_size();
+    }
+    uint8_t const* csuffix_kv_area() const {
+        return cbitset_area() + bitset_size();
+    }
 
     prefix_entry* get_prefix_entry(uint16_t slot_num) {
         return r_cast< prefix_entry* >(
@@ -877,7 +955,11 @@ private:
         return r_cast< suffix_entry const* >(csuffix_kv_area() + (idx * suffix_entry::size()));
     }
 
-    static constexpr uint32_t get_key_size() { return prefix_entry::key_size() + suffix_entry::key_size(); }
-    static constexpr uint32_t get_value_size() { return prefix_entry::value_size() + suffix_entry::value_size(); }
+    static constexpr uint32_t get_key_size() {
+        return prefix_entry::key_size() + suffix_entry::key_size();
+    }
+    static constexpr uint32_t get_value_size() {
+        return prefix_entry::value_size() + suffix_entry::value_size();
+    }
 };
 } // namespace homestore

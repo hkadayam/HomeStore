@@ -24,8 +24,8 @@ struct FixedLenBtree {
     using BtreeType = Btree< TestFixedKey, TestFixedValue >;
     using KeyType = TestFixedKey;
     using ValueType = TestFixedValue;
-    static constexpr btree_node_type leaf_node_type = btree_node_type::FIXED;
-    static constexpr btree_node_type interior_node_type = btree_node_type::FIXED;
+    static constexpr BtreeNodeType leaf_node_type = BtreeNodeType::FIXED;
+    static constexpr BtreeNodeType interior_node_type = BtreeNodeType::FIXED;
     static constexpr IndexStore::Type store_type = StoreType;
 };
 
@@ -34,8 +34,8 @@ struct VarKeySizeBtree {
     using BtreeType = Btree< TestVarLenKey, TestFixedValue >;
     using KeyType = TestVarLenKey;
     using ValueType = TestFixedValue;
-    static constexpr btree_node_type leaf_node_type = btree_node_type::VAR_KEY;
-    static constexpr btree_node_type interior_node_type = btree_node_type::VAR_KEY;
+    static constexpr BtreeNodeType leaf_node_type = BtreeNodeType::VAR_KEY;
+    static constexpr BtreeNodeType interior_node_type = BtreeNodeType::VAR_KEY;
     static constexpr IndexStore::Type store_type = StoreType;
 };
 
@@ -44,8 +44,8 @@ struct VarValueSizeBtree {
     using BtreeType = Btree< TestFixedKey, TestVarLenValue >;
     using KeyType = TestFixedKey;
     using ValueType = TestVarLenValue;
-    static constexpr btree_node_type leaf_node_type = btree_node_type::VAR_VALUE;
-    static constexpr btree_node_type interior_node_type = btree_node_type::FIXED;
+    static constexpr BtreeNodeType leaf_node_type = BtreeNodeType::VAR_VALUE;
+    static constexpr BtreeNodeType interior_node_type = BtreeNodeType::FIXED;
     static constexpr IndexStore::Type store_type = StoreType;
 };
 
@@ -54,8 +54,8 @@ struct VarObjSizeBtree {
     using BtreeType = Btree< TestVarLenKey, TestVarLenValue >;
     using KeyType = TestVarLenKey;
     using ValueType = TestVarLenValue;
-    static constexpr btree_node_type leaf_node_type = btree_node_type::VAR_OBJECT;
-    static constexpr btree_node_type interior_node_type = btree_node_type::VAR_KEY;
+    static constexpr BtreeNodeType leaf_node_type = BtreeNodeType::VAR_OBJECT;
+    static constexpr BtreeNodeType interior_node_type = BtreeNodeType::VAR_KEY;
     static constexpr IndexStore::Type store_type = StoreType;
 };
 
@@ -64,7 +64,7 @@ struct PrefixIntervalBtree {
     using BtreeType = Btree< TestIntervalKey, TestIntervalValue >;
     using KeyType = TestIntervalKey;
     using ValueType = TestIntervalValue;
-    static constexpr btree_node_type leaf_node_type = btree_node_type::FIXED_PREFIX;
-    static constexpr btree_node_type interior_node_type = btree_node_type::FIXED;
+    static constexpr BtreeNodeType leaf_node_type = BtreeNodeType::FIXED_PREFIX;
+    static constexpr BtreeNodeType interior_node_type = BtreeNodeType::FIXED;
     static constexpr IndexStore::Type store_type = StoreType;
 };

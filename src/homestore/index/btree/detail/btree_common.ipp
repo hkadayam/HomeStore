@@ -19,27 +19,35 @@
 
 namespace homestore {
 
-#define to_variant_node(n) static_cast< VariantNode< K, V >* >((n).operator->())
+// to_variant_node removed — multi_get/get_any/multi_put/multi_remove are now template methods on NodeCore
 
 template < typename K, typename V >
-BtreeTask< btree_status_t > Btree< K, V >::post_order_traversal(LockType ltype, const auto& cb) {
+BtreeTask< BtreeStatus > Btree< K, V >::post_order_traversal(LockType ltype, const auto& cb) {
     // Read and write locks have different guard types; each path is explicit.
-    btree_status_t ret{btree_status_t::success};
+    BtreeStatus ret{BtreeStatus::success};
     if (ltype == LockType::Write) {
         auto tree_lock = CO_AWAIT(lock_tree_excl());
         if (m_root_node_info.bnode_id() != empty_bnodeid) {
             auto [read_ret, root] = CO_AWAIT(read_node(m_root_node_info.bnode_id(), ltype));
-            if (read_ret != btree_status_t::success) { CO_RETURN read_ret; }
+            if (read_ret != BtreeStatus::success) {
+                CO_RETURN read_ret;
+            }
             ret = CO_AWAIT(post_order_traversal(std::move(root), ltype, cb));
-            if (ret == btree_status_t::node_freed) { ret = btree_status_t::success; }
+            if (ret == BtreeStatus::node_freed) {
+                ret = BtreeStatus::success;
+            }
         }
     } else {
         auto tree_lock = CO_AWAIT(lock_tree_shared());
         if (m_root_node_info.bnode_id() != empty_bnodeid) {
             auto [read_ret, root] = CO_AWAIT(read_node(m_root_node_info.bnode_id(), ltype));
-            if (read_ret != btree_status_t::success) { CO_RETURN read_ret; }
+            if (read_ret != BtreeStatus::success) {
+                CO_RETURN read_ret;
+            }
             ret = CO_AWAIT(post_order_traversal(std::move(root), ltype, cb));
-            if (ret == btree_status_t::node_freed) { ret = btree_status_t::success; }
+            if (ret == BtreeStatus::node_freed) {
+                ret = BtreeStatus::success;
+            }
         }
     }
     CO_RETURN ret;
@@ -47,22 +55,26 @@ BtreeTask< btree_status_t > Btree< K, V >::post_order_traversal(LockType ltype, 
 
 // Takes node by value — owns the lock. RAII unlocks when function returns (or callback freed the node).
 template < typename K, typename V >
-BtreeTask< btree_status_t > Btree< K, V >::post_order_traversal(Node node, LockType ltype, const auto& cb) {
-    btree_status_t ret = btree_status_t::success;
+BtreeTask< BtreeStatus > Btree< K, V >::post_order_traversal(Node node, LockType ltype, const auto& cb) {
+    BtreeStatus ret = BtreeStatus::success;
 
     if (!node->is_leaf()) {
         uint32_t i{0};
         BtreeLinkInfo child_info;
         while (i <= node->total_entries()) {
             if (i == node->total_entries()) {
-                if (!node->has_valid_edge()) { break; }
+                if (!node->has_valid_edge()) {
+                    break;
+                }
                 child_info.set_bnode_id(node->edge_id());
             } else {
                 node->get_nth_value(i, &child_info, false /* copy */);
             }
 
             auto [child_ret, child] = CO_AWAIT(read_node(child_info.bnode_id(), ltype));
-            if (child_ret != btree_status_t::success) { CO_RETURN child_ret; }
+            if (child_ret != BtreeStatus::success) {
+                CO_RETURN child_ret;
+            }
 
             ret = CO_AWAIT(post_order_traversal(std::move(child), ltype, cb));
             // child is moved-from; RAII in the recursive call handles unlock/free.
@@ -76,9 +88,11 @@ BtreeTask< btree_status_t > Btree< K, V >::post_order_traversal(Node node, LockT
 
 template < typename K, typename V >
 BtreeTask< void > Btree< K, V >::get_all_kvs(std::vector< std::pair< K, V > >& kvs) const {
-    CO_AWAIT(post_order_traversal(LockType::Read, [this, &kvs](Node node, bool is_leaf) -> btree_status_t {
-        if (!is_leaf) { node->get_all_kvs(kvs); }
-        return btree_status_t::success;
+    CO_AWAIT(post_order_traversal(LockType::Read, [this, &kvs](Node node, bool is_leaf) -> BtreeStatus {
+        if (!is_leaf) {
+            node->get_all_kvs(kvs);
+        }
+        return BtreeStatus::success;
     }));
     CO_RETURN_VOID;
 }
@@ -92,9 +106,9 @@ folly::Future< folly::Unit > Btree< K, V >::destroy() {
     }
 
     if (m_store->is_ephemeral()) {
-        post_order_traversal(LockType::Write, [this](Node node, bool is_leaf) -> btree_status_t {
+        post_order_traversal(LockType::Write, [this](Node node, bool is_leaf) -> BtreeStatus {
             remove_node(std::move(node));
-            return btree_status_t::node_freed;
+            return BtreeStatus::node_freed;
         });
     } else if (!m_store->is_fast_destroy_supported()) {
         // TODO: Implement full range remove.
@@ -119,7 +133,9 @@ BtreeTask< uint64_t > Btree< K, V >::get_child_node_cnt(bnodeid_t bnodeid) const
     uint64_t cnt{0};
 
     auto [ret, node] = CO_AWAIT(read_node(bnodeid, LockType::Read));
-    if (ret != btree_status_t::success) { CO_RETURN cnt; }
+    if (ret != BtreeStatus::success) {
+        CO_RETURN cnt;
+    }
 
     if (!node->is_leaf()) {
         uint32_t i = 0;
@@ -128,7 +144,9 @@ BtreeTask< uint64_t > Btree< K, V >::get_child_node_cnt(bnodeid_t bnodeid) const
             cnt += CO_AWAIT(get_child_node_cnt(p.bnode_id())) + 1;
             ++i;
         }
-        if (node->has_valid_edge()) { cnt += CO_AWAIT(get_child_node_cnt(node->edge_id())) + 1; }
+        if (node->has_valid_edge()) {
+            cnt += CO_AWAIT(get_child_node_cnt(node->edge_id())) + 1;
+        }
     }
     // RAII: node unlocks when it goes out of scope
     CO_RETURN cnt;
@@ -137,7 +155,9 @@ BtreeTask< uint64_t > Btree< K, V >::get_child_node_cnt(bnodeid_t bnodeid) const
 template < typename K, typename V >
 BtreeTask< void > Btree< K, V >::to_string_internal(bnodeid_t bnodeid, std::string& buf) const {
     auto [ret, node] = CO_AWAIT(read_node(bnodeid, LockType::Read));
-    if (ret != btree_status_t::success) { CO_RETURN_VOID; }
+    if (ret != BtreeStatus::success) {
+        CO_RETURN_VOID;
+    }
 
     fmt::format_to(std::back_inserter(buf), "{}\n", node->to_string(true /* print_friendly */));
 
@@ -149,7 +169,9 @@ BtreeTask< void > Btree< K, V >::to_string_internal(bnodeid_t bnodeid, std::stri
             CO_AWAIT(to_string_internal(p.bnode_id(), buf));
             ++i;
         }
-        if (node->has_valid_edge()) { CO_AWAIT(to_string_internal(node->edge_id(), buf)); }
+        if (node->has_valid_edge()) {
+            CO_AWAIT(to_string_internal(node->edge_id(), buf));
+        }
     }
     // RAII unlock
     CO_RETURN_VOID;
@@ -159,7 +181,9 @@ template < typename K, typename V >
 BtreeTask< void > Btree< K, V >::to_custom_string_internal(bnodeid_t bnodeid, std::string& buf,
                                                            NodeCore::ToStringCallback< K, V > const& cb) const {
     auto [ret, node] = CO_AWAIT(read_node(bnodeid, LockType::Read));
-    if (ret != btree_status_t::success) { CO_RETURN_VOID; }
+    if (ret != BtreeStatus::success) {
+        CO_RETURN_VOID;
+    }
 
     fmt::format_to(std::back_inserter(buf), "{}\n", node->to_custom_string(cb));
 
@@ -171,7 +195,9 @@ BtreeTask< void > Btree< K, V >::to_custom_string_internal(bnodeid_t bnodeid, st
             CO_AWAIT(to_custom_string_internal(p.bnode_id(), buf, cb));
             ++i;
         }
-        if (node->has_valid_edge()) { CO_AWAIT(to_custom_string_internal(node->edge_id(), buf, cb)); }
+        if (node->has_valid_edge()) {
+            CO_AWAIT(to_custom_string_internal(node->edge_id(), buf, cb));
+        }
     }
     CO_RETURN_VOID;
 }
@@ -181,7 +207,9 @@ BtreeTask< void > Btree< K, V >::to_dot_keys(bnodeid_t bnodeid, std::string& buf
                                              std::map< uint32_t, std::vector< uint64_t > >& l_map,
                                              std::map< uint64_t, BtreeVisualizeVariables >& info_map) const {
     auto [ret, node] = CO_AWAIT(read_node(bnodeid, LockType::Read));
-    if (ret != btree_status_t::success) { CO_RETURN_VOID; }
+    if (ret != BtreeStatus::success) {
+        CO_RETURN_VOID;
+    }
 
     fmt::format_to(std::back_inserter(buf), "{}\n", node->to_dot_keys());
     l_map[node->level()].push_back(node->node_id());
@@ -254,9 +282,13 @@ void Btree< K, V >::validate_sanity_next_child(Node const& parent_node, uint32_t
     K parent_key;
 
     if (parent_node->has_valid_edge()) {
-        if (ind == parent_node->total_entries()) { return; }
+        if (ind == parent_node->total_entries()) {
+            return;
+        }
     } else {
-        if (ind == parent_node->total_entries() - 1) { return; }
+        if (ind == parent_node->total_entries() - 1) {
+            return;
+        }
     }
     parent_node->get_nth_value(ind + 1, &child_info, false /* copy */);
 
@@ -284,7 +316,7 @@ BtreeTask< void > Btree< K, V >::print_node(const bnodeid_t& bnodeid) const {
 
     auto tree_lock = CO_AWAIT(lock_tree_shared());
     auto [ret, node] = CO_AWAIT(read_node(bnodeid, LockType::Read));
-    if (ret == btree_status_t::success) {
+    if (ret == BtreeStatus::success) {
         buf = node->to_string(true /* print_friendly */);
         // RAII: node unlocks when it goes out of scope
     }
@@ -294,17 +326,17 @@ BtreeTask< void > Btree< K, V >::print_node(const bnodeid_t& bnodeid) const {
 }
 
 template < typename K, typename V >
-void Btree< K, V >::append_route_trace(BtreeRequest& req, Node const& node, btree_event_t event,
-                                       uint32_t start_idx, uint32_t end_idx) const {
+void Btree< K, V >::append_route_trace(BtreeRequest& req, Node const& node, BtreeEvent event, uint32_t start_idx,
+                                       uint32_t end_idx) const {
     if (req.m_route_tracing) {
-        req.m_route_tracing->emplace_back(trace_route_entry{.node_id = node->node_id(),
-                                                            .node = node.operator->(),
-                                                            .start_idx = start_idx,
-                                                            .end_idx = end_idx,
-                                                            .num_entries = node->total_entries(),
-                                                            .level = node->level(),
-                                                            .is_leaf = node->is_leaf(),
-                                                            .event = event});
+        req.m_route_tracing->emplace_back(TraceRouteEntry{.node_id = node->node_id(),
+                                                          .node = node.operator->(),
+                                                          .start_idx = start_idx,
+                                                          .end_idx = end_idx,
+                                                          .num_entries = node->total_entries(),
+                                                          .level = node->level(),
+                                                          .is_leaf = node->is_leaf(),
+                                                          .event = event});
     }
 }
 } // namespace homestore

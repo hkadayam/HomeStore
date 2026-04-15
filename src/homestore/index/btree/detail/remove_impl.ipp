@@ -20,7 +20,7 @@ namespace homestore {
 
 template < typename K, typename V >
 template < typename ReqT >
-BtreeTask< btree_status_t > Btree< K, V >::remove(ReqT& req) {
+BtreeTask< BtreeStatus > Btree< K, V >::remove(ReqT& req) {
     static_assert(std::is_same_v< ReqT, BtreeSingleRemoveRequest > ||
                       std::is_same_v< ReqT, BtreeRangeRemoveRequest< K > > ||
                       std::is_same_v< ReqT, BtreeRemoveAnyRequest< K > >,
@@ -29,20 +29,24 @@ BtreeTask< btree_status_t > Btree< K, V >::remove(ReqT& req) {
     LockType acq_lock = LockType::Read;
 
     for (;;) {
-        btree_status_t ret = btree_status_t::success;
+        BtreeStatus ret = BtreeStatus::success;
         bool need_collapse = false;
 
         {
             auto tree_lock = CO_AWAIT(lock_tree_shared());
 
             auto [read_ret, root] = CO_AWAIT(read_node(m_root_node_info.bnode_id(), LockType::ReadInteriorWriteLeaf));
-            if (read_ret != btree_status_t::success) {
-                if (read_ret == btree_status_t::retry) { continue; }
+            if (read_ret != BtreeStatus::success) {
+                if (read_ret == BtreeStatus::retry) {
+                    continue;
+                }
                 CO_RETURN read_ret;
             }
 
             if (root->total_entries() == 0) {
-                if (root->is_leaf()) { CO_RETURN btree_status_t::not_found; }
+                if (root->is_leaf()) {
+                    CO_RETURN BtreeStatus::not_found;
+                }
 
                 BT_NODE_LOG_ASSERT_EQ(root->has_valid_edge(), true, root.operator->(),
                                       "Orphaned root with no entries and no edge");
@@ -51,15 +55,16 @@ BtreeTask< btree_status_t > Btree< K, V >::remove(ReqT& req) {
                 // tree_lock released at end of this block before check_collapse_root acquires excl
             } else {
                 ret = CO_AWAIT(do_remove(std::move(root), req));
-                if (ret == btree_status_t::retry) { continue; }
+                if (ret == BtreeStatus::retry) {
+                    continue;
+                }
                 CO_RETURN ret;
             }
         } // tree_lock released here
 
         if (need_collapse) {
             ret = CO_AWAIT(check_collapse_root(req));
-            if (ret != btree_status_t::success && ret != btree_status_t::merge_not_required &&
-                ret != btree_status_t::retry) {
+            if (ret != BtreeStatus::success && ret != BtreeStatus::merge_not_required && ret != BtreeStatus::retry) {
                 LOGERROR("check collapse read failed btree name {}", m_bt_cfg.name());
                 CO_RETURN ret;
             }
@@ -72,8 +77,8 @@ BtreeTask< btree_status_t > Btree< K, V >::remove(ReqT& req) {
 // On interior nodes, child locks are acquired and released by RAII or explicit unlock.
 template < typename K, typename V >
 template < typename ReqT >
-BtreeTask< btree_status_t > Btree< K, V >::do_remove(Node my_node, ReqT& req) {
-    btree_status_t ret = btree_status_t::success;
+BtreeTask< BtreeStatus > Btree< K, V >::do_remove(Node my_node, ReqT& req) {
+    BtreeStatus ret = BtreeStatus::success;
     bool at_least_one_child_modified{false};
 
     if (my_node->is_leaf()) {
@@ -86,7 +91,9 @@ BtreeTask< btree_status_t > Btree< K, V >::do_remove(Node my_node, ReqT& req) {
 #endif
 
         if constexpr (std::is_same_v< ReqT, BtreeSingleRemoveRequest >) {
-            if ((modified = my_node->remove_one(req.key(), nullptr, req.m_outval))) { ++removed_count; }
+            if ((modified = my_node->remove_one(req.key(), nullptr, req.m_outval))) {
+                ++removed_count;
+            }
         } else if constexpr (std::is_same_v< ReqT, BtreeRangeRemoveRequest< K > >) {
             remove_filter_cb_t cb = nullptr;
             if (req.m_filter) {
@@ -98,7 +105,9 @@ BtreeTask< btree_status_t > Btree< K, V >::do_remove(Node my_node, ReqT& req) {
             modified = (removed_count != 0);
             req.shift_working_range();
         } else if constexpr (std::is_same_v< ReqT, BtreeRemoveAnyRequest< K > >) {
-            if ((modified = my_node->remove_any(req.m_range, req.m_outkey, req.m_outval))) { ++removed_count; }
+            if ((modified = my_node->remove_any(req.m_range, req.m_outkey, req.m_outval))) {
+                ++removed_count;
+            }
         }
 #ifndef NDEBUG
         my_node->validate_key_order< K >();
@@ -106,9 +115,11 @@ BtreeTask< btree_status_t > Btree< K, V >::do_remove(Node my_node, ReqT& req) {
         if (modified) {
             write_node(my_node);
             COUNTER_DECREMENT(m_metrics, btree_obj_count, removed_count);
-            if (req.m_route_tracing) { append_route_trace(req, my_node, btree_event_t::REMOVE); }
+            if (req.m_route_tracing) {
+                append_route_trace(req, my_node, BtreeEvent::REMOVE);
+            }
         }
-        CO_RETURN modified ? btree_status_t::success : btree_status_t::not_found;
+        CO_RETURN modified ? BtreeStatus::success : BtreeStatus::not_found;
         // RAII: my_node destructor unlocks
     }
 
@@ -129,29 +140,33 @@ BtreeTask< btree_status_t > Btree< K, V >::do_remove(Node my_node, ReqT& req) {
         } else if constexpr (std::is_same_v< ReqT, BtreeRangeRemoveRequest< K > >) {
             auto const matched = my_node->match_range< K >(req.working_range(), start_idx, end_idx);
             if (!matched) {
-                CO_RETURN(at_least_one_child_modified ? btree_status_t::success : btree_status_t::not_found);
+                CO_RETURN(at_least_one_child_modified ? BtreeStatus::success : BtreeStatus::not_found);
             }
         } else if constexpr (std::is_same_v< ReqT, BtreeRemoveAnyRequest< K > >) {
             auto const matched = my_node->match_range< K >(req.m_range, start_idx, end_idx);
             if (!matched) {
-                CO_RETURN(at_least_one_child_modified ? btree_status_t::success : btree_status_t::not_found);
+                CO_RETURN(at_least_one_child_modified ? BtreeStatus::success : BtreeStatus::not_found);
             }
             end_idx = start_idx = (end_idx - start_idx) / 2; // pick middle
         }
 
-        if (req.m_route_tracing) { append_route_trace(req, my_node, btree_event_t::READ, start_idx, end_idx); }
+        if (req.m_route_tracing) {
+            append_route_trace(req, my_node, BtreeEvent::READ, start_idx, end_idx);
+        }
         curr_idx = start_idx;
 
         while (curr_idx <= end_idx) {
-            NodeId child_id;
+            NodeLink child_id;
             auto [child_ret, child] = CO_AWAIT(get_child_node(my_node, curr_idx, child_id, LockType::Read));
-            if (child_ret != btree_status_t::success) {
-                CO_RETURN(at_least_one_child_modified ? btree_status_t::success : child_ret);
+            if (child_ret != BtreeStatus::success) {
+                CO_RETURN(at_least_one_child_modified ? BtreeStatus::success : child_ret);
             }
 
             if (child->is_merge_needed(m_bt_cfg)) {
                 uint32_t node_end_idx = my_node->total_entries();
-                if (!my_node->has_valid_edge()) { --node_end_idx; }
+                if (!my_node->has_valid_edge()) {
+                    --node_end_idx;
+                }
                 if (node_end_idx > (curr_idx + m_bt_cfg.m_max_merge_nodes - 1)) {
                     node_end_idx = curr_idx + m_bt_cfg.m_max_merge_nodes - 1;
                 }
@@ -159,15 +174,17 @@ BtreeTask< btree_status_t > Btree< K, V >::do_remove(Node my_node, ReqT& req) {
                 if (node_end_idx > curr_idx) {
                     // Upgrade parent + child to WRITE; on failure, caller must retry.
                     ret = CO_AWAIT(upgrade_node_locks(my_node, child));
-                    if (ret != btree_status_t::success) {
-                        CO_RETURN(at_least_one_child_modified ? btree_status_t::success : ret);
+                    if (ret != BtreeStatus::success) {
+                        CO_RETURN(at_least_one_child_modified ? BtreeStatus::success : ret);
                     }
 
                     ret = CO_AWAIT(merge_nodes(my_node, child, curr_idx, node_end_idx));
-                    if ((ret != btree_status_t::success) && (ret != btree_status_t::merge_not_required)) {
-                        CO_RETURN(at_least_one_child_modified ? btree_status_t::success : ret);
-                    } else if (ret == btree_status_t::success) {
-                        if (req.m_route_tracing) { append_route_trace(req, child, btree_event_t::MERGE); }
+                    if ((ret != BtreeStatus::success) && (ret != BtreeStatus::merge_not_required)) {
+                        CO_RETURN(at_least_one_child_modified ? BtreeStatus::success : ret);
+                    } else if (ret == BtreeStatus::success) {
+                        if (req.m_route_tracing) {
+                            append_route_trace(req, child, BtreeEvent::MERGE);
+                        }
                         COUNTER_INCREMENT(m_metrics, btree_merge_count, 1);
                         need_retry_inner = true;
                         break; // exit while loop, retry the do-while
@@ -213,44 +230,52 @@ BtreeTask< btree_status_t > Btree< K, V >::do_remove(Node my_node, ReqT& req) {
             }
 
             ret = CO_AWAIT(do_remove(std::move(child), req));
-            if (ret == btree_status_t::success) { at_least_one_child_modified = true; }
+            if (ret == BtreeStatus::success) {
+                at_least_one_child_modified = true;
+            }
             ++curr_idx;
         }
     } while (need_retry_inner);
 
     // RAII: my_node destructor unlocks (no-op if already unlocked via unlock_node above)
-    CO_RETURN(at_least_one_child_modified ? btree_status_t::success : ret);
+    CO_RETURN(at_least_one_child_modified ? BtreeStatus::success : ret);
 }
 
 template < typename K, typename V >
 template < typename ReqT >
-BtreeTask< btree_status_t > Btree< K, V >::check_collapse_root(ReqT& req) {
-    if (!m_bt_cfg.m_merge_turned_on) { CO_RETURN btree_status_t::merge_not_required; }
-    btree_status_t ret = btree_status_t::success;
+BtreeTask< BtreeStatus > Btree< K, V >::check_collapse_root(ReqT& req) {
+    if (!m_bt_cfg.m_merge_turned_on) {
+        CO_RETURN BtreeStatus::merge_not_required;
+    }
+    BtreeStatus ret = BtreeStatus::success;
 
     auto tree_lock = CO_AWAIT(lock_tree_excl());
 
     auto [read_ret, root] = CO_AWAIT(read_node(m_root_node_info.bnode_id(), LockType::Write));
-    if (read_ret != btree_status_t::success) { CO_RETURN read_ret; }
+    if (read_ret != BtreeStatus::success) {
+        CO_RETURN read_ret;
+    }
 
     if (root->total_entries() != 0 || root->is_leaf()) {
         // Some other thread already collapsed root.
-        CO_RETURN btree_status_t::success; // RAII: root + tree_lock released
+        CO_RETURN BtreeStatus::success; // RAII: root + tree_lock released
     }
 
     BT_NODE_DBG_ASSERT_EQ(root->has_valid_edge(), true, root.operator->());
     {
         auto [child_ret, child] = CO_AWAIT(read_node(root->edge_id(), LockType::Write));
-        if (child_ret != btree_status_t::success) {
+        if (child_ret != BtreeStatus::success) {
             CO_RETURN child_ret; // root RAII at function exit
         }
 
         ret = m_underlying->on_root_changed(child);
-        if (ret != btree_status_t::success) {
+        if (ret != BtreeStatus::success) {
             CO_RETURN ret; // child + root RAII at block/function exit
         }
 
-        if (req.m_route_tracing) { append_route_trace(req, root, btree_event_t::MERGE); }
+        if (req.m_route_tracing) {
+            append_route_trace(req, root, BtreeEvent::MERGE);
+        }
 
         remove_node(std::move(root)); // unlock + remove; RAII is now no-op
         m_root_node_info = child->link_info();
@@ -263,11 +288,13 @@ BtreeTask< btree_status_t > Btree< K, V >::check_collapse_root(ReqT& req) {
 }
 
 template < typename K, typename V >
-BtreeTask< btree_status_t > Btree< K, V >::merge_nodes(Node const& parent_node, Node const& leftmost_node,
-                                                       uint32_t start_idx, uint32_t end_idx) {
-    if (!m_bt_cfg.m_merge_turned_on) { CO_RETURN btree_status_t::merge_not_required; }
+BtreeTask< BtreeStatus > Btree< K, V >::merge_nodes(Node const& parent_node, Node const& leftmost_node,
+                                                    uint32_t start_idx, uint32_t end_idx) {
+    if (!m_bt_cfg.m_merge_turned_on) {
+        CO_RETURN BtreeStatus::merge_not_required;
+    }
 
-    btree_status_t ret{btree_status_t::success};
+    BtreeStatus ret{BtreeStatus::success};
     NodeList old_nodes;
     NodeList new_nodes;
     old_nodes.reserve(end_idx - start_idx + 1);
@@ -275,7 +302,9 @@ BtreeTask< btree_status_t > Btree< K, V >::merge_nodes(Node const& parent_node, 
 
     // Erase last element from list. If node_removal==true, backend-removes it before popping.
     auto erase_last_node = [this](NodeList& list, bool node_removal) {
-        if (node_removal) { remove_node(std::move(list.back())); }
+        if (node_removal) {
+            remove_node(std::move(list.back()));
+        }
         list.pop_back(); // RAII: destructor unlocks if not already removed
     };
 
@@ -300,7 +329,7 @@ BtreeTask< btree_status_t > Btree< K, V >::merge_nodes(Node const& parent_node, 
             parent_node->get_nth_value(idx, &child_info, false /* copy */);
 
             auto [child_ret, child] = CO_AWAIT(read_node(child_info.bnode_id(), LockType::Write));
-            if (child_ret != btree_status_t::success) {
+            if (child_ret != BtreeStatus::success) {
                 ret = child_ret;
                 goto out;
             }
@@ -346,7 +375,7 @@ BtreeTask< btree_status_t > Btree< K, V >::merge_nodes(Node const& parent_node, 
 
     // Commit only if we actually reduced node count.
     if (new_nodes.size() >= old_nodes.size()) {
-        ret = btree_status_t::merge_not_required;
+        ret = BtreeStatus::merge_not_required;
         goto out;
     }
 
@@ -377,9 +406,9 @@ BtreeTask< btree_status_t > Btree< K, V >::merge_nodes(Node const& parent_node, 
     }
     write_node(leftmost_node);
     write_node(parent_node);
-    ret = btree_status_t::success;
+    ret = BtreeStatus::success;
 
-    if (ret == btree_status_t::success) {
+    if (ret == BtreeStatus::success) {
         // Explicitly remove old nodes (backend marks storage for reuse).
         for (auto& node : old_nodes) {
             remove_node(std::move(node));
@@ -392,7 +421,7 @@ out:
     // Free the temp clone (NONE-locked; remove_node just frees storage).
     remove_node(std::move(cloned_new_node));
 
-    if (ret != btree_status_t::success) {
+    if (ret != BtreeStatus::success) {
         // new_nodes: were allocated but never committed — explicitly remove.
         for (auto& node : new_nodes) {
             remove_node(std::move(node));

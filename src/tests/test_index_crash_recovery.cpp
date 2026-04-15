@@ -27,8 +27,6 @@
 
 using namespace homestore;
 
- 
-
 // TODO Add tests to do write,remove after recovery.
 // TODO Test with var len key with io mgr page size is 512.
 
@@ -107,7 +105,9 @@ public:
 
     OperationList generateOperations(size_t numOperations, bool reset = false) {
         std::vector< Operation > operations;
-        if (reset) { this->reset(); }
+        if (reset) {
+            this->reset();
+        }
         if (putFreq_ == 100 && end_range_ - start_range_ + 1 - in_use_key_cnt_.load() < numOperations) {
             LOGDEBUG("All keys are in use, skipping operation generation. end_range_ {} start_range_ {} "
                      "in_use_key_cnt_ {}, numOperations {}",
@@ -143,7 +143,9 @@ public:
 
     __attribute__((noinline)) std::string showKeyState(uint64_t key) const {
         auto it = keyStates.find(key);
-        if (it != keyStates.end()) { return it->second ? "Put" : "Remove"; }
+        if (it != keyStates.end()) {
+            return it->second ? "Put" : "Remove";
+        }
         return "Not in keyStates";
     }
 
@@ -151,7 +153,9 @@ public:
         OperationList occurrences;
         for (size_t i = 0; i < operations.size(); ++i) {
             const auto& [opKey, opType] = operations[i];
-            if (opKey == key) { occurrences.emplace_back(i, opType); }
+            if (opKey == key) {
+                occurrences.emplace_back(i, opType);
+            }
         }
         return occurrences;
     }
@@ -450,7 +454,9 @@ struct IndexCrashTest : public test_common::HSTestHelper, BtreeTestHelper< TestT
         uint32_t count = 0;
         this->m_shadow_map.foreach ([this, new_keys, &count](K key, V value) {
             // discard the new keys to check
-            if (new_keys.find(key.key()) != new_keys.end()) { return; }
+            if (new_keys.find(key.key()) != new_keys.end()) {
+                return;
+            }
             count++;
             auto copy_key = std::make_unique< K >();
             *copy_key = key;
@@ -458,11 +464,11 @@ struct IndexCrashTest : public test_common::HSTestHelper, BtreeTestHelper< TestT
             auto req = BtreeSingleGetRequest{copy_key.get(), out_v.get()};
             req.enable_route_tracing();
             const auto ret = this->m_bt->get(req);
-            if (ret != btree_status_t::success) {
+            if (ret != BtreeStatus::success) {
                 this->print_keys(fmt::format("Sanity check: key {}", key.key()));
                 this->dump_to_file("sanity_fail.txt");
             }
-            ASSERT_EQ(ret, btree_status_t::success) << "Missing key " << key << " in btree but present in shadow map";
+            ASSERT_EQ(ret, BtreeStatus::success) << "Missing key " << key << " in btree but present in shadow map";
         });
         LOGINFO("Sanity check passed for {} keys!", count);
     }
@@ -487,7 +493,7 @@ struct IndexCrashTest : public test_common::HSTestHelper, BtreeTestHelper< TestT
             LOGINFO("Visualize the tree file after recovery : {}", rec_filename);
             this->visualize_keys(rec_filename);
         }
-         // this->print_keys("Post crash and recovery, btree structure: ");
+        // this->print_keys("Post crash and recovery, btree structure: ");
         sanity_check(operations);
         //        Added to the index service right after recovery. Not needed here
         //        test_common::HSTestHelper::trigger_cp(true);
@@ -499,7 +505,7 @@ struct IndexCrashTest : public test_common::HSTestHelper, BtreeTestHelper< TestT
             LOGINFO("Visualize the tree after reapply {}", re_filename);
             this->visualize_keys(re_filename);
         }
-         // this->print_keys("Post reapply, btree structure: ");
+        // this->print_keys("Post reapply, btree structure: ");
 
         this->get_all();
         LOGINFO("After reapply: {} keys in shadow map and actually {} in tress", this->m_shadow_map.size(),
@@ -559,7 +565,7 @@ struct IndexCrashTest : public test_common::HSTestHelper, BtreeTestHelper< TestT
         uint32_t num_keys{0};
 
         for (auto [k, _] : operations) {
-            this->put(k, btree_put_type::INSERT, true /* expect_success */);
+            this->put(k, BtreePutType::INSERT, true /* expect_success */);
             num_keys++;
         }
 
@@ -684,7 +690,7 @@ struct IndexCrashTest : public test_common::HSTestHelper, BtreeTestHelper< TestT
                         continue;
                     }
                     LOGDEBUG("Inserting key {}", k);
-                    this->put(k, btree_put_type::INSERT, true /* expect_success */);
+                    this->put(k, BtreePutType::INSERT, true /* expect_success */);
                     num_keys++;
                 }
                 if (!time_to_stop()) {
@@ -720,7 +726,9 @@ struct IndexCrashTest : public test_common::HSTestHelper, BtreeTestHelper< TestT
                     crash_test_options.num_entries, this->tree_key_count() * 100.0 / crash_test_options.num_entries);
             }
             // this->print_keys(fmt::format("reapply: after round {}", round));
-            if (renew_btree_after_crash) { this->reset_btree(); };
+            if (renew_btree_after_crash) {
+                this->reset_btree();
+            };
         }
         this->destroy_btree();
         log_obj_life_counter();
@@ -758,7 +766,7 @@ TYPED_TEST(IndexCrashTest, SplitOnLeftEdge) {
     LOGINFO("Step 1: Fill up the last quarter of the tree");
     auto const num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
     for (auto k = num_entries * 3 / 4; k < num_entries; ++k) {
-        this->put(k, btree_put_type::INSERT, true /* expect_success */);
+        this->put(k, BtreePutType::INSERT, true /* expect_success */);
     }
 
     // Trigger the cp to make sure middle part is successful
@@ -772,7 +780,7 @@ TYPED_TEST(IndexCrashTest, SplitOnLeftEdge) {
             "new child");
     this->set_basic_flip("crash_flush_on_split_at_right_child");
     for (auto k = num_entries / 2; k < num_entries * 3 / 4; ++k) {
-        this->put(k, btree_put_type::INSERT, true /* expect_success */);
+        this->put(k, BtreePutType::INSERT, true /* expect_success */);
     }
     LOGINFO("Step 4: Crash and reapply the missing entries to tree");
     this->crash_and_recover(num_entries / 2, num_entries);
@@ -784,7 +792,7 @@ TYPED_TEST(IndexCrashTest, SplitOnLeftEdge) {
     for (auto k = num_entries / 4; k < num_entries / 2; ++k) {
         // LOGINFO("inserting key {}", k);
         // this->visualize_keys("tree_before_" + to_string(k) + ".dot");
-        this->put(k, btree_put_type::INSERT, true /* expect_success */);
+        this->put(k, BtreePutType::INSERT, true /* expect_success */);
     }
     this->visualize_keys("tree_before_crash.dot");
     this->dump_to_file("tree_before_crash.dot");
@@ -795,7 +803,7 @@ TYPED_TEST(IndexCrashTest, SplitOnLeftEdge) {
             "parent node");
     this->set_basic_flip("crash_flush_on_split_at_parent");
     for (auto k = 0u; k < num_entries / 4; ++k) {
-        this->put(k, btree_put_type::INSERT, true /* expect_success */);
+        this->put(k, BtreePutType::INSERT, true /* expect_success */);
     }
     LOGINFO("Step 8: Post crash we reapply the missing entries to tree");
     this->crash_and_recover(0, num_entries);
@@ -820,10 +828,12 @@ TYPED_TEST(IndexCrashTest, SplitCrash1) {
         //        generator.printKeyOccurrences(operations));
         for (auto [k, _] : operations) {
             //          LOGINFO("\t\t\t\t\t\t\t\t\t\t\t\t\tupserting entry {}", k);
-            this->put(k, btree_put_type::INSERT, true /* expect_success */);
+            this->put(k, BtreePutType::INSERT, true /* expect_success */);
         }
         this->crash_and_recover(flips[i], operations, fmt::format("recover_tree_crash_{}.dot", i + 1));
-        if (renew_btree_after_crash) { this->reset_btree(); };
+        if (renew_btree_after_crash) {
+            this->reset_btree();
+        };
     }
 }
 
@@ -874,7 +884,7 @@ TYPED_TEST(IndexCrashTest, MergeRemoveBasic) {
         LOGINFO("Step {}-1: Populate some keys and flush", i + 1);
         auto const num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
         for (auto k = 0u; k < num_entries; ++k) {
-            this->put(k, btree_put_type::INSERT, true /* expect_success */);
+            this->put(k, BtreePutType::INSERT, true /* expect_success */);
         }
         test_common::HSTestHelper::trigger_cp(true);
         this->m_shadow_map.save(this->m_shadow_filename);
@@ -966,7 +976,7 @@ TYPED_TEST(IndexCrashTest, MergeRemoveBasic) {
 //         this->reset_btree();
 //         LOGINFO("Step {}-1: Init btree", i + 1);
 //         for (auto k = 0u; k < num_entries; ++k) {
-//             this->put(k, btree_put_type::INSERT, true /* expect_success */);
+//             this->put(k, BtreePutType::INSERT, true /* expect_success */);
 //         }
 //         test_common::HSTestHelper::trigger_cp(true);
 //         this->print_keys("Inited tree");
@@ -1003,7 +1013,7 @@ TYPED_TEST(IndexCrashTest, MergeRemoveBasic) {
 //
 //     auto initTree = [this, num_entries]() {
 //         for (auto k = 0u; k < num_entries; ++k) {
-//             this->put(k, btree_put_type::INSERT, true /* expect_success */);
+//             this->put(k, BtreePutType::INSERT, true /* expect_success */);
 //         }
 //         test_common::HSTestHelper::trigger_cp(true);
 //         this->m_shadow_map.save(this->m_shadow_filename);

@@ -27,7 +27,6 @@ namespace homestore {
 template < typename K, typename V >
 class MiniTrieNode : public VariantNode< K, V > {
 public:
-    using BtreeNode::get_nth_key_internal;
     using BtreeNode::get_nth_key_size;
     using BtreeNode::get_nth_obj_size;
     using BtreeNode::get_nth_value;
@@ -36,6 +35,7 @@ public:
     using BtreeNode::node_data_area_size;
     using BtreeNode::node_data_size;
     using BtreeNode::node_gen;
+    using BtreeNode::read_nth_key;
     using BtreeNode::to_string;
     using BtreeNode::total_entries;
     using VariantNode< K, V >::get_nth_value;
@@ -72,20 +72,26 @@ private:
     MiniTrieNode(uint8_t* node_buf, bnodeid_t id, bool init, bool is_leaf, uint32_t node_size,
                  bool is_temp_node = false) :
             VariantNode< K, V >(node_buf, id, init, is_leaf, node_size, is_temp_node) {
-        if (init) { new (this->node_data_area()) Header(this->node_data_size()); }
+        if (init) {
+            new (this->node_data_area()) Header(this->node_data_size());
+        }
     }
 
     virtual ~MiniTrieNode() = default;
 
     ////////////////////////////////////// All overrides of BtreeNode ///////////////////////////////////
-    btree_status_t insert(uint32_t idx, const BtreeKey& key, const BtreeValue& val) override {
+    BtreeStatus insert(uint32_t idx, const BtreeKey& key, const BtreeValue& val) override {
         uint32_t prev_match_size{0};
         uint32_t next_match_size{0};
 
         auto kblob = key.serialize();
         auto vblob = val.serialize();
-        if (idx > 0) { prev_match_size = check_prefix_match(kblob, nth_entry(idx - 1)); }
-        if ((idx + 1) < total_entries()) { next_match_size = check_prefix_match(kblob, nth_entry(idx + 1)); }
+        if (idx > 0) {
+            prev_match_size = check_prefix_match(kblob, nth_entry(idx - 1));
+        }
+        if ((idx + 1) < total_entries()) {
+            next_match_size = check_prefix_match(kblob, nth_entry(idx + 1));
+        }
 
         if (prev_match_size == 0 && next_match_size == 0) {
             insert_standalone(idx, kblob, vblob);
@@ -95,11 +101,13 @@ private:
             insert_dependent(idx, idx + 1, next_match_size, extract_suffix_blob(kblob, next_match_size), vblob);
         }
         inc_gen();
-        return btree_status_t::success;
+        return BtreeStatus::success;
     }
 
     void update(uint32_t idx, const BtreeValue& val) override {
-        if (update_if_edge(idx, val)) { return; }
+        if (update_if_edge(idx, val)) {
+            return;
+        }
 
         auto new_val_blob = val.serialize();
         auto const gen{node_gen() + 1};
@@ -139,18 +147,24 @@ private:
         set_gen(gen);
     }
 
-    void remove(uint32_t idx) override { remove(idx, idx); }
+    void remove(uint32_t idx) override {
+        remove(idx, idx);
+    }
 
     void remove(uint32_t idx_s, uint32_t idx_e) override {
         auto const gen{this->node_gen() + 1};
         if (idx_e == total_entries()) {
             remove_if_edge(idx_e);
-            if (idx_e-- == 0) { goto done; }
+            if (idx_e-- == 0) {
+                goto done;
+            }
         }
 
         for (uint32_t idx{idx_s}; idx <= idx_e; ++idx) {
             auto e = nth_entry(idx);
-            if (--get_prefix_info(e).refcount == 0) { free_space(e->prefix_offset, PrefixInfo::size(e->prefix_size)); }
+            if (--get_prefix_info(e).refcount == 0) {
+                free_space(e->prefix_offset, PrefixInfo::size(e->prefix_size));
+            }
             free_space(e->kv_offset, e->suffix_size + e->value_size);
         }
 
@@ -168,10 +182,12 @@ private:
         inc_gen();
     }
 
-    uint32_t available_size() const override { return immediate_available_space() + header()->hole_size; }
+    uint32_t available_size() const override {
+        return immediate_available_space() + header()->hole_size;
+    }
 
-    bool has_room_for_put(btree_put_type put_type, uint32_t key_size, uint32_t value_size) const override {
-        if (put_type == btree_put_type::UPDATE) {
+    bool has_room_for_put(BtreePutType put_type, uint32_t key_size, uint32_t value_size) const override {
+        if (put_type == BtreePutType::UPDATE) {
             needed_size = value_size;
         } else {
             needed_size = sizeof(Entry) + PrefixInfo::size(key_size) + value_size;
@@ -179,7 +195,7 @@ private:
         return (available_size() >= needed_size);
     }
 
-    void get_nth_key_internal(uint32_t idx, BtreeKey& out_key, bool copy) const override {
+    void read_nth_key(uint32_t idx, BtreeKey& out_key, bool copy) const override {
         DEBUG_ASSERT_LT(idx, this->total_entries(), "node={}", to_string());
         auto prefix_blob = nth_prefix(idx);
         auto suffix_blob = nth_suffix(idx);
@@ -212,7 +228,9 @@ private:
         auto const this_gen{this->node_gen() + 1};
         auto const other_gen{other.node_gen() + 1};
 
-        if (nentries == 0) { return 0; /* Nothing to move */ }
+        if (nentries == 0) {
+            return 0; /* Nothing to move */
+        }
 
         uint32_t nmoved{0};
         if (!this->is_leaf() && this->has_valid_edge()) {
@@ -245,7 +263,9 @@ private:
             ++nmoved;
         }
 
-        if (total_entries() == 0) { goto done; }
+        if (total_entries() == 0) {
+            goto done;
+        }
         uint32_t idx = this->total_entries() - 1;
         while (idx > 0) {
             if (available_size() >= size) {
@@ -274,7 +294,9 @@ private:
             auto vblob = get_nth_value(idx, false);
 
             // We reached threshold of how much we could move
-            if ((kblob.size() + vblob.size() + sizeof(Entry)) > size) { break; }
+            if ((kblob.size() + vblob.size() + sizeof(Entry)) > size) {
+                break;
+            }
 
             insert(this->total_entries(), kblob, vblob);
             ++n;
@@ -290,13 +312,13 @@ private:
 
     /* Insert the key and value in provided index
      * Assumption: Node lock is already taken */
-    btree_status_t insert(uint32_t ind, const BtreeKey& key, const BtreeValue& val) override {
+    BtreeStatus insert(uint32_t ind, const BtreeKey& key, const BtreeValue& val) override {
         LOGTRACEMOD(btree, "{}:{}", key.to_string(), val.to_string());
         auto sz = insert(ind, key.serialize(), val.serialize());
 #ifndef NDEBUG
         validate_sanity();
 #endif
-        return (sz == 0) ? btree_status_t::space_not_avail : btree_status_t::success;
+        return (sz == 0) ? BtreeStatus::space_not_avail : BtreeStatus::success;
     }
 
 #ifndef NDEBUG
@@ -427,7 +449,7 @@ private:
     }*/
 
     uint32_t move_out_to_right_by_entries(const BtreeConfig& cfg, BtreeNode& o, uint32_t nentries) override {
-        auto& other = static_cast< VariableNode& >(o);
+        auto& other = static_cast< VarSizeNode& >(o);
         const auto this_gen = this->node_gen();
         const auto other_gen = other.node_gen();
 
@@ -470,7 +492,7 @@ private:
     }
 
     uint32_t move_out_to_right_by_size(const BtreeConfig& cfg, BtreeNode& o, uint32_t size_to_move) override {
-        auto& other = static_cast< VariableNode& >(o);
+        auto& other = static_cast< VarSizeNode& >(o);
         auto this_gen = this->node_gen();
         auto other_gen = other.node_gen();
         uint32_t nmoved{0};
@@ -523,7 +545,7 @@ private:
     }
 
     uint32_t copy_by_size(const BtreeConfig& cfg, const BtreeNode& o, uint32_t start_idx, uint32_t copy_size) override {
-        auto& other = static_cast< const VariableNode& >(o);
+        auto& other = static_cast< const VarSizeNode& >(o);
         auto this_gen = this->node_gen();
 
         auto idx = start_idx;
@@ -552,7 +574,7 @@ private:
 
     uint32_t copy_by_entries(const BtreeConfig& cfg, const BtreeNode& o, uint32_t start_idx,
                              uint32_t nentries) override {
-        auto& other = static_cast< const VariableNode& >(o);
+        auto& other = static_cast< const VarSizeNode& >(o);
         auto this_gen = this->node_gen();
 
         nentries = std::min(nentries, other.total_entries() - start_idx);
@@ -577,7 +599,7 @@ private:
     }
 
     /*uint32_t move_in_from_right_by_entries(const BtreeConfig& cfg, BtreeNode& o, uint32_t nentries) override {
-        auto& other = static_cast< VariableNode& >(o);
+        auto& other = static_cast< VarSizeNode& >(o);
         auto this_gen = this->node_gen();
         auto other_gen = other.node_gen();
         nentries = std::min(nentries, other.total_entries());
@@ -620,7 +642,7 @@ private:
     }
 
     uint32_t move_in_from_right_by_size(const BtreeConfig& cfg, BtreeNode& o, uint32_t size_to_move) override {
-        auto& other = static_cast< VariableNode& >(o);
+        auto& other = static_cast< VarSizeNode& >(o);
         uint32_t moved_size = 0U;
         auto this_gen = this->node_gen();
         auto other_gen = other.node_gen();
@@ -672,9 +694,9 @@ private:
         memcpy(uintptr_cast(get_nth_obj(ind)), kb.cbytes(), kb.size());
     }
 
-    bool has_room_for_put(btree_put_type put_type, uint32_t key_size, uint32_t value_size) const override {
+    bool has_room_for_put(BtreePutType put_type, uint32_t key_size, uint32_t value_size) const override {
         auto needed_size = key_size + value_size;
-        if ((put_type == btree_put_type::UPSERT) || (put_type == btree_put_type::INSERT)) {
+        if ((put_type == BtreePutType::UPSERT) || (put_type == BtreePutType::INSERT)) {
             needed_size += get_record_size();
         }
         return (available_size() >= needed_size);
@@ -684,7 +706,7 @@ private:
     virtual void set_nth_key_len(uint8_t* rec_ptr, uint32_t key_len) = 0;
     virtual void set_nth_value_len(uint8_t* rec_ptr, uint32_t value_len) = 0;
 
-    void get_nth_key_internal(uint32_t ind, BtreeKey& out_key, bool copy) const override {
+    void read_nth_key(uint32_t ind, BtreeKey& out_key, bool copy) const override {
         assert(ind < this->total_entries());
         sisl::Blob b{const_cast< uint8_t* >(get_nth_obj(ind)), get_nth_key_size(ind)};
         out_key.deserialize(b, copy);
@@ -886,11 +908,11 @@ protected:
 };
 
 template < typename K, typename V >
-class VarKeySizeNode : public VariableNode< K, V > {
+class VarKeySizeNode : public VarSizeNode< K, V > {
 public:
     VarKeySizeNode(uint8_t* node_buf, bnodeid_t id, bool init, bool is_leaf, const BtreeConfig& cfg) :
-            VariableNode< K, V >(node_buf, id, init, is_leaf, cfg) {
-        this->set_node_type(btree_node_type::VAR_KEY);
+            VarSizeNode< K, V >(node_buf, id, init, is_leaf, cfg) {
+        this->set_node_type(BtreeNodeType::VAR_KEY);
     }
     virtual ~VarKeySizeNode() = default;
 
@@ -918,11 +940,11 @@ private:
 
 /***************** Template Specialization for variable value records ******************/
 template < typename K, typename V >
-class VarValueSizeNode : public VariableNode< K, V > {
+class VarValueSizeNode : public VarSizeNode< K, V > {
 public:
     VarValueSizeNode(uint8_t* node_buf, bnodeid_t id, bool init, bool is_leaf, const BtreeConfig& cfg) :
-            VariableNode< K, V >(node_buf, id, init, is_leaf, cfg) {
-        this->set_node_type(btree_node_type::VAR_VALUE);
+            VarSizeNode< K, V >(node_buf, id, init, is_leaf, cfg) {
+        this->set_node_type(BtreeNodeType::VAR_VALUE);
     }
     virtual ~VarValueSizeNode() = default;
 
@@ -950,11 +972,11 @@ private:
 
 /***************** Template Specialization for variable object records ******************/
 template < typename K, typename V >
-class VarObjSizeNode : public VariableNode< K, V > {
+class VarObjSizeNode : public VarSizeNode< K, V > {
 public:
     VarObjSizeNode(uint8_t* node_buf, bnodeid_t id, bool init, bool is_leaf, const BtreeConfig& cfg) :
-            VariableNode< K, V >(node_buf, id, init, is_leaf, cfg) {
-        this->set_node_type(btree_node_type::VAR_OBJECT);
+            VarSizeNode< K, V >(node_buf, id, init, is_leaf, cfg) {
+        this->set_node_type(BtreeNodeType::VAR_OBJECT);
     }
     virtual ~VarObjSizeNode() = default;
 

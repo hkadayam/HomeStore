@@ -25,33 +25,33 @@
 
 namespace homestore {
 template < typename T, typename... Args >
-static NodeCore* do_create_node(NodeCore::Allocator::Token token, Args&&... args) {
+static NodeCore* do_create_node(Args&&... args) {
     uint8_t* ptr = NodeCore::Allocator::get(token).alloc_btree_node(sizeof(T));
     T* node = new (ptr) T(std::forward< Args >(args)..., token);
     return dynamic_cast< NodeCore* >(node);
 }
 
 template < typename K, typename V, typename... Args >
-static NodeCore* do_form_node(btree_node_type node_type, NodeCore::Allocator::Token token, Args&&... args) {
+static NodeCore* do_form_node(BtreeNodeType node_type, Args&&... args) {
     NodeCore* n{nullptr};
     switch (node_type) {
-    case btree_node_type::VAR_OBJECT:
+    case BtreeNodeType::VAR_OBJECT:
         n = do_create_node< VarObjSizeNode< K, V > >(token, std::forward< Args >(args)...);
         break;
 
-    case btree_node_type::FIXED:
+    case BtreeNodeType::FIXED:
         n = do_create_node< SimpleNode< K, V > >(token, std::forward< Args >(args)...);
         break;
 
-    case btree_node_type::VAR_VALUE:
+    case BtreeNodeType::VAR_VALUE:
         n = do_create_node< VarValueSizeNode< K, V > >(token, std::forward< Args >(args)...);
         break;
 
-    case btree_node_type::VAR_KEY:
+    case BtreeNodeType::VAR_KEY:
         n = do_create_node< VarKeySizeNode< K, V > >(token, std::forward< Args >(args)...);
         break;
 
-    case btree_node_type::FIXED_PREFIX:
+    case BtreeNodeType::FIXED_PREFIX:
         n = do_create_node< FixedPrefixNode< K, V > >(token, std::forward< Args >(args)...);
         break;
 
@@ -63,23 +63,21 @@ static NodeCore* do_form_node(btree_node_type node_type, NodeCore::Allocator::To
 }
 
 template < typename K, typename V >
-NodeCore* Btree< K, V >::alloc_node_core(bnodeid_t id, bool is_leaf) const {
-    auto const token = NodeCore::Allocator::default_token;
+NodeCore* Btree< K, V >::alloc_node_core(std::shared_ptr< uint8_t > node_buf, bnodeid_t id, bool is_leaf) const {
     if (is_leaf) {
-        return do_form_node< K, V >(m_bt_cfg.leaf_node_type(), token, id, is_leaf, m_bt_cfg.node_size());
+        return do_form_node< K, V >(bt_cfg_.leaf_node_type(), std::move(node_buf), id, is_leaf, bt_cfg_.node_size());
     } else {
-        return do_form_node< K, NodeId >(m_bt_cfg.interior_node_type(), token, id, is_leaf,
-                                                m_bt_cfg.node_size());
+        return do_form_node< K, NodeLink >(bt_cfg_.interior_node_type(), std::move(node_buf), id, is_leaf,
+                                           bt_cfg_.node_size());
     }
 }
 
 template < typename K, typename V >
-NodeCore* Btree< K, V >::load_node_core(uint8_t* node_buf, bnodeid_t id) const {
-    auto const token = NodeCore::Allocator::default_token;
+NodeCore* Btree< K, V >::load_node_core(std::shared_ptr< uint8_t > node_buf, bnodeid_t id) const {
     if (NodeCore::identify_leaf_node(node_buf)) {
-        return do_form_node< K, V >(m_bt_cfg.leaf_node_type(), token, node_buf, id);
+        return do_form_node< K, V >(bt_cfg_.leaf_node_type(), std::move(node_buf), id);
     } else {
-        return do_form_node< K, NodeId >(m_bt_cfg.interior_node_type(), token, node_buf, id);
+        return do_form_node< K, NodeLink >(bt_cfg_.interior_node_type(), std::move(node_buf), id);
     }
 }
 

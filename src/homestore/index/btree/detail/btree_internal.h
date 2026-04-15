@@ -18,11 +18,10 @@
 #include <boost/preprocessor/control/if.hpp>
 #include <boost/preprocessor/facilities/empty.hpp>
 #include <boost/preprocessor/facilities/identity.hpp>
-#include <folly/small_vector.h>
 #include <boost/vmd/is_empty.hpp>
-#include <sisl/fds/utils.h>
-#include <sisl/metrics/metrics.h>
-#include <homestore/index/index_common.h>
+
+#include "sisl/fds/utils.h"
+#include "sisl/metrics/metrics.h"
 
 namespace homestore {
 
@@ -48,10 +47,10 @@ namespace homestore {
     })
 
 #define BT_LOG(level, msg, ...)                                                                                        \
-    { LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, this->m_bt_cfg, )), msg, ##__VA_ARGS__); }
+    { LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, this->bt_cfg_, )), msg, ##__VA_ARGS__); }
 
 #define BT_NODE_LOG(level, node, msg, ...)                                                                             \
-    { LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, this->m_bt_cfg, node)), msg, ##__VA_ARGS__); }
+    { LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, this->bt_cfg_, node)), msg, ##__VA_ARGS__); }
 
 #define SPECIFIC_BT_LOG(level, bt, msg, ...)                                                                           \
     { LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, bt.bt_config(), )), msg, ##__VA_ARGS__); }
@@ -67,7 +66,7 @@ namespace homestore {
                                                               fmt::make_format_args(req->to_string()))))               \
                 ();                                                                                                    \
                 fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[btree={}] "},                                   \
-                                fmt::make_format_args(m_cfg.name()));                                                  \
+                                fmt::make_format_args(cfg_.name()));                                                   \
                 fmt::vformat_to(fmt::appender{buf}, fmt::string_view{msgcb},                                           \
                                 fmt::make_format_args(std::forward< decltype(args) >(args)...));                       \
                 return true;                                                                                           \
@@ -104,7 +103,7 @@ namespace homestore {
                                                               fmt::make_format_args(req->to_string()))))               \
                 ();                                                                                                    \
                 fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[btree={}] "},                                   \
-                                fmt::make_format_args(m_cfg.name()));                                                  \
+                                fmt::make_format_args(cfg_.name()));                                                   \
                 fmt::vformat_to(fmt::appender{buf}, fmt::string_view{msgcb},                                           \
                                 fmt::make_format_args(std::forward< decltype(args) >(args)...));                       \
                 return true;                                                                                           \
@@ -122,7 +121,7 @@ namespace homestore {
                                                               fmt::make_format_args(req->to_string()))))               \
                 ();                                                                                                    \
                 fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[btree={}] "},                                   \
-                                fmt::make_format_args(m_cfg.name()));                                                  \
+                                fmt::make_format_args(cfg_.name()));                                                   \
                 fmt::vformat_to(fmt::appender{buf}, fmt::string_view{msgcb},                                           \
                                 fmt::make_format_args(std::forward< decltype(args) >(args)...));                       \
                 return true;                                                                                           \
@@ -132,10 +131,10 @@ namespace homestore {
 #endif
 
 #define BT_ASSERT(assert_type, cond, ...)                                                                              \
-    { assert_type##_ASSERT_FMT(cond, _BT_LOG_METHOD_IMPL(, this->m_bt_cfg, ), ##__VA_ARGS__); }
+    { assert_type##_ASSERT_FMT(cond, _BT_LOG_METHOD_IMPL(, this->bt_cfg_, ), ##__VA_ARGS__); }
 
 #define BT_ASSERT_CMP(assert_type, val1, cmp, val2, ...)                                                               \
-    { assert_type##_ASSERT_CMP(val1, cmp, val2, _BT_LOG_METHOD_IMPL(, this->m_bt_cfg, ), ##__VA_ARGS__); }
+    { assert_type##_ASSERT_CMP(val1, cmp, val2, _BT_LOG_METHOD_IMPL(, this->bt_cfg_, ), ##__VA_ARGS__); }
 
 #define BT_DBG_ASSERT(cond, ...) BT_ASSERT(DEBUG, cond, ##__VA_ARGS__)
 #define BT_DBG_ASSERT_EQ(val1, val2, ...) BT_ASSERT_CMP(DEBUG, val1, ==, val2, ##__VA_ARGS__)
@@ -162,10 +161,10 @@ namespace homestore {
 #define BT_REL_ASSERT_GE(val1, val2, ...) BT_ASSERT_CMP(RELEASE, val1, >=, val2, ##__VA_ARGS__)
 
 #define BT_NODE_ASSERT(assert_type, cond, node, ...)                                                                   \
-    { assert_type##_ASSERT_FMT(cond, _BT_LOG_METHOD_IMPL(, m_bt_cfg, node), ##__VA_ARGS__); }
+    { assert_type##_ASSERT_FMT(cond, _BT_LOG_METHOD_IMPL(, bt_cfg_, node), ##__VA_ARGS__); }
 
 #define BT_NODE_ASSERT_CMP(assert_type, val1, cmp, val2, node, ...)                                                    \
-    { assert_type##_ASSERT_CMP(val1, cmp, val2, _BT_LOG_METHOD_IMPL(, m_bt_cfg, node), ##__VA_ARGS__); }
+    { assert_type##_ASSERT_CMP(val1, cmp, val2, _BT_LOG_METHOD_IMPL(, bt_cfg_, node), ##__VA_ARGS__); }
 
 #define BT_NODE_DBG_ASSERT(cond, ...) BT_NODE_ASSERT(DEBUG, cond, ##__VA_ARGS__)
 #define BT_NODE_DBG_ASSERT_EQ(val1, val2, ...) BT_NODE_ASSERT_CMP(DEBUG, val1, ==, val2, ##__VA_ARGS__)
@@ -199,16 +198,16 @@ using bnodeid_t = uint64_t;
 static constexpr bnodeid_t empty_bnodeid = std::numeric_limits< bnodeid_t >::max();
 static constexpr uint16_t bt_init_crc_16 = 0x8005;
 
-VENUM(btree_node_type, uint32_t, FIXED = 0, VAR_VALUE = 1, VAR_KEY = 2, VAR_OBJECT = 3, FIXED_PREFIX = 4, COMPACT = 5)
+VENUM(BtreeNodeType, uint32_t, FIXED = 0, VAR_VALUE = 1, VAR_KEY = 2, VAR_OBJECT = 3, FIXED_PREFIX = 4, COMPACT = 5)
 
-ENUM(btree_status_t, uint32_t, success, not_found, retry, has_more, node_read_failed, put_failed, space_not_avail,
+ENUM(BtreeStatus, uint32_t, success, not_found, retry, has_more, node_read_failed, put_failed, space_not_avail,
      cp_mismatch, merge_not_required, merge_failed, crc_mismatch, not_supported, node_freed)
 
 class NodeCore;
 
-ENUM(btree_event_t, uint8_t, READ, MUTATE, REMOVE, SPLIT, REPAIR, MERGE);
+ENUM(BtreeEvent, uint8_t, READ, MUTATE, REMOVE, SPLIT, REPAIR, MERGE);
 
-struct trace_route_entry {
+struct TraceRouteEntry {
     bnodeid_t node_id{empty_bnodeid};
     NodeCore* node{nullptr};
     uint32_t start_idx{0};
@@ -216,7 +215,7 @@ struct trace_route_entry {
     uint32_t num_entries{0};
     uint16_t level{0};
     bool is_leaf{false};
-    btree_event_t event{btree_event_t::READ};
+    BtreeEvent event{BtreeEvent::READ};
 
     std::string to_string() const {
         return fmt::format("[level={} {} event={} id={} ptr={} start_idx={} end_idx={} entries={}]", level,
@@ -226,38 +225,38 @@ struct trace_route_entry {
 };
 
 struct BtreeConfig {
-    uint32_t m_node_size{0};
-    uint8_t m_ideal_fill_pct{90};
-    uint8_t m_suggested_min_pct{30};
-    uint8_t m_split_pct{50};
-    uint32_t m_max_merge_nodes{3};
-    bool m_rebalance_turned_on{false};
-    bool m_merge_turned_on{true};
+    uint32_t node_size_{0};
+    uint32_t inline_value_size_{std::numeric_limits< uint32_t >::max()}; // values larger than this go to overflow
+    uint8_t ideal_fill_pct_{90};
+    uint8_t suggested_min_pct_{30};
+    uint8_t split_pct_{50};
+    uint32_t max_merge_nodes_{3};
+    bool rebalance_turned_on_{false};
+    bool merge_turned_on_{true};
 
-    btree_node_type m_leaf_node_type{btree_node_type::VAR_OBJECT};
-    btree_node_type m_int_node_type{btree_node_type::VAR_KEY};
-    IndexStore::Type m_store_type{IndexStore::Type::COPY_ON_WRITE_BTREE};
-    std::string m_btree_name{""}; // Unique name for the btree
+    BtreeNodeType leaf_node_type_{BtreeNodeType::VAR_OBJECT};
+    BtreeNodeType int_node_type_{BtreeNodeType::VAR_KEY};
+    std::string btree_name_{""}; // Unique name for the btree
 
 private:
-    uint32_t m_suggested_min_size; // Precomputed values
-    uint32_t m_ideal_fill_size;
+    uint32_t suggested_min_size_; // Precomputed values
+    uint32_t ideal_fill_size_;
 
 public:
     void finalize(uint32_t node_header_size) {
-        m_ideal_fill_size = (uint32_t)((m_node_size - node_header_size) * m_ideal_fill_pct) / 100;
-        m_suggested_min_size = (uint32_t)((m_node_size - node_header_size) * m_suggested_min_pct) / 100;
+        ideal_fill_size_ = (uint32_t)((node_size_ - node_header_size) * ideal_fill_pct_) / 100;
+        suggested_min_size_ = (uint32_t)((node_size_ - node_header_size) * suggested_min_pct_) / 100;
     }
 
-    uint32_t node_size() const { return m_node_size; };
-    uint32_t split_size(uint32_t filled_size) const { return uint32_cast(filled_size * m_split_pct) / 100; }
-    uint32_t ideal_fill_size() const { return m_ideal_fill_size; }
-    uint32_t suggested_min_size() const { return m_suggested_min_size; }
+    uint32_t node_size() const { return node_size_; };
+    uint32_t inline_value_size() const { return inline_value_size_; }
+    uint32_t split_size(uint32_t filled_size) const { return uint32_cast(filled_size * split_pct_) / 100; }
+    uint32_t ideal_fill_size() const { return ideal_fill_size_; }
+    uint32_t suggested_min_size() const { return suggested_min_size_; }
 
-    const std::string& name() const { return m_btree_name; }
-    btree_node_type leaf_node_type() const { return m_leaf_node_type; }
-    btree_node_type interior_node_type() const { return m_int_node_type; }
-    IndexStore::Type store_type() const { return m_store_type; }
+    const std::string& name() const { return btree_name_; }
+    BtreeNodeType leaf_node_type() const { return leaf_node_type_; }
+    BtreeNodeType interior_node_type() const { return int_node_type_; }
 };
 
 class BtreeMetrics : public sisl::MetricsGroup {
@@ -279,9 +278,9 @@ public:
         REGISTER_COUNTER(btree_num_pc_gen_mismatch, "Number of gen mismatches to recover");
 
         REGISTER_HISTOGRAM(btree_int_node_occupancy, "Interior node occupancy", "btree_node_occupancy",
-                           {"node_type", "interior"}, HistogramBucketsType(LinearUpto128Buckets));
+                           {"node_type", "interior"});
         REGISTER_HISTOGRAM(btree_leaf_node_occupancy, "Leaf node occupancy", "btree_node_occupancy",
-                           {"node_type", "leaf"}, HistogramBucketsType(LinearUpto128Buckets));
+                           {"node_type", "leaf"});
         REGISTER_COUNTER(btree_retry_count, "number of retries");
         REGISTER_COUNTER(write_err_cnt, "number of errors in write");
         REGISTER_COUNTER(query_err_cnt, "number of errors in query");

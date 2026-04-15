@@ -27,7 +27,6 @@
 
 using namespace homestore;
 
-
 // TODO Add tests to do write,remove after recovery.
 // TODO Test with var len key with io mgr page size is 512.
 
@@ -70,11 +69,21 @@ static void set_options() {
         g_opts.run_time_secs = 36000; // Limit is on ios than time
     }
 
-    if (SISL_OPTIONS.count("num_entries")) { g_opts.num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >(); }
-    if (SISL_OPTIONS.count("preload_size")) { g_opts.preload_size = SISL_OPTIONS["preload_size"].as< uint32_t >(); }
-    if (SISL_OPTIONS.count("num_ios")) { g_opts.num_ios = SISL_OPTIONS["num_ios"].as< uint32_t >(); }
-    if (SISL_OPTIONS.count("run_time")) { g_opts.run_time_secs = SISL_OPTIONS["run_time"].as< uint32_t >(); }
-    if (SISL_OPTIONS.count("disable_merge")) { g_opts.disable_merge = SISL_OPTIONS["disable_merge"].as< bool >(); }
+    if (SISL_OPTIONS.count("num_entries")) {
+        g_opts.num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
+    }
+    if (SISL_OPTIONS.count("preload_size")) {
+        g_opts.preload_size = SISL_OPTIONS["preload_size"].as< uint32_t >();
+    }
+    if (SISL_OPTIONS.count("num_ios")) {
+        g_opts.num_ios = SISL_OPTIONS["num_ios"].as< uint32_t >();
+    }
+    if (SISL_OPTIONS.count("run_time")) {
+        g_opts.run_time_secs = SISL_OPTIONS["run_time"].as< uint32_t >();
+    }
+    if (SISL_OPTIONS.count("disable_merge")) {
+        g_opts.disable_merge = SISL_OPTIONS["disable_merge"].as< bool >();
+    }
 
     if (SISL_OPTIONS.count("seed")) {
         LOGINFO("Using seed {} to sow the random generation", SISL_OPTIONS["seed"].as< uint64_t >());
@@ -188,7 +197,7 @@ TYPED_TEST(BtreeTest, SequentialInsert) {
     const auto entries_iter1 = g_opts.num_entries / 2;
     LOGINFO("Step 1: Do Forward sequential insert for {} entries", entries_iter1);
     for (uint32_t i{0}; i < entries_iter1; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
         // this->print();
     }
     LOGINFO("Step 2: Query {} entries and validate with pagination of 75 entries", entries_iter1);
@@ -198,7 +207,7 @@ TYPED_TEST(BtreeTest, SequentialInsert) {
     const auto entries_iter2 = g_opts.num_entries - entries_iter1;
     LOGINFO("Step 3: Do Reverse sequential insert of remaining {} entries", entries_iter2);
     for (uint32_t i{g_opts.num_entries - 1}; i >= entries_iter1; --i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
     LOGINFO("Step 4: Query {} entries and validate with pagination of 90 entries", entries_iter2);
     this->do_query(entries_iter1, g_opts.num_entries - 1, 90);
@@ -231,7 +240,7 @@ TYPED_TEST(BtreeTest, RandomInsert) {
     std::random_shuffle(vec.begin(), vec.end());
     LOGINFO("Step 1: Do forward random insert for {} entries", g_opts.num_entries);
     for (uint32_t i{0}; i < g_opts.num_entries; ++i) {
-        this->put(vec[i], btree_put_type::INSERT);
+        this->put(vec[i], BtreePutType::INSERT);
     }
     this->get_all();
 }
@@ -241,7 +250,7 @@ TYPED_TEST(BtreeTest, SequentialRemove) {
     // Forward sequential insert
     LOGINFO("Step 1: Do Forward sequential insert for {} entries", g_opts.num_entries);
     for (uint32_t i{0}; i < g_opts.num_entries; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
     LOGINFO("Step 2: Query {} entries and validate with pagination of 75 entries", g_opts.num_entries);
     this->do_query(0, g_opts.num_entries - 1, 75);
@@ -275,7 +284,7 @@ TYPED_TEST(BtreeTest, SimpleRemoveRange) {
     const auto num_entries = 20;
     LOGINFO("Step 1: Do forward sequential insert for {} entries", num_entries);
     for (uint32_t i{0}; i < num_entries; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
     LOGINFO("Step 2: Do range remove for {} entries", num_entries);
     //    this->print_keys(); // EXPECT size = 20 : 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
@@ -300,7 +309,7 @@ TYPED_TEST(BtreeTest, RandomRemove) {
     // Forward sequential insert
     LOGINFO("Step 1: Do forward sequential insert for {} entries", g_opts.num_entries);
     for (uint32_t i{0}; i < g_opts.num_entries; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
 
     std::vector< uint32_t > vec(g_opts.num_entries);
@@ -319,7 +328,7 @@ TYPED_TEST(BtreeTest, RandomRemoveRange) {
     // Forward sequential insert
     LOGINFO("Step 1: Do forward sequential insert for {} entries", g_opts.num_entries);
     for (uint32_t i{0}; i < g_opts.num_entries; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
     // generate keys including out of bound
     static thread_local std::uniform_int_distribution< uint32_t > s_rand_key_generator{0, g_opts.num_entries};
@@ -342,7 +351,7 @@ TYPED_TEST(BtreeTest, RangeUpdate) {
     // Forward sequential insert
     LOGINFO("Step 1: Do Forward sequential insert for {} entries", g_opts.num_entries);
     for (uint32_t i{0}; i < g_opts.num_entries; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
 
     LOGINFO("Step 2: Do Range Update of random intervals between [1-50] for 100 times with random key ranges");
@@ -357,12 +366,14 @@ TYPED_TEST(BtreeTest, RangeUpdate) {
 
 TYPED_TEST(BtreeTest, CpFlush) {
     using TestT = typename TestFixture::T;
-    if (TestT::store_type == IndexStore::Type::MEM_BTREE) { GTEST_SKIP(); }
+    if (TestT::store_type == IndexStore::Type::MEM_BTREE) {
+        GTEST_SKIP();
+    }
 
     LOGINFO("CpFlush test start");
     LOGINFO("Do Forward sequential insert for {} entries", g_opts.num_entries / 2);
     for (uint32_t i = 0; i < g_opts.num_entries; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
 
     // Remove some of the entries.
@@ -398,13 +409,15 @@ TYPED_TEST(BtreeTest, CpFlush) {
 
 TYPED_TEST(BtreeTest, MultipleCpFlush) {
     using TestT = typename TestFixture::T;
-    if (TestT::store_type == IndexStore::Type::MEM_BTREE) { GTEST_SKIP(); }
+    if (TestT::store_type == IndexStore::Type::MEM_BTREE) {
+        GTEST_SKIP();
+    }
 
     LOGINFO("MultipleCpFlush test start");
 
     LOGINFO("Do Forward sequential insert for {} entries", g_opts.num_entries / 2);
     for (uint32_t i = 0; i < g_opts.num_entries / 2; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
         if (i % 500 == 0) {
             LOGINFO("Trigger checkpoint flush wait=false.");
             test_common::HSTestHelper::trigger_cp(false /* wait */);
@@ -415,7 +428,7 @@ TYPED_TEST(BtreeTest, MultipleCpFlush) {
     test_common::HSTestHelper::trigger_cp(false /* wait */);
 
     for (uint32_t i = g_opts.num_entries / 2; i < g_opts.num_entries; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
 
     LOGINFO("Trigger checkpoint flush wait=false.");
@@ -445,7 +458,9 @@ TYPED_TEST(BtreeTest, MultipleCpFlush) {
 
 TYPED_TEST(BtreeTest, ThreadedCpFlush) {
     using TestT = typename TestFixture::T;
-    if (TestT::store_type == IndexStore::Type::MEM_BTREE) { GTEST_SKIP(); }
+    if (TestT::store_type == IndexStore::Type::MEM_BTREE) {
+        GTEST_SKIP();
+    }
 
     LOGINFO("ThreadedCpFlush test start");
 
@@ -455,7 +470,7 @@ TYPED_TEST(BtreeTest, ThreadedCpFlush) {
         LOGINFO("Do Forward sequential insert for {} entries", g_opts.num_entries);
         uint32_t j = 0;
         for (uint32_t i = 0; i < g_opts.num_entries; ++i) {
-            this->put(i, btree_put_type::INSERT);
+            this->put(i, BtreePutType::INSERT);
             last_index = i;
         }
     });

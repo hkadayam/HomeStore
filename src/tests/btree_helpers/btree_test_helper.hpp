@@ -58,10 +58,14 @@ struct BtreeTestHelper {
         m_bt = std::move(bt);
         m_shadow_filename = fmt::format("/tmp/btree_{}_shadow_map", m_bt->ordinal());
 
-        if (!load) { std::filesystem::remove(m_shadow_filename); }
+        if (!load) {
+            std::filesystem::remove(m_shadow_filename);
+        }
         m_max_range_input = m_options.num_entries;
         m_is_multi_threaded = is_multi_threaded;
-        if (m_options.disable_merge) { m_cfg.m_merge_turned_on = false; }
+        if (m_options.disable_merge) {
+            m_cfg.m_merge_turned_on = false;
+        }
 
         if (m_is_multi_threaded) {
             std::mutex mtx;
@@ -141,12 +145,14 @@ public:
             iomanager.run_on_forget(m_fibers[i], [this, start_range, end_range, &test_count, fiber_id, preload_size]() {
                 m_start_time = Clock::now();
                 for (uint32_t i = start_range; i < end_range; i++) {
-                    put(i, btree_put_type::INSERT);
+                    put(i, BtreePutType::INSERT);
                     track_progress(preload_size, "Preload");
                 }
                 {
                     std::unique_lock lg(m_test_done_mtx);
-                    if (--test_count == 0) { m_test_done_cv.notify_one(); }
+                    if (--test_count == 0) {
+                        m_test_done_cv.notify_one();
+                    }
                 }
             });
         }
@@ -159,7 +165,9 @@ public:
         LOGINFO("Btree{}: Preload Done", m_bt->ordinal());
     }
 
-    uint32_t get_op_num() const { return m_num_ops.load(); }
+    uint32_t get_op_num() const {
+        return m_num_ops.load();
+    }
 
     void track_progress(uint32_t max_ops, std::string_view work_type) {
         static Clock::time_point last_print_time{Clock::now()};
@@ -186,7 +194,7 @@ public:
     }
 
     ////////////////////// All put operation variants ///////////////////////////////
-    void put(uint64_t k, btree_put_type put_type, bool expect = true) {
+    void put(uint64_t k, BtreePutType put_type, bool expect = true) {
         do_put(k, put_type, V::generate_rand(), expect);
     }
 
@@ -194,7 +202,7 @@ public:
         auto [start_k, end_k] = m_shadow_map.pick_random_non_existing_keys(1);
         RELEASE_ASSERT_EQ(start_k, end_k, "Range scheduler pick_random_non_existing_keys issue");
 
-        do_put(start_k, btree_put_type::INSERT, V::generate_rand());
+        do_put(start_k, BtreePutType::INSERT, V::generate_rand());
     }
 
     void force_upsert(uint64_t k) {
@@ -202,8 +210,8 @@ public:
         K key = K{k};
         V value = V::generate_rand();
 
-        auto const ret = m_bt->put_one(key, value, btree_put_type::UPSERT, existing_v.get());
-        ASSERT_EQ(ret, btree_status_t::success) << "Upsert key=" << k << " failed with error=" << enum_name(ret);
+        auto const ret = m_bt->put_one(key, value, BtreePutType::UPSERT, existing_v.get());
+        ASSERT_EQ(ret, BtreeStatus::success) << "Upsert key=" << k << " failed with error=" << enum_name(ret);
         m_shadow_map.force_put(k, value);
     }
 
@@ -214,8 +222,8 @@ public:
             << "Asked to put_delta for key=" << k << " but its not in the map";
 
         auto existing_v = std::make_unique< V >();
-        auto const ret = m_bt->put_one(key, it->second, btree_put_type::UPSERT, existing_v.get());
-        ASSERT_EQ(ret, btree_status_t::success) << "Upsert key=" << k << " failed with error=" << enum_name(ret);
+        auto const ret = m_bt->put_one(key, it->second, BtreePutType::UPSERT, existing_v.get());
+        ASSERT_EQ(ret, BtreeStatus::success) << "Upsert key=" << k << " failed with error=" << enum_name(ret);
     }
 
     void range_put(uint32_t start_k, uint32_t end_k, V const& value, bool update) {
@@ -224,8 +232,8 @@ public:
         auto const nkeys = end_k - start_k + 1;
 
         auto const [ret, cookie] = m_bt->put_range(BtreeKeyRange< K >{start_key, true, end_key, true},
-                                                   update ? btree_put_type::UPDATE : btree_put_type::UPSERT, value);
-        ASSERT_EQ(ret, btree_status_t::success) << "range_put failed for " << start_k << "-" << end_k;
+                                                   update ? BtreePutType::UPDATE : BtreePutType::UPSERT, value);
+        ASSERT_EQ(ret, BtreeStatus::success) << "range_put failed for " << start_k << "-" << end_k;
 
         if (update) {
             m_shadow_map.range_update(start_key, nkeys, value);
@@ -236,7 +244,9 @@ public:
 
     void range_put_random() {
         bool is_update{true};
-        if constexpr (std::is_same_v< V, TestIntervalValue >) { is_update = false; }
+        if constexpr (std::is_same_v< V, TestIntervalValue >) {
+            is_update = false;
+        }
 
         static thread_local std::uniform_int_distribution< uint32_t > s_rand_range_generator{1, 50};
 
@@ -252,11 +262,13 @@ public:
         auto existing_v = std::make_unique< V >();
         auto pk = std::make_unique< K >(k);
 
-        bool removed = (m_bt->remove_one(*pk, existing_v.get()) == btree_status_t::success);
+        bool removed = (m_bt->remove_one(*pk, existing_v.get()) == BtreeStatus::success);
         if (care_success) {
             ASSERT_EQ(removed, m_shadow_map.exists(*pk))
                 << "Removal of key " << pk->key() << " status doesn't match with shadow";
-            if (removed) { m_shadow_map.remove_and_check(*pk, *existing_v); }
+            if (removed) {
+                m_shadow_map.remove_and_check(*pk, *existing_v);
+            }
         } else {
             // Do not care if the key is not present in the btree, just cleanup the shadow map
             m_shadow_map.erase(*pk);
@@ -287,9 +299,13 @@ public:
     }
 
     ////////////////////// All query operation variants ///////////////////////////////
-    void query_all() { do_query(0u, m_options.num_entries - 1, UINT32_MAX); }
+    void query_all() {
+        do_query(0u, m_options.num_entries - 1, UINT32_MAX);
+    }
 
-    void query_all_paginate(uint32_t batch_size) { do_query(0u, m_options.num_entries - 1, batch_size); }
+    void query_all_paginate(uint32_t batch_size) {
+        do_query(0u, m_options.num_entries - 1, batch_size);
+    }
 
     void do_query(uint32_t start_k, uint32_t end_k, uint32_t batch_size) {
         std::vector< std::pair< K, V > > out_vector;
@@ -297,7 +313,7 @@ public:
         uint32_t remaining = m_shadow_map.num_elems_in_range(start_k, end_k);
         auto it = m_shadow_map.map_const().lower_bound(K{start_k});
 
-        btree_status_t ret;
+        BtreeStatus ret;
         QueryPaginateCookie< K > cookie;
 
         while (remaining > 0) {
@@ -315,9 +331,9 @@ public:
             ASSERT_EQ(out_vector.size(), expected_count) << "Received incorrect value on query pagination";
 
             if (remaining < batch_size) {
-                ASSERT_EQ(ret, btree_status_t::success) << "Expected success on query";
+                ASSERT_EQ(ret, BtreeStatus::success) << "Expected success on query";
             } else if (remaining > batch_size) {
-                ASSERT_EQ(ret, btree_status_t::has_more) << "Expected query to return has_more";
+                ASSERT_EQ(ret, BtreeStatus::has_more) << "Expected query to return has_more";
             } else if (remaining == batch_size) {
                 // we don't know, go to the next round
             }
@@ -332,7 +348,7 @@ public:
         }
         out_vector.clear();
         ret = m_bt->query_next(cookie, out_vector);
-        ASSERT_EQ(ret, btree_status_t::success) << "Expected success on query";
+        ASSERT_EQ(ret, BtreeStatus::success) << "Expected success on query";
         ASSERT_EQ(out_vector.size(), 0) << "Received incorrect value on empty query pagination";
 
         m_shadow_map.guard().unlock();
@@ -355,7 +371,7 @@ public:
             auto out_v = std::make_unique< V >();
             const auto ret = m_bt->get_one(key, out_v.get());
 
-            ASSERT_EQ(ret, btree_status_t::success) << "Missing key " << key << " in btree but present in shadow map";
+            ASSERT_EQ(ret, BtreeStatus::success) << "Missing key " << key << " in btree but present in shadow map";
             ASSERT_EQ((const V&)*out_v, value) << "Found value in btree doesn't return correct data for key=" << key;
         });
     }
@@ -365,7 +381,7 @@ public:
         auto out_v = std::make_unique< V >();
         const auto status = m_bt->get_one(key, out_v.get());
 
-        if (status == btree_status_t::success) {
+        if (status == BtreeStatus::success) {
             m_shadow_map.validate_data(key, (const V&)*out_v);
         } else {
             ASSERT_EQ(m_shadow_map.exists(key), false) << "Node key " << k << " is missing in the btree";
@@ -378,7 +394,7 @@ public:
         auto const status =
             m_bt->get_any(BtreeKeyRange< K >{K{start_k}, true, K{end_k}, true}, out_k.get(), out_v.get());
 
-        if (status == btree_status_t::success) {
+        if (status == BtreeStatus::success) {
             ASSERT_EQ(m_shadow_map.exists_in_range(*out_k, start_k, end_k), true)
                 << "Get Any returned key=" << *out_k << " which is not in range " << start_k << "-" << end_k
                 << "according to shadow map";
@@ -406,7 +422,9 @@ public:
         LOGINFO("Btree{}: {} IOs completed", m_bt->ordinal(), m_options.num_ios);
     }
 
-    void dump_to_file(const std::string& file = "") const { m_bt->dump(file); }
+    void dump_to_file(const std::string& file = "") const {
+        m_bt->dump(file);
+    }
     void print_keys(const std::string& preamble = "") const {
         auto print_key_range = [](std::vector< std::pair< K, V > > const& kvs) -> std::string {
             uint32_t start = 0;
@@ -428,7 +446,9 @@ public:
 
         LOGINFO("{}{}", preamble.empty() ? "" : preamble + ":\n", m_bt->to_custom_string(print_key_range));
     }
-    void visualize_keys(const std::string& file) const { m_bt->visualize_tree_keys(file); }
+    void visualize_keys(const std::string& file) const {
+        m_bt->visualize_tree_keys(file);
+    }
 
     void compare_files(const std::string& before, const std::string& after) {
         std::ifstream b(before, std::ifstream::ate);
@@ -460,7 +480,9 @@ public:
     }
 
     ///////////////////////// All crash recovery methods ///////////////////////////////////
-    void save_snapshot() { this->m_shadow_map.save(m_shadow_filename); }
+    void save_snapshot() {
+        this->m_shadow_map.save(m_shadow_filename);
+    }
 
     void reapply_after_crash() {
         ShadowMap< K, V > snapshot_map{m_shadow_map.max_keys()};
@@ -484,18 +506,20 @@ public:
     }
 
 private:
-    void do_put(uint64_t k, btree_put_type put_type, V const& value, bool expect_success = true) {
+    void do_put(uint64_t k, BtreePutType put_type, V const& value, bool expect_success = true) {
         auto existing_v = std::make_unique< V >();
         K key = K{k};
         auto ret = m_bt->put_one(key, value, put_type, existing_v.get());
-        bool done = expect_success ? (ret == btree_status_t::success) : (ret == btree_status_t::put_failed);
+        bool done = expect_success ? (ret == BtreeStatus::success) : (ret == BtreeStatus::put_failed);
 
-        if (put_type == btree_put_type::INSERT) {
+        if (put_type == BtreePutType::INSERT) {
             ASSERT_EQ(done, !m_shadow_map.exists(key));
-        } else if (put_type == btree_put_type::UPDATE) {
+        } else if (put_type == BtreePutType::UPDATE) {
             ASSERT_EQ(done, m_shadow_map.exists(key));
         }
-        if (expect_success) { m_shadow_map.put_and_check(key, value, *existing_v, done); }
+        if (expect_success) {
+            m_shadow_map.put_and_check(key, value, *existing_v, done);
+        }
     }
 
     void do_range_remove(uint64_t start_k, uint64_t end_k, bool all_existing) {
@@ -505,7 +529,7 @@ private:
         auto [ret, cookie] = m_bt->remove_range(BtreeKeyRange< K >{start_key, true, end_key, true});
         if (all_existing) {
             m_shadow_map.range_erase(start_key, end_key);
-            ASSERT_EQ((ret == btree_status_t::success), true)
+            ASSERT_EQ((ret == BtreeStatus::success), true)
                 << "not a successful remove op for range " << start_k << "-" << end_k;
         } else if (start_k < m_max_range_input) {
             K end_range{std::min(end_k, uint64_cast(m_max_range_input - 1))};
@@ -541,7 +565,9 @@ public:
                 }
                 {
                     std::unique_lock lg(m_test_done_mtx);
-                    if (--test_count == 0) { m_test_done_cv.notify_one(); }
+                    if (--test_count == 0) {
+                        m_test_done_cv.notify_one();
+                    }
                 }
             });
         }

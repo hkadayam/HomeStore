@@ -30,7 +30,6 @@
 #include "btree_helpers/btree_test_helper.hpp"
 
 using namespace homestore;
- 
 
 SISL_OPTION_GROUP(
     test_mem_btree,
@@ -54,40 +53,40 @@ SISL_OPTION_GROUP(
 struct FixedLenBtreeTest {
     using KeyType = TestFixedKey;
     using ValueType = TestFixedValue;
-    static constexpr btree_node_type leaf_node_type = btree_node_type::FIXED;
-    static constexpr btree_node_type interior_node_type = btree_node_type::FIXED;
+    static constexpr BtreeNodeType leaf_node_type = BtreeNodeType::FIXED;
+    static constexpr BtreeNodeType interior_node_type = BtreeNodeType::FIXED;
     static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };
 
 struct VarKeySizeBtreeTest {
     using KeyType = TestVarLenKey;
     using ValueType = TestFixedValue;
-    static constexpr btree_node_type leaf_node_type = btree_node_type::VAR_KEY;
-    static constexpr btree_node_type interior_node_type = btree_node_type::VAR_KEY;
+    static constexpr BtreeNodeType leaf_node_type = BtreeNodeType::VAR_KEY;
+    static constexpr BtreeNodeType interior_node_type = BtreeNodeType::VAR_KEY;
     static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };
 
 struct VarValueSizeBtreeTest {
     using KeyType = TestFixedKey;
     using ValueType = TestVarLenValue;
-    static constexpr btree_node_type leaf_node_type = btree_node_type::VAR_VALUE;
-    static constexpr btree_node_type interior_node_type = btree_node_type::FIXED;
+    static constexpr BtreeNodeType leaf_node_type = BtreeNodeType::VAR_VALUE;
+    static constexpr BtreeNodeType interior_node_type = BtreeNodeType::FIXED;
     static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };
 
 struct VarObjSizeBtreeTest {
     using KeyType = TestVarLenKey;
     using ValueType = TestVarLenValue;
-    static constexpr btree_node_type leaf_node_type = btree_node_type::VAR_OBJECT;
-    static constexpr btree_node_type interior_node_type = btree_node_type::VAR_OBJECT;
+    static constexpr BtreeNodeType leaf_node_type = BtreeNodeType::VAR_OBJECT;
+    static constexpr BtreeNodeType interior_node_type = BtreeNodeType::VAR_OBJECT;
     static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };
 
 struct PrefixIntervalBtreeTest {
     using KeyType = TestIntervalKey;
     using ValueType = TestIntervalValue;
-    static constexpr btree_node_type leaf_node_type = btree_node_type::FIXED_PREFIX;
-    static constexpr btree_node_type interior_node_type = btree_node_type::FIXED;
+    static constexpr BtreeNodeType leaf_node_type = BtreeNodeType::FIXED_PREFIX;
+    static constexpr BtreeNodeType interior_node_type = BtreeNodeType::FIXED;
     static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };
 
@@ -116,7 +115,7 @@ TYPED_TEST(BtreeTest, SequentialInsert) {
     const auto entries_iter1 = num_entries / 2;
     LOGINFO("Step 1: Do forward sequential insert for {} entries", entries_iter1);
     for (uint32_t i{0}; i < entries_iter1; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
     LOGINFO("Step 2: Query {} entries and validate with pagination of 75 entries", entries_iter1);
     this->do_query(0, entries_iter1 - 1, 75);
@@ -125,7 +124,7 @@ TYPED_TEST(BtreeTest, SequentialInsert) {
     const auto entries_iter2 = num_entries - entries_iter1;
     LOGINFO("Step 3: Do reverse sequential insert of remaining {} entries", entries_iter2);
     for (uint32_t i{num_entries - 1}; i >= entries_iter1; --i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
     LOGINFO("Step 4: Query {} entries and validate with pagination of 90 entries", entries_iter2);
     this->do_query(entries_iter1, num_entries - 1, 90);
@@ -152,7 +151,7 @@ TYPED_TEST(BtreeTest, SequentialRemove) {
     const auto num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
     LOGINFO("Step 1: Do forward sequential insert for {} entries", num_entries);
     for (uint32_t i{0}; i < num_entries; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
     LOGINFO("Step 2: Query {} entries and validate with pagination of 75 entries", num_entries);
     this->do_query(0, num_entries - 1, 75);
@@ -187,7 +186,7 @@ TYPED_TEST(BtreeTest, RandomInsert) {
     std::random_shuffle(vec.begin(), vec.end());
     LOGINFO("Step 1: Do forward random insert for {} entries", num_entries);
     for (uint32_t i{0}; i < num_entries; ++i) {
-        this->put(vec[i], btree_put_type::INSERT);
+        this->put(vec[i], BtreePutType::INSERT);
     }
     this->get_all();
 }
@@ -197,7 +196,7 @@ TYPED_TEST(BtreeTest, RangeUpdate) {
     const auto num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
     LOGINFO("Step 1: Do forward sequential insert for {} entries", num_entries);
     for (uint32_t i{0}; i < num_entries; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
 
     LOGINFO("Step 2: Do range update of random intervals between [1-50] for 100 times with random key ranges");
@@ -214,7 +213,7 @@ TYPED_TEST(BtreeTest, SimpleRemoveRange) {
     const auto num_entries = 20;
     LOGINFO("Step 1: Do forward sequential insert for {} entries", num_entries);
     for (uint32_t i{0}; i < num_entries; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
     LOGINFO("Step 2: Do range remove for {} entries", num_entries);
     //    this->print_keys(); // EXPECT size = 20 : 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
@@ -241,7 +240,7 @@ TYPED_TEST(BtreeTest, RandomRemove) {
 
     LOGINFO("Step 1: Do forward sequential insert for {} entries", num_entries);
     for (uint32_t i{0}; i < num_entries; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
 
     std::vector< uint32_t > vec(num_entries);
@@ -264,7 +263,7 @@ TYPED_TEST(BtreeTest, RandomRemoveRange) {
 
     LOGINFO("Step 1: Do forward sequential insert for {} entries", num_entries);
     for (uint32_t i{0}; i < num_entries; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
     // generate keys including out of bound
     static thread_local std::uniform_int_distribution< uint32_t > s_rand_key_generator{0, num_entries};

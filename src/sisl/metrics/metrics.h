@@ -115,14 +115,20 @@ using MetricsGroupWrapper = MetricsGroup; // backward compat alias
 // These expand to calls of the template-based register_counter/gauge/histogram
 // functions above.  They must be used inside a MetricsGroup subclass constructor
 // where `this` is a MetricsGroup*.
-#define REGISTER_COUNTER(name, desc, ...) sisl::register_counter< #name >(*this, desc)
-#define REGISTER_GAUGE(name, desc, ...) sisl::register_gauge< #name >(*this, desc)
-#define REGISTER_HISTOGRAM(name, desc, ...) sisl::register_histogram< #name >(*this, desc)
+#define REGISTER_COUNTER(name, desc, ...) sisl::register_counter< #name >(*this, desc, ##__VA_ARGS__)
+#define REGISTER_GAUGE(name, desc, ...) sisl::register_gauge< #name >(*this, desc, ##__VA_ARGS__)
+#define REGISTER_HISTOGRAM(name, desc, ...) sisl::register_histogram< #name >(*this, desc, ##__VA_ARGS__)
 
 #define COUNTER_INCREMENT(grp, name, val) sisl::counter_increment< #name >(grp, val)
 #define COUNTER_DECREMENT(grp, name, val) sisl::counter_decrement< #name >(grp, val)
+#define COUNTER_INCREMENT_IF_ELSE(grp, cond, name_a, name_b, val)                                                      \
+    (cond) ? COUNTER_INCREMENT(grp, name_a, val) : COUNTER_INCREMENT(grp, name_b, val)
+#define COUNTER_DECREMENT_IF_ELSE(grp, cond, name_a, name_b, val)                                                      \
+    (cond) ? COUNTER_DECREMENT(grp, name_a, val) : COUNTER_DECREMENT(grp, name_b, val)
 #define GAUGE_UPDATE(grp, name, val) sisl::gauge_update< #name >(grp, val)
 #define HISTOGRAM_OBSERVE(grp, name, val) sisl::histogram_observe< #name >(grp, val)
+#define HISTOGRAM_OBSERVE_IF_ELSE(grp, cond, name_a, name_b, val)                                                      \
+    (cond) ? HISTOGRAM_OBSERVE(grp, name_a, val) : HISTOGRAM_OBSERVE(grp, name_b, val)
 
 ////////////////////////////////////////// MetricTag + template record/register API ///////////////////////////////
 //

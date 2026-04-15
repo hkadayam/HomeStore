@@ -15,13 +15,25 @@
  *********************************************************************************/
 #pragma once
 
+#include <cstdint>
+#include <cstring>
 #include <string>
+#include <variant>
 #include <vector>
+
 #include <fmt/format.h>
-#include <sisl/fds/buffer.h>
-#include <homestore/index/btree/detail/btree_internal.h>
+
+#include "homestore/blk.h"
+#include "sisl/fds/buffer.h"
+#include "homestore/index/btree/detail/btree_internal.h"
 
 namespace homestore {
+
+template < typename K >
+static K dummy_key;
+
+template < typename V >
+static V dummy_value;
 
 ENUM(MultiMatchOption, uint16_t,
      DO_NOT_CARE, // Select anything that matches
@@ -30,7 +42,7 @@ ENUM(MultiMatchOption, uint16_t,
      MID          // Select the middle one
 )
 
-ENUM(btree_put_type, uint16_t,
+ENUM(BtreePutType, uint16_t,
      INSERT, // Insert only if it doesn't exist
      UPDATE, // Update only if it exists
      UPSERT  // Update if exists, insert otherwise
@@ -79,11 +91,11 @@ class BtreeTraversalState;
 template < typename K >
 class BtreeKeyRange {
 public:
-    K m_start_key;
-    K m_end_key;
-    bool m_start_incl{true};
-    bool m_end_incl{true};
-    MultiMatchOption m_multi_selector{MultiMatchOption::DO_NOT_CARE};
+    K start_key_;
+    K end_key_;
+    bool start_incl_{true};
+    bool end_incl_{true};
+    MultiMatchOption multi_selector_{MultiMatchOption::DO_NOT_CARE};
 
     friend class BtreeTraversalState< K >;
 
@@ -92,11 +104,11 @@ public:
 
     BtreeKeyRange(const K& start_key, bool start_incl, const K& end_key, bool end_incl = true,
                   MultiMatchOption option = MultiMatchOption::DO_NOT_CARE) :
-            m_start_key{start_key},
-            m_end_key{end_key},
-            m_start_incl{start_incl},
-            m_end_incl{end_incl},
-            m_multi_selector{option} {}
+            start_key_{std::move(start_key)},
+            end_key_{std::move(end_key)},
+            start_incl_{start_incl},
+            end_incl_{end_incl},
+            multi_selector_{option} {}
 
     BtreeKeyRange(const K& start_key, const K& end_key) : BtreeKeyRange(start_key, true, end_key, true) {}
 
@@ -105,21 +117,21 @@ public:
     BtreeKeyRange& operator=(const BtreeKeyRange< K >& other) = default;
     BtreeKeyRange& operator=(BtreeKeyRange< K >&& other) = default;
 
-    void set_multi_option(MultiMatchOption o) { m_multi_selector = o; }
-    const K& start_key() const { return m_start_key; }
-    const K& end_key() const { return m_end_key; }
-    bool is_start_inclusive() const { return m_start_incl; }
-    bool is_end_inclusive() const { return m_end_incl; }
-    MultiMatchOption multi_option() const { return m_multi_selector; }
+    void set_multi_option(MultiMatchOption o) { multi_selector_ = o; }
+    const K& start_key() const { return start_key_; }
+    const K& end_key() const { return end_key_; }
+    bool is_start_inclusive() const { return start_incl_; }
+    bool is_end_inclusive() const { return end_incl_; }
+    MultiMatchOption multi_option() const { return multi_selector_; }
 
     void set_start_key(K&& key, bool incl) {
-        m_start_key = std::move(key);
-        m_start_incl = incl;
+        start_key_ = std::move(key);
+        start_incl_ = incl;
     }
 
     void set_end_key(K&& key, bool incl) {
-        m_end_key = std::move(key);
-        m_end_incl = incl;
+        end_key_ = std::move(key);
+        end_incl_ = incl;
     }
 
     std::string to_string() const {
@@ -135,9 +147,73 @@ public:
 
     virtual sisl::Blob serialize() const = 0;
     virtual uint32_t serialized_size() const = 0;
-    virtual void deserialize(const sisl::Blob& b, bool copy) = 0;
+    virtual void deserialize(sisl::Blob const& b, bool copy) = 0;
+    virtual bool is_overflow_value() const { return false; }
+
+    // Overflow-aware deserialize. Default asserts on overflow — only ValueOrOverflow<V> handles it.
+    virtual void deserialize(sisl::Blob const& b, bool copy, bool is_overflow) {
+        HS_DBG_ASSERT(!is_overflow, "overflow deserialize called on non-overflow-capable value");
+        deserialize(b, copy);
+    }
+
+    // Serialize into an owned aligned buffer for overflow I/O. Default copies serialize() into a ByteArray.
+    virtual sisl::ByteArray serialize_to_byte_array() const {
+        auto blob = serialize();
+        auto ba = sisl::make_byte_array(blob.size(), 512, sisl::Buftag::btree_node);
+        std::memcpy(ba->bytes(), blob.cbytes(), blob.size());
+        return ba;
+    }
 
     virtual std::string to_string() const { return ""; }
+};
+
+// ── ValueOrOverflow<V> ─────────────────────────────────────────────────────────
+// Discriminated union: either an inline value V or an overflow BlkId reference.  Inherits BtreeValue so it can be
+// passed through the existing node virtual interface (insert/update/get_nth_value all take BtreeValue&).
+//
+// Write: node calls serialize() — dispatches to V::serialize() or BlkId bytes.
+// Read:  node calls deserialize(blob, copy, is_overflow) — dispatches based on the overflow bit.
+template < typename V >
+class ValueOrOverflow : public BtreeValue {
+    std::variant< V, BlkId > data_;
+
+public:
+    ValueOrOverflow() = default;
+    ValueOrOverflow(V val) : data_{std::move(val)} {}
+    ValueOrOverflow(BlkId bid) : data_{std::move(bid)} {}
+
+    bool is_overflow() const { return std::holds_alternative< BlkId >(data_); }
+    V const& inline_value() const { return std::get< V >(data_); }
+    V& inline_value() { return std::get< V >(data_); }
+    BlkId const& blkid() const { return std::get< BlkId >(data_); }
+
+    static ValueOrOverflow make_inline(V val) { return ValueOrOverflow{std::move(val)}; }
+    static ValueOrOverflow make_overflow(BlkId bid) { return ValueOrOverflow{std::move(bid)}; }
+
+    sisl::Blob serialize() const override {
+        if (is_overflow()) {
+            return sisl::Blob{to_cu8ptr(&std::get< BlkId >(data_)), sizeof(BlkId)};
+        }
+        return inline_value().serialize();
+    }
+
+    uint32_t serialized_size() const override { return is_overflow() ? sizeof(BlkId) : value().serialized_size(); }
+
+    void deserialize(sisl::Blob const& b, bool copy) override { std::get< V >(data_).deserialize(b, copy); }
+
+    void deserialize(sisl::Blob const& b, bool copy, bool is_overflow) override {
+        if (is_overflow) {
+            BlkId bid;
+            std::memcpy(&bid, b.cbytes(), sizeof(BlkId));
+            data_ = std::move(bid);
+        } else {
+            data_ = V{};
+            std::get< V >(data_).deserialize(b, copy);
+        }
+    }
+
+    bool is_overflow_value() const override { return is_overflow(); }
+    std::string to_string() const override { return is_overflow() ? "overflow" : inline_value().to_string(); }
 };
 
 class BtreeIntervalValue : public BtreeValue {
@@ -152,76 +228,63 @@ public:
     virtual void deserialize(sisl::Blob const& prefix, sisl::Blob const& suffix, bool copy) = 0;
 };
 
-struct BtreeLockTracker;
-template < typename K >
-struct BtreeQueryCursor {
-    std::unique_ptr< K > m_last_key;
-    std::unique_ptr< BtreeLockTracker > m_locked_nodes;
-    BtreeQueryCursor() = default;
-
-    const sisl::Blob serialize() const { return m_last_key ? m_last_key->serialize() : sisl::Blob{}; };
-    virtual std::string to_string() const { return (m_last_key) ? m_last_key->to_string() : "null"; }
-};
-
 // This class holds the current state of the search. This is where intermediate search state are stored
 // and it is mutated by the do_put and do_query methods. Expect the current_sub_range and cursor to keep
 // getting updated on calls.
 template < typename K >
 class BtreeTraversalState {
 protected:
-    const BtreeKeyRange< K > m_input_range;
-    BtreeKeyRange< K > m_working_range;
+    const BtreeKeyRange< K > input_range_;
+    BtreeKeyRange< K > working_range_;
 
 public:
     BtreeTraversalState(BtreeKeyRange< K >&& inp_range) :
-            m_input_range{std::move(inp_range)}, m_working_range{m_input_range} {}
+            input_range_{std::move(inp_range)}, working_range_{input_range_} {}
     BtreeTraversalState(const BtreeTraversalState& other) = default;
     BtreeTraversalState(BtreeTraversalState&& other) = default;
 
-    const BtreeKeyRange< K >& input_range() const { return m_input_range; }
-    const BtreeKeyRange< K >& working_range() const { return m_working_range; }
+    const BtreeKeyRange< K >& input_range() const { return input_range_; }
+    const BtreeKeyRange< K >& working_range() const { return working_range_; }
 
     // Trim the end key of the working range to a child boundary before descending.
-    void trim_working_range(K&& end_key, bool end_incl) {
-        m_working_range.set_end_key(std::move(end_key), end_incl);
-    }
+    void trim_working_range(K&& end_key, bool end_incl) { working_range_.set_end_key(std::move(end_key), end_incl); }
 
     // Shift working range start to current end_key (exclusive) and reset end to full input_range end.
     // Used after each leaf so the next sibling sees the right remaining range.
     void shift_working_range() {
-        m_working_range.set_start_key(std::move(m_working_range.m_end_key), false);
-        m_working_range.m_end_key = m_input_range.end_key();
-        m_working_range.m_end_incl = m_input_range.is_end_inclusive();
+        working_range_.set_start_key(std::move(working_range_.end_key_), false);
+        working_range_.end_key_ = input_range_.end_key();
+        working_range_.end_incl_ = input_range_.is_end_inclusive();
     }
 
     // Shift working range start to a specific key (e.g. last_failed_key from multi_put).
     void shift_working_range(K&& start_key, bool start_incl) {
-        m_working_range.set_start_key(std::move(start_key), start_incl);
-        m_working_range.m_end_key = m_input_range.end_key();
-        m_working_range.m_end_incl = m_input_range.is_end_inclusive();
+        working_range_.set_start_key(std::move(start_key), start_incl);
+        working_range_.end_key_ = input_range_.end_key();
+        working_range_.end_incl_ = input_range_.is_end_inclusive();
     }
 
-    const K& first_key() const { return m_working_range.start_key(); }
+    const K& first_key() const { return working_range_.start_key(); }
 
     uint32_t first_key_size() const {
         if (is_start_inclusive() || K::is_fixed_size()) {
-            return m_working_range.start_key().serialized_size();
+            return working_range_.start_key().serialized_size();
         } else {
             return K::get_max_size();
         }
     }
 
 private:
-    bool is_start_inclusive() const { return m_input_range.is_start_inclusive(); }
-    bool is_end_inclusive() const { return m_input_range.is_end_inclusive(); }
+    bool is_start_inclusive() const { return input_range_.is_start_inclusive(); }
+    bool is_end_inclusive() const { return input_range_.is_end_inclusive(); }
 };
 
-class NodeId : public BtreeValue {
+class NodeLink : public BtreeValue {
     bnodeid_t id_{empty_bnodeid};
 
 public:
-    NodeId() = default;
-    explicit NodeId(bnodeid_t id) : id_{id} {}
+    NodeLink() = default;
+    explicit NodeLink(bnodeid_t id) : id_{id} {}
 
     bnodeid_t id() const { return id_; }
     void set_id(bnodeid_t id) { id_ = id; }
@@ -236,14 +299,10 @@ public:
     uint32_t serialized_size() const override { return sizeof(bnodeid_t); }
     static uint32_t get_fixed_size() { return sizeof(bnodeid_t); }
     void deserialize(const sisl::Blob& b, bool copy) override {
-        DEBUG_ASSERT_EQ(b.size(), sizeof(bnodeid_t), "NodeId deserialize received invalid blob");
+        DEBUG_ASSERT_EQ(b.size(), sizeof(bnodeid_t), "NodeLink deserialize received invalid blob");
         id_ = *r_cast< bnodeid_t const* >(b.cbytes());
     }
     std::string to_string() const override { return fmt::format("{}", id_); }
 };
 
-ENUM(put_filter_decision, uint8_t, keep, replace, remove);
-using put_filter_cb_t = std::function< put_filter_decision(BtreeKey const&, BtreeValue const&, BtreeValue const&) >;
-using remove_filter_cb_t = std::function< bool(BtreeKey const&, BtreeValue const&) >;
-using get_filter_cb_t = std::function< bool(BtreeKey const&, BtreeValue const&) >;
 } // namespace homestore

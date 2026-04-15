@@ -124,12 +124,12 @@ Node COWBtree::create_node(bool is_leaf) {
 
     auto cache_handle = node_cache_->insert(id, core, sisl::CacheHint::HOT);
     HS_REL_ASSERT(cache_handle, "create_node: cache insert failed for node_id={}", id);
-    return Node{COWNodeHandle{std::move(cache_handle)}, LockType::Write};
+    return Node::construct(COWNodeHandle{std::move(cache_handle)}, LockType::Write);
 }
 
-folly::coro::Task< Node > COWBtree::read_node(bnodeid_t id, LockType lock_type) const {
+BtreeResult< Node > COWBtree::read_node(bnodeid_t id, LockType lock_type) const {
     if (auto h = node_cache_->find(id); h) {
-        co_return Node{COWNodeHandle{std::move(h)}, lock_type}; // Found in cache
+        CO_RETURN CO_AWAIT Node::async_construct(COWNodeHandle{std::move(h)}, lock_type);
     }
 
     // Get the mapping of nodeid -> blkid
@@ -138,10 +138,13 @@ folly::coro::Task< Node > COWBtree::read_node(bnodeid_t id, LockType lock_type) 
 
     // Read blkid from the stream
     IOBuffer io_buf{base_btree_->node_size(), node_stream_->block_size(), sisl::Buftag::btree_node};
-    auto ec = co_await node_stream_->read(io_buf, blkid);
-    HS_REL_ASSERT(!ec, "read_node: AppendBlkStream::read failed for node_id={} blkid={}", id, blkid.to_string());
+    auto ec = CO_AWAIT node_stream_->read(io_buf, blkid);
+    if (ec) {
+        COWBT_LOG(ERROR, "read_node: stream read failed for node_id={} blkid={} ec={}", id, blkid.to_string(),
+                  ec.message());
+        CO_RETURN folly::makeUnexpected(BtreeStatus::node_read_failed);
+    }
 
-    // Construct node from the blk read and insert into the cache
     auto core = base_btree_->construct_existing_node(io_buf.release_to_shared_ptr(), id);
     auto h = node_cache_->insert(id, std::move(core), sisl::CacheHint::COLD);
     if (!h) {
@@ -149,16 +152,22 @@ folly::coro::Task< Node > COWBtree::read_node(bnodeid_t id, LockType lock_type) 
         h = node_cache_->find(id);
         HS_REL_ASSERT(h, "read_node: cache insert and find both failed for node_id={}", id);
     }
-    co_return Node{COWNodeHandle{std::move(h)}, lock_type};
+
+    auto node = CO_AWAIT Node::async_construct(COWNodeHandle{std::move(h)}, lock_type);
+    if (node.lock_type() == LockType::Write) {
+        auto status = prepare_for_write(node);
+        if (status != BtreeStatus::success) {
+            CO_RETURN folly::makeUnexpected(status);
+        }
+    }
+    CO_RETURN std::move(node);
 }
 
-btree_status_t COWBtree::write_node(Node const& node) {
-    // COW: all persistence happens at flush time. Nothing to do here.
+void COWBtree::write_node(const Node& node) {
     HS_DBG_ASSERT_EQ(node.lock_type(), LockType::Write, "write_node called without write lock");
-    return btree_status_t::success;
 }
 
-btree_status_t COWBtree::prepare_for_write(Node const& node) {
+BtreeStatus COWBtree::prepare_for_write(const Node& node) {
     // Called under write lock just before mutating a node.
     // In COW semantics, every mutation produces a new version; we track the node as dirty
     // in the current CP session so flush_nodes() will append it to the AppendBlkStream.
@@ -171,14 +180,14 @@ btree_status_t COWBtree::prepare_for_write(Node const& node) {
     auto const mod_cp_id = core.get_modified_cp_id();
     if (mod_cp_id == cur_cp_id) {
         // Already marked dirty in this CP — reuse the same buffer.
-        return btree_status_t::success;
+        return BtreeStatus::success;
     }
 
     if (mod_cp_id > cur_cp_id) {
         // A newer cp has already modified this node, it can happen while this thread entered older CP and while its
         // processing cp switchover has happened and newer CP end up racing ahead and modified this node. We simply
         // should ask at the top of btree to just retry which will automatically enter into the new CP.
-        return btree_status_t::retry;
+        return BtreeStatus::retry;
     }
 
     // If the buffer is still held by a previous CP's flush pipeline (use_count > 1), the flush thread could be reading
@@ -200,24 +209,22 @@ btree_status_t COWBtree::prepare_for_write(Node const& node) {
 
     core.set_modified_cp_id(cur_cp_id);
     add_to_dirty_node_list(FlushNodeEntry{std::move(handle), buf}, cur_cp_id);
-    return btree_status_t::success;
+    return BtreeStatus::success;
 }
 
-void COWBtree::remove_node(Node const& node) {
+void COWBtree::remove_node(const Node& node) {
     HS_DBG_ASSERT_EQ(node.lock_type(), LockType::Write, "remove_node called without write lock");
     auto const id = node->node_id();
 
-    // Remove it from the cache and put it in list to flush
     node_cache_->remove(id);
     add_to_remove_node_list(id);
 }
 
-btree_status_t COWBtree::on_root_changed(Node const& root) {
+void COWBtree::on_root_changed(const Node& root) {
     mutable_super_blk().root_node_id = root->node_id();
 
     CPGuard cpg = cp_mgr().cp_guard();
     cp_session(cpg->id())->new_root_id_.store(root->node_id());
-    return btree_status_t::success;
 }
 
 uint64_t COWBtree::space_occupied() const {
@@ -232,14 +239,14 @@ uint64_t COWBtree::space_occupied() const {
 // delete: evict from cache, add BlkId to deleted list. Actual invalidate happens at flush time.
 // ──────────────────────────────────────────────────────────────────────────────────────────────────
 
-btree_status_t COWBtree::write_overflow(const sisl::ByteArray& buf, BlkId& out_blkid) {
+BtreeStatus COWBtree::write_overflow(const sisl::ByteArray& buf, BlkId& out_blkid) {
     auto const blk_sz = overflow_stream_->block_size();
     auto const nblks = s_cast< blk_count_t >((buf->size() + blk_sz - 1) / blk_sz);
 
     // Allocate blks in overflow stream
     auto status = overflow_stream_->alloc_blk(nblks, blk_alloc_hints{}, out_blkid);
     if (status != BlkAllocStatus::SUCCESS) {
-        return btree_status_t::space_not_avail;
+        return BtreeStatus::space_not_avail;
     }
 
     // Insert into cache; the returned CacheHandle pins the entry so the evictor can't reclaim it while dirty.
@@ -247,31 +254,31 @@ btree_status_t COWBtree::write_overflow(const sisl::ByteArray& buf, BlkId& out_b
     HS_REL_ASSERT(handle, "write_overflow: cache insert failed for blkid={}", out_blkid.to_string());
     add_to_dirty_overflow_list(std::move(handle));
 
-    return btree_status_t::success;
+    return BtreeStatus::success;
 }
 
-folly::coro::Task< btree_status_t > COWBtree::read_overflow(const BlkId& blkid, sisl::ByteArray& out_buf) const {
+folly::coro::Task< BtreeStatus > COWBtree::read_overflow(const BlkId& blkid, sisl::ByteArray& out_buf) const {
     if (auto h = overflow_cache_->find(blkid); h) {
         out_buf = h.value().buf;
-        co_return btree_status_t::success;
+        co_return BtreeStatus::success;
     }
 
     auto const blk_sz = overflow_stream_->block_size();
     auto ba = sisl::make_byte_array(blkid.blk_count() * blk_sz, blk_sz, sisl::Buftag::btree_node);
     auto ec = co_await overflow_stream_->read(*ba, blkid);
     if (ec) {
-        co_return btree_status_t::node_read_failed;
+        co_return BtreeStatus::node_read_failed;
     }
 
     overflow_cache_->insert(blkid, OverflowEntry{blkid, ba}, sisl::CacheHint::COLD);
     out_buf = std::move(ba);
-    co_return btree_status_t::success;
+    co_return BtreeStatus::success;
 }
 
-btree_status_t COWBtree::delete_overflow(const BlkId& blkid) {
+BtreeStatus COWBtree::delete_overflow(const BlkId& blkid) {
     overflow_cache_->remove(blkid);
     add_to_remove_overflow_list(blkid);
-    return btree_status_t::success;
+    return BtreeStatus::success;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

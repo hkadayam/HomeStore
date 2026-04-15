@@ -1,6 +1,5 @@
 /*********************************************************************************
- * Modifications Copyright 2017-2019 eBay Inc.
- *
+ * Copyright 2024-2026 Harihara Kadayam
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,142 +14,153 @@
  *********************************************************************************/
 #pragma once
 
-#include <functional>
-#include <memory>
 #include <string>
 #include <vector>
 
-#include <boost/intrusive_ptr.hpp>
-// #include <flip/flip.hpp>
 #include <sisl/logging/logging.h>
-#include <sisl/fds/buffer.hpp>
 
-#include <homestore/index/btree/btree.h>
-#include <homestore/index/btree/detail/btree_common.ipp>
-#include <homestore/index/btree/detail/btree_node_mgr.ipp>
-#include <homestore/index/btree/detail/mutate_impl.ipp>
-#include <homestore/index/btree/detail/btree_query_impl.ipp>
-#include <homestore/index/btree/detail/get_impl.ipp>
-#include <homestore/index/btree/detail/btree_remove_impl.ipp>
-#include <homestore/index/btree/detail/btree_node.h>
+#include "homestore/index/btree/btree.h"
+#include "homestore/index/btree/detail/node_value_helpers.ipp"
+#include "homestore/index/btree/detail/btree_common.ipp"
+#include "homestore/index/btree/detail/btree_node_mgr.ipp"
+#include "homestore/index/btree/detail/mutate_impl.ipp"
+#include "homestore/index/btree/detail/query_impl.ipp"
+#include "homestore/index/btree/detail/get_impl.ipp"
+#include "homestore/index/btree/detail/remove_impl.ipp"
 
 namespace homestore {
 template < typename K, typename V >
-Btree< K, V >::Btree(BtreeConfig const& cfg, uuid_t uuid, uuid_t parent_uuid, uint32_t user_sb_size) :
-        BtreeBase::BtreeBase(cfg, uuid, parent_uuid, user_sb_size) {
-    create_root_node();
+Btree< K, V >::Btree(BtreeConfig const& cfg, cshared< UnderlyingBtree >& underlying_btree) :
+        BtreeBase::BtreeBase(cfg, underlying_btree) {
 }
 
 template < typename K, typename V >
-Btree< K, V >::Btree(BtreeConfig const& cfg, superblk< IndexSuperBlock >&& sb) :
-        BtreeBase::BtreeBase(cfg, std::move(sb)) {
-    if (m_root_node_info.bnode_id() == empty_bnodeid) {
-        BT_LOG(INFO, "Loaded an empty btree, we are creating a new root node");
-        create_root_node();
-    }
+BtreeResult< PutStats > Btree< K, V >::put_one(BtreeKey const& key, BtreeValue const& value, PutFilter* filter) {
+    BtreeSinglePutRequest req{*this, key, value, BtreePutType::UPSERT, nullptr, filter};
+    auto ret = CO_AWAIT(put(req));
+    CO_RETURN(ret == BtreeStatus::success) ? req.stats_ : folly::makeUnexpected(ret);
 }
 
 template < typename K, typename V >
-Btree< K, V >::~Btree() {
-    if (is_ephemeral()) { destroy(); }
-}
-
-template < typename K, typename V >
-BtreeTask< btree_status_t > Btree< K, V >::put_one(BtreeKey const& key, BtreeValue const& value,
-                                                    btree_put_type put_type, BtreeValue* existing_val,
-                                                    PutFilter* filter) {
-    BtreeSinglePutRequest req{*this, &key, &value, put_type, existing_val, filter};
-    CO_RETURN CO_AWAIT(put(req));
-}
-
-template < typename K, typename V >
-BtreeTask< btree_status_t > Btree< K, V >::put_range(BtreeKeyRange< K >&& inp_range, btree_put_type put_type,
-                                                      BtreeValue const& value, PutFilter* filter) {
+BtreeResult< PutStats > Btree< K, V >::put_range(BtreeKeyRange< K >&& inp_range, BtreePutType put_type,
+                                                 BtreeValue const& value, PutFilter* filter) {
     BtreeRangePutRequest< K > req{*this, std::move(inp_range), put_type, &value, filter};
-    CO_RETURN CO_AWAIT(put(req));
+    auto ret = CO_AWAIT(put(req));
+    CO_RETURN(ret == BtreeStatus::success) ? req.stats_ : folly::makeUnexpected(ret);
 }
 
 template < typename K, typename V >
-BtreeTask< std::pair< btree_status_t, bool > >
-Btree< K, V >::scan_and_put_one(BtreeKey& insert_key, BtreeValue const& value,
-                                 BtreeKeyRange< K > const& scan_range, PutFilter* filter, size_t max_scan) {
+BtreeResult< bool > Btree< K, V >::scan_and_put_one(BtreeKey& insert_key, BtreeValue const& value,
+                                                    BtreeKeyRange< K > const& scan_range, PutFilter* filter,
+                                                    size_t max_scan) {
     BtreeScanPutRequest< K > req{*this, insert_key, value, scan_range, filter, max_scan};
     auto ret = CO_AWAIT(put(req));
-    CO_RETURN {ret, req.m_inserted};
+    CO_RETURN(ret == BtreeStatus::success) ? req.inserted_ : folly::makeUnexpected(ret);
 }
 
 template < typename K, typename V >
-BtreeTask< std::pair< btree_status_t, PutStats > >
-Btree< K, V >::batch_put(std::vector< std::pair< K, V > >&& entries, btree_put_type put_type) {
-    if (entries.empty()) CO_RETURN {btree_status_t::success, PutStats{}};
+BtreeResult< PutStats > Btree< K, V >::batch_put(std::vector< std::pair< K, V > >&& entries, BtreePutType put_type) {
+    if (entries.empty()) {
+        CO_RETURN PutStats{};
+    }
     BtreeBatchPutRequest< K, V > req{*this, std::move(entries), put_type};
     auto ret = CO_AWAIT(put(req));
-    CO_RETURN {ret, req.m_stats};
+    CO_RETURN(ret == BtreeStatus::success) ? req.stats_ : folly::makeUnexpected(ret);
 }
 
 template < typename K, typename V >
-BtreeTask< btree_status_t > Btree< K, V >::get_one(BtreeKey const& key, BtreeValue* out_val) {
-    BtreeSingleGetRequest req{*this, &key, out_val};
-    CO_RETURN CO_AWAIT(get(req));
+BtreeResult< V > Btree< K, V >::remove_one(BtreeKey const& key, RemoveFilter* filter) {
+    V out_val;
+    BtreeSingleRemoveRequest req{*this, &key, &out_val};
+    auto ret = CO_AWAIT(remove(req));
+    CO_RETURN(ret == BtreeStatus::success) ? std::move(out_val) : folly::makeUnexpected(ret);
 }
 
 template < typename K, typename V >
-BtreeTask< btree_status_t > Btree< K, V >::get_any(BtreeKeyRange< K >&& inp_range, BtreeKey* out_key,
-                                                    BtreeValue* out_val) {
-    BtreeGetAnyRequest< K > req{*this, std::move(inp_range), out_key, out_val};
-    CO_RETURN CO_AWAIT(get(req));
+BtreeResult< std::pair< K, V > > Btree< K, V >::remove_any(BtreeKeyRange< K >&& inp_range) {
+    K out_key;
+    V out_val;
+    BtreeRemoveAnyRequest< K > req{*this, std::move(inp_range), &out_key, &out_val};
+    auto ret = CO_AWAIT(remove(req));
+    CO_RETURN(ret == BtreeStatus::success) ? std::make_pair(std::move(out_key), std::move(out_val))
+                                           : folly::makeUnexpected(ret);
 }
 
 template < typename K, typename V >
-BtreeTask< btree_status_t > Btree< K, V >::remove_one(BtreeKey const& key, BtreeValue* out_val) {
-    BtreeSingleRemoveRequest req{*this, &key, out_val};
-    CO_RETURN CO_AWAIT(remove(req));
+BtreeResult< uint32_t > Btree< K, V >::remove_range(BtreeKeyRange< K >&& inp_range, RemoveFilter* filter) {
+    BtreeRangeRemoveRequest< K > req{*this, std::move(inp_range), std::numeric_limits< uint32_t >::max(), filter};
+    auto ret = CO_AWAIT(remove(req));
+    CO_RETURN ret == BtreeStatus::success ? req.removed_count_ : folly::makeUnexpected(ret);
 }
 
 template < typename K, typename V >
-BtreeTask< btree_status_t > Btree< K, V >::remove_any(BtreeKeyRange< K >&& inp_range, BtreeKey* out_key,
-                                                       BtreeValue* out_val) {
-    BtreeRemoveAnyRequest< K > req{*this, std::move(inp_range), out_key, out_val};
-    CO_RETURN CO_AWAIT(remove(req));
+BtreeResult< V > Btree< K, V >::get(BtreeKey const& key) {
+    V out_val;
+    BtreeSingleGetRequest req{*this, &key, &out_val};
+    auto ret = CO_AWAIT(get(req));
+    CO_RETURN(ret == BtreeStatus::success) ? std::move(out_val) : folly::makeUnexpected(ret);
 }
 
 template < typename K, typename V >
-BtreeTask< std::pair< btree_status_t, RemovePaginateCookie< K > > >
-Btree< K, V >::remove_range(BtreeKeyRange< K >&& inp_range, uint32_t batch_size, RemoveFilter* filter) {
-    auto req_ptr =
-        std::make_unique< BtreeRangeRemoveRequest< K > >(*this, std::move(inp_range), batch_size, filter);
-    auto status = CO_AWAIT(remove(*req_ptr));
-    CO_RETURN std::pair(status, std::move(req_ptr));
+BtreeResult< std::pair< K, V > > Btree< K, V >::get_any(BtreeKeyRange< K >&& inp_range) {
+    K out_key;
+    V out_val;
+    BtreeGetAnyRequest< K > req{*this, std::move(inp_range), &out_key, &out_val};
+    auto ret = CO_AWAIT(get(req));
+    CO_RETURN(ret == BtreeStatus::success) ? std::make_pair(std::move(out_key), std::move(out_val))
+                                           : folly::makeUnexpected(ret);
 }
 
 template < typename K, typename V >
-BtreeTask< btree_status_t > Btree< K, V >::remove_range_next(RemovePaginateCookie< K >& cookie) {
-    auto const status = CO_AWAIT(remove(*cookie));
-    if (status != btree_status_t::has_more) { cookie.reset(); }
-    CO_RETURN status;
+BtreeResult< QueryResultHandle< K, V > > Btree< K, V >::query(BtreeKeyRange< K >&& inp_range, uint32_t batch_size,
+                                                              BtreeQueryType query_type, GetFilter* filter,
+                                                              bool reverse_order) {
+    if (reverse_order) {
+        query_type = BtreeQueryType::Traversal;
+    }
+
+    QueryResultHandle< K, V > handle;
+    handle.next_range_ = inp_range;
+    handle.query_type_ = query_type;
+    handle.batch_size_ = batch_size;
+    handle.filter_ = filter;
+    handle.reverse_order_ = reverse_order;
+
+    BtreeQueryRequest< K > req{*this, std::move(inp_range), query_type, batch_size, filter, reverse_order};
+    auto status = CO_AWAIT(query(req, handle.results));
+
+    if (status != BtreeStatus::success && status != BtreeStatus::has_more) {
+        CO_RETURN folly::makeUnexpected(status);
+    }
+
+    handle.has_more_ = false;
+    if (status == BtreeStatus::has_more) {
+        handle.has_more_ = true;
+        handle.next_range_ = req.working_range();
+    }
+    CO_RETURN std::move(handle);
 }
 
 template < typename K, typename V >
-BtreeTask< std::pair< btree_status_t, QueryPaginateCookie< K > > >
-Btree< K, V >::query(BtreeKeyRange< K >&& inp_range,            // Input range to query for
-                     std::vector< std::pair< K, V > >& out_kvs, // Results will be appended
-                     uint32_t batch_size,                       // Batch size, default the whole set
-                     BtreeQueryType query_type,                 // See query_impl for more details
-                     GetFilter* filter                          // Any filtering condition while picking the result set
-) {
-    auto req_ptr = std::make_unique< BtreeQueryRequest< K > >(*this, std::move(inp_range), query_type, batch_size,
-                                                              filter);
-    auto status = CO_AWAIT(query(*req_ptr, out_kvs));
-    CO_RETURN std::pair(status, std::move(req_ptr));
-}
+BtreeResult< QueryResultHandle< K, V > > Btree< K, V >::query_next_batch(QueryResultHandle< K, V >&& handle) {
+    handle.results.clear();
 
-template < typename K, typename V >
-BtreeTask< btree_status_t > Btree< K, V >::query_next(QueryPaginateCookie< K >& cookie,
-                                                       std::vector< std::pair< K, V > >& out_kvs) {
-    if (cookie == nullptr) { CO_RETURN btree_status_t::success; }
-    auto const status = CO_AWAIT(query(*cookie, out_kvs));
-    if (status != btree_status_t::has_more) { cookie.reset(); }
-    CO_RETURN status;
+    BtreeQueryRequest< K > qreq{*this,
+                                BtreeKeyRange< K >{handle.next_range_},
+                                handle.query_type_,
+                                handle.batch_size_,
+                                handle.filter_,
+                                handle.reverse_order_};
+
+    auto ret = CO_AWAIT(query(qreq, handle.results));
+    handle.has_more_ = (ret == BtreeStatus::has_more);
+    if (ret != BtreeStatus::success && ret != BtreeStatus::has_more) {
+        CO_RETURN folly::makeUnexpected(ret);
+    }
+    if (handle.has_more_) {
+        handle.next_range_ = qreq.working_range();
+    }
+    CO_RETURN std::move(handle);
 }
 
 #if 0
@@ -158,7 +168,7 @@ BtreeTask< btree_status_t > Btree< K, V >::query_next(QueryPaginateCookie< K >& 
  * @brief : verify btree is consistent and no corruption;
  *
  * @param update_debug_bm : true or false;
- *
+ * 
  * @return : true if btree is not corrupted.
  *           false if btree is corrupted;
  */
@@ -249,7 +259,7 @@ BtreeTask< std::string > Btree< K, V >::to_digraph_visualize_format() const {
 
 template < typename K, typename V >
 BtreeTask< void > Btree< K, V >::dump(const std::string& file, std::string format,
-                                       NodeCore::ToStringCallback< K, V > cb) const {
+                                      NodeCore::ToStringCallback< K, V > cb) const {
     if (file.empty()) {
         BT_LOG(ERROR, "Wrong file name to dump btree");
         CO_RETURN_VOID;
@@ -287,9 +297,13 @@ bnodeid_t Btree< K, V >::root_node_id() const {
 
 template < typename K, typename V >
 BtreeTask< uint64_t > Btree< K, V >::count_keys(bnodeid_t bnodeid) const {
-    if (bnodeid == empty_bnodeid) { CO_RETURN 0ULL; }
+    if (bnodeid == empty_bnodeid) {
+        CO_RETURN 0ULL;
+    }
     auto [ret, node] = CO_AWAIT(read_node(bnodeid, LockType::Read));
-    if (ret != btree_status_t::success) { CO_RETURN 0ULL; }
+    if (ret != BtreeStatus::success) {
+        CO_RETURN 0ULL;
+    }
     uint64_t result = 0;
     if (!node->is_leaf()) {
         uint32_t i = 0;
@@ -299,7 +313,9 @@ BtreeTask< uint64_t > Btree< K, V >::count_keys(bnodeid_t bnodeid) const {
             result += CO_AWAIT(count_keys(child_info.bnode_id()));
             ++i;
         }
-        if (node->has_valid_edge()) { result += CO_AWAIT(count_keys(node->edge_id())); }
+        if (node->has_valid_edge()) {
+            result += CO_AWAIT(count_keys(node->edge_id()));
+        }
     } else {
         result = node->total_entries();
     }

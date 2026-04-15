@@ -15,17 +15,21 @@
  *********************************************************************************/
 
 #pragma once
+
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 
-#include <sisl/fds/atomic_counter.h>
-#include <sisl/fds/enum.h>
-#include <sisl/fds/obj_life_counter.h>
-#include <homestore/index/btree/btree_async.h>
-#include <homestore/index/btree/detail/btree_internal.h>
-#include <homestore/index/btree/btree_kv.h>
-#include <homestore/crc.h>
+#include <folly/small_vector.h>
+
+#include "common/defs.h"
+#include "homestore/crc.h"
+#include "sisl/fds/enum.h"
+#include "sisl/fds/obj_life_counter.h"
+#include "homestore/index/btree/btree_async.h"
+#include "homestore/index/btree/detail/btree_internal.h"
+#include "homestore/index/btree/btree_kv.h"
 
 namespace homestore {
 /// Node locking modes.
@@ -33,14 +37,7 @@ namespace homestore {
 /// leaf nodes are write-locked. This avoids holding exclusive locks high in the tree during descent.
 ENUM(LockType, uint8_t, None, Read, Write, ReadInteriorWriteLeaf)
 
-/// Resolve to the actual Read/Write lock type for a node of the given type.
-inline LockType resolve_node_lock_type(LockType lt, bool is_leaf) {
-    return (lt == LockType::ReadInteriorWriteLeaf) ? (is_leaf ? LockType::Write : LockType::Read) : lt;
-}
-
 class NodeCore : public sisl::ObjLifeCounter< NodeCore > {
-    using node_find_result_t = std::pair< bool, uint32_t >;
-
 public:
     static constexpr uint8_t BTREE_NODE_VERSION = 1;
     static constexpr uint8_t BTREE_NODE_MAGIC = 0xab;
@@ -50,26 +47,23 @@ public:
         uint8_t magic{BTREE_NODE_MAGIC};     // offset=0
         uint8_t version{BTREE_NODE_VERSION}; // offset=1
         uint16_t checksum{0};                // offset=2
-        uint32_t nentries;                   // offset 4
-
-        bnodeid_t node_id{empty_bnodeid};   // offset=8
-        bnodeid_t next_node{empty_bnodeid}; // offset=16
-        uint64_t node_gen{0};               // offset=24: Generation of this node, incremented on every update
-
-        bnodeid_t edge_id;          // offset=32: Edge entry information
-        int64_t modified_cp_id{-1}; // offset=40: Checkpoint ID of the last modification of this node
-
-        uint16_t level;            // offset=48: Level of the node within the tree
-        uint16_t node_size;        // offset=50: Size of node, max 64K
-        uint8_t node_type;         // offset=52: Type of the node (simple vs varlen etc..)
-        uint8_t leaf : 1;          // offset=53: Is leaf or not, TODO: Cache this in wrapper to avoid bit ops
-        uint8_t node_deleted : 1;  // offset=53: Is node deleted or not
-        uint8_t reserved[2]{0, 0}; // offset=54-55: Reserved
+        uint32_t nentries;                   // offset=4
+        bnodeid_t node_id{empty_bnodeid};    // offset=8
+        bnodeid_t next_node{empty_bnodeid};  // offset=16
+        bnodeid_t edge_id;                   // offset=32: Edge entry information
+        uint64_t node_gen{0};                // offset=24: Generation of this node, incremented on every update
+        int64_t modified_cp_id{-1};          // offset=40: Checkpoint ID of the last modification of this node
+        uint16_t level;                      // offset=48: Level of the node within the tree
+        uint16_t node_size;                  // offset=50: Size of node, max 64K
+        uint8_t node_type;                   // offset=52: Type of the node (simple vs varlen etc..)
+        uint8_t leaf : 1;                    // offset=53: Is leaf or not, TODO: Cache this in wrapper to avoid bit ops
+        uint8_t node_deleted : 1;            // offset=53: Is node deleted or not
+        uint8_t reserved[2]{0, 0};           // offset=54-55: Reserved
 
         PersistentHeader() : nentries{0}, leaf{0}, node_deleted{0} {}
         std::string to_string() const {
             auto snext = (next_node == empty_bnodeid) ? "" : " next=" + std::to_string(next_node);
-            auto sedge = (edge_info.m_bnodeid == empty_bnodeid) ? "" : fmt::format(" edge={}", edge_info.m_bnodeid);
+            auto sedge = (edge_info.bnodeid_ == empty_bnodeid) ? "" : fmt::format(" edge={}", edge_info.bnodeid_);
             return fmt::format("magic={} version={} csum={} node_id={} nentries={} node_type={} is_leaf={} "
                                "deleted?={} gen={} modified_cp_id={}{}{} level={} ",
                                magic, version, checksum, node_id, snext, nentries, node_type, leaf, node_deleted,
@@ -78,7 +72,7 @@ public:
 
         std::string to_compact_string() const {
             auto snext = (next_node == empty_bnodeid) ? "" : " next=" + std::to_string(next_node);
-            auto sedge = (edge_info.m_bnodeid == empty_bnodeid) ? "" : fmt::format(" edge={}", edge_info.m_bnodeid);
+            auto sedge = (edge_info.bnodeid_ == empty_bnodeid) ? "" : fmt::format(" edge={}", edge_info.bnodeid_);
             return fmt::format("id={}{}{} {} level={} nentries={}{} mod_cp={}", node_id, snext, sedge,
                                leaf ? "LEAF" : "INTERIOR", level, nentries, (node_deleted == 0x1) ? "  Deleted" : "",
                                modified_cp_id);
@@ -95,43 +89,55 @@ public:
     ///               (AlignedSharedPtr IS-A shared_ptr, so assignment works directly)
     ///
     /// Replacing the buffer (CoW on write) is a simple reassignment:
-    ///   node->m_phys_node_buf = new_buf;
+    ///   node->phys_node_buf_ = new_buf;
     /// The old buffer stays alive until all shared_ptr holders drop their copy.
-    std::shared_ptr< uint8_t > m_phys_node_buf;
-    mutable BtreeMutex m_lock;
+    std::shared_ptr< uint8_t > phys_node_buf_;
+    mutable BtreeSharedMutex lock_;
 
 public:
     /// Construct a fresh node. The caller allocates and provides the buffer.
     NodeCore(std::shared_ptr< uint8_t > buf, bnodeid_t id, bool is_leaf, uint32_t node_size) :
-            m_phys_node_buf{std::move(buf)} {
-        new (m_phys_node_buf.get()) PersistentHeader{};
+            phys_node_buf_{std::move(buf)} {
+        new (phys_node_buf_.get()) PersistentHeader{};
         set_node_id(id);
         set_leaf(is_leaf);
         set_node_size(node_size);
     }
 
     /// Construct from an existing buffer (e.g. after reading from disk/memory).
-    NodeCore(std::shared_ptr< uint8_t > buf, bnodeid_t id) : m_phys_node_buf{std::move(buf)} {
+    NodeCore(std::shared_ptr< uint8_t > buf, bnodeid_t id) : phys_node_buf_{std::move(buf)} {
         DEBUG_ASSERT_EQ(node_id(), id);
         DEBUG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC);
         DEBUG_ASSERT_EQ(version(), BTREE_NODE_VERSION);
     }
 
-    virtual ~NodeCore() = default; // shared_ptr deleter frees m_phys_node_buf automatically
+    virtual ~NodeCore() = default; // shared_ptr deleter frees phys_node_buf_ automatically
 
     // Identify if a node is a leaf node or not, from raw buffer, by just reading PersistentHeader
-    static bool identify_leaf_node(uint8_t* buf) { return (r_cast< PersistentHeader* >(buf))->leaf; }
-    static std::string to_string_buf(uint8_t* buf) { return (r_cast< PersistentHeader* >(buf))->to_compact_string(); }
+    static bool identify_leaf_node(uint8_t* buf) {
+        return (r_cast< PersistentHeader* >(buf))->leaf;
+    }
+    static std::string to_string_buf(uint8_t* buf) {
+        return (r_cast< PersistentHeader* >(buf))->to_compact_string();
+    }
 
     static bool is_valid_node(sisl::Blob const& buf) {
         auto phdr = r_cast< PersistentHeader const* >(buf.cbytes());
-        if ((phdr->magic != BTREE_NODE_MAGIC) || (phdr->version != BTREE_NODE_VERSION)) { return false; }
-        if ((uint32_cast(phdr->node_size) + 1) != buf.size()) { return false; }
-        if (phdr->node_id == empty_bnodeid) { return false; }
+        if ((phdr->magic != BTREE_NODE_MAGIC) || (phdr->version != BTREE_NODE_VERSION)) {
+            return false;
+        }
+        if ((uint32_cast(phdr->node_size) + 1) != buf.size()) {
+            return false;
+        }
+        if (phdr->node_id == empty_bnodeid) {
+            return false;
+        }
 
         auto const exp_checksum = crc16_t10dif(bt_init_crc_16, (buf.cbytes() + sizeof(PersistentHeader)),
                                                buf.size() - sizeof(PersistentHeader));
-        if (phdr->checksum != exp_checksum) { return false; }
+        if (phdr->checksum != exp_checksum) {
+            return false;
+        }
 
         return true;
     }
@@ -150,7 +156,7 @@ public:
     ///         The first value is a boolean indicating whether the key was found in the node.
     ///         The second value is an integer representing the index of the entry with the specified key or the index
     ///         of the first entry greater than the key.
-    node_find_result_t find(BtreeKey const& key, BtreeValue* outval, bool copy_val) const {
+    std::pair< bool, uint32_t > find(BtreeKey const& key, BtreeValue* outval, bool copy_val) const {
         LOGMSG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC, "Magic mismatch on btree_node {}",
                          get_persistent_header_const()->to_string());
 
@@ -160,9 +166,13 @@ public:
                 DEBUG_ASSERT_EQ(found, false);
                 return std::make_pair(found, idx);
             }
-            if (outval) { *((NodeId*)outval) = get_edge_value(); }
+            if (outval) {
+                *((NodeLink*)outval) = get_edge_value();
+            }
         } else {
-            if (outval) { get_nth_value(idx, outval, copy_val); }
+            if (outval) {
+                get_nth_value(idx, outval, copy_val);
+            }
         }
         return std::make_pair(found, idx);
     }
@@ -194,29 +204,35 @@ public:
             // search or less than or equal in case of inclusive search.
             if (!efound || !range.is_end_inclusive()) {
                 // If we are already on the first key, then obviously nothing has been matched.
-                if (end_idx == 0) { return false; }
+                if (end_idx == 0) {
+                    return false;
+                }
                 --end_idx;
             }
 
             // If we point to same start and end without any match, it is hitting unavailable range
-            if (start_idx > end_idx) { return false; }
+            if (start_idx > end_idx) {
+                return false;
+            }
         }
 
         return true;
     }
 
-    virtual btree_status_t insert(const BtreeKey& key, const BtreeValue& val) {
+    virtual BtreeStatus insert(const BtreeKey& key, const BtreeValue& val) {
         const auto [found, idx] = find(key, nullptr, false);
         DEBUG_ASSERT(!is_leaf() || (!found), "Invalid node"); // We do not support duplicate keys yet
         insert(idx, key, val);
         DEBUG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC, "{}", get_persistent_header_const()->to_string());
-        return btree_status_t::success;
+        return BtreeStatus::success;
     }
 
     virtual bool remove_one(const BtreeKey& key, BtreeKey* outkey, BtreeValue* outval) {
         const auto [found, idx] = find(key, outval, true);
         if (found) {
-            if (outkey) { get_nth_key_internal(idx, *outkey, true); }
+            if (outkey) {
+                read_nth_key(idx, *outkey, true);
+            }
             remove(idx);
             LOGMSG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC, "{}", get_persistent_header_const()->to_string());
         }
@@ -246,60 +262,30 @@ public:
 
     virtual void overwrite(const NodeCore& other_node) {
         DEBUG_ASSERT_EQ(node_size(), other_node.node_size(), "{}", get_persistent_header_const()->to_string());
-        std::memcpy(m_phys_node_buf.get(), other_node.m_phys_node_buf.get(), other_node.node_size());
-    }
-
-    void get_adjacent_indicies(uint32_t cur_ind, std::vector< uint32_t >& indices_list, uint32_t max_indices) const {
-        uint32_t i = 0;
-        uint32_t start_ind;
-        uint32_t end_ind;
-        uint32_t nentries = total_entries();
-
-        auto max_ind = ((max_indices / 2) - 1 + (max_indices % 2));
-        end_ind = cur_ind + (max_indices / 2);
-        if (cur_ind < max_ind) {
-            end_ind += max_ind - cur_ind;
-            start_ind = 0;
-        } else {
-            start_ind = cur_ind - max_ind;
-        }
-
-        for (i = start_ind; (i <= end_ind) && (indices_list.size() < max_indices); ++i) {
-            if (i == nentries) {
-                if (has_valid_edge()) { indices_list.push_back(i); }
-                break;
-            } else {
-                indices_list.push_back(i);
-            }
-        }
+        std::memcpy(phys_node_buf_.get(), other_node.phys_node_buf_.get(), other_node.node_size());
     }
 
     template < typename K >
     K get_nth_key(uint32_t idx, bool copy) const {
         K k;
-        get_nth_key_internal(idx, k, copy);
+        read_nth_key(idx, k, copy);
         return k;
     }
 
     template < typename K >
     K get_last_key() const {
-        if (total_entries() == 0) { return K{}; }
+        if (total_entries() == 0) {
+            return K{};
+        }
         return get_nth_key< K >(total_entries() - 1, true);
     }
 
     template < typename K >
     K get_first_key() const {
-        if (total_entries() == 0) { return K{}; }
-        return get_nth_key< K >(0, true);
-    }
-
-    template < typename K, typename V >
-    void get_all_kvs(std::vector< std::pair< K, V > >& kvs) const {
-        for (uint32_t i{0}; i < total_entries(); ++i) {
-            V v;
-            get_nth_value(i, &v, true);
-            kvs.emplace_back(std::make_pair(get_nth_key< K >(i, true), v));
+        if (total_entries() == 0) {
+            return K{};
         }
+        return get_nth_key< K >(0, true);
     }
 
     template < typename K >
@@ -315,35 +301,33 @@ public:
         return true;
     }
 
-    virtual NodeId get_edge_value() const { return NodeId{edge_id(), edge_link_version()}; }
+    virtual NodeLink get_edge_value() const {
+        return NodeLink{edge_id()};
+    }
 
     virtual void set_edge_value(const BtreeValue& v) {
         auto const b = v.serialize();
-        auto const l = r_cast< NodeId::bnode_link_info const* >(b.cbytes());
-        DEBUG_ASSERT_EQ(b.size(), sizeof(NodeId::bnode_link_info));
+        auto const l = r_cast< NodeLink::bnode_link_info const* >(b.cbytes());
+        DEBUG_ASSERT_EQ(b.size(), sizeof(NodeLink::bnode_link_info));
         set_edge_info(*l);
     }
 
-    void invalidate_edge() { set_edge_id(empty_bnodeid); }
+    void invalidate_edge() {
+        set_edge_id(empty_bnodeid);
+    }
 
-    uint32_t total_entries() const { return get_persistent_header_const()->nentries; }
+    uint32_t total_entries() const {
+        return get_persistent_header_const()->nentries;
+    }
 
-    void set_level(uint16_t l) { get_persistent_header()->level = l; }
-    uint16_t level() const { return get_persistent_header_const()->level; }
+    void set_level(uint16_t l) {
+        get_persistent_header()->level = l;
+    }
+    uint16_t level() const {
+        return get_persistent_header_const()->level;
+    }
 
     // uint32_t total_entries() const { return (has_valid_edge() ? total_entries() + 1 : total_entries()); }
-
-    /// Acquire a shared (read) lock. Use CO_AWAIT(node->lock_shared()).
-    BtreeTask< void > lock_shared() const { CO_RETURN CO_AWAIT(btree_lock_shared(m_lock)); }
-
-    /// Acquire an exclusive (write) lock. Use CO_AWAIT(node->lock_excl()).
-    BtreeTask< void > lock_excl() const { CO_RETURN CO_AWAIT(btree_lock_excl(m_lock)); }
-
-    /// Release a shared lock (always synchronous).
-    void unlock_shared() const { m_lock.unlock_shared(); }
-
-    /// Release an exclusive lock (always synchronous).
-    void unlock_excl() const { m_lock.unlock(); }
 
     template < typename K, typename V >
     using ToStringCallback = std::function< std::string(std::vector< std::pair< K, V > > const&) >;
@@ -355,8 +339,8 @@ public:
                                this->level(), this->total_entries(), (this->is_leaf() ? "LEAF" : "INTERIOR"), snext,
                                this->node_gen());
         if (this->has_valid_edge()) {
-            fmt::format_to(std::back_inserter(str), " edge={}.{}", this->edge_info().m_bnodeid,
-                           this->edge_info().m_link_version);
+            fmt::format_to(std::back_inserter(str), " edge={}.{}", this->edge_info().bnodeid_,
+                           this->edge_info().link_version_);
         }
 
         if (this->total_entries() == 0) {
@@ -381,19 +365,23 @@ public:
         }
 
         // Should not happen
-        if (this->is_node_deleted()) { fmt::format_to(std::back_inserter(str), " **DELETED** "); }
+        if (this->is_node_deleted()) {
+            fmt::format_to(std::back_inserter(str), " **DELETED** ");
+        }
 
         return str;
     }
 
 public:
     // Public method which needs to be implemented by variants
-    virtual btree_status_t insert(uint32_t ind, const BtreeKey& key, const BtreeValue& val) = 0;
-    virtual void remove(uint32_t ind) { remove(ind, ind); }
+    virtual BtreeStatus insert(uint32_t ind, const BtreeKey& key, const BtreeValue& val) = 0;
+    virtual void remove(uint32_t ind) {
+        remove(ind, ind);
+    }
     virtual void remove(uint32_t ind_s, uint32_t ind_e) = 0;
     virtual void remove_all() = 0;
-    virtual void update(uint32_t ind, const BtreeValue& val) = 0;
-    virtual void update(uint32_t ind, const BtreeKey& key, const BtreeValue& val) = 0;
+    virtual BtreeStatus update(uint32_t ind, const BtreeValue& val) = 0;
+    virtual BtreeStatus update(uint32_t ind, const BtreeKey& key, const BtreeValue& val) = 0;
 
     virtual uint32_t move_out_to_right_by_entries(NodeCore& other_node, uint32_t nentries) = 0;
     virtual uint32_t move_out_to_right_by_size(NodeCore& other_node, uint32_t size) = 0;
@@ -423,40 +411,41 @@ public:
 #endif
 
     virtual uint32_t available_size() const = 0;
-    virtual bool has_room_for_put(btree_put_type put_type, uint32_t key_size, uint32_t value_size) const = 0;
+    virtual bool has_room_for_put(BtreePutType put_type, uint32_t key_size, uint32_t value_size) const = 0;
     virtual uint32_t get_entries_size(uint32_t start_idx, uint32_t end_idx) const = 0;
 
     virtual int compare_nth_key(const BtreeKey& cmp_key, uint32_t ind) const = 0;
-    virtual void get_nth_key_internal(uint32_t ind, BtreeKey& out_key, bool copykey) const = 0;
+    virtual void read_nth_key(uint32_t ind, BtreeKey& out_key, bool copykey) const = 0;
     virtual uint32_t get_nth_key_size(uint32_t ind) const = 0;
     virtual void get_nth_value(uint32_t ind, BtreeValue* out_val, bool copy) const = 0;
     virtual uint32_t get_nth_value_size(uint32_t ind) const = 0;
-    virtual uint32_t get_nth_obj_size(uint32_t ind) const { return get_nth_key_size(ind) + get_nth_value_size(ind); }
-
-    // Method just to please compiler
-    template < typename V >
-    V edge_value_internal() const {
-        return V{edge_id()};
+    virtual bool is_nth_value_overflow(uint32_t /*ind*/) const { return false; }
+    virtual uint32_t get_nth_obj_size(uint32_t ind) const {
+        return get_nth_key_size(ind) + get_nth_value_size(ind);
     }
 
     virtual std::string to_string(bool print_friendly = false) const = 0;
     virtual std::string to_dot_keys() const = 0;
 
 protected:
-    node_find_result_t bsearch_node(const BtreeKey& key) const {
+    std::pair< bool, uint32_t > bsearch_node(const BtreeKey& key) const {
         DEBUG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC);
         auto [found, idx] = bsearch(-1, total_entries(), key);
-        if (found) { DEBUG_ASSERT_LT(idx, total_entries()); }
+        if (found) {
+            DEBUG_ASSERT_LT(idx, total_entries());
+        }
 
         return std::make_pair(found, idx);
     }
 
-    node_find_result_t bsearch(int start, int end, const BtreeKey& key) const {
+    std::pair< bool, uint32_t > bsearch(int start, int end, const BtreeKey& key) const {
         int mid = 0;
         bool found{false};
         uint32_t end_of_search_index{0};
 
-        if ((end - start) <= 1) { return std::make_pair(found, end_of_search_index); }
+        if ((end - start) <= 1) {
+            return std::make_pair(found, end_of_search_index);
+        }
         while ((end - start) > 1) {
             mid = start + (end - start) / 2;
             DEBUG_ASSERT(mid >= 0 && mid < int_cast(total_entries()), "Invalid mid={}", mid);
@@ -477,26 +466,50 @@ protected:
 
 public:
     /// Returns a shared_ptr copy — caller holds shared ownership until done.
-    /// CoW backends can replace m_phys_node_buf underneath; old buffer lives until all copies are dropped.
-    std::shared_ptr< uint8_t > share_phys_node_buf() const { return m_phys_node_buf; }
-
-    PersistentHeader* get_persistent_header() { return r_cast< PersistentHeader* >(m_phys_node_buf.get()); }
-    const PersistentHeader* get_persistent_header_const() const {
-        return r_cast< const PersistentHeader* >(m_phys_node_buf.get());
+    /// CoW backends can replace phys_node_buf_ underneath; old buffer lives until all copies are dropped.
+    std::shared_ptr< uint8_t > share_phys_node_buf() const {
+        return phys_node_buf_;
     }
-    uint8_t* node_data_area() { return (m_phys_node_buf.get() + sizeof(PersistentHeader)); }
-    const uint8_t* node_data_area_const() const { return (m_phys_node_buf.get() + sizeof(PersistentHeader)); }
 
-    uint8_t magic() const { return get_persistent_header_const()->magic; }
-    void set_magic() { get_persistent_header()->magic = BTREE_NODE_MAGIC; }
+    PersistentHeader* get_persistent_header() {
+        return r_cast< PersistentHeader* >(phys_node_buf_.get());
+    }
+    const PersistentHeader* get_persistent_header_const() const {
+        return r_cast< const PersistentHeader* >(phys_node_buf_.get());
+    }
+    uint8_t* node_data_area() {
+        return (phys_node_buf_.get() + sizeof(PersistentHeader));
+    }
+    const uint8_t* node_data_area_const() const {
+        return (phys_node_buf_.get() + sizeof(PersistentHeader));
+    }
 
-    uint8_t version() const { return get_persistent_header_const()->version; }
-    uint16_t checksum() const { return get_persistent_header_const()->checksum; }
-    void init_checksum() { get_persistent_header()->checksum = 0; }
+    uint8_t magic() const {
+        return get_persistent_header_const()->magic;
+    }
+    void set_magic() {
+        get_persistent_header()->magic = BTREE_NODE_MAGIC;
+    }
 
-    void set_node_id(bnodeid_t id) { get_persistent_header()->node_id = id; }
-    bnodeid_t node_id() const { return get_persistent_header_const()->node_id; }
-    int64_t get_modified_cp_id() const { return get_persistent_header_const()->modified_cp_id; }
+    uint8_t version() const {
+        return get_persistent_header_const()->version;
+    }
+    uint16_t checksum() const {
+        return get_persistent_header_const()->checksum;
+    }
+    void init_checksum() {
+        get_persistent_header()->checksum = 0;
+    }
+
+    void set_node_id(bnodeid_t id) {
+        get_persistent_header()->node_id = id;
+    }
+    bnodeid_t node_id() const {
+        return get_persistent_header_const()->node_id;
+    }
+    int64_t get_modified_cp_id() const {
+        return get_persistent_header_const()->modified_cp_id;
+    }
 
     void set_checksum() {
         get_persistent_header()->checksum = crc16_t10dif(bt_init_crc_16, node_data_area_const(), node_data_size());
@@ -507,48 +520,98 @@ public:
         return ((magic() == BTREE_NODE_MAGIC) && (checksum() == exp_checksum));
     }
 
-    bool is_leaf() const { return get_persistent_header_const()->leaf; }
-    btree_node_type get_node_type() const {
-        return s_cast< btree_node_type >(get_persistent_header_const()->node_type);
+    bool is_leaf() const {
+        return get_persistent_header_const()->leaf;
+    }
+    BtreeNodeType get_node_type() const {
+        return s_cast< BtreeNodeType >(get_persistent_header_const()->node_type);
     }
 
-    void set_total_entries(uint32_t n) { get_persistent_header()->nentries = n; }
-    void add_entries(uint32_t addn = 1u) { get_persistent_header()->nentries += addn; }
-    void sub_entries(uint32_t subn = 1u) { get_persistent_header()->nentries -= subn; }
+    void set_total_entries(uint32_t n) {
+        get_persistent_header()->nentries = n;
+    }
+    void add_entries(uint32_t addn = 1u) {
+        get_persistent_header()->nentries += addn;
+    }
+    void sub_entries(uint32_t subn = 1u) {
+        get_persistent_header()->nentries -= subn;
+    }
 
-    void set_leaf(bool leaf) { get_persistent_header()->leaf = leaf; }
-    void set_node_type(btree_node_type t) { get_persistent_header()->node_type = uint32_cast(t); }
-    void set_node_size(uint32_t size) { get_persistent_header()->node_size = s_cast< uint16_t >(size - 1); }
-    uint64_t node_gen() const { return get_persistent_header_const()->node_gen; }
-    uint32_t node_size() const { return s_cast< uint32_t >(get_persistent_header_const()->node_size) + 1; }
-    uint32_t node_data_size() const { return node_size() - sizeof(PersistentHeader); }
+    void set_leaf(bool leaf) {
+        get_persistent_header()->leaf = leaf;
+    }
+    void set_node_type(BtreeNodeType t) {
+        get_persistent_header()->node_type = uint32_cast(t);
+    }
+    void set_node_size(uint32_t size) {
+        get_persistent_header()->node_size = s_cast< uint16_t >(size - 1);
+    }
+    uint64_t node_gen() const {
+        return get_persistent_header_const()->node_gen;
+    }
+    uint32_t node_size() const {
+        return s_cast< uint32_t >(get_persistent_header_const()->node_size) + 1;
+    }
+    uint32_t node_data_size() const {
+        return node_size() - sizeof(PersistentHeader);
+    }
 
-    void inc_gen() { get_persistent_header()->node_gen++; }
-    void set_gen(uint64_t g) { get_persistent_header()->node_gen = g; }
+    void inc_gen() {
+        get_persistent_header()->node_gen++;
+    }
+    void set_gen(uint64_t g) {
+        get_persistent_header()->node_gen = g;
+    }
 
-    void set_node_deleted() { get_persistent_header()->node_deleted = 0x1; }
-    bool is_node_deleted() const { return (get_persistent_header_const()->node_deleted == 0x1); }
+    void set_node_deleted() {
+        get_persistent_header()->node_deleted = 0x1;
+    }
+    bool is_node_deleted() const {
+        return (get_persistent_header_const()->node_deleted == 0x1);
+    }
 
-    NodeId link_info() const { return NodeId{node_id()}; }
+    NodeLink link_info() const {
+        return NodeLink{node_id()};
+    }
 
-    virtual uint32_t occupied_size() const { return (node_data_size() - available_size()); }
-    bool is_merge_needed(const BtreeConfig& cfg) const { return (occupied_size() < cfg.suggested_min_size()); }
+    virtual uint32_t occupied_size() const {
+        return (node_data_size() - available_size());
+    }
+    bool is_merge_needed(const BtreeConfig& cfg) const {
+        return (occupied_size() < cfg.suggested_min_size());
+    }
 
-    bnodeid_t next_node() const { return get_persistent_header_const()->next_node; }
-    void set_next_node(bnodeid_t b) { get_persistent_header()->next_node = b; }
+    bnodeid_t next_node() const {
+        return get_persistent_header_const()->next_node;
+    }
+    void set_next_node(bnodeid_t b) {
+        get_persistent_header()->next_node = b;
+    }
 
-    bnodeid_t edge_id() const { return get_persistent_header_const()->edge_info.m_bnodeid; }
-    void set_edge_id(bnodeid_t edge) { get_persistent_header()->edge_info.m_bnodeid = edge; }
+    bnodeid_t edge_id() const {
+        return get_persistent_header_const()->edge_info.bnodeid_;
+    }
+    void set_edge_id(bnodeid_t edge) {
+        get_persistent_header()->edge_info.bnodeid_ = edge;
+    }
 
-    NodeId edge_as_val() const { return NodeId{edge_id()}; }
-    void set_edge(const NodeId& id) { set_edge_id(id.id()); }
+    NodeLink edge_as_val() const {
+        return NodeLink{edge_id()};
+    }
+    void set_edge(const NodeLink& id) {
+        set_edge_id(id.id());
+    }
 
     bool has_valid_edge() const {
-        if (is_leaf()) { return false; }
+        if (is_leaf()) {
+            return false;
+        }
         return (edge_id() != empty_bnodeid);
     }
 
-    void set_modified_cp_id(int64_t id) { get_persistent_header()->modified_cp_id = id; }
+    void set_modified_cp_id(int64_t id) {
+        get_persistent_header()->modified_cp_id = id;
+    }
 };
 
 ///
@@ -585,18 +648,35 @@ class Node {
 public:
     static constexpr size_t kStorageBytes = 3 * sizeof(void*);
 
-private:
-    alignas(void*) std::byte storage_[kStorageBytes]{};
-    NodeHandle* handle_{nullptr};
-    LockType lock_type_{LockType::None};
+    /// Resolve to the actual Read/Write lock type for a node of the given type.
+    static LockType resolve_node_lock_type(LockType lt, bool is_leaf) {
+        return (lt == LockType::ReadInteriorWriteLeaf) ? (is_leaf ? LockType::Write : LockType::Read) : lt;
+    }
 
-public:
-    Node() = default;
+    static Node construct(NodeHandle& src, LockType lt) {
+        Node n;
+        src.move_to(n.storage_);
+        n.handle_ = r_cast< NodeHandle* >(n.storage_);
+        n.lock_type_ = resolve_node_lock_type(lt, n.handle_->get()->is_leaf());
+        if (n.lock_type_ == LockType::Read) {
+            n.handle_->get()->lock_.lock_shared();
+        } else if (n.lock_type_ == LockType::Write) {
+            n.handle_->get()->lock_.lock();
+        }
+        return n;
+    }
 
-    /// Transfers a backend-stack NodeHandle into inline storage via move_to().
-    Node(NodeHandle& src, LockType lt) : lock_type_{lt} {
-        src.move_to(storage_);
-        handle_ = r_cast< NodeHandle* >(storage_);
+    static BtreeTask< Node > async_construct(NodeHandle& src, LockType lt) {
+        Node n;
+        src.move_to(n.storage_);
+        n.handle_ = r_cast< NodeHandle* >(n.storage_);
+        n.lock_type_ = resolve_node_lock_type(lt, n.handle_->get()->is_leaf());
+        if (n.lock_type_ == LockType::Read) {
+            CO_AWAIT n.handle_->get()->lock_.co_lock_shared();
+        } else if (n.lock_type_ == LockType::Write) {
+            CO_AWAIT n.handle_->get()->lock_.co_lock();
+        }
+        CO_RETURN std::move(n);
     }
 
     Node(Node&& o) noexcept : lock_type_{o.lock_type_} {
@@ -620,20 +700,50 @@ public:
     ~Node() {
         if (handle_) {
             if (lock_type_ == LockType::Read) {
-                handle_->get()->unlock_shared();
+                handle_->get()->lock_.unlock_shared();
             } else if (lock_type_ == LockType::Write) {
-                handle_->get()->unlock_excl();
+                handle_->get()->lock_.unlock();
             }
-            handle_->~NodeHandle(); // then release backend reference (raw ptr, cache slot, etc.)
+            handle_->~NodeHandle();
             handle_ = nullptr;
         }
+    }
+
+    // Acquire a lock on the node. Caller must have previously released or never locked.
+    BtreeTask< void > acquire(LockType lt) {
+        HS_DBG_ASSERT_EQ(lock_type_, LockType::None, "acquire called on already-locked node");
+        lock_type_ = resolve_node_lock_type(lt, handle_->get()->is_leaf());
+        if (lock_type_ == LockType::Read) {
+            CO_AWAIT handle_->get()->lock_.co_lock_shared();
+        } else if (lock_type_ == LockType::Write) {
+            CO_AWAIT handle_->get()->lock_.co_lock();
+        }
+    }
+
+    // Release the currently held lock without destroying the node handle.  After release(), lock_type() == None.
+    void release() {
+        if (!handle_) {
+            return;
+        }
+        if (lock_type_ == LockType::Read) {
+            handle_->get()->lock_.unlock_shared();
+        } else if (lock_type_ == LockType::Write) {
+            handle_->get()->lock_.unlock();
+        }
+        lock_type_ = LockType::None;
     }
 
     NodeCore* operator->() const { return handle_->get(); }
     NodeCore& operator*() const { return *handle_->get(); }
     bool valid() const { return handle_ && handle_->valid(); }
     LockType lock_type() const { return lock_type_; }
-    void set_lock_type(LockType lt) { lock_type_ = lt; }
+
+private:
+    Node() = default;
+
+    alignas(void*) std::byte storage_[kStorageBytes]{};
+    NodeHandle* handle_{nullptr};
+    LockType lock_type_{LockType::None};
 };
 
 using NodeList = folly::small_vector< Node, 3 >;

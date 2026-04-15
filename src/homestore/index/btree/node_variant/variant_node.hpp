@@ -63,7 +63,9 @@ public:
     virtual uint32_t multi_get(BtreeKeyRange< K > const& range, uint32_t max_count, uint32_t& start_idx,
                                uint32_t& end_idx, std::vector< std::pair< K, V > >* out_values = nullptr,
                                get_filter_cb_t const& filter_cb = nullptr) const {
-        if (!match_range(range, start_idx, end_idx)) { return 0; }
+        if (!match_range(range, start_idx, end_idx)) {
+            return 0;
+        }
 
         uint32_t count = std::min(end_idx - start_idx + 1, max_count);
         if (out_values || filter_cb) {
@@ -73,7 +75,9 @@ public:
                 K key = get_nth_key< K >(i, (out_values != nullptr) /* copy */);
                 V val = get_nth_value(i, (out_values != nullptr) /* copy */);
                 if (!filter_cb || filter_cb(key, val)) {
-                    if (out_values) { out_values->emplace_back(std::move(key), std::move(val)); }
+                    if (out_values) {
+                        out_values->emplace_back(std::move(key), std::move(val));
+                    }
                 } else {
                     --count;
                 }
@@ -129,7 +133,9 @@ public:
 
         std::tie(efound, end_idx) = bsearch_node(range.end_key());
         if (efound && !range.is_end_inclusive()) {
-            if (end_idx == 0) { return std::make_pair(false, 0); }
+            if (end_idx == 0) {
+                return std::make_pair(false, 0);
+            }
             --end_idx;
             efound = false;
         }
@@ -161,8 +167,12 @@ public:
             copy_val = false;
         }
 
-        if (out_key) { get_nth_key_internal(result_idx, *out_key, copy_key); }
-        if (out_val) { get_nth_value(result_idx, out_val, copy_val); }
+        if (out_key) {
+            read_nth_key(result_idx, *out_key, copy_key);
+        }
+        if (out_val) {
+            get_nth_value(result_idx, out_val, copy_val);
+        }
 
         return (!filter_cb || filter_cb(*out_key, *out_val)) ? std::make_pair(true, result_idx)
                                                              : std::make_pair(false, 0u);
@@ -199,7 +209,7 @@ public:
     /// is used as an filter to remove anything that needn't be updated.
     /// @return A boolean indicating whether the operation was successful.
     ///
-    virtual bool put(BtreeKey const& key, BtreeValue const& val, btree_put_type put_type, BtreeValue* existing_val,
+    virtual bool put(BtreeKey const& key, BtreeValue const& val, BtreePutType put_type, BtreeValue* existing_val,
                      put_filter_cb_t const& filter_cb = nullptr) {
         LOGMSG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC, "Magic mismatch on btree_node {}",
                          get_persistent_header_const()->to_string());
@@ -211,7 +221,9 @@ public:
 
         const auto [found, idx] = find(key, nullptr, false);
         if (found) {
-            if (existing_val) { get_nth_value(idx, existing_val, true); }
+            if (existing_val) {
+                get_nth_value(idx, existing_val, true);
+            }
             if (filter_cb &&
                 filter_cb(get_nth_key< K >(idx, false), get_nth_value(idx, false), val) !=
                     put_filter_decision::replace) {
@@ -219,16 +231,17 @@ public:
             }
         }
 
-        if (put_type == btree_put_type::INSERT) {
+        if (put_type == BtreePutType::INSERT) {
             if (found) {
                 LOGDEBUG("Attempt to insert duplicate entry {}", key.to_string());
                 return false;
             }
-            ret = (insert(idx, key, val) == btree_status_t::success);
-        } else if (put_type == btree_put_type::UPDATE) {
-            if (!found) return false;
+            ret = (insert(idx, key, val) == BtreeStatus::success);
+        } else if (put_type == BtreePutType::UPDATE) {
+            if (!found)
+                return false;
             update(idx, key, val);
-        } else if (put_type == btree_put_type::UPSERT) {
+        } else if (put_type == BtreePutType::UPSERT) {
             (found) ? update(idx, key, val) : (void)insert(idx, key, val);
         } else {
             DEBUG_ASSERT(false, "Wrong put_type {}", put_type);
@@ -252,28 +265,32 @@ public:
     ///     put_filter_decision::remove, the entry is removed from the node.
     ///     put_filter_decision::keep, the entry is not modified and the method moves on to the next entry.
     /// @return Btree status typically .
-    ///         If all keys were upserted successfully, the method returns btree_status_t::success.
+    ///         If all keys were upserted successfully, the method returns BtreeStatus::success.
     ///         If the method ran out of space in the node, the method returns the key that was last put and the status
-    ///         as btree_status_t::has_more
-    virtual btree_status_t multi_put(BtreeKeyRange< K > const& keys, BtreeKey const&, BtreeValue const& val,
-                                     btree_put_type put_type, K* last_failed_key,
-                                     put_filter_cb_t const& filter_cb = nullptr) {
-        if (put_type != btree_put_type::UPDATE) {
+    ///         as BtreeStatus::has_more
+    virtual BtreeStatus multi_put(BtreeKeyRange< K > const& keys, BtreeKey const&, BtreeValue const& val,
+                                  BtreePutType put_type, K* last_failed_key,
+                                  put_filter_cb_t const& filter_cb = nullptr) {
+        if (put_type != BtreePutType::UPDATE) {
             DEBUG_ASSERT(false, "For non-interval keys multi-put should be really update and cannot insert");
-            return btree_status_t::not_supported;
+            return BtreeStatus::not_supported;
         }
         DEBUG_ASSERT_EQ(this->is_leaf(), true, "Multi put entries on node are supported only for leaf nodes");
 
         // Match the key range to get start and end idx. If none of the ranges here matches, we have to return not_found
         uint32_t start_idx;
         uint32_t end_idx;
-        if (!this->match_range(keys, start_idx, end_idx)) { return btree_status_t::not_found; }
+        if (!this->match_range(keys, start_idx, end_idx)) {
+            return BtreeStatus::not_found;
+        }
 
         const auto new_val_size = val.serialized_size();
         for (auto idx{start_idx}; idx <= end_idx; ++idx) {
             if (!has_room_for_put(put_type, get_nth_key_size(idx), new_val_size)) {
-                if (last_failed_key) { this->get_nth_key_internal(idx, *last_failed_key, true); }
-                return btree_status_t::has_more;
+                if (last_failed_key) {
+                    this->read_nth_key(idx, *last_failed_key, true);
+                }
+                return BtreeStatus::has_more;
             }
             if (filter_cb) {
                 auto decision = filter_cb(get_nth_key< K >(idx, false), get_nth_value(idx, false), val);
@@ -287,7 +304,7 @@ public:
                 update(idx, val);
             }
         }
-        return btree_status_t::success;
+        return BtreeStatus::success;
     }
 
     ///////////////////////////////////////// Remove related APIs of the node /////////////////////////////////////////
@@ -297,7 +314,9 @@ public:
         // Match the key range to get start and end idx. If none of the ranges here matches, we have to return not_found
         uint32_t start_idx{0};
         uint32_t end_idx{0};
-        if (!this->match_range(keys, start_idx, end_idx)) { return 0u; }
+        if (!this->match_range(keys, start_idx, end_idx)) {
+            return 0u;
+        }
 
         auto removed_count = end_idx - start_idx + 1;
         auto ret = removed_count;

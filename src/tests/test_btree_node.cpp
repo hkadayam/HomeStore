@@ -84,14 +84,16 @@ struct NodeTest : public testing::Test {
         m_node2 = std::make_unique< typename T::NodeType >(2ul, true, g_node_size, g_token);
     }
 
-    void put(uint32_t k, btree_put_type put_type) {
+    void put(uint32_t k, BtreePutType put_type) {
         K key{k};
         V value{V::generate_rand()};
         V existing_v;
         bool done = m_node1->put(key, value, put_type, &existing_v);
 
         bool expected_done{true};
-        if (m_shadow_map.find(key) != m_shadow_map.end()) { expected_done = (put_type != btree_put_type::INSERT); }
+        if (m_shadow_map.find(key) != m_shadow_map.end()) {
+            expected_done = (put_type != BtreePutType::INSERT);
+        }
         ASSERT_EQ(done, expected_done) << "Expected put of key " << k << " of put_type " << enum_name(put_type)
                                        << " to be " << expected_done;
         if (expected_done) {
@@ -105,15 +107,15 @@ struct NodeTest : public testing::Test {
     }
 
     void put_range(uint64_t k, uint32_t count) {
-        btree_put_type put_type;
+        BtreePutType put_type;
         if constexpr (!std::is_same_v< V, TestIntervalValue >) {
             // For non-interval values we support only update, so we need to first put the value
             for (uint32_t i{0}; i < count; ++i) {
-                this->put(k + i, btree_put_type::UPSERT);
+                this->put(k + i, BtreePutType::UPSERT);
             }
-            put_type = btree_put_type::UPDATE;
+            put_type = BtreePutType::UPDATE;
         } else {
-            put_type = btree_put_type::UPSERT;
+            put_type = BtreePutType::UPSERT;
         }
 
         K start_key{k};
@@ -121,16 +123,20 @@ struct NodeTest : public testing::Test {
         V value{V::generate_rand()};
         auto status = m_node1->multi_put(BtreeKeyRange{start_key, true, end_key, true}, start_key, value, put_type,
                                          nullptr /* last_failed_key */);
-        ASSERT_EQ(status, btree_status_t::success) << "Expected range put of key " << k << " to " << k + count - 1
-                                                   << " of put_type " << enum_name(put_type) << " to be successful";
+        ASSERT_EQ(status, BtreeStatus::success) << "Expected range put of key " << k << " to " << k + count - 1
+                                                << " of put_type " << enum_name(put_type) << " to be successful";
 
         for (uint32_t i{0}; i < count; ++i) {
             K key{k + i};
             V range_value{value};
-            if constexpr (std::is_same_v< V, TestIntervalValue >) { range_value.shift(i); }
+            if constexpr (std::is_same_v< V, TestIntervalValue >) {
+                range_value.shift(i);
+            }
 
             if (m_shadow_map.find(key) != m_shadow_map.end()) {
-                if (put_type != btree_put_type::INSERT) { m_shadow_map.insert_or_assign(key, range_value); }
+                if (put_type != BtreePutType::INSERT) {
+                    m_shadow_map.insert_or_assign(key, range_value);
+                }
             } else {
                 m_shadow_map.insert(std::make_pair(key, range_value));
             }
@@ -150,7 +156,9 @@ struct NodeTest : public testing::Test {
             m_shadow_map[key] = value;
         }
 
-        if (validate_update) { validate_specific(k); }
+        if (validate_update) {
+            validate_specific(k);
+        }
     }
 
     void remove(uint32_t k, bool validate_remove = true) {
@@ -174,7 +182,9 @@ struct NodeTest : public testing::Test {
 
         ASSERT_EQ(removed_1 || removed_2, shadow_found) << "To remove key=" << k << " is not present in the nodes";
 
-        if (validate_remove) { validate_specific(k); }
+        if (validate_remove) {
+            validate_specific(k);
+        }
     }
 
 #if 0
@@ -305,8 +315,10 @@ struct NodeTest : public testing::Test {
 protected:
     void put_list(const std::vector< uint32_t >& keys) {
         for (const auto& k : keys) {
-            if (!this->has_room()) { break; }
-            put(k, btree_put_type::INSERT);
+            if (!this->has_room()) {
+                break;
+            }
+            put(k, BtreePutType::INSERT);
         }
     }
 
@@ -315,8 +327,12 @@ protected:
         LOGDEBUG("Node2:\n {}", m_node2->to_string(true));
     }
 
-    uint32_t remaining_space() const { return m_node1->available_size(); }
-    bool has_room() const { return remaining_space() > (g_max_keysize + g_max_valsize + 32); }
+    uint32_t remaining_space() const {
+        return m_node1->available_size();
+    }
+    bool has_room() const {
+        return remaining_space() > (g_max_keysize + g_max_valsize + 32);
+    }
 
 private:
     void validate_data(const K& key, const V& node_val) const {
@@ -332,7 +348,7 @@ TYPED_TEST_SUITE(NodeTest, NodeTypes);
 
 TYPED_TEST(NodeTest, SequentialInsert) {
     for (uint32_t i{0}; (i < 100 && this->has_room()); ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
     this->print();
     this->validate_get_all();
@@ -343,28 +359,28 @@ TYPED_TEST(NodeTest, SequentialInsert) {
 
 TYPED_TEST(NodeTest, SimpleInsert) {
     auto oc = this->m_node1->occupied_size();
-    this->put(1, btree_put_type::INSERT);
-    this->put(2, btree_put_type::INSERT);
-    this->put(3, btree_put_type::INSERT);
+    this->put(1, BtreePutType::INSERT);
+    this->put(2, BtreePutType::INSERT);
+    this->put(3, BtreePutType::INSERT);
     this->remove(2);
     this->remove(1);
     this->remove(3);
     auto oc2 = this->m_node1->occupied_size();
     ASSERT_EQ(oc, oc2) << "Occupied size cannot be more than original size";
-    this->put(1, btree_put_type::INSERT);
-    this->put(2, btree_put_type::INSERT);
-    this->put(3, btree_put_type::INSERT);
+    this->put(1, BtreePutType::INSERT);
+    this->put(2, BtreePutType::INSERT);
+    this->put(3, BtreePutType::INSERT);
     this->remove(3);
     this->remove(2);
     this->remove(1);
     ASSERT_EQ(oc, oc2) << "Occupied size must be the same as original size";
 
-    this->put(2, btree_put_type::INSERT);
-    this->put(1, btree_put_type::INSERT);
-    this->put(4, btree_put_type::INSERT);
-    this->put(3, btree_put_type::INSERT);
+    this->put(2, BtreePutType::INSERT);
+    this->put(1, BtreePutType::INSERT);
+    this->put(4, BtreePutType::INSERT);
+    this->put(3, BtreePutType::INSERT);
     for (uint32_t i = 5; i <= 50; ++i) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
     LOGDEBUG("Creating a hole with size of 11 for prefix compaction usecase");
     for (uint32_t i = 10; i <= 20; ++i) {
@@ -378,7 +394,7 @@ TYPED_TEST(NodeTest, SimpleInsert) {
 
 TYPED_TEST(NodeTest, ReverseInsert) {
     for (uint32_t i{100}; (i > 0 && this->has_room()); --i) {
-        this->put(i - 1, btree_put_type::INSERT);
+        this->put(i - 1, BtreePutType::INSERT);
     }
     this->print();
     this->validate_get_all();
@@ -411,7 +427,7 @@ TYPED_TEST(NodeTest, RangePutGet) {
 
 TYPED_TEST(NodeTest, RemoveRangeIndex) {
     for (uint32_t i = 0; i < 20; i++) {
-        this->put(i, btree_put_type::INSERT);
+        this->put(i, BtreePutType::INSERT);
     }
     this->print();
     this->remove_range(5, 10); // size = 14  EXPECT: 0 1 2 3 4 [5 6 7 8 9 10] 11 12 13 14 15 16 17 18 19
@@ -436,7 +452,7 @@ TYPED_TEST(NodeTest, Update) {
 TYPED_TEST(NodeTest, RandomInsertRemoveUpdate) {
     uint32_t num_inserted{0};
     while (this->has_room()) {
-        this->put(g_randkey_generator(g_re), btree_put_type::INSERT);
+        this->put(g_randkey_generator(g_re), BtreePutType::INSERT);
         ++num_inserted;
     }
     LOGDEBUG("After random insertion of {} objects", num_inserted);

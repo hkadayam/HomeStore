@@ -68,6 +68,7 @@ add_subdirectory(homestore/device)
 add_subdirectory(homestore/meta)
 add_subdirectory(homestore/checkpoint)
 add_subdirectory(homestore/blob)
+add_subdirectory(homestore/index/mem_btree)
 # TODO: re-enable remaining modules
 # add_subdirectory(homestore/logstore)
 # add_subdirectory(homestore/index)

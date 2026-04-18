@@ -24,6 +24,7 @@
 #include <fmt/format.h>
 
 #include "homestore/blk.h"
+#include "homestore/base/homestore_assert.hpp"
 #include "sisl/fds/buffer.h"
 #include "homestore/index/btree/detail/btree_internal.h"
 
@@ -197,7 +198,9 @@ public:
         return inline_value().serialize();
     }
 
-    uint32_t serialized_size() const override { return is_overflow() ? sizeof(BlkId) : value().serialized_size(); }
+    uint32_t serialized_size() const override {
+        return is_overflow() ? sizeof(BlkId) : inline_value().serialized_size();
+    }
 
     void deserialize(sisl::Blob const& b, bool copy) override { std::get< V >(data_).deserialize(b, copy); }
 

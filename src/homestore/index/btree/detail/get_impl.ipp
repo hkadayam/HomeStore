@@ -10,7 +10,7 @@ BtreeTask< BtreeStatus > Btree< K, V >::get(ReqT& greq) {
                   "get api is called with non get request type");
 
     auto tree_lock = CO_AWAIT(lock_tree_shared());
-    auto root_result = CO_AWAIT(read_node(root_node_id_, LockType::Read));
+    auto root_result = CO_AWAIT(underlying_->read_node(root_node_id_, LockType::Read));
     if (!root_result.hasValue()) {
         CO_RETURN root_result.error();
     }
@@ -24,7 +24,7 @@ BtreeTask< BtreeStatus > Btree< K, V >::do_get(Node my_node, ReqT& greq) {
         if constexpr (std::is_same_v< BtreeSingleGetRequest, ReqT >) {
             auto const [found, idx] = my_node->find(greq.key(), nullptr, false);
             if (!found) {
-                CO_RETURN BtreeStatus::not_found;
+                CO_RETURN BtreeStatus::key_not_found;
             }
 
             auto status = CO_AWAIT read_from_node(my_node, idx, *s_cast< V* >(greq.outval_));
@@ -41,7 +41,7 @@ BtreeTask< BtreeStatus > Btree< K, V >::do_get(Node my_node, ReqT& greq) {
             uint32_t start_idx{0};
             uint32_t end_idx{0};
             if (!my_node->match_range(greq.range_, start_idx, end_idx)) {
-                CO_RETURN BtreeStatus::not_found;
+                CO_RETURN BtreeStatus::key_not_found;
             }
 
             uint32_t idx;
@@ -88,7 +88,7 @@ BtreeTask< BtreeStatus > Btree< K, V >::do_get(Node my_node, ReqT& greq) {
         }
     }
 
-    auto child_result = CO_AWAIT(read_node(child_id.bnode_id(), LockType::Read));
+    auto child_result = CO_AWAIT(underlying_->read_node(child_id.id(), LockType::Read));
     if (!child_result.hasValue()) {
         CO_RETURN child_result.error();
     }

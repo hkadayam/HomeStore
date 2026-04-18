@@ -50,7 +50,7 @@ public:
         uint32_t nentries;                   // offset=4
         bnodeid_t node_id{empty_bnodeid};    // offset=8
         bnodeid_t next_node{empty_bnodeid};  // offset=16
-        bnodeid_t edge_id;                   // offset=32: Edge entry information
+        bnodeid_t edge_id{empty_bnodeid};    // offset=32: Edge entry information
         uint64_t node_gen{0};                // offset=24: Generation of this node, incremented on every update
         int64_t modified_cp_id{-1};          // offset=40: Checkpoint ID of the last modification of this node
         uint16_t level;                      // offset=48: Level of the node within the tree
@@ -62,17 +62,17 @@ public:
 
         PersistentHeader() : nentries{0}, leaf{0}, node_deleted{0} {}
         std::string to_string() const {
-            auto snext = (next_node == empty_bnodeid) ? "" : " next=" + std::to_string(next_node);
-            auto sedge = (edge_info.bnodeid_ == empty_bnodeid) ? "" : fmt::format(" edge={}", edge_info.bnodeid_);
+            auto snext = (next_node == empty_bnodeid) ? "" : fmt::format(" next={}", next_node);
+            auto sedge = (edge_id == empty_bnodeid) ? "" : fmt::format(" edge={}", edge_id);
             return fmt::format("magic={} version={} csum={} node_id={} nentries={} node_type={} is_leaf={} "
-                               "deleted?={} gen={} modified_cp_id={}{}{} level={} ",
-                               magic, version, checksum, node_id, snext, nentries, node_type, leaf, node_deleted,
+                               "deleted?={} gen={} modified_cp_id={}{}{} level={}",
+                               magic, version, checksum, node_id, nentries, node_type, leaf, node_deleted,
                                node_gen, modified_cp_id, snext, sedge, level);
         }
 
         std::string to_compact_string() const {
             auto snext = (next_node == empty_bnodeid) ? "" : " next=" + std::to_string(next_node);
-            auto sedge = (edge_info.bnodeid_ == empty_bnodeid) ? "" : fmt::format(" edge={}", edge_info.bnodeid_);
+            auto sedge = (edge_id == empty_bnodeid) ? "" : fmt::format(" edge={}", edge_id);
             return fmt::format("id={}{}{} {} level={} nentries={}{} mod_cp={}", node_id, snext, sedge,
                                leaf ? "LEAF" : "INTERIOR", level, nentries, (node_deleted == 0x1) ? "  Deleted" : "",
                                modified_cp_id);
@@ -255,7 +255,7 @@ public:
         const auto [found, idx] = find(key, outval, true);
         if (found) {
             update(idx, val);
-            LOGMSG_ASSERT((magic() == BTREE_NODE_MAGIC), "{}", get_persistent_header_const()->to_string());
+            LOGMSG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC, "{}", get_persistent_header_const()->to_string());
         }
         return found;
     }
@@ -306,10 +306,8 @@ public:
     }
 
     virtual void set_edge_value(const BtreeValue& v) {
-        auto const b = v.serialize();
-        auto const l = r_cast< NodeLink::bnode_link_info const* >(b.cbytes());
-        DEBUG_ASSERT_EQ(b.size(), sizeof(NodeLink::bnode_link_info));
-        set_edge_info(*l);
+        // v is always a NodeLink for edge slots (edges store child node ids, not user values).
+        set_edge_id(s_cast< NodeLink const& >(v).id());
     }
 
     void invalidate_edge() {
@@ -335,12 +333,10 @@ public:
     template < typename K, typename V >
     std::string to_custom_string(ToStringCallback< K, V > const& cb) const {
         std::string snext = (this->next_node() == empty_bnodeid) ? "" : fmt::format(" next_node={}", this->next_node());
-        auto str = fmt::format("id={}.{} level={} nEntries={} {}{} node_gen={} ", this->node_id(), this->link_version(),
-                               this->level(), this->total_entries(), (this->is_leaf() ? "LEAF" : "INTERIOR"), snext,
-                               this->node_gen());
+        auto str = fmt::format("id={} level={} nEntries={} {}{} node_gen={} ", this->node_id(), this->level(),
+                               this->total_entries(), (this->is_leaf() ? "LEAF" : "INTERIOR"), snext, this->node_gen());
         if (this->has_valid_edge()) {
-            fmt::format_to(std::back_inserter(str), " edge={}.{}", this->edge_info().bnodeid_,
-                           this->edge_info().link_version_);
+            fmt::format_to(std::back_inserter(str), " edge={}", this->edge_id());
         }
 
         if (this->total_entries() == 0) {
@@ -381,6 +377,7 @@ public:
     virtual void remove(uint32_t ind_s, uint32_t ind_e) = 0;
     virtual void remove_all() = 0;
     virtual BtreeStatus update(uint32_t ind, const BtreeValue& val) = 0;
+    virtual BtreeStatus update(uint32_t ind, const BtreeKey& key) = 0;
     virtual BtreeStatus update(uint32_t ind, const BtreeKey& key, const BtreeValue& val) = 0;
 
     virtual uint32_t move_out_to_right_by_entries(NodeCore& other_node, uint32_t nentries) = 0;
@@ -397,12 +394,10 @@ public:
     /// @param other_cursor [in, out] The starting index within `other` node to begin copying.
     ///                     This cursor is advanced by the number of entries successfully copied.
     /// @param upto_size The target maximum occupied size for the current node after appending.
-    /// @param copy_only_if_fits Should the copy happen only if all entries from cursor till end fits to `this` node.
     ///
     /// @return If any entries have been copied.
     /// @note Assumes appropriate node locks are held externally.
-    virtual bool append_copy_in_upto_size(const NodeCore& other_node, uint32_t& other_cursor, uint32_t upto_size,
-                                          bool copy_only_if_fits) = 0;
+    virtual bool append_copy_in_upto_size(const NodeCore& other_node, uint32_t& other_cursor, uint32_t upto_size) = 0;
 
 #if 0
     virtual uint32_t copy_by_size(const NodeCore& other_node, uint32_t start_idx, uint32_t size) = 0;
@@ -419,12 +414,18 @@ public:
     virtual uint32_t get_nth_key_size(uint32_t ind) const = 0;
     virtual void get_nth_value(uint32_t ind, BtreeValue* out_val, bool copy) const = 0;
     virtual uint32_t get_nth_value_size(uint32_t ind) const = 0;
-    virtual bool is_nth_value_overflow(uint32_t /*ind*/) const { return false; }
+    virtual bool is_nth_value_overflow(uint32_t /*ind*/) const {
+        return false;
+    }
     virtual uint32_t get_nth_obj_size(uint32_t ind) const {
         return get_nth_key_size(ind) + get_nth_value_size(ind);
     }
 
     virtual std::string to_string(bool print_friendly = false) const = 0;
+    virtual std::string to_basic_string() const {
+        return fmt::format("{}-{}", level(), node_id());
+    }
+
     virtual std::string to_dot_keys() const = 0;
 
 protected:
@@ -589,10 +590,10 @@ public:
     }
 
     bnodeid_t edge_id() const {
-        return get_persistent_header_const()->edge_info.bnodeid_;
+        return get_persistent_header_const()->edge_id;
     }
     void set_edge_id(bnodeid_t edge) {
-        get_persistent_header()->edge_info.bnodeid_ = edge;
+        get_persistent_header()->edge_id = edge;
     }
 
     NodeLink edge_as_val() const {
@@ -672,11 +673,11 @@ public:
         n.handle_ = r_cast< NodeHandle* >(n.storage_);
         n.lock_type_ = resolve_node_lock_type(lt, n.handle_->get()->is_leaf());
         if (n.lock_type_ == LockType::Read) {
-            CO_AWAIT n.handle_->get()->lock_.co_lock_shared();
+            CO_AWAIT lock_shared_async(n.handle_->get()->lock_);
         } else if (n.lock_type_ == LockType::Write) {
-            CO_AWAIT n.handle_->get()->lock_.co_lock();
+            CO_AWAIT lock_async(n.handle_->get()->lock_);
         }
-        CO_RETURN std::move(n);
+        CO_RETURN n;
     }
 
     Node(Node&& o) noexcept : lock_type_{o.lock_type_} {
@@ -714,9 +715,9 @@ public:
         HS_DBG_ASSERT_EQ(lock_type_, LockType::None, "acquire called on already-locked node");
         lock_type_ = resolve_node_lock_type(lt, handle_->get()->is_leaf());
         if (lock_type_ == LockType::Read) {
-            CO_AWAIT handle_->get()->lock_.co_lock_shared();
+            CO_AWAIT lock_shared_async(handle_->get()->lock_);
         } else if (lock_type_ == LockType::Write) {
-            CO_AWAIT handle_->get()->lock_.co_lock();
+            CO_AWAIT lock_async(handle_->get()->lock_);
         }
     }
 

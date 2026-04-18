@@ -21,10 +21,11 @@
 #include <memory>
 #include <array>
 
-#include <homestore/index/btree/btree_kv.h>
-#include <homestore/index/btree/node_variant/simple_node.hpp>
-#include <homestore/index/btree/node_variant/varlen_node.hpp>
-#include <homestore/index/btree/node_variant/prefix_node.hpp>
+#include "homestore/index/btree/btree_kv.h"
+#include "homestore/index/btree/node_variant/simple_node.hpp"
+#include "homestore/index/btree/node_variant/varlen_node.hpp"
+// TODO: re-enable prefix_node when variant_node.hpp is ported.
+// #include "homestore/index/btree/node_variant/prefix_node.hpp"
 
 static constexpr uint32_t g_max_keysize{100}; // for  node size = 512 : free space : 442 => 100+100+6(record size) = 46%
 static constexpr uint32_t g_max_valsize{100};
@@ -54,7 +55,9 @@ static std::string gen_random_string(size_t len, uint32_t preamble = std::numeri
     static thread_local std::random_device rd{};
     static thread_local std::default_random_engine re{rd()};
     std::uniform_int_distribution< size_t > rand_char{0, alphanum.size() - 1};
-    if (len < str.size()) { len = str.size(); }
+    if (len < str.size()) {
+        len = str.size();
+    }
     for (size_t i{0}; i < len - str.size(); ++i) {
         str += alphanum[rand_char(re)];
     }
@@ -76,17 +79,17 @@ using namespace homestore;
 
 class TestFixedKey : public BtreeKey {
 private:
-    uint64_t m_key{0};
+    uint64_t key_{0};
 
 public:
     TestFixedKey() = default;
-    TestFixedKey(uint64_t k) : m_key{k} {}
+    TestFixedKey(uint64_t k) : key_{k} {}
     TestFixedKey(const TestFixedKey& other) : TestFixedKey(other.serialize(), true) {}
     TestFixedKey(const BtreeKey& other) : TestFixedKey(other.serialize(), true) {}
-    TestFixedKey(const sisl::Blob& b, bool copy) : BtreeKey(), m_key{*(r_cast< const uint64_t* >(b.cbytes()))} {}
+    TestFixedKey(const sisl::Blob& b, bool copy) : BtreeKey(), key_{*(r_cast< const uint64_t* >(b.cbytes()))} {}
     TestFixedKey& operator=(const TestFixedKey& other) = default;
     TestFixedKey& operator=(BtreeKey const& other) {
-        m_key = s_cast< TestFixedKey const& >(other).m_key;
+        key_ = s_cast< TestFixedKey const& >(other).key_;
         return *this;
     }
 
@@ -94,9 +97,9 @@ public:
 
     int compare(const BtreeKey& o) const override {
         const TestFixedKey& other = s_cast< const TestFixedKey& >(o);
-        if (m_key < other.m_key) {
+        if (key_ < other.key_) {
             return -1;
-        } else if (m_key > other.m_key) {
+        } else if (key_ > other.key_) {
             return 1;
         } else {
             return 0;
@@ -104,13 +107,13 @@ public:
     }
 
     /*int compare_range(const BtreeKeyRange& range) const override {
-        if (m_key == start_key(range)) {
+        if (key_ == start_key(range)) {
             return range.is_start_inclusive() ? 0 : -1;
-        } else if (m_key < start_key(range)) {
+        } else if (key_ < start_key(range)) {
             return -1;
-        } else if (m_key == end_key(range)) {
+        } else if (key_ == end_key(range)) {
             return range.is_end_inclusive() ? 0 : 1;
-        } else if (m_key > end_key(range)) {
+        } else if (key_ > end_key(range)) {
             return 1;
         } else {
             return 0;
@@ -118,14 +121,14 @@ public:
     }*/
 
     sisl::Blob serialize() const override {
-        return sisl::Blob{uintptr_cast(const_cast< uint64_t* >(&m_key)), uint32_cast(sizeof(uint64_t))};
+        return sisl::Blob{uintptr_cast(const_cast< uint64_t* >(&key_)), uint32_cast(sizeof(uint64_t))};
     }
     uint32_t serialized_size() const override { return get_fixed_size(); }
     static bool is_fixed_size() { return true; }
     static uint32_t get_fixed_size() { return (sizeof(uint64_t)); }
-    std::string to_string() const { return fmt::format("{}", m_key); }
+    std::string to_string() const { return fmt::format("{}", key_); }
 
-    void deserialize(const sisl::Blob& b, bool copy) override { m_key = *(r_cast< const uint64_t* >(b.cbytes())); }
+    void deserialize(const sisl::Blob& b, bool copy) override { key_ = *(r_cast< const uint64_t* >(b.cbytes())); }
 
     static uint32_t get_max_size() { return get_fixed_size(); }
     friend std::ostream& operator<<(std::ostream& os, const TestFixedKey& k) {
@@ -143,20 +146,20 @@ public:
     bool operator<(const TestFixedKey& o) const { return (compare(o) < 0); }
     bool operator==(const TestFixedKey& other) const { return (compare(other) == 0); }
 
-    uint64_t key() const { return m_key; }
+    uint64_t key() const { return key_; }
     uint64_t start_key(const BtreeKeyRange< TestFixedKey >& range) const {
         const TestFixedKey& k = (const TestFixedKey&)(range.start_key());
-        return k.m_key;
+        return k.key_;
     }
     uint64_t end_key(const BtreeKeyRange< TestFixedKey >& range) const {
         const TestFixedKey& k = (const TestFixedKey&)(range.end_key());
-        return k.m_key;
+        return k.key_;
     }
 };
 
 class TestVarLenKey : public BtreeKey {
 private:
-    uint64_t m_key{0};
+    uint64_t key_{0};
 
     static uint64_t rand_key_size() {
         return (uint64_cast(std::abs(std::round(g_randkeysize_generator(g_re)))) % g_max_keysize) + 1;
@@ -177,7 +180,7 @@ private:
 
 public:
     TestVarLenKey() = default;
-    TestVarLenKey(uint64_t k) : BtreeKey(), m_key{k} {}
+    TestVarLenKey(uint64_t k) : BtreeKey(), key_{k} {}
     TestVarLenKey(const BtreeKey& other) : TestVarLenKey(other.serialize(), true) {}
     TestVarLenKey(const TestVarLenKey& other) = default;
     TestVarLenKey(TestVarLenKey&& other) = default;
@@ -188,11 +191,11 @@ public:
     virtual ~TestVarLenKey() = default;
 
     sisl::Blob serialize() const override {
-        const auto& data = idx_to_key(m_key);
+        const auto& data = idx_to_key(key_);
         return sisl::Blob{(uint8_t*)(data->c_str()), (uint32_t)data->size()};
     }
 
-    uint32_t serialized_size() const override { return idx_to_key(m_key)->size(); }
+    uint32_t serialized_size() const override { return idx_to_key(key_)->size(); }
     static bool is_fixed_size() { return false; }
     static uint32_t get_fixed_size() {
         assert(0);
@@ -203,8 +206,8 @@ public:
         std::string data{r_cast< const char* >(b.cbytes()), b.size()};
         std::stringstream ss;
         ss << std::hex << data.substr(0, 8);
-        ss >> m_key;
-        assert(data == *idx_to_key(m_key));
+        ss >> key_;
+        assert(data == *idx_to_key(key_));
     }
 
     // Add 8 bytes for preamble.
@@ -212,9 +215,9 @@ public:
 
     int compare(const BtreeKey& o) const override {
         const TestVarLenKey& other = s_cast< const TestVarLenKey& >(o);
-        if (m_key < other.m_key) {
+        if (key_ < other.key_) {
             return -1;
-        } else if (m_key > other.m_key) {
+        } else if (key_ > other.key_) {
             return 1;
         } else {
             return 0;
@@ -222,20 +225,20 @@ public:
     }
 
     /*    int compare_range(const BtreeKeyRange& range) const override {
-            if (m_key == start_key(range)) {
+            if (key_ == start_key(range)) {
                 return range.is_start_inclusive() ? 0 : -1;
-            } else if (m_key < start_key(range)) {
+            } else if (key_ < start_key(range)) {
                 return -1;
-            } else if (m_key == end_key(range)) {
+            } else if (key_ == end_key(range)) {
                 return range.is_end_inclusive() ? 0 : 1;
-            } else if (m_key > end_key(range)) {
+            } else if (key_ > end_key(range)) {
                 return 1;
             } else {
                 return 0;
             }
         } */
 
-    std::string to_string() const { return fmt::format("{}-{}", m_key, idx_to_key(m_key)->substr(0, 8)); }
+    std::string to_string() const { return fmt::format("{}-{}", key_, idx_to_key(key_)->substr(0, 8)); }
 
     friend std::ostream& operator<<(std::ostream& os, const TestVarLenKey& k) {
         os << k.to_string();
@@ -252,42 +255,44 @@ public:
     bool operator<(const TestVarLenKey& o) const { return (compare(o) < 0); }
     bool operator==(const TestVarLenKey& other) const { return (compare(other) == 0); }
 
-    uint64_t key() const { return m_key; }
+    uint64_t key() const { return key_; }
     uint64_t start_key(const BtreeKeyRange< TestVarLenKey >& range) const {
         const TestVarLenKey& k = (const TestVarLenKey&)(range.start_key());
-        return k.m_key;
+        return k.key_;
     }
     uint64_t end_key(const BtreeKeyRange< TestVarLenKey >& range) const {
         const TestVarLenKey& k = (const TestVarLenKey&)(range.end_key());
-        return k.m_key;
+        return k.key_;
     }
 };
 
 class TestIntervalKey : public BtreeIntervalKey {
 private:
 #pragma pack(1)
-    uint32_t m_base{0};
-    uint32_t m_offset{0};
+    uint32_t base_{0};
+    uint32_t offset_{0};
 #pragma pack()
 
 public:
     TestIntervalKey() = default;
     TestIntervalKey(uint64_t k) {
-        m_base = uint32_cast(k >> 32);
-        m_offset = uint32_cast(k & 0xFFFFFFFF);
+        base_ = uint32_cast(k >> 32);
+        offset_ = uint32_cast(k & 0xFFFFFFFF);
     }
-    TestIntervalKey(uint32_t b, uint32_t o) : m_base{b}, m_offset{o} {}
+    TestIntervalKey(uint32_t b, uint32_t o) : base_{b}, offset_{o} {
+    }
     TestIntervalKey(const TestIntervalKey& other) = default;
-    TestIntervalKey(const BtreeKey& other) : TestIntervalKey(other.serialize(), true) {}
+    TestIntervalKey(const BtreeKey& other) : TestIntervalKey(other.serialize(), true) {
+    }
     TestIntervalKey(const sisl::Blob& b, bool copy) : BtreeIntervalKey() {
         TestIntervalKey const* other = r_cast< TestIntervalKey const* >(b.cbytes());
-        m_base = other->m_base;
-        m_offset = other->m_offset;
+        base_ = other->base_;
+        offset_ = other->offset_;
     }
 
     TestIntervalKey& operator=(TestIntervalKey const& other) {
-        m_base = other.m_base;
-        m_offset = other.m_offset;
+        base_ = other.base_;
+        offset_ = other.offset_;
         return *this;
     };
     virtual ~TestIntervalKey() = default;
@@ -295,13 +300,13 @@ public:
     /////////////////// Overriding methods of BtreeKey /////////////////
     int compare(BtreeKey const& o) const override {
         TestIntervalKey const& other = s_cast< TestIntervalKey const& >(o);
-        if (m_base < other.m_base) {
+        if (base_ < other.base_) {
             return -1;
-        } else if (m_base > other.m_base) {
+        } else if (base_ > other.base_) {
             return 1;
-        } else if (m_offset < other.m_offset) {
+        } else if (offset_ < other.offset_) {
             return -1;
-        } else if (m_offset > other.m_offset) {
+        } else if (offset_ > other.offset_) {
             return 1;
         } else {
             return 0;
@@ -312,63 +317,87 @@ public:
         return sisl::Blob{uintptr_cast(const_cast< TestIntervalKey* >(this)), uint32_cast(sizeof(TestIntervalKey))};
     }
 
-    uint32_t serialized_size() const override { return sizeof(TestIntervalKey); }
+    uint32_t serialized_size() const override {
+        return sizeof(TestIntervalKey);
+    }
 
     void deserialize(sisl::Blob const& b, bool copy) override {
         assert(b.size() == sizeof(TestIntervalKey));
         TestIntervalKey const* other = r_cast< TestIntervalKey const* >(b.cbytes());
-        m_base = other->m_base;
-        m_offset = other->m_offset;
+        base_ = other->base_;
+        offset_ = other->offset_;
     }
 
-    std::string to_string() const override { return fmt::format("{}", key()); }
+    std::string to_string() const override {
+        return fmt::format("{}", key());
+    }
 
-    static uint32_t get_max_size() { return sizeof(TestIntervalKey); }
+    static uint32_t get_max_size() {
+        return sizeof(TestIntervalKey);
+    }
 
-    static bool is_fixed_size() { return true; }
+    static bool is_fixed_size() {
+        return true;
+    }
 
-    static uint32_t get_fixed_size() { return sizeof(TestIntervalKey); }
+    static uint32_t get_fixed_size() {
+        return sizeof(TestIntervalKey);
+    }
 
     /////////////////// Overriding methods of BtreeIntervalKey /////////////////
-    void shift(int n) override { m_offset += n; }
+    void shift(int n) override {
+        offset_ += n;
+    }
 
     int distance(BtreeKey const& f) const override {
         TestIntervalKey const& from = s_cast< TestIntervalKey const& >(f);
-        uint64_t this_val = (uint64_cast(m_base) << 32) | m_offset;
-        uint64_t from_val = (uint64_cast(from.m_base) << 32) | from.m_offset;
+        uint64_t this_val = (uint64_cast(base_) << 32) | offset_;
+        uint64_t from_val = (uint64_cast(from.base_) << 32) | from.offset_;
         DEBUG_ASSERT_GE(this_val, from_val, "Invalid from key for distance");
         return static_cast< int >(this_val - from_val);
     }
 
-    bool is_interval_key() const override { return true; }
+    bool is_interval_key() const override {
+        return true;
+    }
 
     sisl::Blob serialize_prefix() const override {
-        return sisl::Blob{uintptr_cast(const_cast< uint32_t* >(&m_base)), uint32_cast(sizeof(uint32_t))};
+        return sisl::Blob{uintptr_cast(const_cast< uint32_t* >(&base_)), uint32_cast(sizeof(uint32_t))};
     }
 
     sisl::Blob serialize_suffix() const override {
-        return sisl::Blob{uintptr_cast(const_cast< uint32_t* >(&m_offset)), uint32_cast(sizeof(uint32_t))};
+        return sisl::Blob{uintptr_cast(const_cast< uint32_t* >(&offset_)), uint32_cast(sizeof(uint32_t))};
     }
 
-    uint32_t serialized_prefix_size() const override { return uint32_cast(sizeof(uint32_t)); }
+    uint32_t serialized_prefix_size() const override {
+        return uint32_cast(sizeof(uint32_t));
+    }
 
-    uint32_t serialized_suffix_size() const override { return uint32_cast(sizeof(uint32_t)); };
+    uint32_t serialized_suffix_size() const override {
+        return uint32_cast(sizeof(uint32_t));
+    };
 
     void deserialize(sisl::Blob const& prefix, sisl::Blob const& suffix, bool) {
         DEBUG_ASSERT_EQ(prefix.size(), sizeof(uint32_t), "Invalid prefix size on deserialize");
         DEBUG_ASSERT_EQ(suffix.size(), sizeof(uint32_t), "Invalid suffix size on deserialize");
         uint32_t const* other_p = r_cast< uint32_t const* >(prefix.cbytes());
-        m_base = *other_p;
+        base_ = *other_p;
 
         uint32_t const* other_s = r_cast< uint32_t const* >(suffix.cbytes());
-        m_offset = *other_s;
+        offset_ = *other_s;
     }
 
     /////////////////// Local methods for helping tests //////////////////
-    bool operator<(const TestIntervalKey& o) const { return (compare(o) < 0); }
-    bool operator==(const TestIntervalKey& other) const { return (compare(other) == 0); }
+    bool operator<(const TestIntervalKey& o) const {
+        return (compare(o) < 0);
+    }
+    bool operator==(const TestIntervalKey& other) const {
+        return (compare(other) == 0);
+    }
 
-    uint64_t key() const { return (uint64_cast(m_base) << 32) | m_offset; }
+    uint64_t key() const {
+        return (uint64_cast(base_) << 32) | offset_;
+    }
     uint64_t start_key(const BtreeKeyRange< TestIntervalKey >& range) const {
         const TestIntervalKey& k = (const TestIntervalKey&)(range.start_key());
         return k.key();
@@ -383,11 +412,11 @@ public:
     }
 
     friend std::istream& operator>>(std::istream& is, TestIntervalKey& k) {
-        uint32_t m_base;
-        uint32_t m_offset;
+        uint32_t base_;
+        uint32_t offset_;
         char dummy;
-        is >> m_base >> dummy >> m_offset;
-        k = TestIntervalKey{m_base, m_offset};
+        is >> base_ >> dummy >> offset_;
+        k = TestIntervalKey{base_, offset_};
         return is;
     }
 };
@@ -396,29 +425,29 @@ class TestFixedValue : public BtreeValue {
 private:
 public:
     TestFixedValue(bnodeid_t val) { assert(0); }
-    TestFixedValue(uint32_t val) : BtreeValue() { m_val = val; }
+    TestFixedValue(uint32_t val) : BtreeValue() { val_ = val; }
     TestFixedValue() : TestFixedValue((uint32_t)-1) {}
-    TestFixedValue(const TestFixedValue& other) : BtreeValue() { m_val = other.m_val; };
-    TestFixedValue(const sisl::Blob& b, bool copy) : BtreeValue() { m_val = *(r_cast< uint32_t const* >(b.cbytes())); }
+    TestFixedValue(const TestFixedValue& other) : BtreeValue() { val_ = other.val_; };
+    TestFixedValue(const sisl::Blob& b, bool copy) : BtreeValue() { val_ = *(r_cast< uint32_t const* >(b.cbytes())); }
     virtual ~TestFixedValue() = default;
 
     static TestFixedValue generate_rand() { return TestFixedValue{g_randval_generator(g_re)}; }
 
     TestFixedValue& operator=(const TestFixedValue& other) {
-        m_val = other.m_val;
+        val_ = other.val_;
         return *this;
     }
 
     sisl::Blob serialize() const override {
-        sisl::Blob b{r_cast< uint8_t const* >(&m_val), uint32_cast(sizeof(m_val))};
+        sisl::Blob b{r_cast< uint8_t const* >(&val_), uint32_cast(sizeof(val_))};
         return b;
     }
 
-    uint32_t serialized_size() const override { return sizeof(m_val); }
-    static uint32_t get_fixed_size() { return sizeof(m_val); }
-    void deserialize(const sisl::Blob& b, bool copy) { m_val = *(r_cast< uint32_t const* >(b.cbytes())); }
+    uint32_t serialized_size() const override { return sizeof(val_); }
+    static uint32_t get_fixed_size() { return sizeof(val_); }
+    void deserialize(const sisl::Blob& b, bool copy) { val_ = *(r_cast< uint32_t const* >(b.cbytes())); }
 
-    std::string to_string() const override { return fmt::format("{}", m_val); }
+    std::string to_string() const override { return fmt::format("{}", val_); }
 
     friend std::ostream& operator<<(std::ostream& os, const TestFixedValue& v) {
         os << v.to_string();
@@ -433,12 +462,12 @@ public:
     }
 
     // This is not mandatory overridden method for BtreeValue, but for testing comparision
-    bool operator==(const TestFixedValue& other) const { return (m_val == other.m_val); }
+    bool operator==(const TestFixedValue& other) const { return (val_ == other.val_); }
 
-    uint32_t value() const { return m_val; }
+    uint32_t value() const { return val_; }
 
 private:
-    uint32_t m_val;
+    uint32_t val_;
 };
 
 class TestVarLenValue : public BtreeValue {
@@ -449,31 +478,31 @@ private:
 
 public:
     TestVarLenValue(bnodeid_t val) { assert(0); }
-    TestVarLenValue(const std::string& val) : BtreeValue(), m_val{val} {}
+    TestVarLenValue(const std::string& val) : BtreeValue(), val_{val} {}
     TestVarLenValue() = default;
-    TestVarLenValue(const TestVarLenValue& other) : BtreeValue() { m_val = other.m_val; };
+    TestVarLenValue(const TestVarLenValue& other) : BtreeValue() { val_ = other.val_; };
     TestVarLenValue(const sisl::Blob& b, bool copy) :
-            BtreeValue(), m_val{std::string((const char*)b.cbytes(), b.size())} {}
+            BtreeValue(), val_{std::string((const char*)b.cbytes(), b.size())} {}
     virtual ~TestVarLenValue() = default;
 
     TestVarLenValue& operator=(const TestVarLenValue& other) {
-        m_val = other.m_val;
+        val_ = other.val_;
         return *this;
     }
 
     static TestVarLenValue generate_rand() { return TestVarLenValue{gen_random_string(rand_val_size())}; }
 
     sisl::Blob serialize() const override {
-        sisl::Blob b{r_cast< const uint8_t* >(m_val.c_str()), uint32_cast(m_val.size())};
+        sisl::Blob b{r_cast< const uint8_t* >(val_.c_str()), uint32_cast(val_.size())};
         return b;
     }
 
-    uint32_t serialized_size() const override { return (uint32_t)m_val.size(); }
+    uint32_t serialized_size() const override { return (uint32_t)val_.size(); }
     static uint32_t get_fixed_size() { return 0; }
 
-    void deserialize(const sisl::Blob& b, bool copy) { m_val = std::string((const char*)b.cbytes(), b.size()); }
+    void deserialize(const sisl::Blob& b, bool copy) { val_ = std::string((const char*)b.cbytes(), b.size()); }
 
-    std::string to_string() const override { return fmt::format("{}", m_val); }
+    std::string to_string() const override { return fmt::format("{}", val_); }
 
     friend std::ostream& operator<<(std::ostream& os, const TestVarLenValue& v) {
         os << v.to_string();
@@ -488,28 +517,34 @@ public:
     }
 
     // This is not mandatory overridden method for BtreeValue, but for testing comparision
-    bool operator==(const TestVarLenValue& other) const { return (m_val == other.m_val); }
+    bool operator==(const TestVarLenValue& other) const { return (val_ == other.val_); }
 
-    std::string value() const { return m_val; }
+    std::string value() const { return val_; }
 
 private:
-    std::string m_val;
+    std::string val_;
 };
 
 class TestIntervalValue : public BtreeIntervalValue {
 private:
 #pragma pack(1)
-    uint32_t m_base_val{0};
-    uint16_t m_offset{0};
+    uint32_t base_val_{0};
+    uint16_t offset_{0};
 #pragma pack()
 
 public:
-    TestIntervalValue(bnodeid_t val) { assert(0); }
-    TestIntervalValue(uint32_t val, uint16_t o) : BtreeIntervalValue(), m_base_val{val}, m_offset{o} {}
+    TestIntervalValue(bnodeid_t val) {
+        assert(0);
+    }
+    TestIntervalValue(uint32_t val, uint16_t o) : BtreeIntervalValue(), base_val_{val}, offset_{o} {
+    }
     TestIntervalValue() = default;
     TestIntervalValue(const TestIntervalValue& other) :
-            BtreeIntervalValue(), m_base_val{other.m_base_val}, m_offset{other.m_offset} {}
-    TestIntervalValue(const sisl::Blob& b, bool copy) : BtreeIntervalValue() { this->deserialize(b, copy); }
+            BtreeIntervalValue(), base_val_{other.base_val_}, offset_{other.offset_} {
+    }
+    TestIntervalValue(const sisl::Blob& b, bool copy) : BtreeIntervalValue() {
+        this->deserialize(b, copy);
+    }
     virtual ~TestIntervalValue() = default;
 
     static TestIntervalValue generate_rand() {
@@ -523,16 +558,24 @@ public:
         return b;
     }
 
-    uint32_t serialized_size() const override { return sizeof(TestIntervalValue); }
-    static uint32_t get_fixed_size() { return sizeof(TestIntervalValue); }
+    uint32_t serialized_size() const override {
+        return sizeof(TestIntervalValue);
+    }
+    static uint32_t get_fixed_size() {
+        return sizeof(TestIntervalValue);
+    }
     void deserialize(const sisl::Blob& b, bool) {
         TestIntervalValue const* other = r_cast< TestIntervalValue const* >(b.cbytes());
-        m_base_val = other->m_base_val;
-        m_offset = other->m_offset;
+        base_val_ = other->base_val_;
+        offset_ = other->offset_;
     }
 
-    std::string to_string() const override { return fmt::format("{}", value()); }
-    uint64_t value() const { return (uint64_cast(m_base_val) << 16) | m_offset; }
+    std::string to_string() const override {
+        return fmt::format("{}", value());
+    }
+    uint64_t value() const {
+        return (uint64_cast(base_val_) << 16) | offset_;
+    }
 
     friend std::ostream& operator<<(std::ostream& os, const TestIntervalValue& v) {
         os << v.to_string();
@@ -540,34 +583,40 @@ public:
     }
 
     friend std::istream& operator>>(std::istream& is, TestIntervalValue& v) {
-        uint32_t m_base_val;
-        uint16_t m_offset;
+        uint32_t base_val_;
+        uint16_t offset_;
         char dummy;
-        is >> m_base_val >> dummy >> m_offset;
-        v = TestIntervalValue{m_base_val, m_offset};
+        is >> base_val_ >> dummy >> offset_;
+        v = TestIntervalValue{base_val_, offset_};
         return is;
     }
 
     ///////////////////////////// Overriding methods of BtreeIntervalValue //////////////////////////
-    void shift(int n) override { m_offset += n; }
+    void shift(int n) override {
+        offset_ += n;
+    }
 
     sisl::Blob serialize_prefix() const override {
-        return sisl::Blob{uintptr_cast(const_cast< uint32_t* >(&m_base_val)), uint32_cast(sizeof(uint32_t))};
+        return sisl::Blob{uintptr_cast(const_cast< uint32_t* >(&base_val_)), uint32_cast(sizeof(uint32_t))};
     }
     sisl::Blob serialize_suffix() const override {
-        return sisl::Blob{uintptr_cast(const_cast< uint16_t* >(&m_offset)), uint32_cast(sizeof(uint16_t))};
+        return sisl::Blob{uintptr_cast(const_cast< uint16_t* >(&offset_)), uint32_cast(sizeof(uint16_t))};
     }
-    uint32_t serialized_prefix_size() const override { return uint32_cast(sizeof(uint32_t)); }
-    uint32_t serialized_suffix_size() const override { return uint32_cast(sizeof(uint16_t)); }
+    uint32_t serialized_prefix_size() const override {
+        return uint32_cast(sizeof(uint32_t));
+    }
+    uint32_t serialized_suffix_size() const override {
+        return uint32_cast(sizeof(uint16_t));
+    }
 
     void deserialize(sisl::Blob const& prefix, sisl::Blob const& suffix, bool) override {
         DEBUG_ASSERT_EQ(prefix.size(), sizeof(uint32_t), "Invalid prefix size on deserialize");
         DEBUG_ASSERT_EQ(suffix.size(), sizeof(uint16_t), "Invalid suffix size on deserialize");
-        m_base_val = *(r_cast< uint32_t const* >(prefix.cbytes()));
-        m_offset = *(r_cast< uint16_t const* >(suffix.cbytes()));
+        base_val_ = *(r_cast< uint32_t const* >(prefix.cbytes()));
+        offset_ = *(r_cast< uint16_t const* >(suffix.cbytes()));
     }
 
     bool operator==(TestIntervalValue const& other) const {
-        return ((m_base_val == other.m_base_val) && (m_offset == other.m_offset));
+        return ((base_val_ == other.base_val_) && (offset_ == other.offset_));
     }
 };

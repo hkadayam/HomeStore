@@ -25,24 +25,23 @@
 
 namespace homestore {
 
+// fmt v11's make_format_args requires lvalue references; use format_to + fmt::runtime which takes a forwarding
+// reference parameter pack so both rvalues and lvalues bind.
 #define _BT_LOG_METHOD_IMPL(req, btcfg, node)                                                                          \
     ([&](fmt::memory_buffer& buf, const char* msgcb, auto&&... args) -> bool {                                         \
-        fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}:{}] "},                                              \
-                        fmt::make_format_args(file_name(__FILE__), __LINE__));                                         \
-        BOOST_PP_IF(BOOST_VMD_IS_EMPTY(req), BOOST_PP_EMPTY,                                                           \
-                    BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[req={}] "},               \
-                                                      fmt::make_format_args(req->to_string()))))                       \
+        fmt::format_to(fmt::appender{buf}, fmt::runtime("[{}:{}] "), file_name(__FILE__), __LINE__);                   \
+        BOOST_PP_IF(                                                                                                   \
+            BOOST_VMD_IS_EMPTY(req), BOOST_PP_EMPTY,                                                                   \
+            BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("[req={}] "), req->to_string())))        \
         ();                                                                                                            \
         BOOST_PP_IF(BOOST_VMD_IS_EMPTY(btcfg), BOOST_PP_EMPTY,                                                         \
-                    BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[btree={}] "},             \
-                                                      fmt::make_format_args(btcfg.name()))))                           \
+                    BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("[btree={}] "), btcfg.name())))  \
         ();                                                                                                            \
         BOOST_PP_IF(BOOST_VMD_IS_EMPTY(node), BOOST_PP_EMPTY,                                                          \
-                    BOOST_PP_IDENTITY(fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[node={}] "},              \
-                                                      fmt::make_format_args(node->to_string()))))                      \
+                    BOOST_PP_IDENTITY(                                                                                 \
+                        fmt::format_to(fmt::appender{buf}, fmt::runtime("[node={}] "), node->to_basic_string())))      \
         ();                                                                                                            \
-        fmt::vformat_to(fmt::appender{buf}, fmt::string_view{msgcb},                                                   \
-                        fmt::make_format_args(std::forward< decltype(args) >(args)...));                               \
+        fmt::format_to(fmt::appender{buf}, fmt::runtime(msgcb), std::forward< decltype(args) >(args)...);              \
         return true;                                                                                                   \
     })
 
@@ -198,10 +197,57 @@ using bnodeid_t = uint64_t;
 static constexpr bnodeid_t empty_bnodeid = std::numeric_limits< bnodeid_t >::max();
 static constexpr uint16_t bt_init_crc_16 = 0x8005;
 
+// ── OpGuard ─────────────────────────────────────────────────────────────────
+// Type-erased RAII guard for btree operations. COWBtree places a CPGuard inside; MemBtree uses default (no-op).
+// No heap allocation, no vptr — just an inline buffer + function pointer for destruction.
+struct OpGuard {
+    static constexpr size_t kBufSize = 16;
+    alignas(8) uint8_t buf_[kBufSize]{};
+    void (*dtor_)(uint8_t*){nullptr};
+
+    OpGuard() = default;
+    ~OpGuard() {
+        if (dtor_) {
+            dtor_(buf_);
+        }
+    }
+
+    OpGuard(OpGuard&& o) noexcept : dtor_{o.dtor_} {
+        std::memcpy(buf_, o.buf_, kBufSize);
+        o.dtor_ = nullptr;
+    }
+    OpGuard(OpGuard const&) = delete;
+    OpGuard& operator=(OpGuard const&) = delete;
+    OpGuard& operator=(OpGuard&&) = delete;
+
+    template < typename T >
+    static OpGuard make(T val) {
+        static_assert(sizeof(T) <= kBufSize, "OpGuard buffer too small for this type");
+        static_assert(alignof(T) <= 8, "OpGuard alignment insufficient for this type");
+        OpGuard g;
+        new (g.buf_) T{std::move(val)};
+        g.dtor_ = [](uint8_t* p) { r_cast< T* >(p)->~T(); };
+        return g;
+    }
+};
+
 VENUM(BtreeNodeType, uint32_t, FIXED = 0, VAR_VALUE = 1, VAR_KEY = 2, VAR_OBJECT = 3, FIXED_PREFIX = 4, COMPACT = 5)
 
-ENUM(BtreeStatus, uint32_t, success, not_found, retry, has_more, node_read_failed, put_failed, space_not_avail,
-     cp_mismatch, merge_not_required, merge_failed, crc_mismatch, not_supported, node_freed)
+ENUM(BtreeStatus, uint32_t,
+     success,                  // Operation completed fully
+     has_more,                 // Query pagination: more results available, call query_next_batch
+     retry,                    // Concurrent modification detected, caller should retry from root
+     node_full,                // Node too full for insert/update, you can retry with larger estimated size in value
+     key_not_found,            // Key or range not found
+     key_already_exists,       // INSERT_ONLY_IF_NOT_EXISTS and key already present
+     merge_not_required,       // Merge check determined no merge is beneficial. An internal status not exposed to user
+     partial_removal,          // Remove operation completed partially, caller can retry, but might or might not help
+     interior_entry_corrupted, // Interior node entry is missing
+     space_not_avail,          // No space in the system to alloc a node
+     node_read_failed,         // I/O error reading a node
+     node_freed,               // Node was deleted by a concurrent merge, An internal status - not exposed to user
+     not_supported             // Operation not supported by the btree
+);
 
 class NodeCore;
 
@@ -262,14 +308,16 @@ public:
 class BtreeMetrics : public sisl::MetricsGroup {
 public:
     explicit BtreeMetrics(const char* inst_name) : sisl::MetricsGroup("Btree", inst_name) {
-        REGISTER_COUNTER(btree_obj_count, "Btree object count", PublishAs::Gauge);
-        REGISTER_COUNTER(btree_leaf_node_count, "Btree Leaf node count", "btree_node_count", {"node_type", "leaf"},
-                         PublishAs::Gauge);
+        // register_counter signature: (grp, desc, report_name="", label_pair={}, ptype=Histogram).  For Gauge-published
+        // counters without a custom report_name/label, pass empty defaults explicitly.
+        REGISTER_COUNTER(btree_obj_count, "Btree object count", "", sisl::MetricLabel{"", ""}, sisl::PublishAs::Gauge);
+        REGISTER_COUNTER(btree_leaf_node_count, "Btree Leaf node count", "btree_node_count",
+                         sisl::MetricLabel{"node_type", "leaf"}, sisl::PublishAs::Gauge);
         REGISTER_COUNTER(btree_int_node_count, "Btree Interior node count", "btree_node_count",
-                         {"node_type", "interior"}, PublishAs::Gauge);
+                         sisl::MetricLabel{"node_type", "interior"}, sisl::PublishAs::Gauge);
         REGISTER_COUNTER(btree_split_count, "Total number of btree node splits");
         REGISTER_COUNTER(btree_merge_count, "Total number of btree node merges");
-        REGISTER_COUNTER(btree_depth, "Depth of btree", PublishAs::Gauge);
+        REGISTER_COUNTER(btree_depth, "Depth of btree", "", sisl::MetricLabel{"", ""}, sisl::PublishAs::Gauge);
 
         REGISTER_COUNTER(btree_int_node_writes, "Total number of btree interior node writes", "btree_node_writes",
                          {"node_type", "interior"});
@@ -284,6 +332,7 @@ public:
         REGISTER_COUNTER(btree_retry_count, "number of retries");
         REGISTER_COUNTER(write_err_cnt, "number of errors in write");
         REGISTER_COUNTER(query_err_cnt, "number of errors in query");
+        REGISTER_COUNTER(remove_err_cnt, "number of errors in remove");
         REGISTER_COUNTER(read_node_count_in_write_ops, "number of nodes read in write_op");
         REGISTER_COUNTER(read_node_count_in_query_ops, "number of nodes read in query_op");
         REGISTER_COUNTER(btree_write_ops_count, "number of btree operations");
@@ -300,7 +349,7 @@ public:
                            "btree_inclusive_time_in_node", {"node_type", "leaf"});
 
         register_me_to_farm();
-    }
+    } // namespace homestore
 
     ~BtreeMetrics() { deregister_me_from_farm(); }
 };

@@ -4,7 +4,7 @@
 
 #include "homestore/index/btree/btree_base.h"
 #include "homestore/index/btree/detail/btree_node.h"
-#include "common/homestore_assert.hpp"
+#include "homestore/base/homestore_assert.hpp"
 
 namespace homestore {
 
@@ -38,20 +38,21 @@ void BtreeBase::create_root_node() {
     underlying_->on_root_changed(root);
 }
 
-BtreeResult< Node > BtreeBase::get_child_node(const Node& parent_node, uint32_t parent_index, NodeLink& child_link,
+BtreeResult< Node > BtreeBase::get_child_node(const Node& parent_node, uint32_t parent_index,
                                               LockType lock_type) const {
+    NodeLink child_link;
     if (parent_index == parent_node->total_entries()) {
         if (!parent_node->has_valid_edge()) {
             BT_NODE_LOG_ASSERT(false, parent_node, "Child index {} does not have valid bnode_id", parent_index);
-            CO_RETURN folly::makeUnexpected(BtreeStatus::not_found);
+            CO_RETURN folly::makeUnexpected(BtreeStatus::interior_entry_corrupted);
         }
         child_link = parent_node->get_edge_value();
     } else {
         BT_NODE_LOG_ASSERT_LT(parent_index, parent_node->total_entries(), parent_node);
-        parent_node->get_nth_value(parent_index, &child_link, false /* copy */);
+        parent_node->get_nth_value(parent_index, &child_link, /*copy=*/false);
     }
 
-    CO_RETURN CO_AWAIT(underlying_->read_node(child_link.bnode_id(), lock_type));
+    CO_RETURN CO_AWAIT(underlying_->read_node(child_link.id(), lock_type));
 }
 
 void BtreeBase::write_node(Node const& node) {
@@ -103,7 +104,6 @@ BtreeTask< BtreeStatus > BtreeBase::upgrade_node_locks(Node& parent_node, Node& 
         (child_gen != child_node->node_gen())) {
         CO_RETURN BtreeStatus::retry;
     }
-
 
 #if 0
 #ifdef _PRERELEASE

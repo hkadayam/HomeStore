@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <bit>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -65,8 +66,8 @@ private:
 
 public:
     BlkId() = default;
-    explicit BlkId(uint64_t id_int);
-    BlkId(blk_num_t blk_num, blk_count_t nblks, chunk_num_t chunk_num);
+    explicit BlkId(uint64_t id_int) : s{std::bit_cast< serialized >(id_int)} {}
+    BlkId(blk_num_t blk_num, blk_count_t nblks, chunk_num_t chunk_num) : s{blk_num, nblks, chunk_num} {}
     BlkId(BlkId const&) = default;
     BlkId& operator=(BlkId const&) = default;
     BlkId(BlkId&&) noexcept = default;
@@ -79,18 +80,32 @@ public:
     blk_num_t blk_num() const { return s.blk_num_; }
     blk_count_t blk_count() const { return s.nblks_; }
     chunk_num_t chunk_num() const { return s.chunk_num_; }
-    std::pair< BlkId, BlkId > split(blk_count_t count) const;
 
-    void invalidate();
-    uint64_t to_integer() const;
-    sisl::Blob serialize() const;
-    void deserialize(sisl::Blob const& b, bool copy);
-    uint32_t serialized_size() const;
-    std::string to_string() const;
-    bool is_valid() const;
-    static uint32_t expected_serialized_size();
+    std::pair< BlkId, BlkId > split(blk_count_t count) const {
+        return {BlkId{blk_num(), count, chunk_num()},
+                BlkId{blk_num() + count, (blk_count_t)(blk_count() - count), chunk_num()}};
+    }
 
-    static int compare(BlkId const& one, BlkId const& two);
+    void invalidate() { s.nblks_ = 0; }
+    uint64_t to_integer() const { return std::bit_cast< uint64_t >(s); }
+    bool is_valid() const { return blk_count() > 0; }
+
+    sisl::Blob serialize() const { return sisl::Blob{r_cast< uint8_t const* >(&s), sizeof(serialized)}; }
+    void deserialize(sisl::Blob const& b, bool) { s = *r_cast< serialized const* >(b.cbytes()); }
+    uint32_t serialized_size() const { return sizeof(BlkId); }
+    static uint32_t expected_serialized_size() { return sizeof(BlkId); }
+
+    std::string to_string() const {
+        return is_valid() ? fmt::format("blk#={} count={} chunk={}", blk_num(), blk_count(), chunk_num())
+                          : "Invalid_Blkid";
+    }
+
+    static int compare(BlkId const& one, BlkId const& two) {
+        if (one.chunk_num() != two.chunk_num()) { return one.chunk_num() < two.chunk_num() ? -1 : 1; }
+        if (one.blk_num() != two.blk_num()) { return one.blk_num() < two.blk_num() ? -1 : 1; }
+        if (one.blk_count() != two.blk_count()) { return one.blk_count() < two.blk_count() ? -1 : 1; }
+        return 0;
+    }
 };
 
 /// A small collection of BlkIds, stack-allocated for up to 4 pieces.

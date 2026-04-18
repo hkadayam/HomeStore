@@ -139,8 +139,8 @@ public:
     BtreeSinglePutRequest(BtreeBase& btree, const BtreeKey& k, const BtreeValue& v, BtreePutType put_type,
                           BtreeValue* existing_val, PutFilter* filter = nullptr) :
             BtreeRequest{btree, btree.route_tracer().is_enabled_for(BtreeRouteTracer::Op::PUT)},
-            k_{std::move(k)},
-            v_{std::move(v)},
+            k_{&k},
+            v_{&v},
             put_type_{put_type},
             existing_val_{existing_val},
             filter_{filter} {}
@@ -154,8 +154,9 @@ public:
     const BtreeKey& key() const { return *k_; }
     const BtreeValue& value() const { return *v_; }
 
-    const BtreeKey k_;
-    const BtreeValue v_;
+    // Pointers (not refs) so the struct stays default-movable; BtreeKey/BtreeValue are abstract bases.
+    BtreeKey const* k_;
+    BtreeValue const* v_;
     const BtreePutType put_type_;
     BtreeValue* existing_val_;
     PutFilter* filter_{nullptr};
@@ -170,7 +171,7 @@ public:
             BtreeRangeRequest< K >{btree, std::move(inp_range), std::numeric_limits< uint32_t >::max(),
                                    btree.route_tracer().is_enabled_for(BtreeRouteTracer::Op::PUT)},
             put_type_{put_type},
-            newval_{value},
+            newval_{&value},
             filter_{filter} {}
 
     ~BtreeRangePutRequest() {
@@ -195,8 +196,7 @@ public:
     using entry_t = std::pair< K, V >;
 
     BtreeBatchPutRequest(BtreeBase& btree, std::vector< entry_t > entries,
-                         BtreePutType put_type = BtreePutType::INSERT_ONLY_IF_NOT_EXISTS,
-                         PutFilter* filter = nullptr) :
+                         BtreePutType put_type = BtreePutType::INSERT, PutFilter* filter = nullptr) :
             BtreeRequest{btree, false},
             entries_{std::move(entries)},
             put_type_{put_type},
@@ -324,6 +324,7 @@ public:
     }
 
     RemoveFilter* filter_{nullptr};
+    uint32_t removed_count_{0}; // accumulated in do_remove across leaf visits
 };
 
 ////////////////////////////////////////////// 3: Get Operations //////////////////////////////////////////////
@@ -440,7 +441,6 @@ struct QueryResultHandle {
     uint32_t batch_size_{UINT32_MAX};
     GetFilter* filter_{nullptr};
     bool reverse_order_{false};
-    CPContext* op_context_{nullptr};
 
     bool has_more() const { return has_more_; }
 };

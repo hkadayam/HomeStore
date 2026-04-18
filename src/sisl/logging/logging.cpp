@@ -272,8 +272,7 @@ static std::string setup_modules() {
     auto m = sisl::logging::LogModulesV2::instance().get_all_module_levels();
     for (auto const& [mod_name, lvl] : m) {
         auto lvl_str = spdlog::level::to_string_view(lvl).data();
-        fmt::vformat_to(std::back_inserter(out_str), std::string_view{"{}={}, "},
-                        fmt::make_format_args(mod_name, lvl_str));
+        fmt::format_to(std::back_inserter(out_str), fmt::runtime("{}={}, "), mod_name, lvl_str);
     }
 
     return out_str;

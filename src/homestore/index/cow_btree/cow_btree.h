@@ -122,6 +122,8 @@ public:
     void on_root_changed(const Node& root) override;
     uint64_t space_occupied() const override;
 
+    OpGuard enter_op() override { return OpGuard::make(cp_mgr().cp_guard()); }
+
     // ── Overflow support ─────────────────────────────────────────────────────
     BtreeStatus write_overflow(const sisl::ByteArray& buf, BlkId& out_blkid) override;
     folly::coro::Task< BtreeStatus > read_overflow(const BlkId& blkid, sisl::ByteArray& out_buf) const override;

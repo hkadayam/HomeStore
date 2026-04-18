@@ -38,6 +38,9 @@ public:
     virtual void on_root_changed(Node const& root) = 0;
     virtual uint64_t space_occupied() const = 0;
 
+    // Optional per-op guard (e.g. CPGuard in COWBtree).  MemBtree returns a no-op default.
+    virtual OpGuard enter_op() { return OpGuard{}; }
+
     virtual BtreeStatus write_overflow(sisl::ByteArray const& buf, BlkId& out_blkid) {
         return BtreeStatus::not_supported;
     }
@@ -98,10 +101,7 @@ protected:
     void create_root_node();
     virtual Node clone_temp_node(NodeCore const& node) = 0;
 
-    BtreeResult< Node > read_and_lock_node(NodeLink id, LockType lock_type) const;
-    BtreeResult< Node > get_child_node(const Node& parent_node, uint32_t index, NodeLink& child_nodeid,
-                                       LockType lock_type) const;
-
+    BtreeResult< Node > get_child_node(const Node& parent_node, uint32_t index, LockType lock_type) const;
     BtreeTask< BtreeStatus > upgrade_node_locks(Node& parent_node, Node& child_node);
 
 protected:

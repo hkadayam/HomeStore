@@ -27,41 +27,45 @@ BtreeTask< BtreeStatus > Btree< K, V >::put(ReqT& put_req) {
                   "put api is called with non put request type");
     COUNTER_INCREMENT(metrics_, btree_write_ops_count, 1);
 
-    for (;;) {
-        bool need_split{false};
-        {
-            auto tree_lock = CO_AWAIT(lock_tree_shared());
-            auto root_result = CO_AWAIT(read_node(root_node_id_, LockType::ReadInteriorWriteLeaf));
-            if (!root_result.hasValue()) {
-                CO_RETURN root_result.error();
-            }
-            auto root = std::move(root_result.value());
+retry:
+    auto op_guard = underlying_->enter_op();
+    BtreeStatus ret{BtreeStatus::success};
+    bool need_split{false};
 
-            if (is_split_needed(root, put_req)) {
-                need_split = true;
-                // tree_lock and root released at end of scope before check_split_root takes excl lock
-            } else {
-                auto ret = CO_AWAIT(do_put(std::move(root), put_req));
-                if (ret != BtreeStatus::success) {
-                    if (ret != BtreeStatus::retry) {
-                        BT_LOG(ERROR, "btree put failed {}", ret);
-                        COUNTER_INCREMENT(metrics_, write_err_cnt, 1);
-                    } else {
-                        COUNTER_INCREMENT(metrics_, btree_retry_count, 1);
-                    }
-                }
-                CO_RETURN ret;
-            }
+    {
+        auto tree_lock = CO_AWAIT(lock_tree_shared());
+        auto root_result = CO_AWAIT(underlying_->read_node(root_node_id_, LockType::ReadInteriorWriteLeaf));
+        if (!root_result.hasValue()) {
+            ret = root_result.error();
+            goto handle;
         }
+        auto root = std::move(root_result.value());
 
-        if (need_split) {
-            auto split_ret = CO_AWAIT(check_split_root(put_req));
-            if (split_ret != BtreeStatus::success) {
-                BT_LOG(ERROR, "Root split failed");
-                COUNTER_INCREMENT(metrics_, write_err_cnt, 1);
-                CO_RETURN split_ret;
-            }
+        if (is_split_needed(root, put_req)) {
+            need_split = true;
+        } else {
+            ret = CO_AWAIT(do_put(std::move(root), put_req));
         }
+    }
+
+    if (need_split) {
+        ret = CO_AWAIT(check_split_root(put_req));
+        if (ret == BtreeStatus::success) {
+            goto retry;
+        }
+        BT_LOG(ERROR, "Root split failed");
+    }
+
+handle:
+    if (ret == BtreeStatus::success) {
+        CO_RETURN ret;
+    } else if (ret == BtreeStatus::retry) {
+        COUNTER_INCREMENT(metrics_, btree_retry_count, 1);
+        goto retry;
+    } else {
+        BT_LOG(ERROR, "btree put failed {}", ret);
+        COUNTER_INCREMENT(metrics_, write_err_cnt, 1);
+        CO_RETURN ret;
     }
 }
 
@@ -88,8 +92,9 @@ retry:
                   std::is_same_v< ReqT, BtreeBatchPutRequest< K, V > >) {
         const auto matched = my_node->match_range(req.working_range(), start_idx, end_idx);
         if (!matched) {
-            BT_NODE_LOG_ASSERT(false, my_node, "match_range returns 0 entries for interior node");
-            ret = BtreeStatus::put_failed;
+            BT_NODE_LOG_ASSERT(false, my_node, "working_range()={} did not match node={}",
+                               req.working_range().to_string(), my_node->to_string());
+            ret = BtreeStatus::interior_entry_corrupted;
             goto out;
         }
     } else if constexpr (std::is_same_v< ReqT, BtreeSinglePutRequest > ||
@@ -105,10 +110,9 @@ retry:
 
     curr_idx = start_idx;
     while (curr_idx <= end_idx) {
-        NodeLink child_id;
-        auto child_result = CO_AWAIT(get_child_node(my_node, curr_idx, child_id, LockType::ReadInteriorWriteLeaf));
+        auto child_result = CO_AWAIT(get_child_node(my_node, curr_idx, LockType::ReadInteriorWriteLeaf));
         if (!child_result.hasValue()) {
-            ret = (child_result.error() == BtreeStatus::not_found) ? BtreeStatus::retry : child_result.error();
+            ret = child_result.error();
             goto out;
         }
         auto child_node = std::move(child_result.value());
@@ -217,8 +221,8 @@ BtreeTask< BtreeStatus > Btree< K, V >::put_one_in_leaf(Node const& node, BtreeS
     auto decision = PutFilterDecision::Replace;
 
     if (found) {
-        if (req.put_type_ == BtreePutType::INSERT_ONLY_IF_NOT_EXISTS) {
-            CO_RETURN BtreeStatus::already_exists;
+        if (req.put_type_ == BtreePutType::INSERT) {
+            CO_RETURN BtreeStatus::key_already_exists;
         }
 
         if (req.existing_val_) {
@@ -237,8 +241,8 @@ BtreeTask< BtreeStatus > Btree< K, V >::put_one_in_leaf(Node const& node, BtreeS
             ++req.stats_.removed;
             CO_RETURN BtreeStatus::success;
         }
-    } else if (req.put_type_ == BtreePutType::REPLACE_ONLY_IF_EXISTS) {
-        CO_RETURN BtreeStatus::not_found;
+    } else if (req.put_type_ == BtreePutType::UPDATE) {
+        CO_RETURN BtreeStatus::key_not_found;
     }
 
     auto const& val = (decision == PutFilterDecision::ReplaceWith) ? *req.filter_->replacement_value() : req.value();
@@ -264,7 +268,7 @@ BtreeTask< BtreeStatus > Btree< K, V >::put_range_in_leaf(Node const& node, Btre
     uint32_t start_idx{0};
     uint32_t end_idx{0};
     if (!node->match_range(req.working_range(), start_idx, end_idx)) {
-        CO_RETURN BtreeStatus::not_found;
+        CO_RETURN BtreeStatus::key_not_found;
     }
 
     K last_failed_key;
@@ -325,7 +329,7 @@ BtreeTask< BtreeStatus > Btree< K, V >::put_batch_in_leaf(Node const& node, Btre
 
         auto const [found, idx] = node->find(key, nullptr, false);
         if (found) {
-            if (req.put_type_ == BtreePutType::INSERT_ONLY_IF_NOT_EXISTS) {
+            if (req.put_type_ == BtreePutType::INSERT) {
                 req.advance();
                 continue;
             }
@@ -350,7 +354,7 @@ BtreeTask< BtreeStatus > Btree< K, V >::put_batch_in_leaf(Node const& node, Btre
             }
             ++req.stats_.updated;
         } else {
-            if (req.put_type_ == BtreePutType::REPLACE_ONLY_IF_EXISTS) {
+            if (req.put_type_ == BtreePutType::UPDATE) {
                 req.advance();
                 continue;
             }
@@ -413,7 +417,7 @@ BtreeTask< BtreeStatus > Btree< K, V >::put_scan_in_leaf(Node const& node, Btree
     } else {
         if (!has_room_in_node(node, BtreePutType::UPSERT, req.insert_key_.serialized_size(),
                               req.value_.serialized_size())) {
-            ret = BtreeStatus::space_not_avail;
+            ret = BtreeStatus::node_full;
         } else {
             ret = CO_AWAIT insert_in_node(node, ins_idx, req.insert_key_, req.value_);
             if (ret == BtreeStatus::success) {
@@ -433,7 +437,7 @@ BtreeTask< BtreeStatus > Btree< K, V >::check_split_root(ReqT& req) {
     BtreeStatus ret = BtreeStatus::success;
 
     auto tree_lock = CO_AWAIT(lock_tree_excl());
-    auto root_result = CO_AWAIT(read_node(root_node_id_, LockType::Write));
+    auto root_result = CO_AWAIT(underlying_->read_node(root_node_id_, LockType::Write));
     if (!root_result.hasValue()) {
         CO_RETURN root_result.error();
     }
@@ -474,9 +478,6 @@ template < typename K, typename V >
 BtreeStatus Btree< K, V >::split_node(Node const& parent_node, Node const& child_node, uint32_t parent_ind,
                                       K* out_split_key) {
     Node child_node2 = child_node->is_leaf() ? create_leaf_node() : create_interior_node();
-    if (!child_node2.valid()) {
-        return BtreeStatus::space_not_avail;
-    }
 
     child_node2->set_next_node(child_node->next_node());
     child_node->set_next_node(child_node2->node_id());

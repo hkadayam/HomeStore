@@ -55,7 +55,7 @@ struct var_node_header {
 // [Persistent Header][var node header][Record][Record].. ...  ... [key][value][key][value]
 //
 template < typename K, typename V >
-class VarSizeNode : public BtreeNode {
+class VarSizeNode : public NodeCore {
 public:
     VarSizeNode(std::shared_ptr< uint8_t > buf, bnodeid_t id, bool is_leaf, uint32_t node_size) :
             NodeCore(std::move(buf), id, is_leaf, node_size) {
@@ -81,7 +81,7 @@ public:
 #ifndef NDEBUG
         validate_sanity();
 #endif
-        return (sz == 0) ? BtreeStatus::space_not_avail : BtreeStatus::success;
+        return (sz == 0) ? BtreeStatus::node_full : BtreeStatus::success;
     }
 
 #ifndef NDEBUG
@@ -90,7 +90,7 @@ public:
         // validate if keys are in ascending order
         K prevKey;
         while (i < this->total_entries()) {
-            K key = BtreeNode::get_nth_key< K >(i, false);
+            K key = NodeCore::get_nth_key< K >(i, false);
             uint64_t kp = *(uint64_t*)key.serialize().bytes();
             if (i > 0 && prevKey.compare(key) > 0) {
                 DEBUG_ASSERT(false, "Found non sorted entry: {} -> {}", kp, to_string());
@@ -111,6 +111,13 @@ public:
             return BtreeStatus::success;
         }
         K key = NodeCore::get_nth_key< K >(idx, true);
+        return update(idx, key, val);
+    }
+
+    BtreeStatus update(uint32_t idx, const BtreeKey& key) override {
+        DEBUG_ASSERT_LT(idx, this->total_entries());
+        V val;
+        this->get_nth_value(idx, &val, true /* copy */);
         return update(idx, key, val);
     }
 
@@ -146,8 +153,8 @@ public:
             get_var_node_header()->add_available_space(cur_obj_size - new_obj_size);
             this->inc_gen();
         } else {
-            if (available_size() < (new_obj_size - cur_obj_size)) {
-                return BtreeStatus::space_not_avail;
+            if (available_size() < uint32_t(new_obj_size - cur_obj_size)) {
+                return BtreeStatus::node_full;
             }
             remove(idx, idx);
             auto sz = insert(idx, kblob, vblob);
@@ -241,7 +248,7 @@ public:
 
         if (!this->is_leaf() && (other.total_entries() != 0)) {
             // Incase this node is an edge node, move the stick to the right hand side node
-            other.set_edge_info(this->edge_info());
+            other.set_edge_id(this->edge_id());
             this->invalidate_edge();
         }
         remove(full_move ? 0u : idx + 1, start_idx); // Remove all entries in bulk
@@ -284,7 +291,7 @@ public:
 
         if (!this->is_leaf() && (other.total_entries() != 0)) {
             // Incase this node is an edge node, move the stick to the right hand side node
-            other.set_edge_info(this->edge_info());
+            other.set_edge_id(this->edge_id());
             this->invalidate_edge();
         }
 
@@ -309,8 +316,7 @@ public:
         return cum_size;
     }
 
-    bool append_copy_in_upto_size(const NodeCore& o, uint32_t& other_cursor, uint32_t upto_size,
-                                  bool copy_only_if_fits) override {
+    bool append_copy_in_upto_size(const NodeCore& o, uint32_t& other_cursor, uint32_t upto_size) override {
         if (occupied_size() >= upto_size) {
             return false;
         }
@@ -318,19 +324,8 @@ public:
             return true;
         }
         auto const room = upto_size - occupied_size();
-
-        if (copy_only_if_fits) {
-            if (o.get_entries_size(other_cursor, o.total_entries()) > room) {
-                return false;
-            }
-        }
         auto const ncopied = copy_by_size(o, other_cursor, room);
         other_cursor += ncopied;
-
-        if (copy_only_if_fits) {
-            DEBUG_ASSERT_EQ(other_cursor, o.total_entries(),
-                            "We proceeded to copy after it checking size, but end up not copying all");
-        }
         return true;
     }
 
@@ -361,7 +356,7 @@ public:
 
         // If we copied everything from start_idx till end and if its an edge node, need to copy the edge id as well.
         if (other.has_valid_edge() && ((start_idx + n) == other.total_entries())) {
-            this->set_edge_info(other.edge_info());
+            this->set_edge_id(other.edge_id());
         }
         return n;
     }
@@ -387,7 +382,7 @@ public:
 
         // If we copied everything from start_idx till end and if its an edge node, need to copy the edge id as well.
         if (other.has_valid_edge() && ((start_idx + n) == other.total_entries())) {
-            this->set_edge_info(other.edge_info());
+            this->set_edge_id(other.edge_id());
         }
         return n;
     }
@@ -444,7 +439,7 @@ public:
         if (idx == this->total_entries()) {
             DEBUG_ASSERT_EQ(this->is_leaf(), false, "get_nth_value out-of-bound");
             DEBUG_ASSERT_EQ(this->has_valid_edge(), true, "get_nth_value out-of-bound");
-            *(BtreeLinkInfo*)out_val = this->get_edge_value();
+            *static_cast< NodeLink* >(out_val) = this->get_edge_value();
         } else {
             sisl::Blob b{const_cast< uint8_t* >(get_nth_obj(idx)) + get_nth_key_size(idx), get_nth_value_size(idx)};
             auto const* rec = get_nth_record(idx);
@@ -460,8 +455,7 @@ public:
             get_var_node_header_const()->available_space(),
             (this->next_node() == empty_bnodeid) ? "" : fmt::format(" next_node={}", this->next_node()));
         if (!this->is_leaf() && (this->has_valid_edge())) {
-            fmt::format_to(std::back_inserter(str), "edge_id={}.{}", this->edge_info().bnodeid_,
-                           this->edge_info().link_version_);
+            fmt::format_to(std::back_inserter(str), "edge_id={}", this->edge_id());
         }
         for (uint32_t i{0}; i < this->total_entries(); ++i) {
             V val;
@@ -508,10 +502,11 @@ protected:
         hdr->reclaim_tail(obj_size);
         hdr->sub_available_space(obj_size + this->get_record_size());
 
-        // Create a new record
+        // Create a new record — clear overflow bit since this is a fresh insert (not an overflow value).
         set_nth_key_len(rec, key_blob.size());
         set_nth_value_len(rec, val_blob.size());
         set_record_data_offset(rec, hdr->tail_offset());
+        rec->set_overflow(false);
 
         // Copy the contents of key and value in the offset
         uint8_t* raw_data_ptr = offset_to_ptr_mutable(hdr->tail_offset());

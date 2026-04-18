@@ -281,7 +281,7 @@ public:
         uint32_t start_idx;
         uint32_t end_idx;
         if (!this->match_range(keys, start_idx, end_idx)) {
-            return BtreeStatus::not_found;
+            return BtreeStatus::key_not_found;
         }
 
         const auto new_val_size = val.serialized_size();

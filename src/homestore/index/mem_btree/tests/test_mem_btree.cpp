@@ -16,18 +16,18 @@
 #include <map>
 #include <memory>
 #include <gtest/gtest.h>
-#include <iomgr/io_environment.hpp>
 #include <sisl/options/options.h>
 #include <sisl/logging/logging.h>
 #include <sisl/fds/enum.h>
 #include <boost/algorithm/string.hpp>
 
-#include "test_common/range_scheduler.hpp"
-#include <homestore/homestore.hpp>
-#include <homestore/index/btree/node_variant/simple_node.hpp>
-#include <homestore/index/btree/node_variant/varlen_node.hpp>
-#include <homestore/index/btree/node_variant/prefix_node.hpp>
-#include "btree_helpers/btree_test_helper.hpp"
+#include <iomanager/iomanager.h>
+#include "homestore/index/btree/node_variant/simple_node.hpp"
+#include "homestore/index/btree/node_variant/varlen_node.hpp"
+// TODO: re-enable prefix_node when variant_node.hpp is ported.
+// #include "homestore/index/btree/node_variant/prefix_node.hpp"
+#include "homestore/index/mem_btree/mem_btree.h"
+#include "homestore/index/btree/tests/btree_test_helper.hpp"
 
 using namespace homestore;
 
@@ -55,7 +55,6 @@ struct FixedLenBtreeTest {
     using ValueType = TestFixedValue;
     static constexpr BtreeNodeType leaf_node_type = BtreeNodeType::FIXED;
     static constexpr BtreeNodeType interior_node_type = BtreeNodeType::FIXED;
-    static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };
 
 struct VarKeySizeBtreeTest {
@@ -63,7 +62,6 @@ struct VarKeySizeBtreeTest {
     using ValueType = TestFixedValue;
     static constexpr BtreeNodeType leaf_node_type = BtreeNodeType::VAR_KEY;
     static constexpr BtreeNodeType interior_node_type = BtreeNodeType::VAR_KEY;
-    static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };
 
 struct VarValueSizeBtreeTest {
@@ -71,7 +69,6 @@ struct VarValueSizeBtreeTest {
     using ValueType = TestVarLenValue;
     static constexpr BtreeNodeType leaf_node_type = BtreeNodeType::VAR_VALUE;
     static constexpr BtreeNodeType interior_node_type = BtreeNodeType::FIXED;
-    static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };
 
 struct VarObjSizeBtreeTest {
@@ -79,16 +76,26 @@ struct VarObjSizeBtreeTest {
     using ValueType = TestVarLenValue;
     static constexpr BtreeNodeType leaf_node_type = BtreeNodeType::VAR_OBJECT;
     static constexpr BtreeNodeType interior_node_type = BtreeNodeType::VAR_OBJECT;
-    static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };
 
+#if 0
 struct PrefixIntervalBtreeTest {
     using KeyType = TestIntervalKey;
     using ValueType = TestIntervalValue;
     static constexpr BtreeNodeType leaf_node_type = BtreeNodeType::FIXED_PREFIX;
     static constexpr BtreeNodeType interior_node_type = BtreeNodeType::FIXED;
-    static constexpr IndexStore::Type store_type = IndexStore::Type::MEM_BTREE;
 };
+#endif
+
+static BtreeTestOptions make_options() {
+    return BtreeTestOptions{
+        .num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >(),
+        .preload_size = SISL_OPTIONS["preload_size"].as< uint32_t >(),
+        .num_ios = SISL_OPTIONS["num_iters"].as< uint32_t >(),
+        .run_time_secs = SISL_OPTIONS["run_time"].as< uint32_t >(),
+        .disable_merge = SISL_OPTIONS["disable_merge"].as< bool >(),
+    };
+}
 
 template < typename TestType >
 struct BtreeTest : public BtreeTestHelper< TestType >, public ::testing::Test {
@@ -96,11 +103,15 @@ struct BtreeTest : public BtreeTestHelper< TestType >, public ::testing::Test {
     using K = typename TestType::KeyType;
     using V = typename TestType::ValueType;
 
-    BtreeTest() : testing::Test() {}
+    BtreeTest() : BtreeTestHelper< TestType >(make_options()), ::testing::Test() {}
 
     void SetUp() override {
-        BtreeTestHelper< TestType >::SetUp();
-        this->m_bt = std::make_shared< Btree< K, V > >(this->m_cfg);
+        // Finalize config now that leaf/int node types are known; MemBtree is header-only and doesn't need iomanager.
+        this->cfg_.node_size_ = g_node_size;
+        this->cfg_.finalize(sizeof(NodeCore::PersistentHeader));
+        auto bt = MemBtree::create< K, V >(this->cfg_);
+        bt->route_tracer().enable_all();
+        BtreeTestHelper< TestType >::SetUp(std::move(bt), /*load=*/false, /*is_multi_threaded=*/false);
     }
 };
 
@@ -269,7 +280,7 @@ TYPED_TEST(BtreeTest, RandomRemoveRange) {
     static thread_local std::uniform_int_distribution< uint32_t > s_rand_key_generator{0, num_entries};
     //    this->print_keys();
     LOGINFO("Step 2: Do range remove for maximum of {} iterations", num_iters);
-    for (uint32_t i{0}; (i < num_iters) && this->m_shadow_map.size(); ++i) {
+    for (uint32_t i{0}; (i < num_iters) && this->shadow_map_.size(); ++i) {
         uint32_t key1 = s_rand_key_generator(g_re);
         uint32_t key2 = s_rand_key_generator(g_re);
 
@@ -287,23 +298,20 @@ struct BtreeConcurrentTest : public BtreeTestHelper< TestType >, public ::testin
     using K = typename TestType::KeyType;
     using V = typename TestType::ValueType;
 
-    BtreeConcurrentTest() : testing::Test() { this->m_is_multi_threaded = true; }
+    BtreeConcurrentTest() : BtreeTestHelper< TestType >(make_options()), ::testing::Test() {}
 
     void SetUp() override {
-        LOGINFO("Starting iomgr with {} threads", SISL_OPTIONS["num_threads"].as< uint32_t >());
-        ioenvironment.with_iomgr(iomgr::iomgr_params{.num_threads = SISL_OPTIONS["num_threads"].as< uint32_t >(),
-                                                     .is_spdk = false,
-                                                     .num_fibers = 1 + SISL_OPTIONS["num_fibers"].as< uint32_t >(),
-                                                     .app_mem_size_mb = 0,
-                                                     .hugepage_size_mb = 0});
-
-        BtreeTestHelper< TestType >::SetUp();
-        this->m_bt = std::make_shared< Btree< K, V > >(this->m_cfg);
+        init_iomgr(SISL_OPTIONS["num_threads"].as< uint32_t >());
+        this->cfg_.node_size_ = g_node_size;
+        this->cfg_.finalize(sizeof(NodeCore::PersistentHeader));
+        BtreeTestHelper< TestType >::SetUp(MemBtree::create< K, V >(this->cfg_),
+                                           /*load=*/false, /*is_multi_threaded=*/true);
     }
 
     void TearDown() override {
         BtreeTestHelper< TestType >::TearDown();
-        iomanager.stop();
+        this->bt_.reset();
+        stop_iomgr();
     }
 };
 
@@ -335,6 +343,5 @@ int main(int argc, char* argv[]) {
         LOGINFO("No seed provided. Using randomly generated seed: {}", seed);
         g_re.seed(seed);
     }
-    auto ret = RUN_ALL_TESTS();
-    return ret;
+    return RUN_ALL_TESTS();
 }

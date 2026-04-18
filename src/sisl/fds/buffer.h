@@ -461,7 +461,9 @@ inline ByteArray make_byte_array(IoBlobSafe&& blob) {
 inline ByteArray make_byte_array(std::shared_ptr< uint8_t > owner, uint32_t size, bool is_aligned = true) {
     auto* raw = owner.get();
     return ByteArray(new IoBlobSafe(raw, size, is_aligned), [o = std::move(owner)](IoBlobSafe* p) {
-        p->set_bytes(nullptr);
+        // Null out bytes_ so IoBlobSafe's destructor skips buf_free — the captured `o` shared_ptr owns the buffer.
+        // static_cast is required to disambiguate between the uint8_t* and uint8_t const* overloads of set_bytes.
+        p->set_bytes(static_cast< uint8_t* >(nullptr));
         delete p;
     });
 }

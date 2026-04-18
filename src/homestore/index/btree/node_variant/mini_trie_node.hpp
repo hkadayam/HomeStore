@@ -318,7 +318,7 @@ private:
 #ifndef NDEBUG
         validate_sanity();
 #endif
-        return (sz == 0) ? BtreeStatus::space_not_avail : BtreeStatus::success;
+        return (sz == 0) ? BtreeStatus::node_full : BtreeStatus::success;
     }
 
 #ifndef NDEBUG

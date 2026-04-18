@@ -18,9 +18,6 @@
 #include "homestore/index/btree/btree_kv.h"
 #include "homestore/index/btree/detail/btree_node.h"
 
-using namespace std;
-using namespace boost;
-
 namespace homestore {
 
 template < typename K, typename V >
@@ -64,6 +61,15 @@ public:
         return BtreeStatus::success;
     }
 
+    BtreeStatus update(uint32_t ind, const BtreeKey& key) override {
+        DEBUG_ASSERT_LT(ind, this->total_entries());
+        uint8_t* entry = this->node_data_area() + (get_nth_obj_size(ind) * ind);
+        sisl::Blob const kblob = key.serialize();
+        std::memcpy(entry, kblob.cbytes(), kblob.size());
+        this->inc_gen();
+        return BtreeStatus::success;
+    }
+
     BtreeStatus update(uint32_t ind, const BtreeKey& key, const BtreeValue& val) override {
         if (ind == this->total_entries()) {
             DEBUG_ASSERT_EQ(this->is_leaf(), false);
@@ -85,7 +91,7 @@ public:
             DEBUG_ASSERT((!this->is_leaf() && this->has_valid_edge()), "node={}", to_string());
             // Set the last key/value as edge entry and by decrementing entry count automatically removed the last
             // entry.
-            BtreeLinkInfo new_edge;
+            NodeLink new_edge;
             get_nth_value(ind_s - 1, &new_edge, false);
             set_nth_value(total_entries, new_edge);
             sub_entries(total_entries - ind_s + 1);
@@ -130,7 +136,7 @@ public:
 
         // If there is an edgeEntry in this node, it needs to move to move out as well.
         if (!this->is_leaf() && this->has_valid_edge()) {
-            other_node.set_edge_info(this->edge_info());
+            other_node.set_edge_id(this->edge_id());
             this->invalidate_edge();
         }
 
@@ -155,8 +161,7 @@ public:
         return get_nth_key< K >(ind, false).compare(cmp_key);
     }
 
-    bool append_copy_in_upto_size(const NodeCore& o, uint32_t& other_cursor, uint32_t upto_size,
-                                  bool copy_only_if_fits) override {
+    bool append_copy_in_upto_size(const NodeCore& o, uint32_t& other_cursor, uint32_t upto_size) override {
         auto& other = s_cast< const SimpleNode< K, V >& >(o);
         if (occupied_size() >= upto_size) {
             return false;
@@ -165,15 +170,6 @@ public:
             return true;
         }
         auto const room = upto_size - occupied_size();
-
-        if (copy_only_if_fits) {
-            // Whats going to come in is more than what we are supposed to accept or what has been available. std::min
-            // check here is to ensure that even though we have available space, but if it exceeds requested upto_size,
-            // then bail out.
-            if (other.get_entries_size(other_cursor, other.total_entries()) > room) {
-                return false;
-            }
-        }
 
         DEBUG_ASSERT_LT(other_cursor, other.total_entries(), "Invalid cursor pointed in src node={}",
                         other.to_string());
@@ -186,12 +182,7 @@ public:
 
         // If we copied everything from start_idx till end and if its an edge node, need to copy the edge id as well.
         if (other.has_valid_edge() && (other_cursor == other.total_entries())) {
-            this->set_edge_info(other.edge_info());
-        }
-
-        if (copy_only_if_fits) {
-            DEBUG_ASSERT_EQ(other_cursor, other.total_entries(),
-                            "We proceeded to copy after it checking size, but end up not copying all");
+            this->set_edge_id(other.edge_id());
         }
         return true;
     }
@@ -214,7 +205,7 @@ public:
 
         // If we copied everything from start_idx till end and if its an edge node, need to copy the edge id as well.
         if (other.has_valid_edge() && ((start_idx + nentries) == other.total_entries())) {
-            this->set_edge_info(other.edge_info());
+            this->set_edge_id(other.edge_id());
         }
         return nentries;
     }
@@ -239,7 +230,7 @@ public:
         if (ind == this->total_entries()) {
             DEBUG_ASSERT_EQ(this->is_leaf(), false, "setting value outside bounds on leaf node");
             DEBUG_ASSERT_EQ(this->has_valid_edge(), true, "node={}", to_string());
-            *(BtreeLinkInfo*)out_val = this->get_edge_value();
+            *(NodeLink*)out_val = this->get_edge_value();
         } else {
             sisl::Blob b{const_cast< uint8_t* >(this->node_data_area_const() + (get_nth_obj_size(ind) * ind) +
                                                 get_nth_key_size(ind)),
@@ -261,8 +252,7 @@ public:
                                this->node_id(), this->level(), this->total_entries(),
                                (this->is_leaf() ? "LEAF" : "INTERIOR"), snext);
         if (this->has_valid_edge()) {
-            fmt::format_to(std::back_inserter(str), " edge={}.{}", this->edge_info().m_bnodeid,
-                           this->edge_info().m_link_version);
+            fmt::format_to(std::back_inserter(str), " edge={}", this->edge_id());
         }
 
         for (uint32_t i{0}; i < this->total_entries(); ++i) {
@@ -301,15 +291,14 @@ public:
             //            str += " <tr>";
             for (uint32_t i{0}; i < this->total_entries(); ++i) {
                 uint32_t cur_key = get_nth_key< K >(i, false).key();
-                BtreeLinkInfo child_info;
+                NodeLink child_info;
                 get_nth_value(i, &child_info, false /* copy */);
                 str += fmt::format(R"(
                 <td port="connector{}"></td><td port="key{}">{}.{}</td>)",
-                                   i, i, cur_key, child_info.link_version());
+                                   i, i, cur_key, child_info.id());
             }
-            std::string sedge = this->has_valid_edge() ? "edge:" + std::to_string(this->edge_info().m_bnodeid) + "." +
-                    std::to_string(this->edge_info().m_link_version)
-                                                       : "";
+            std::string sedge =
+                this->has_valid_edge() ? "edge:" + std::to_string(this->edge_id()) : "";
             str += fmt::format(R"(
                 <td port="connector{}"></td>
                 <td>{}.{}<br/> gen={}<br/>{} {} </td></tr></table>>];)",
@@ -440,13 +429,13 @@ public:
     }
 
     void set_nth_value(uint32_t ind, const BtreeValue& v) {
-        sisl::Blob b = v.serialize();
         if (ind >= this->total_entries()) {
             RELEASE_ASSERT_EQ(this->is_leaf(), false, "setting value outside bounds on leaf node");
-            DEBUG_ASSERT_EQ(b.size(), sizeof(BtreeLinkInfo::bnode_link_info),
-                            "Invalid value size being set for non-leaf node");
-            this->set_edge_info(*r_cast< BtreeLinkInfo::bnode_link_info const* >(b.cbytes()));
+            // Edge slot always stores a child NodeLink.  Downcast and pull the bnodeid_t directly instead of going
+            // through serialize()/reinterpret_cast.
+            this->set_edge_id(s_cast< NodeLink const& >(v).id());
         } else {
+            sisl::Blob b = v.serialize();
             uint8_t* entry = this->node_data_area() + (get_nth_obj_size(ind) * ind) + get_nth_key_size(ind);
             std::memcpy(entry, b.cbytes(), b.size());
         }

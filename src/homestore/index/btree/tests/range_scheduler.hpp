@@ -20,7 +20,7 @@
 
 #pragma once
 
-#include <sisl/fds/bitset.h>
+#include "sisl/fds/bitset.h"
 #include <cassert>
 
 namespace homestore {
@@ -44,17 +44,18 @@ static std::pair< uint64_t, uint64_t > get_next_contiguous_set_bits(const sisl::
 
 class RangeScheduler {
 private:
-    sisl::Bitset m_existing_keys;
-    sisl::Bitset m_working_keys;
-    std::uniform_int_distribution< uint32_t > m_rand_start_key_generator;
-    std::random_device m_rd;
+    sisl::Bitset existing_keys_;
+    sisl::Bitset working_keys_;
+    std::uniform_int_distribution< uint32_t > rand_start_key_generator_;
+    std::random_device rd_;
 
 public:
-    RangeScheduler(uint32_t num_keys) : m_existing_keys{num_keys}, m_working_keys{num_keys} {
-        m_rand_start_key_generator = std::uniform_int_distribution< uint32_t >(0, num_keys - 1);
+    RangeScheduler(uint32_t num_keys) : existing_keys_{num_keys}, working_keys_{num_keys} {
+        rand_start_key_generator_ = std::uniform_int_distribution< uint32_t >(0, num_keys - 1);
     }
 
     void remove_keys_from_working(uint32_t s, uint32_t e) { remove_from_working(s, e); }
+    uint64_t existing_count() const { return existing_keys_.get_set_count(); }
 
     void put_key(uint32_t key) {
         add_to_existing(key);
@@ -81,7 +82,9 @@ public:
         auto max_tries = 10;
         do {
             ret = try_pick_random_non_existing_keys(max_keys);
-            if (ret.first != UINT32_MAX) { break; }
+            if (ret.first != UINT32_MAX) {
+                break;
+            }
         } while (--max_tries);
 
         return ret;
@@ -92,7 +95,9 @@ public:
         auto max_tries = 10;
         do {
             ret = try_pick_random_existing_keys(max_keys);
-            if (ret.first != UINT32_MAX) { break; }
+            if (ret.first != UINT32_MAX) {
+                break;
+            }
         } while (--max_tries);
 
         return ret;
@@ -103,7 +108,9 @@ public:
         auto max_tries = 10;
         do {
             ret = try_pick_random_non_working_keys(max_keys);
-            if (ret.first != UINT32_MAX) { break; }
+            if (ret.first != UINT32_MAX) {
+                break;
+            }
         } while (--max_tries);
 
         return ret;
@@ -111,13 +118,13 @@ public:
 
 private:
     std::pair< uint32_t, uint32_t > try_pick_random_non_existing_keys(uint32_t max_keys) {
-        if ((m_existing_keys.size() - m_existing_keys.get_set_count()) == 0) {
+        if ((existing_keys_.size() - existing_keys_.get_set_count()) == 0) {
             throw std::out_of_range("All keys are being worked on right now");
         }
 
-        uint32_t const search_start = m_rand_start_key_generator(m_rd);
-        auto bb = m_existing_keys.get_next_contiguous_n_reset_bits(search_start, max_keys);
-        if (bb.nbits && m_working_keys.is_bits_reset(bb.start_bit, bb.nbits)) {
+        uint32_t const search_start = rand_start_key_generator_(rd_);
+        auto bb = existing_keys_.get_next_contiguous_n_reset_bits(search_start, max_keys);
+        if (bb.nbits && working_keys_.is_bits_reset(bb.start_bit, bb.nbits)) {
             uint32_t const start = uint32_cast(bb.start_bit);
             uint32_t const end = uint32_cast(bb.start_bit + bb.nbits - 1);
             add_to_working(start, end);
@@ -128,15 +135,14 @@ private:
     }
 
     std::pair< uint32_t, uint32_t > try_pick_random_existing_keys(uint32_t max_keys) {
-        if (m_existing_keys.get_set_count() == 0) {
-            DEBUG_ASSERT(false, "Couldn't find one existing keys");
-            throw std::out_of_range("Couldn't find one existing keys");
+        if (existing_keys_.get_set_count() == 0) {
+            return std::pair(UINT32_MAX, UINT32_MAX);
         }
 
-        uint32_t const search_start = m_rand_start_key_generator(m_rd);
-        auto [s, count] = get_next_contiguous_set_bits(m_existing_keys, search_start, max_keys);
+        uint32_t const search_start = rand_start_key_generator_(rd_);
+        auto [s, count] = get_next_contiguous_set_bits(existing_keys_, search_start, max_keys);
 
-        if (count && m_working_keys.is_bits_reset(s, count)) {
+        if (count && working_keys_.is_bits_reset(s, count)) {
             uint32_t const start = uint32_cast(s);
             uint32_t const end = uint32_cast(s + count - 1);
             add_to_working(start, end);
@@ -147,8 +153,8 @@ private:
     }
 
     std::pair< uint32_t, uint32_t > try_pick_random_non_working_keys(uint32_t max_keys) {
-        uint32_t const search_start = m_rand_start_key_generator(m_rd);
-        auto bb = m_working_keys.get_next_contiguous_n_reset_bits(search_start, max_keys);
+        uint32_t const search_start = rand_start_key_generator_(rd_);
+        auto bb = working_keys_.get_next_contiguous_n_reset_bits(search_start, max_keys);
 
         if (bb.nbits) {
             uint32_t const start = uint32_cast(bb.start_bit);
@@ -164,20 +170,20 @@ private:
 
     void add_to_working(uint32_t s) { add_to_working(s, s); }
 
-    void add_to_existing(uint32_t s, uint32_t e) { m_existing_keys.set_bits(s, e - s + 1); }
+    void add_to_existing(uint32_t s, uint32_t e) { existing_keys_.set_bits(s, e - s + 1); }
 
-    void add_to_working(uint32_t s, uint32_t e) { m_working_keys.set_bits(s, e - s + 1); }
+    void add_to_working(uint32_t s, uint32_t e) { working_keys_.set_bits(s, e - s + 1); }
 
-    void remove_from_existing(uint32_t s, uint32_t e) { m_existing_keys.reset_bits(s, e - s + 1); }
+    void remove_from_existing(uint32_t s, uint32_t e) { existing_keys_.reset_bits(s, e - s + 1); }
 
     void remove_from_existing(uint32_t s) { remove_from_existing(s, s); }
 
     void remove_from_working(uint32_t s) { remove_from_working(s, s); }
 
-    void remove_from_working(uint32_t s, uint32_t e) { m_working_keys.reset_bits(s, e - s + 1); }
+    void remove_from_working(uint32_t s, uint32_t e) { working_keys_.reset_bits(s, e - s + 1); }
 
-    bool is_working(uint32_t cur_key) const { return m_working_keys.is_bits_set(cur_key, 1); }
+    bool is_working(uint32_t cur_key) const { return working_keys_.is_bits_set(cur_key, 1); }
 
-    bool is_existing(uint32_t cur_key) const { return m_existing_keys.is_bits_set(cur_key, 1); }
+    bool is_existing(uint32_t cur_key) const { return existing_keys_.is_bits_set(cur_key, 1); }
 };
 }; // namespace homestore

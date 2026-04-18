@@ -5,7 +5,6 @@ include_directories (BEFORE .)
 
 add_library(hs_blkalloc OBJECT)
 target_sources(hs_blkalloc PRIVATE
-        blk.cpp
         bitmap_blk_allocator.cpp
         slab_blk_allocator.cpp
         segment_manager.cpp

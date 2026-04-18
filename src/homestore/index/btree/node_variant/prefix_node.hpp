@@ -197,7 +197,7 @@ public:
                 cur_key.shift(1);
             }
             if (!has_room(1u)) {
-                return BtreeStatus::space_not_avail;
+                return BtreeStatus::node_full;
             }
             bool upserted_all{false};
 
@@ -485,7 +485,7 @@ public:
 
     BtreeStatus insert(uint32_t idx, BtreeKey const& key, BtreeValue const& val) override {
         if (!has_room(1u)) {
-            return BtreeStatus::space_not_avail;
+            return BtreeStatus::node_full;
         }
 
         std::memmove(get_suffix_entry(idx + 1), get_suffix_entry(idx),
@@ -608,8 +608,7 @@ public:
         return (prefix_entry::size() + suffix_entry::size()) * (end_idx - start_idx);
     }
 
-    bool append_copy_in_upto_size(const BtreeNode& o, uint32_t& other_cursor, uint32_t upto_size,
-                                  bool copy_only_if_fits) override {
+    bool append_copy_in_upto_size(const BtreeNode& o, uint32_t& other_cursor, uint32_t upto_size) override {
         // Make all calculations for fit based on that we will do compaction
         auto const filled_size = this->node_data_size() - available_size_with_compaction();
         if (filled_size >= upto_size) {
@@ -621,11 +620,6 @@ public:
         auto const room = upto_size - filled_size; // This much we have actual room for
 
         auto const bringin_size = o.get_entries_size(other_cursor, o.total_entries());
-        if (copy_only_if_fits) {
-            if (bringin_size > room) {
-                return false;
-            }
-        }
 
         // We made size calculations based on if we need compaction or not, however if we can fit all of other node
         // without compaction, we try to avoid it.
@@ -634,11 +628,6 @@ public:
         }
         auto const ncopied = copy_internal(o, other_cursor, true /* by_size*/, room);
         other_cursor += ncopied;
-
-        if (copy_only_if_fits) {
-            DEBUG_ASSERT_EQ(other_cursor, o.total_entries(),
-                            "We proceeded to copy after it checking size, but end up not copying all");
-        }
         return true;
     }
 

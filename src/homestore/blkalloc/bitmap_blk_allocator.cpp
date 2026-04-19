@@ -18,6 +18,7 @@
 #include "base/homestore_assert.hpp"
 
 namespace homestore {
+namespace blkalloc {
 
 BitmapBlkAllocator::BitmapBlkAllocator(BlkAllocConfig const& cfg, SegmentManager& seg_mgr, chunk_num_t id,
                                        std::optional< sisl::ByteArray > buf) :
@@ -190,4 +191,5 @@ std::string BitmapBlkAllocator::to_string() const {
                        available_blks());
 }
 
+} // namespace blkalloc
 } // namespace homestore

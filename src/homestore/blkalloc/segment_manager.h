@@ -28,6 +28,7 @@
 #include "blk_cache.h"
 
 namespace homestore {
+namespace blkalloc {
 
 ///
 /// SlabCache — per-portion in-memory block cache.
@@ -117,10 +118,7 @@ struct InmemPortion {
     mutable std::mutex mtx_;
 
     InmemPortion(blk_num_t start, blk_num_t end, blk_num_t max_cached_blks, chunk_num_t chunk_id) :
-            start_blk_{start},
-            end_blk_{end},
-            slab_cache_{max_cached_blks, chunk_id},
-            sweep_cursor_{start} {}
+            start_blk_{start}, end_blk_{end}, slab_cache_{max_cached_blks, chunk_id}, sweep_cursor_{start} {}
 
     InmemPortion(InmemPortion const&) = delete;
     InmemPortion(InmemPortion&&) = delete;
@@ -190,4 +188,5 @@ private:
     std::atomic< uint32_t > rr_seg_{0};
 };
 
+} // namespace blkalloc
 } // namespace homestore

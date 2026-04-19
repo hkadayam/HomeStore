@@ -41,6 +41,8 @@ namespace homestore {
 #define BLKALLOC_LOG_ASSERT_CMP(val1, cmp, val2, ...)                                                                  \
     HS_SUBMOD_ASSERT_CMP(LOGMSG_ASSERT_CMP, val1, cmp, val2, , "blkalloc", get_name(), ##__VA_ARGS__)
 
+namespace blkalloc {
+
 struct BlkAllocConfig {
     friend class BlkAllocator;
 
@@ -154,4 +156,5 @@ protected:
     const chunk_num_t chunk_id_{0};
 };
 
+} // namespace blkalloc
 } // namespace homestore

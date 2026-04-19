@@ -28,6 +28,7 @@
 #include "device/virtual_dev.h"
 
 namespace homestore {
+using namespace blkalloc;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Constructors and Factory Methods (create/load)

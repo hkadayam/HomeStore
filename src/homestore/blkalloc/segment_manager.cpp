@@ -20,6 +20,7 @@
 #include "segment_manager.h"
 
 namespace homestore {
+namespace blkalloc {
 
 // ==================== SlabCache ====================
 SlabCache::SlabCache(blk_num_t max_cached_blks, chunk_num_t chunk_id) :
@@ -249,4 +250,5 @@ InmemPortion& SegmentManager::next_alloc_portion(Segment& seg) {
     return *seg.portions_[idx];
 }
 
+} // namespace blkalloc
 } // namespace homestore

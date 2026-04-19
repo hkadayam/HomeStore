@@ -43,6 +43,7 @@
  
 
 using namespace homestore;
+using namespace homestore::blkalloc;
 
 /* This verbose syntax for a simple random range is precisely why people started hating C++ */
 static thread_local std::random_device g_rd{};

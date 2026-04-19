@@ -25,6 +25,7 @@
 #include "base/homestore_assert.hpp"
 
 namespace homestore {
+namespace blkalloc {
 
 using slab_idx_t = blk_count_t;
 
@@ -67,4 +68,5 @@ static constexpr std::array< std::pair< slab_idx_t, uint8_t >, slab_tbl_size > n
      {7, 114}, {7, 115}, {7, 116}, {7, 117}, {7, 118}, {7, 119}, {7, 120}, {7, 121}, {7, 122}, {7, 123}, {7, 124},
      {7, 125}, {7, 126}, {7, 127}, {8, 0}}};
 
+} // namespace blkalloc
 } // namespace homestore

@@ -36,6 +36,7 @@
 #include "base/homestore_config.hpp"
 
 namespace homestore {
+namespace blkalloc {
 
 enum class AllocMode : uint8_t {
     CompactAlloc,  // entire capacity fits in slab; no inmem_bm_; no sweep thread; ondisk_bm_ when persistent
@@ -60,22 +61,23 @@ struct SlabBlkAllocConfig : public BlkAllocConfig {
     explicit SlabBlkAllocConfig(std::string const& name) : SlabBlkAllocConfig{0, 0, 0, 0, false, name} {}
 
     SlabBlkAllocConfig(uint32_t blk_size, uint32_t ppage_sz, uint32_t align_sz, uint64_t size, bool persistent,
-                          std::string const& name) :
+                       std::string const& name) :
             BlkAllocConfig{blk_size, align_sz, size, persistent, name},
             phys_page_size_{ppage_sz},
             num_segments_{HS_DYNAMIC_CONFIG(blkallocator.max_segments)} {
         const blk_num_t total_cache_blks = static_cast< blk_num_t >(
             HS_DYNAMIC_CONFIG(blkallocator.free_blk_cache_count_by_vdev_percent) * capacity_ / 100.0);
         const blk_num_t num_portions = std::max< blk_num_t >((capacity_ - 1) / blks_per_portion_ + 1, 1u);
-        const float refill_pct = HS_DYNAMIC_CONFIG(blkallocator.free_blk_cache_refill_threshold_pct);
+        const float refill_pct = HS_DYNAMIC_CONFIG(blkallocator.slab_refill_threshold_pct);
 
         // Auto-populate slab distribution from defaults if not configured.
-        auto const& dist = HS_DYNAMIC_CONFIG(blkallocator.free_blk_slab_distribution);
+        auto const& dist = HS_DYNAMIC_CONFIG(blkallocator.slab_distribution);
         if (dist.empty()) {
             HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
-                auto& slab_pct_dist = s.blkallocator.free_blk_slab_distribution;
+                auto& slab_pct_dist = s.blkallocator.slab_distribution;
                 if (slab_pct_dist.empty()) {
-                    static constexpr std::array< double, 9 > defaults{15.0, 7.0, 7.0, 6.0, 10.0, 10.0, 10.0, 10.0, 25.0};
+                    static constexpr std::array< double, 9 > defaults{15.0, 7.0,  7.0,  6.0, 10.0,
+                                                                      10.0, 10.0, 10.0, 25.0};
                     slab_pct_dist.insert(slab_pct_dist.begin(), defaults.begin(), defaults.end());
                 }
             });
@@ -83,12 +85,12 @@ struct SlabBlkAllocConfig : public BlkAllocConfig {
         }
 
         slab_idx_t idx{0};
-        for (auto const& pct : HS_DYNAMIC_CONFIG(blkallocator.free_blk_slab_distribution)) {
-            if (idx >= SlabCache::NUM_SLABS) break;
+        for (auto const& pct : HS_DYNAMIC_CONFIG(blkallocator.slab_distribution)) {
+            if (idx >= SlabCache::NUM_SLABS)
+                break;
             auto& sc = slab_cfgs_[idx];
             sc.slab_size = static_cast< blk_count_t >(1) << idx;
-            const blk_num_t total_entries =
-                static_cast< blk_num_t >((total_cache_blks / sc.slab_size) * (pct / 100.0));
+            const blk_num_t total_entries = static_cast< blk_num_t >((total_cache_blks / sc.slab_size) * (pct / 100.0));
             sc.max_entries = total_entries / std::max< blk_num_t >(num_portions, 1u);
             sc.refill_threshold_pct = refill_pct;
             ++idx;
@@ -124,9 +126,7 @@ public:
         REGISTER_COUNTER(num_alloc_partial, "Number of blk alloc partial allocations");
         REGISTER_COUNTER(num_retries, "Number of times it retried because of empty cache");
         REGISTER_COUNTER(num_blks_alloc_direct, "Number of blks alloc directly from bitmap");
-
-        REGISTER_HISTOGRAM(frag_pct_distribution, "Distribution of fragmentation percentage",
-                           HistogramBucketsType(LinearUpto64Buckets));
+        REGISTER_HISTOGRAM(frag_pct_distribution, "Distribution of fragmentation percentage");
 
         register_me_to_farm();
     }
@@ -159,8 +159,7 @@ public:
 class SlabBlkAllocator : public BlkAllocator {
 public:
     // buf: nullopt for a fresh allocator; a serialized ByteArray (from the meta service) for recovery.
-    SlabBlkAllocator(SlabBlkAllocConfig const& cfg, std::optional< sisl::ByteArray > buf,
-                        chunk_num_t chunk_id);
+    SlabBlkAllocator(SlabBlkAllocConfig const& cfg, std::optional< sisl::ByteArray > buf, chunk_num_t chunk_id);
     SlabBlkAllocator(SlabBlkAllocator const&) = delete;
     SlabBlkAllocator(SlabBlkAllocator&&) noexcept = delete;
     SlabBlkAllocator& operator=(SlabBlkAllocator const&) = delete;
@@ -219,4 +218,5 @@ private:
     blk_num_t sweep_blks_added_{0};
 };
 
+} // namespace blkalloc
 } // namespace homestore

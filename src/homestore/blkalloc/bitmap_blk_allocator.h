@@ -29,6 +29,7 @@
 #include "segment_manager.h"
 
 namespace homestore {
+namespace blkalloc {
 
 ///
 /// BitmapBlkAllocator — Holds a sisl::Bitset over num_blks bits and uses a non-owning SegmentManager& for the
@@ -138,4 +139,5 @@ void BitmapBlkAllocator::scan_free_blks(InmemPortion& portion, F&& consumer) {
     portion.sweep_cursor_ = cursor;
 }
 
+} // namespace blkalloc
 } // namespace homestore

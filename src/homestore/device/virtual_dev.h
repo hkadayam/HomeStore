@@ -42,7 +42,7 @@ namespace homestore {
 #define VDEV_LOG(level, vdev, msg, ...) HS_SUBMOD_LOG(level, device, , "vdev", vdev, msg, ##__VA_ARGS__)
 
 class PhysicalDev;
-class BlkAllocator;
+namespace blkalloc { class BlkAllocator; }
 
 VENUM(MultiPDevOpts, uint8_t, AllPDevStriped = 0, AllPDevMirrored = 1, SingleFirstPDev = 2, SingleRandomPDev = 3);
 VENUM(BlkAllocatorType, uint8_t, None = 0, SlabCompact = 1, SlabExtend = 2, Append = 3);

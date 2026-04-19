@@ -44,6 +44,7 @@
 #include "blkalloc/slab_blk_allocator.h"
 
 using namespace homestore;
+using namespace homestore::blkalloc;
 
 static thread_local std::random_device g_rd{};
 static thread_local std::default_random_engine g_re{g_rd()};
@@ -65,6 +66,7 @@ struct BlkMapT {
         std::lock_guard< std::mutex > lk{*mtx_};
         return map_.erase(k);
     }
+
 private:
     std::unordered_map< blk_num_t, blk_count_t > map_;
     std::unique_ptr< std::mutex > mtx_;
@@ -74,8 +76,7 @@ using BlkListAccessorT = BlkListT::Accessor;
 using size_generator_t = std::function< blk_count_t(void) >;
 
 struct AllocedBlkTracker {
-    AllocedBlkTracker(const uint64_t quota) :
-            m_alloced_blk_list{BlkListT::create(8)}, m_max_quota{quota} {}
+    AllocedBlkTracker(const uint64_t quota) : m_alloced_blk_list{BlkListT::create(8)}, m_max_quota{quota} {}
 
     void adjust_limits(const uint8_t hi_limit_pct) {
         m_lo_limit = m_alloced_blk_list.size();
@@ -109,10 +110,7 @@ struct BlkAllocatorTest {
     bool m_track_slabs{false};
     size_t m_num_slabs{0};
 
-    BlkAllocatorTest() :
-            m_rand_blk_generator{1, m_total_count} {
-        m_slab_alloced_blks.emplace_back(m_total_count);
-    }
+    BlkAllocatorTest() : m_rand_blk_generator{1, m_total_count} { m_slab_alloced_blks.emplace_back(m_total_count); }
     BlkAllocatorTest(const BlkAllocatorTest&) = delete;
     BlkAllocatorTest(BlkAllocatorTest&&) noexcept = delete;
     BlkAllocatorTest& operator=(const BlkAllocatorTest&) = delete;
@@ -130,8 +128,7 @@ struct BlkAllocatorTest {
         for (size_t slab_index{0}; slab_index < slab_distribution.size(); ++slab_index) {
             cum_pct += slab_distribution[slab_index];
             const blk_count_t slab_size{to_u16(to_u16(1) << slab_index)};
-            const blk_num_t slab_count{
-                to_u32((m_total_count / slab_size) * (slab_distribution[slab_index] / 100.0))};
+            const blk_num_t slab_count{to_u32((m_total_count / slab_size) * (slab_distribution[slab_index] / 100.0))};
             if (slab_index == 0) {
                 m_slab_alloced_blks[0].m_max_quota = slab_count;
             } else {
@@ -140,7 +137,9 @@ struct BlkAllocatorTest {
             cum += slab_count * slab_size;
         }
         assert(cum_pct < 100.0 * (1.0 + std::numeric_limits< double >::epsilon()));
-        if (cum < m_total_count) { m_slab_alloced_blks[0].m_max_quota += m_total_count - cum; }
+        if (cum < m_total_count) {
+            m_slab_alloced_blks[0].m_max_quota += m_total_count - cum;
+        }
     }
 
     [[nodiscard]] BlkListAccessorT& blk_list(const slab_idx_t idx) {
@@ -226,7 +225,9 @@ struct BlkAllocatorTest {
         }
 
         for (auto& t : threads) {
-            if (t.joinable()) { t.join(); }
+            if (t.joinable()) {
+                t.join();
+            }
         }
         ASSERT_EQ(terminate_flag, false);
     }
@@ -279,8 +280,12 @@ struct BlkAllocatorTest {
                     }
                 } while (blk_list(idx).size() > 0);
             } else {
-                if (++idx == m_num_slabs) { idx = 0; }
-                if (idx == start_idx) { break; }
+                if (++idx == m_num_slabs) {
+                    idx = 0;
+                }
+                if (idx == start_idx) {
+                    break;
+                }
             }
         } while (n_blks == 0);
         HS_REL_ASSERT_GE(n_blks, 1);
@@ -378,7 +383,7 @@ struct SlabBlkAllocatorTest : public ::testing::Test, BlkAllocatorTest {
         // Bump retry count for CompactAlloc: the test hammers many threads on a small block space, which
         // amplifies the transient slab-empty window from concurrent break_up. Production default of 2 is
         // fine for real workloads.
-        HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.blkallocator.max_varsize_blk_alloc_attempt = 8; });
+        HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.blkallocator.max_slab_alloc_attempt = 8; });
         HS_SETTINGS_FACTORY().save();
     }
     SlabBlkAllocatorTest(const SlabBlkAllocatorTest&) = delete;
@@ -400,7 +405,9 @@ struct SlabBlkAllocatorTest : public ::testing::Test, BlkAllocatorTest {
 
     // Create allocator in ExpandedAlloc mode (slab cache + bitmap fallback + sweep thread).
     void create_expanded_allocator(const bool use_slabs = true, uint64_t size = 0) {
-        if (size == 0) { size = to_u64(m_total_count); }
+        if (size == 0) {
+            size = to_u64(m_total_count);
+        }
         SlabBlkAllocConfig cfg{4096, 4096, 4096, size * 4096, false, "test_expanded"};
         cfg.alloc_mode = AllocMode::ExpandedAlloc;
         cfg.use_slab_cache_ = use_slabs;
@@ -417,7 +424,9 @@ struct SlabBlkAllocatorTest : public ::testing::Test, BlkAllocatorTest {
             return false;
         }
         if (ret == BlkAllocStatus::SUCCESS) {
-            if (!alloced(bid, track_block_group)) { return false; }
+            if (!alloced(bid, track_block_group)) {
+                return false;
+            }
         }
         return true;
     }
@@ -452,7 +461,9 @@ struct SlabBlkAllocatorTest : public ::testing::Test, BlkAllocatorTest {
 
             blk_count_t sz{0};
             for (auto& bid : bids) {
-                if (!alloced(bid, track_block_group)) { return false; }
+                if (!alloced(bid, track_block_group)) {
+                    return false;
+                }
                 sz += bid.blk_count();
             }
             if (sz != reqd_size) {
@@ -571,7 +582,9 @@ TEST_F(SlabBlkAllocatorTest, compact_alloc_free) {
     run_parallel(nthreads, count / 2, [&](const uint64_t count_per_thread, std::atomic< bool >& terminate_flag) {
         for (uint64_t i{0}; (i < count_per_thread) && !terminate_flag; ++i) {
             BlkId bid;
-            if (!alloc_contiguous_blk(BlkAllocStatus::SUCCESS, bid, false)) { terminate_flag = true; }
+            if (!alloc_contiguous_blk(BlkAllocStatus::SUCCESS, bid, false)) {
+                terminate_flag = true;
+            }
         }
     });
     validate_count();
@@ -588,7 +601,9 @@ TEST_F(SlabBlkAllocatorTest, compact_alloc_free) {
     run_parallel(nthreads, count * 3 / 4, [&](const uint64_t count_per_thread, std::atomic< bool >& terminate_flag) {
         for (uint64_t i{0}; (i < count_per_thread) && !terminate_flag; ++i) {
             BlkId bid;
-            if (!alloc_contiguous_blk(BlkAllocStatus::SUCCESS, bid, false)) { terminate_flag = true; }
+            if (!alloc_contiguous_blk(BlkAllocStatus::SUCCESS, bid, false)) {
+                terminate_flag = true;
+            }
         }
     });
     validate_count();
@@ -611,8 +626,7 @@ void alloc_free_contiguous_unirandsize(SlabBlkAllocatorTest* const test, uint64_
     const uint8_t prealloc_pct{5};
     LOGINFO("Step 1: Pre allocate {}% of total blks which is {} blks in {} threads", prealloc_pct,
             capacity * prealloc_pct / 100, nthreads);
-    [[maybe_unused]] const auto preload_alloced{
-        test->preload(capacity * prealloc_pct / 100, true, rand_func, true)};
+    [[maybe_unused]] const auto preload_alloced{test->preload(capacity * prealloc_pct / 100, true, rand_func, true)};
 
     auto num_iters{SISL_OPTIONS["iters"].as< uint64_t >()};
     const uint64_t divisor{1024};
@@ -690,8 +704,7 @@ TEST_F(SlabBlkAllocatorTest, expanded_contiguous_slabrandsize) {
     const uint64_t preload_amount{to_u64(m_total_count) * prealloc_pct / 100};
     LOGINFO("Step 1: Pre allocate {}% of total blks which is {} blks in {} threads", prealloc_pct, preload_amount,
             nthreads);
-    [[maybe_unused]] const auto preload_alloced{
-        preload(preload_amount, true, BlkAllocatorTest::round_rand_size, true)};
+    [[maybe_unused]] const auto preload_alloced{preload(preload_amount, true, BlkAllocatorTest::round_rand_size, true)};
 
     auto num_iters{SISL_OPTIONS["iters"].as< uint64_t >()};
     const uint64_t divisor{1};
@@ -768,8 +781,8 @@ void alloc_free_scatter_unirandsize(SlabBlkAllocatorTest* const test) {
     const uint8_t runtime_pct{75};
     LOGINFO("Step 2: Do alloc/free scatter blks with completely random size ratio_range=[{}-{}] threads={} iters={}",
             prealloc_pct, runtime_pct, nthreads, num_iters);
-    const auto result{test->do_alloc_free(num_iters, false, BlkAllocatorTest::uniform_rand_size, runtime_pct, false,
-                                          true)};
+    const auto result{
+        test->do_alloc_free(num_iters, false, BlkAllocatorTest::uniform_rand_size, runtime_pct, false, true)};
     const uint64_t calculated_remaining{remaining_after_preload + result.second - result.first};
     const uint64_t remaining{test->m_allocator->available_blks()};
     LOGINFO("Step 3: Reallocate to alloc all remaining count {} calculated remaining {}", remaining,

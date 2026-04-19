@@ -35,7 +35,7 @@ namespace homestore {
 
 // ── Forward declarations ──────────────────────────────────────────────────────
 class PhysicalDev;
-class BlkAllocator; // TODO: forward-declared until blkalloc is ported to new_device/
+namespace blkalloc { class BlkAllocator; }
 
 // ── Interval types ────────────────────────────────────────────────────────────
 using ChunkIntervalSet = boost::icl::split_interval_set< uint64_t >;
@@ -80,10 +80,10 @@ public:
     const uint8_t* user_private() const { return chunk_info_.user_private; }
 
     // ── Block allocator ───────────────────────────────────────────────────────
-    void set_block_allocator(shared< BlkAllocator > alloc) { blk_allocator_ = std::move(alloc); }
+    void set_block_allocator(shared< blkalloc::BlkAllocator > alloc) { blk_allocator_ = std::move(alloc); }
     bool has_blk_allocator() const { return blk_allocator_ != nullptr; }
-    const BlkAllocator* blk_allocator() const { return blk_allocator_.get(); }
-    BlkAllocator* blk_allocator_mutable() { return blk_allocator_.get(); }
+    const blkalloc::BlkAllocator* blk_allocator() const { return blk_allocator_.get(); }
+    blkalloc::BlkAllocator* blk_allocator_mutable() { return blk_allocator_.get(); }
 
     // ── String / debug ────────────────────────────────────────────────────────
     std::string to_string() const;
@@ -92,7 +92,7 @@ private:
     ChunkInfo chunk_info_;
     const uint32_t chunk_slot_;
     shared< PhysicalDev > pdev_;
-    shared< BlkAllocator > blk_allocator_;
+    shared< blkalloc::BlkAllocator > blk_allocator_;
 };
 
 // ── ChunkPool ─────────────────────────────────────────────────────────────────

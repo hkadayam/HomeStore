@@ -23,9 +23,10 @@
 #include "slab_blk_allocator.h"
 
 namespace homestore {
+namespace blkalloc {
 
 SlabBlkAllocator::SlabBlkAllocator(SlabBlkAllocConfig const& cfg, std::optional< sisl::ByteArray > buf,
-                                         chunk_num_t chunk_id) :
+                                   chunk_num_t chunk_id) :
         BlkAllocator{cfg, chunk_id},
         cfg_{cfg},
         seg_mgr_{cfg_.capacity_, cfg_.num_segments_, cfg_.blks_per_portion_,
@@ -83,7 +84,9 @@ SlabBlkAllocator::~SlabBlkAllocator() {
 // ---- CompactAlloc load ----
 
 void SlabBlkAllocator::load() {
-    if (cfg_.alloc_mode != AllocMode::CompactAlloc) { return; }
+    if (cfg_.alloc_mode != AllocMode::CompactAlloc) {
+        return;
+    }
     BLKALLOC_LOG(INFO, "load: populating slab caches for CompactAlloc, persistent={}", cfg_.persistent_);
 
     if (cfg_.persistent_) {
@@ -93,12 +96,11 @@ void SlabBlkAllocator::load() {
         for (auto& seg : seg_mgr_.segments()) {
             for (auto& p_ptr : seg.portions_) {
                 InmemPortion& portion = *p_ptr;
-                ondisk_bm_->scan_free_blks(
-                    portion, [&portion](BlkId const& bid) -> std::pair< bool, blk_count_t > {
-                        portion.slab_cache_.try_free(bid);
-                        // Always set num_consumed to be 0, because ondisk_bm should never set bits directly.
-                        return {true, /*num_consumed=*/0};
-                    });
+                ondisk_bm_->scan_free_blks(portion, [&portion](BlkId const& bid) -> std::pair< bool, blk_count_t > {
+                    portion.slab_cache_.try_free(bid);
+                    // Always set num_consumed to be 0, because ondisk_bm should never set bits directly.
+                    return {true, /*num_consumed=*/0};
+                });
             }
         }
     } else {
@@ -123,9 +125,8 @@ void SlabBlkAllocator::sweep_worker() {
     while (true) {
         {
             std::unique_lock< std::mutex > lk{sweep_mutex_};
-            sweep_cv_.wait_for(
-                lk, std::chrono::milliseconds(HS_DYNAMIC_CONFIG(blkallocator.free_blk_cache_refill_frequency_ms)),
-                [this]() { return sweep_requested_ || sweep_stop_; });
+            sweep_cv_.wait_for(lk, std::chrono::milliseconds(HS_DYNAMIC_CONFIG(blkallocator.slab_refill_frequency_ms)),
+                               [this]() { return sweep_requested_ || sweep_stop_; });
             if (sweep_stop_)
                 break;
             sweep_requested_ = false;
@@ -159,12 +160,11 @@ void SlabBlkAllocator::sweep_worker() {
 // Refill the slab cache for one portion from inmem_bm_. Consumed blocks are marked (num_consumed > 0)
 // so the bitmap tracks them as in-cache and they won't be double-allocated.
 void SlabBlkAllocator::fill_cache_for_portion(InmemPortion& portion) {
-    inmem_bm_->scan_free_blks(
-        portion, [&portion](BlkId const& bid) -> std::pair< bool, blk_count_t > {
-            auto [status, remaining] = portion.slab_cache_.try_free(bid);
-            const blk_count_t consumed = bid.blk_count() - remaining.blk_count();
-            return {consumed > 0, consumed};
-        });
+    inmem_bm_->scan_free_blks(portion, [&portion](BlkId const& bid) -> std::pair< bool, blk_count_t > {
+        auto [status, remaining] = portion.slab_cache_.try_free(bid);
+        const blk_count_t consumed = bid.blk_count() - remaining.blk_count();
+        return {consumed > 0, consumed};
+    });
 }
 
 void SlabBlkAllocator::request_sweep(blk_count_t wait_for_blks) {
@@ -210,9 +210,8 @@ BlkAllocStatus SlabBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const&
     const bool slab_can_satisfy = !hints.is_contiguous || nblks <= max_slab_blks;
 
     if (slab_can_satisfy && (cfg_.alloc_mode == AllocMode::CompactAlloc || cfg_.use_slab_cache_)) {
-        const auto max_attempts = (cfg_.alloc_mode == AllocMode::CompactAlloc)
-            ? HS_DYNAMIC_CONFIG(blkallocator.max_varsize_blk_alloc_attempt)
-            : 1u;
+        const auto max_attempts =
+            (cfg_.alloc_mode == AllocMode::CompactAlloc) ? HS_DYNAMIC_CONFIG(blkallocator.max_slab_alloc_attempt) : 1u;
 
         // Excess collects blocks that couldn't be pushed back to slab during break-up / merge-down.
         // For ExpandedAlloc these are freed back to the bitmap below.
@@ -242,7 +241,9 @@ BlkAllocStatus SlabBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const&
                     if (inmem_bm_ && !excess.empty()) {
                         BLKALLOC_LOG(DEBUG, "alloc nblks={}: returning {} excess blkids to bitmap", nblks,
                                      excess.size());
-                        for (auto const& ebid : excess) { inmem_bm_->free(ebid); }
+                        for (auto const& ebid : excess) {
+                            inmem_bm_->free(ebid);
+                        }
                     }
                     alloced_blk_count_.fetch_add(nblks, std::memory_order_relaxed);
                     BLKALLOC_LOG(DEBUG, "alloc nblks={}: SUCCESS from slab portion=[{},{}), used_blks={}", nblks,
@@ -253,7 +254,9 @@ BlkAllocStatus SlabBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const&
                 // PARTIAL from merge_down: keep the blocks we got and reduce the ask for the next portion.
                 if (status == BlkAllocStatus::PARTIAL) {
                     blk_count_t got_this_round{0};
-                    for (auto const& bid : out_blkids) { got_this_round += bid.blk_count(); }
+                    for (auto const& bid : out_blkids) {
+                        got_this_round += bid.blk_count();
+                    }
                     slab_got = got_this_round;
                     BLKALLOC_LOG(DEBUG, "alloc nblks={}: PARTIAL from slab, got {} so far", nblks, slab_got);
                 }
@@ -264,7 +267,9 @@ BlkAllocStatus SlabBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const&
         if (inmem_bm_ && !excess.empty()) {
             BLKALLOC_LOG(DEBUG, "alloc nblks={}: slab miss, returning {} excess blkids to bitmap", nblks,
                          excess.size());
-            for (auto const& ebid : excess) { inmem_bm_->free(ebid); }
+            for (auto const& ebid : excess) {
+                inmem_bm_->free(ebid);
+            }
         }
 
         if (cfg_.alloc_mode == AllocMode::CompactAlloc) {
@@ -294,7 +299,9 @@ BlkAllocStatus SlabBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const&
         if (status == BlkAllocStatus::PARTIAL) {
             // Got some from bitmap but not all — count total across slab + bitmap results.
             blk_count_t total_got{0};
-            for (auto const& bid : out_blkids) { total_got += bid.blk_count(); }
+            for (auto const& bid : out_blkids) {
+                total_got += bid.blk_count();
+            }
             alloced_blk_count_.fetch_add(total_got, std::memory_order_relaxed);
             return BlkAllocStatus::PARTIAL;
         }
@@ -384,7 +391,9 @@ void SlabBlkAllocator::recovery_completed() {
 // ---- query ----
 
 bool SlabBlkAllocator::is_blk_alloced(BlkId const& b, bool use_lock) const {
-    if (inmem_bm_) { return inmem_bm_->is_blk_alloced(b, use_lock); }
+    if (inmem_bm_) {
+        return inmem_bm_->is_blk_alloced(b, use_lock);
+    }
     return ondisk_bm_ ? ondisk_bm_->is_blk_alloced(b, use_lock) : true;
 }
 
@@ -407,12 +416,13 @@ blk_num_t SlabBlkAllocator::get_used_blks() const {
 }
 
 std::string SlabBlkAllocator::to_string() const {
-    return fmt::format("SlabBlkAllocator name={} total_blks={} used={} available={}", name_, num_blks_,
-                       get_used_blks(), available_blks());
+    return fmt::format("SlabBlkAllocator name={} total_blks={} used={} available={}", name_, num_blks_, get_used_blks(),
+                       available_blks());
 }
 
 nlohmann::json SlabBlkAllocator::get_status(int) const {
     return nlohmann::json{};
 }
 
+} // namespace blkalloc
 } // namespace homestore

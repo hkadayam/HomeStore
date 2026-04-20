@@ -20,7 +20,7 @@
 #include <folly/experimental/io/IoUringBackend.h>
 #endif
 
-namespace homestore {
+namespace iomanager {
 
 #define DRIVE_LOG(level, dev, msg, ...) LOGTRACEMOD(iomgr, "[dev={}] " msg, (dev).dev_name, ##__VA_ARGS__)
 
@@ -71,7 +71,7 @@ void drive_interface_init_reactor(folly::EventBase* eb) {
     t_dr = t_dr_owner.get();
     LOGDEBUGMOD(iomgr, "DriveReactor init: eb={} uring={}", fmt::ptr(eb), fmt::ptr(t_dr->uring));
 
-    eb->runOnDestruction([](){
+    eb->runOnDestruction([]() {
         LOGDEBUGMOD(iomgr, "DriveReactor cleanup: clearing t_dr");
         t_dr = nullptr;
         t_dr_owner.reset();
@@ -88,7 +88,7 @@ folly::coro::Task< std::shared_ptr< IoDevice > > DriveInterface::open_dev(std::s
     int fd = ::open(devname.c_str(), oflags, 0666);
     if (fd < 0)
         throw std::system_error(errno, std::generic_category(), "open: " + devname);
-    struct stat st{};
+    struct stat st {};
     ::fstat(fd, &st);
     co_return std::make_shared< IoDevice >(fd, std::move(devname), S_ISBLK(st.st_mode));
 }
@@ -100,7 +100,7 @@ folly::coro::Task< uint64_t > DriveInterface::get_size(const IoDevice& dev) {
             throw std::system_error(errno, std::generic_category(), "BLKGETSIZE64");
         co_return sz;
     }
-    struct stat st{};
+    struct stat st {};
     ::fstat(dev.fd, &st);
     co_return to_u64(st.st_size);
 }
@@ -171,8 +171,8 @@ folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev,
     co_return co_await do_writev(dev, std::move(iovs), offset);
 }
 
-folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev, const std::vector< sisl::ByteArray >& bufs,
-                                                            uint64_t offset) {
+folly::coro::Task< std::error_code >
+DriveInterface::writev(const IoDevice& dev, const std::vector< sisl::ByteArray >& bufs, uint64_t offset) {
     std::vector< struct iovec > iovs;
     iovs.reserve(bufs.size());
     for (auto& b : bufs)
@@ -225,13 +225,13 @@ folly::coro::Task< std::shared_ptr< IoDevice > > DriveInterface::open_dev(std::s
     int fd = ::open(devname.c_str(), oflags, 0666);
     if (fd < 0)
         throw std::system_error(errno, std::generic_category(), "open: " + devname);
-    struct stat st{};
+    struct stat st {};
     ::fstat(fd, &st);
     co_return std::make_shared< IoDevice >(fd, std::move(devname), false);
 }
 
 folly::coro::Task< uint64_t > DriveInterface::get_size(const IoDevice& dev) {
-    struct stat st{};
+    struct stat st {};
     ::fstat(dev.fd, &st);
     co_return static_cast< uint64_t >(st.st_size);
 }
@@ -260,16 +260,15 @@ folly::coro::Task< std::error_code > DriveInterface::readv(const IoDevice& dev, 
                                                            uint64_t offset) {
     int fd = dev.fd;
     auto* bufs_ptr = &bufs;
-    co_return co_await folly::coro::co_invoke(
-        [fd, bufs_ptr, offset]() mutable -> folly::coro::Task< std::error_code > {
-            for (auto& b : *bufs_ptr) {
-                ssize_t n = ::pread(fd, b.bytes(), b.size(), (off_t)offset);
-                if (n < 0) co_return std::error_code(errno, std::generic_category());
-                offset += b.size();
-            }
-            co_return std::error_code{};
-        })
-        .scheduleOn(folly::getGlobalCPUExecutor().get());
+    co_return co_await folly::coro::co_invoke([fd, bufs_ptr, offset]() mutable -> folly::coro::Task< std::error_code > {
+        for (auto& b : *bufs_ptr) {
+            ssize_t n = ::pread(fd, b.bytes(), b.size(), (off_t)offset);
+            if (n < 0)
+                co_return std::error_code(errno, std::generic_category());
+            offset += b.size();
+        }
+        co_return std::error_code{};
+    }).scheduleOn(folly::getGlobalCPUExecutor().get());
 }
 
 folly::coro::Task< std::error_code > DriveInterface::do_writev(const IoDevice& dev, std::vector< struct iovec >&& iovs,
@@ -296,8 +295,8 @@ folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev,
     co_return co_await do_writev(dev, std::move(iovs), offset);
 }
 
-folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev, const std::vector< sisl::ByteArray >& bufs,
-                                                            uint64_t offset) {
+folly::coro::Task< std::error_code >
+DriveInterface::writev(const IoDevice& dev, const std::vector< sisl::ByteArray >& bufs, uint64_t offset) {
     std::vector< struct iovec > iovs;
     iovs.reserve(bufs.size());
     for (auto& b : bufs)
@@ -338,4 +337,4 @@ folly::coro::Task< std::error_code > DriveInterface::write_zero(const IoDevice& 
 
 #endif // __linux__
 
-} // namespace homestore
+} // namespace iomanager

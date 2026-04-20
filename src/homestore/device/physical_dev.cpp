@@ -28,6 +28,9 @@
 
 namespace homestore {
 
+using namespace iomanager;
+using sisl::IOBuffer;
+
 // ── Global device cache ───────────────────────────────────────────────────────
 // We use a plain std::mutex here because open/close are rare, cold-path operations that don't need to yield.
 namespace {

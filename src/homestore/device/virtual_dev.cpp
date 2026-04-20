@@ -28,6 +28,8 @@
 #include "device/virtual_dev.h"
 
 namespace homestore {
+using namespace iomanager;
+using sisl::IOBuffer;
 using namespace blkalloc;
 
 // ──────────────────────────────────────────────────────────────────────────────

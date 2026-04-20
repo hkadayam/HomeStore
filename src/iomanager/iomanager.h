@@ -18,7 +18,7 @@
 #include <folly/coro/Sleep.h>
 #include <folly/coro/Invoke.h>
 
-namespace homestore {
+namespace iomanager {
 
 // Extracts T from folly::coro::Task<T>
 template < typename Task >
@@ -189,37 +189,62 @@ auto IOManager::spawn_waitable_all(Fn&& fn)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Global singleton
+// Lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
 
 void init_iomgr(size_t num_reactors);
 void stop_iomgr();
-IOManager& iomgr();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Convenience free functions
 // ─────────────────────────────────────────────────────────────────────────────
 
 template < typename F >
+void spawn_detached(ReactorTarget target, F factory);
+
+template < typename T >
+folly::coro::Task< T > spawn_waitable(ReactorTarget target, folly::coro::Task< T > task);
+
+template < typename T >
+T spawn_and_block(ReactorTarget target, folly::coro::Task< T > task);
+
+template < typename Fn >
+auto spawn_waitable_all(Fn&& fn)
+    -> folly::coro::Task< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
+                                              std::vector< task_value_t< Fn, size_t > > > >;
+
+} // namespace iomanager
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Singleton accessor — declared at global scope so callers can write `iomgr()`
+// without any qualification. Defined in iomanager.cpp; delegates to the
+// internal pointer owned inside namespace iomanager.
+// ─────────────────────────────────────────────────────────────────────────────
+
+iomanager::IOManager& iomgr();
+
+namespace iomanager {
+
+template < typename F >
 void spawn_detached(ReactorTarget target, F factory) {
-    iomgr().spawn_detached(target, std::move(factory));
+    ::iomgr().spawn_detached(target, std::move(factory));
 }
 
 template < typename T >
 folly::coro::Task< T > spawn_waitable(ReactorTarget target, folly::coro::Task< T > task) {
-    return iomgr().spawn_waitable(target, std::move(task));
+    return ::iomgr().spawn_waitable(target, std::move(task));
 }
 
 template < typename T >
 T spawn_and_block(ReactorTarget target, folly::coro::Task< T > task) {
-    return iomgr().spawn_and_block(target, std::move(task));
+    return ::iomgr().spawn_and_block(target, std::move(task));
 }
 
 template < typename Fn >
 auto spawn_waitable_all(Fn&& fn)
     -> folly::coro::Task< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
                                               std::vector< task_value_t< Fn, size_t > > > > {
-    return iomgr().spawn_waitable_all(std::forward< Fn >(fn));
+    return ::iomgr().spawn_waitable_all(std::forward< Fn >(fn));
 }
 
-} // namespace homestore
+} // namespace iomanager

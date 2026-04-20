@@ -11,20 +11,14 @@
 #include <folly/io/async/EventBase.h>
 #include <sisl/fds/buffer.h>
 
-namespace homestore {
+namespace iomanager {
+
+using sisl::IOBuffer;
 
 // Called once per reactor thread by IOManager::start(), before the loop runs.
 // Sets up the per-reactor IoUringBackend handle and registers the loopPoll
 // callback that drains CQEs at the start of every EventBase iteration.
 void drive_interface_init_reactor(folly::EventBase* eb);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// IOBuffer — aligned heap buffer, safe for O_DIRECT (512-byte default alignment).
-// Move-only; non-copyable.  Alias for sisl::IoBlobSafe — callers can wrap in
-// ByteArray (shared<IoBlobSafe>) for shared ownership at the persistence layer.
-// ─────────────────────────────────────────────────────────────────────────────
-
-using IOBuffer = sisl::IoBlobSafe;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IoDevice — an open file or block-device file descriptor.
@@ -106,4 +100,4 @@ private:
                                                     uint64_t offset);
 };
 
-} // namespace homestore
+} // namespace iomanager

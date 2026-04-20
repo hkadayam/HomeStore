@@ -25,12 +25,16 @@
 #include "sisl/fds/buffer.h"
 #include "sisl/logging/logging.h"
 
+#include "blkalloc/sweep_service.h"
 #include "device/device_manager.h"
 #include "device/physical_dev.h"
 #include "device/virtual_dev.h"
 #include "managers.h"
 
 namespace homestore {
+
+using namespace iomanager;
+using sisl::IOBuffer;
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
@@ -58,6 +62,9 @@ DeviceManager::DeviceManager(std::vector< DevInfo >&& devs, IOFlag data_open_fla
 
 shared< DeviceManager > DeviceManager::create(std::vector< DevInfo >&& devs, IOFlag data_open_flags,
                                               IOFlag fast_open_flags) {
+    // Bring up the module-scoped sweep service before any chunk/allocator can be constructed.
+    // Idempotent — safe to call across multiple DeviceManager lifetimes within the same process.
+    blkalloc::init_sweep_service();
     auto mgr = shared< DeviceManager >(new DeviceManager(std::move(devs), data_open_flags, fast_open_flags));
     Managers::init_device_mgr(mgr);
     return mgr;

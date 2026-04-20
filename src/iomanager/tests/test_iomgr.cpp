@@ -10,7 +10,7 @@
 #include <sisl/options/options.h>
 #include <iomanager/iomanager.h>
 
-using namespace homestore;
+using namespace iomanager;
 using namespace std::chrono_literals;
 
 SISL_OPTION_GROUP(test_iomgr,

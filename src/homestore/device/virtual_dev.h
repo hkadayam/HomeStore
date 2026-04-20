@@ -32,7 +32,6 @@
 
 #include "homestore/blk.h" // BlkId, BlkIds, BlkAllocStatus, blk_alloc_hints, blk_count_t
 
-#include "iomanager/drive_interface.hpp" // IOBuffer
 #include "device/hs_super_blk.h"         // VDevInfo, ChunkInfo, HSSuperBlk
 #include "device/chunk.h"                // Chunk, ChunkPool
 #include "device/chunk_selector.h"       // IChunkSelector, ChunkSelectorType, concrete selectors
@@ -149,11 +148,11 @@ public:
     // ──────────────────────────────────────────────────────────────────────────────
     // Public APIs: I/Os
     // ──────────────────────────────────────────────────────────────────────────────
-    folly::coro::Task< void > write(const IOBuffer& buf, const BlkId& bid);
-    folly::coro::Task< void > writev(const std::vector< IOBuffer >& bufs, const BlkId& bid);
+    folly::coro::Task< void > write(const sisl::IOBuffer& buf, const BlkId& bid);
+    folly::coro::Task< void > writev(const std::vector< sisl::IOBuffer >& bufs, const BlkId& bid);
     folly::coro::Task< void > writev(const std::vector< sisl::ByteArray >& bufs, const BlkId& bid);
-    folly::coro::Task< std::error_code > read(IOBuffer& buf, const BlkId& bid);
-    folly::coro::Task< std::error_code > readv(std::vector< IOBuffer >& bufs, const BlkId& bid);
+    folly::coro::Task< std::error_code > read(sisl::IOBuffer& buf, const BlkId& bid);
+    folly::coro::Task< std::error_code > readv(std::vector< sisl::IOBuffer >& bufs, const BlkId& bid);
     folly::coro::Task< void > format();
     folly::coro::Task< void > fsync();
 

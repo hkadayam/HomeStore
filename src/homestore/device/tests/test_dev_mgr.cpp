@@ -31,6 +31,8 @@
 #include "device/virtual_dev.h"
 
 using namespace homestore;
+using namespace iomanager;
+using sisl::IOBuffer;
 
 static constexpr uint64_t DEV_SIZE = 128 * 1024 * 1024; // 128 MB
 static constexpr uint32_t BLK_SIZE = 4096;
@@ -347,8 +349,8 @@ int main(int argc, char* argv[]) {
     sisl::logging::SetLogger("test_dev_mgr");
     HomeStoreDynamicConfig::init_settings_default();
     ::testing::InitGoogleTest(&argc, argv);
-    init_iomgr(2);
+    iomanager::init_iomgr(2);
     int rc = RUN_ALL_TESTS();
-    stop_iomgr();
+    iomanager::stop_iomgr();
     return rc;
 }

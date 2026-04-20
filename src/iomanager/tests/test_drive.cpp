@@ -18,7 +18,7 @@
 #include <iomanager/iomanager.h>
 #include <iomanager/drive_interface.hpp>
 
-using namespace homestore;
+using namespace iomanager;
 using namespace std::chrono_literals;
 
 SISL_OPTION_GROUP(test_drive,

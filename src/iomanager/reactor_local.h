@@ -13,7 +13,7 @@
 
 #include "iomanager.h"
 
-namespace homestore {
+namespace iomanager {
 
 template < typename T >
 class ReactorLocal {
@@ -75,4 +75,4 @@ private:
     std::vector< std::unique_ptr< Slot > > slots_;
 };
 
-} // namespace homestore
+} // namespace iomanager

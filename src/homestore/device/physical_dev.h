@@ -30,7 +30,7 @@
 
 #include "device/device_decl.h"          // HSDevType, IOFlag, DevInfo
 #include "device/hs_super_blk.h"         // PDevInfoHeader, FirstBlock, HSSuperBlk
-#include "iomanager/drive_interface.hpp" // DriveInterface, IoDevice, IOBuffer
+#include "iomanager/drive_interface.hpp" // iomanager::DriveInterface, iomanager::IoDevice
 #include "device/chunk.h"                // ChunkInfo, ChunkInterval, ChunkIntervalSet, Chunk
 
 namespace homestore {
@@ -38,7 +38,7 @@ namespace homestore {
 // ── Global device cache ───────────────────────────────────────────────────────
 // The cache avoids reopening the same device when both a format pass and a load
 // pass reference the same underlying file/block device.
-folly::coro::Task< shared< IoDevice > > open_and_cache_dev(const std::string& devname, int oflags);
+folly::coro::Task< shared< iomanager::IoDevice > > open_and_cache_dev(const std::string& devname, int oflags);
 folly::coro::Task< void > close_and_uncache_dev(const std::string& devname);
 
 // ── ChunkProvisioner ──────────────────────────────────────────────────────────
@@ -93,10 +93,10 @@ public:
     // ── Super block ───────────────────────────────────────────────────────────
 
     /// Write buf to offset (and optionally mirrored to the footer).
-    folly::coro::Task< void > write_super_block(const IOBuffer& buf, uint64_t offset);
+    folly::coro::Task< void > write_super_block(const sisl::IOBuffer& buf, uint64_t offset);
 
     /// Read into buf. Caller retains ownership; returns error_code.
-    folly::coro::Task< std::error_code > read_super_block(IOBuffer& buf, uint64_t offset);
+    folly::coro::Task< std::error_code > read_super_block(sisl::IOBuffer& buf, uint64_t offset);
 
     /// Mark formatting as complete: reads FirstBlock back, sets formatting_done=1, recomputes checksum, writes back.
     folly::coro::Task< void > commit_formatting();
@@ -106,13 +106,13 @@ public:
     // ── Data IO ───────────────────────────────────────────────────────────────
     // All async IO methods
 
-    folly::coro::Task< void > write(const IOBuffer& buf, uint64_t offset);
-    folly::coro::Task< void > writev(const std::vector< IOBuffer >& bufs, uint64_t offset);
+    folly::coro::Task< void > write(const sisl::IOBuffer& buf, uint64_t offset);
+    folly::coro::Task< void > writev(const std::vector< sisl::IOBuffer >& bufs, uint64_t offset);
     folly::coro::Task< void > writev(const std::vector< sisl::ByteArray >& bufs, uint64_t offset);
 
-    folly::coro::Task< std::error_code > read(IOBuffer& buf, uint64_t offset);
+    folly::coro::Task< std::error_code > read(sisl::IOBuffer& buf, uint64_t offset);
 
-    folly::coro::Task< std::error_code > readv(std::vector< IOBuffer >& bufs, uint64_t offset);
+    folly::coro::Task< std::error_code > readv(std::vector< sisl::IOBuffer >& bufs, uint64_t offset);
 
     folly::coro::Task< void > write_zero(uint64_t size, uint64_t offset);
     folly::coro::Task< void > fsync();
@@ -202,8 +202,8 @@ private:
 
 private:
     // ── Fields ────────────────────────────────────────────────────────────────
-    shared< IoDevice > iodev_;
-    shared< DriveInterface > drive_iface_;
+    shared< iomanager::IoDevice > iodev_;
+    shared< iomanager::DriveInterface > drive_iface_;
     std::string devname_;
     HSDevType dev_type_{HSDevType::Data};
     DevInfo dev_info_{"", HSDevType::Data};

@@ -8,19 +8,20 @@
 #include <folly/coro/Sleep.h>
 #include <folly/init/Init.h>
 #include <folly/io/async/EventBaseManager.h>
-#include <sisl/logging/logging.h>
 
 #ifdef __linux__
 #include <folly/experimental/io/IoUringBackend.h>
 #endif
 
-namespace homestore {
+#include "sisl/logging/logging.h"
+
+namespace iomanager {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Thread-local reactor id — SIZE_MAX means "not a reactor thread"
 // ─────────────────────────────────────────────────────────────────────────────
 
-thread_local size_t IOManager::t_reactor_id_ = std::numeric_limits<size_t>::max();
+thread_local size_t IOManager::t_reactor_id_ = std::numeric_limits< size_t >::max();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Lifecycle
@@ -37,29 +38,26 @@ void IOManager::start(size_t num_reactors) {
     folly::IoUringBackend::Options uring_opts;
     uring_opts.setCapacity(512);
 
-    ebm_ = std::make_unique<folly::EventBaseManager>(
-        folly::EventBase::Options().setBackendFactory(
-            [uring_opts]() -> std::unique_ptr<folly::EventBaseBackendBase> {
-                return std::make_unique<folly::IoUringBackend>(uring_opts);
-            }));
+    ebm_ = std::make_unique< folly::EventBaseManager >(
+        folly::EventBase::Options().setBackendFactory([uring_opts]() -> std::unique_ptr< folly::EventBaseBackendBase > {
+            return std::make_unique< folly::IoUringBackend >(uring_opts);
+        }));
 #else
-    ebm_ = std::make_unique<folly::EventBaseManager>();
+    ebm_ = std::make_unique< folly::EventBaseManager >();
 #endif
 
-    pool_ = std::make_shared<folly::IOThreadPoolExecutor>(
-        num_reactors,
-        std::make_shared<folly::NamedThreadFactory>("HSReactor"),
-        ebm_.get());
+    pool_ = std::make_shared< folly::IOThreadPoolExecutor >(
+        num_reactors, std::make_shared< folly::NamedThreadFactory >("HSReactor"), ebm_.get());
 
     // Startup barrier: each reactor thread registers its EventBase at a
     // deterministic index and sets up the per-reactor drive state.
-    std::atomic<size_t> assigned{0};
-    folly::Baton<>      barrier;
-    std::atomic<size_t> done{0};
+    std::atomic< size_t > assigned{0};
+    folly::Baton<> barrier;
+    std::atomic< size_t > done{0};
 
     for (size_t i = 0; i < num_reactors; ++i) {
         pool_->add([&, num_reactors]() {
-            size_t my_id  = assigned.fetch_add(1, std::memory_order_relaxed);
+            size_t my_id = assigned.fetch_add(1, std::memory_order_relaxed);
             t_reactor_id_ = my_id;
 
             auto* eb = ebm_->getEventBase();
@@ -72,7 +70,7 @@ void IOManager::start(size_t num_reactors) {
             drive_interface_init_reactor(eb);
 
             LOGDEBUGMOD(iomgr, "Reactor {} started on thread {:x}", my_id,
-                        std::hash<std::thread::id>{}(std::this_thread::get_id()));
+                        std::hash< std::thread::id >{}(std::this_thread::get_id()));
 
             if (done.fetch_add(1, std::memory_order_acq_rel) + 1 == num_reactors) {
                 barrier.post();
@@ -85,24 +83,27 @@ void IOManager::start(size_t num_reactors) {
 }
 
 void IOManager::stop() {
-    if (!pool_) return;
+    if (!pool_)
+        return;
     LOGINFO("IOManager::stop() — calling pool_->join()...");
     pool_->join();
-    LOGINFO("IOManager::stop() — pool_->join() returned");
     pool_.reset();
-    LOGINFO("IOManager::stop() — pool_ reset");
     shard_ebs_.clear();
     num_reactors_ = 0;
     LOGINFO("IOManager stopped");
 }
 
-IOManager::~IOManager() { stop(); }
+IOManager::~IOManager() {
+    stop();
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Accessors
 // ─────────────────────────────────────────────────────────────────────────────
 
-size_t IOManager::current_reactor_id() const { return t_reactor_id_; }
+size_t IOManager::current_reactor_id() const {
+    return t_reactor_id_;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Target resolution
@@ -120,7 +121,7 @@ folly::EventBase* IOManager::resolve_target(ReactorTarget target) const {
         return shard_ebs_[rid];
     }
     case ReactorTarget::Tag::Any:
-        return shard_ebs_[const_cast<IOManager*>(this)->next_reactor()];
+        return shard_ebs_[const_cast< IOManager* >(this)->next_reactor()];
     case ReactorTarget::Tag::All:
         throw std::logic_error("resolve_target called with ReactorTarget::All — use spawn_waitable_all");
     }
@@ -131,23 +132,23 @@ folly::EventBase* IOManager::resolve_target(ReactorTarget target) const {
 // Non-template dispatch methods
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task<void> IOManager::yield_now() {
+folly::coro::Task< void > IOManager::yield_now() {
     co_await folly::coro::co_reschedule_on_current_executor;
 }
 
-folly::coro::Task<void> IOManager::sleep(std::chrono::milliseconds dur) {
+folly::coro::Task< void > IOManager::sleep(std::chrono::milliseconds dur) {
     co_await folly::coro::sleep(dur);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Global singleton
+// Singleton state and lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
 
 namespace {
 // Production: raw pointer set once at init — zero-overhead dereference.
 // Tests can use a different pattern if needed (e.g. reset between tests).
 IOManager* g_iomgr{nullptr};
-}
+} // namespace
 
 void init_iomgr(size_t num_reactors) {
     assert(g_iomgr == nullptr && "init_iomgr called twice");
@@ -170,9 +171,15 @@ void stop_iomgr() {
     g_iomgr = nullptr;
 }
 
-IOManager& iomgr() {
-    assert(g_iomgr != nullptr && "IOManager not initialized — call init_iomgr() first");
-    return *g_iomgr;
+IOManager* singleton_ptr() {
+    return g_iomgr;
 }
 
-} // namespace homestore
+} // namespace iomanager
+
+// Global accessor — only this name leaks to the top-level scope.
+iomanager::IOManager& iomgr() {
+    auto* p = iomanager::singleton_ptr();
+    assert(p != nullptr && "IOManager not initialized — call iomanager::init_iomgr() first");
+    return *p;
+}

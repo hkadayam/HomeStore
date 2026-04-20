@@ -27,19 +27,19 @@ void FollyRcuMetricsGroup::on_register() {
     acc_digests_.resize(nhists_, folly::TDigest{128});
 }
 
-PerThreadMetrics* FollyRcuMetricsGroup::get_or_create() {
-    PerThreadMetrics* m = tl_metrics_.get();
+FollyRcuMetricsGroup::ThreadMetricsPtr* FollyRcuMetricsGroup::get_or_create() {
+    ThreadMetricsPtr* m = tl_metrics_.get();
     if (FOLLY_UNLIKELY(!m)) {
-        auto* p = new PerThreadMetrics{ncntrs_, nhists_};
-        // The destructor lambda fires when the thread exits.  Rather than deleting p we push it onto the zombie list so that the next
-        // collect() still aggregates its data.
-        tl_metrics_.reset(p, [this](PerThreadMetrics* ptr, folly::TLPDestructionMode) { push_zombie(ptr); });
+        auto* p = new ThreadMetricsPtr{ncntrs_, nhists_};
+        // The destructor lambda fires when the thread exits.  Rather than deleting p we push it onto the zombie list
+        // so that the next collect() still aggregates its data.
+        tl_metrics_.reset(p, [this](ThreadMetricsPtr* ptr, folly::TLPDestructionMode) { push_zombie(ptr); });
         m = p;
     }
     return m;
 }
 
-void FollyRcuMetricsGroup::push_zombie(PerThreadMetrics* p) {
+void FollyRcuMetricsGroup::push_zombie(ThreadMetricsPtr* p) {
     std::unique_lock lock{zombie_mutex_};
     zombie_list_.emplace_back(p);
 }
@@ -49,29 +49,27 @@ void FollyRcuMetricsGroup::push_zombie(PerThreadMetrics* p) {
 // blocks until every read-side section has exited — after that, no thread is touching any per-thread data.
 
 void FollyRcuMetricsGroup::counter_increment(uint64_t index, int64_t val) {
-    Rcu::read_guard guard;
-    get_or_create()->counters[index] += val;
+    auto acc = get_or_create()->access();
+    acc->counters[index] += val;
 }
 
 void FollyRcuMetricsGroup::counter_decrement(uint64_t index, int64_t val) {
-    Rcu::read_guard guard;
-    get_or_create()->counters[index] -= val;
+    auto acc = get_or_create()->access();
+    acc->counters[index] -= val;
 }
 
 void FollyRcuMetricsGroup::histogram_observe(uint64_t index, int64_t val) {
-    Rcu::read_guard guard;
-    auto* m = get_or_create();
-    m->pending[index].push_back(to_double(val));
-    if (m->pending[index].size() >= histogram_flush_threshold) { m->flush_histogram(to_u32(index)); }
+    auto acc = get_or_create()->access();
+    acc->pending[index].push_back(to_double(val));
+    if (acc->pending[index].size() >= histogram_flush_threshold) { acc->flush_histogram(to_u32(index)); }
 }
 
 void FollyRcuMetricsGroup::histogram_observe(uint64_t index, int64_t val, uint64_t count) {
-    Rcu::read_guard guard;
-    auto* m = get_or_create();
+    auto acc = get_or_create()->access();
     for (uint64_t i = 0; i < count; ++i) {
-        m->pending[index].push_back(to_double(val));
+        acc->pending[index].push_back(to_double(val));
     }
-    if (m->pending[index].size() >= histogram_flush_threshold) { m->flush_histogram(to_u32(index)); }
+    if (acc->pending[index].size() >= histogram_flush_threshold) { acc->flush_histogram(to_u32(index)); }
 }
 
 // ─── Collect path ─────────────────────────────────────────────────────────────
@@ -94,18 +92,28 @@ void FollyRcuMetricsGroup::collect_and_reset(PerThreadMetrics& ptm) {
 void FollyRcuMetricsGroup::gather_result(bool need_latest, const CounterGatherCb& counter_cb,
                                          const GaugeGatherCb& gauge_cb, const HistogramGatherCb& histogram_cb) {
     if (need_latest) {
-        // After this returns, every writer's read-side section has exited — no thread is touching per-thread data.
+        // Wisr-style pointer-swap rotation: atomically exchange every live thread's slot with a fresh PerThreadMetrics,
+        // then synchronize_rcu() waits for any writer that had dereferenced an old pointer to finish.  After
+        // synchronize returns, olds are exclusively owned by the collector and safe to drain.  rotate_mutex_
+        // serialises concurrent gather_result() callers; drop it if gather is guaranteed to be called single-threaded.
+        std::lock_guard rlock{rotate_mutex_};
+        std::vector< PerThreadMetrics* > olds;
+        for (auto& slot : tl_metrics_.accessAllThreads()) {
+            olds.push_back(slot.make_and_exchange(false /* sync_rcu_now */));
+        }
         Rcu::synchronize();
-
-        for (auto& tl : tl_metrics_.accessAllThreads()) {
-            collect_and_reset(tl);
+        for (auto* old : olds) {
+            collect_and_reset(*old);
+            delete old;
         }
 
-        // Drain zombie list — exited threads whose data hasn't been collected yet.
+        // Drain zombie list — exited threads whose data hasn't been collected yet.  No live writers on zombies, so
+        // direct access() (read_guard-backed read) is safe; no swap needed.
         {
             std::unique_lock lock{zombie_mutex_};
             for (auto& zm : zombie_list_) {
-                collect_and_reset(*zm);
+                auto acc = zm->access();
+                collect_and_reset(*acc);
             }
             zombie_list_.clear();
         }

@@ -57,7 +57,8 @@ public:
 class GlobalMetrics : public MetricsGroup {
 public:
     explicit GlobalMetrics() : MetricsGroup("Global") {
-        REGISTER_COUNTER(num_open_connections, "Total number of connections", PublishAs::Gauge);
+        REGISTER_COUNTER(num_open_connections, "Total number of connections", "", sisl::MetricLabel{"", ""},
+                         PublishAs::Gauge);
         REGISTER_GAUGE(mem_utilization, "Total memory utilization");
         REGISTER_HISTOGRAM(request_per_txn, "Distribution of request per transactions");
 

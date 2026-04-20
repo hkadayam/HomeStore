@@ -90,16 +90,21 @@ public:
     [[nodiscard]] GroupImplType impl_type() const override { return GroupImplType::Rcu; }
 
 private:
+    // Per-thread slot: an RCU-protected pointer to PerThreadMetrics.  Writers dereference under a read-side guard;
+    // the collector atomically swaps it to a fresh object, then synchronize_rcu() ensures any in-flight writer has
+    // finished with the old pointer before the collector drains it.
+    using ThreadMetricsPtr = sisl::Rcu::scoped_ptr< PerThreadMetrics, uint32_t, uint32_t >;
+
     void on_register() override;
     void gather_result(bool need_latest, const CounterGatherCb& counter_cb, const GaugeGatherCb& gauge_cb,
                        const HistogramGatherCb& histogram_cb) override;
 
-    // Get or lazily create the thread-local PerThreadMetrics for this group.
-    PerThreadMetrics* get_or_create();
+    // Get or lazily create the thread-local slot for this group.
+    ThreadMetricsPtr* get_or_create();
 
-    // Called by ThreadLocalPtr destructor when a thread exits — instead of deleting, we move the data to the zombie
-    // list so the collector can still aggregate it on the next gather.
-    void push_zombie(PerThreadMetrics* p);
+    // Called by ThreadLocalPtr destructor when a thread exits — instead of deleting, we move the slot to the zombie
+    // list so the collector can still aggregate its data on the next gather.
+    void push_zombie(ThreadMetricsPtr* p);
 
     // Collect counters and histograms from a PerThreadMetrics into the accumulators, then reset it.
     void collect_and_reset(PerThreadMetrics& ptm);
@@ -112,15 +117,20 @@ private:
     std::vector< int64_t > acc_counters_;
     std::vector< folly::TDigest > acc_digests_;
 
-    // Zombie list: PerThreadMetrics from exited threads. Guarded by zombie_mutex_.
+    // Zombie list: slots from exited threads. Guarded by zombie_mutex_.
     // IMPORTANT: zombie_mutex_ and zombie_list_ must be declared BEFORE tl_metrics_ so that tl_metrics_ is destroyed
     // first. Its destructor fires push_zombie() which locks zombie_mutex_ — that mutex must still be alive.
     std::mutex zombie_mutex_;
-    std::vector< unique< PerThreadMetrics > > zombie_list_;
+    std::vector< unique< ThreadMetricsPtr > > zombie_list_;
 
     // Unique tag so folly::ThreadLocalPtr allows accessAllThreads().
     struct FollyRcuMetricsTag {};
-    folly::ThreadLocalPtr< PerThreadMetrics, FollyRcuMetricsTag > tl_metrics_;
+    folly::ThreadLocalPtr< ThreadMetricsPtr, FollyRcuMetricsTag > tl_metrics_;
+
+    // Serialises concurrent gather_result() callers — the swap-and-drain loop modifies acc_counters_ and
+    // acc_digests_, which have no sync of their own.  If gather_result is guaranteed to be called single-threaded,
+    // this can be removed.
+    std::mutex rotate_mutex_;
 };
 
 } // namespace sisl

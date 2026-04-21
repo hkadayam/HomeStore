@@ -60,14 +60,14 @@ public:
     // passed by const-ref — zero heap allocation, no thread-local state.
     struct BucketCtx {
         const key_extractor_cb_t< K, V >& extractor;
-        const kv_access_cb_t< K, V >&     access_cb; // may be an empty std::function
+        const kv_access_cb_t< K, V >& access_cb; // may be an empty std::function
     };
 
 private:
-    uint32_t                     nbuckets_;
-    SimpleHashBucket< K, V >*    buckets_;
-    key_extractor_cb_t< K, V >   key_extract_cb_;
-    kv_access_cb_t< K, V >       kv_access_cb_;
+    uint32_t nbuckets_;
+    SimpleHashBucket< K, V >* buckets_;
+    key_extractor_cb_t< K, V > key_extract_cb_;
+    kv_access_cb_t< K, V > kv_access_cb_;
 
 #ifdef GLOBAL_HASHSET_LOCK
     mutable std::mutex m;
@@ -86,7 +86,7 @@ public:
     bool erase(const K& key, V& out_val);
     bool update(const K& key, auto&& update_cb);
     bool upsert_or_delete(const K& key, auto&& update_or_delete_cb);
-    K    record_to_key(const ValueEntryBase& record);
+    K record_to_key(const ValueEntryBase& record);
 
     // ── Cache-specific atomic find/insert that bump the refcount ────────────
     // find_and_acquire: finds the entry for `key` and increments its refcount
@@ -130,9 +130,10 @@ private:
 
     using BucketCtx = typename SimpleHashMap< K, V >::BucketCtx;
 
-    static void invoke_access_cb(const BucketCtx& ctx, const SingleEntryHashNode< V >& node,
-                                  const K& key, const V& value, hash_op_t op) {
-        if (ctx.access_cb) ctx.access_cb((const ValueEntryBase&)node, key, value, op);
+    static void invoke_access_cb(const BucketCtx& ctx, const SingleEntryHashNode< V >& node, const K& key,
+                                 const V& value, hash_op_t op) {
+        if (ctx.access_cb)
+            ctx.access_cb((const ValueEntryBase&)node, key, value, op);
     }
 
 public:
@@ -191,7 +192,9 @@ public:
 #endif
         for (const auto& n : list_) {
             const K k = ctx.extractor(n.value_);
-            if (input_key > k) { break; }
+            if (input_key > k) {
+                break;
+            }
             if (input_key == k) {
                 out_val = n.value_;
                 invoke_access_cb(ctx, n, input_key, out_val, hash_op_t::ACCESS);
@@ -211,7 +214,9 @@ public:
 #endif
         for (auto& n : list_) {
             const K k = ctx.extractor(n.value_);
-            if (input_key > k) { break; }
+            if (input_key > k) {
+                break;
+            }
             if (input_key == k) {
                 n.acquire();
                 return {&n, &n.value_};
@@ -229,8 +234,12 @@ public:
         auto it = list_.begin();
         for (auto itend{list_.end()}; it != itend; ++it) {
             const K k = ctx.extractor(it->value_);
-            if (input_key > k) { break; }
-            if (input_key == k) { return nullptr; } // duplicate
+            if (input_key > k) {
+                break;
+            }
+            if (input_key == k) {
+                return nullptr;
+            } // duplicate
         }
 
         auto* n = new SingleEntryHashNode< V >(input_value);
@@ -247,7 +256,9 @@ public:
         auto it = list_.begin();
         for (auto itend{list_.end()}; it != itend; ++it) {
             const K k = ctx.extractor(it->value_);
-            if (input_key > k) { break; }
+            if (input_key > k) {
+                break;
+            }
             if (input_key == k) {
                 SingleEntryHashNode< V >* n = &*it;
                 invoke_access_cb(ctx, *n, input_key, n->value_, hash_op_t::DELETE);
@@ -268,8 +279,13 @@ public:
         auto it = list_.begin();
         for (auto itend{list_.end()}; it != itend; ++it) {
             const K k = ctx.extractor(it->value_);
-            if (input_key > k) { break; }
-            if (input_key == k) { n = &*it; break; }
+            if (input_key > k) {
+                break;
+            }
+            if (input_key == k) {
+                n = &*it;
+                break;
+            }
         }
 
         bool found = (n != nullptr);
@@ -279,12 +295,13 @@ public:
         }
 
         if (update_or_delete_cb(n->value_, found)) {
-            if (found) { invoke_access_cb(ctx, *n, input_key, n->value_, hash_op_t::DELETE); }
+            if (found) {
+                invoke_access_cb(ctx, *n, input_key, n->value_, hash_op_t::DELETE);
+            }
             list_.erase(it);
             delete n;
         } else {
-            invoke_access_cb(ctx, *n, input_key, n->value_,
-                             (found ? hash_op_t::ACCESS : hash_op_t::CREATE));
+            invoke_access_cb(ctx, *n, input_key, n->value_, (found ? hash_op_t::ACCESS : hash_op_t::CREATE));
         }
         return !found;
     }
@@ -295,7 +312,9 @@ public:
 #endif
         for (auto& n : list_) {
             const K k = ctx.extractor(n.value_);
-            if (input_key > k) { break; }
+            if (input_key > k) {
+                break;
+            }
             if (input_key == k) {
                 invoke_access_cb(ctx, n, input_key, n.value_, hash_op_t::ACCESS);
                 update_cb(n.value_);
@@ -309,8 +328,8 @@ public:
 ///////////////////////////////////////////// SimpleHashMap Definitions ///////////////////////////////////
 template < typename K, typename V >
 SimpleHashMap< K, V >::SimpleHashMap(uint32_t nBuckets, const key_extractor_cb_t< K, V >& extract_cb,
-                                     kv_access_cb_t< K, V > access_cb)
-    : nbuckets_{nBuckets}, key_extract_cb_{extract_cb}, kv_access_cb_{std::move(access_cb)} {
+                                     kv_access_cb_t< K, V > access_cb) :
+        nbuckets_{nBuckets}, key_extract_cb_{extract_cb}, kv_access_cb_{std::move(access_cb)} {
     buckets_ = new SimpleHashBucket< K, V >[nBuckets];
 }
 

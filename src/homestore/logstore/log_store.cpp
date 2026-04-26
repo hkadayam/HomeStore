@@ -255,6 +255,22 @@ bool LogStore::in_rollback_range(logid_t log_id) const {
 }
 
 folly::coro::Task< void > LogStore::flush_upto(lsn_t upto_lsn) {
+    if (append_mode_) {
+        if (records_.status(lsn).is_completed) {
+            // Some other append, has flushed ours, so return
+            co_return;
+        }
+
+        // Flush and post flush we should have created lsn record
+        co_await stream_->flush();
+    } else {
+        comp_lsn = records_.active_upto(prev_contiguous_lsn_hint_.load(std::memory_order_relaxed));
+        if (comp_lsn >= upto_lsn) {
+            prev_contiguous_lsn_hint_.store(comp_lsn, std::memory_order_release);
+            co_return;
+        }
+    }
+
     if (tail_lsn_.load(std::memory_order_acquire) >= upto_lsn) {
         co_return;
     }

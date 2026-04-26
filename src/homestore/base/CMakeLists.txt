@@ -10,6 +10,7 @@ target_sources(hs_base PRIVATE
       crc.cpp
       error.cpp
       homestore_status_mgr.cpp
+      resource_mgr.cpp
     )
 target_link_libraries(hs_base ${COMMON_DEPS})
 

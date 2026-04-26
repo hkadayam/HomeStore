@@ -29,7 +29,6 @@
 
 #include "blob/blk_read_tracker.h"
 #include "blob/stream_base.h"
-#include "iomanager/drive_interface.hpp" // IOBuffer
 
 namespace homestore {
 
@@ -116,16 +115,16 @@ public:
     /// Write data to the given block.  buffered=true queues for later flush; buffered=false issues VDev I/O
     /// immediately.  Both paths mark the CP session dirty via CPGuard.
     /// TODO: Impl buffered path — currently asserts buffered==false.
-    folly::coro::Task< void > write(const BlkId& bid, const IOBuffer& buf, bool buffered = false);
+    folly::coro::Task< void > write(const BlkId& bid, const sisl::IOBuffer& buf, bool buffered = false);
 
     /// Scatter-gather write of multiple buffers to a contiguous block range.
-    folly::coro::Task< void > writev(const std::vector< IOBuffer >& bufs, const BlkId& bid);
+    folly::coro::Task< void > writev(const std::vector< sisl::IOBuffer >& bufs, const BlkId& bid);
 
     /// Read into buf.  Tracks the read via BlkReadTracker so invalidate() can wait for it.
-    folly::coro::Task< std::error_code > read(IOBuffer& buf, const BlkId& bid);
+    folly::coro::Task< std::error_code > read(sisl::IOBuffer& buf, const BlkId& bid);
 
     /// Scatter-gather read of multiple buffers from a contiguous block range.  Tracked via BlkReadTracker.
-    folly::coro::Task< std::error_code > readv(std::vector< IOBuffer >& bufs, const BlkId& bid);
+    folly::coro::Task< std::error_code > readv(std::vector< sisl::IOBuffer >& bufs, const BlkId& bid);
 
     /// Flush all physical devices backing this stream's chunks.
     folly::coro::Task< void > fsync();
@@ -148,7 +147,7 @@ private:
 
     // Per-CP write buffer.  Extends base FlushSessionBase with a lock-free per-thread vector of pending writes.
     struct CPSession : StreamBase::FlushSessionBase {
-        sisl::ConcurrentInsertVector< std::pair< BlkId, IOBuffer > > writes;
+        sisl::ConcurrentInsertVector< std::pair< BlkId, sisl::IOBuffer > > writes;
     };
     CPSession cp_session_[CPManager::max_concurent_cps];
     CPSession& cp_session(cp_id_t cp_id) { return cp_session_[cp_id % CPManager::max_concurent_cps]; }

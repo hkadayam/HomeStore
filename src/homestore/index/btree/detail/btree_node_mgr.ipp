@@ -111,12 +111,4 @@ unique< NodeCore > Btree< K, V >::construct_existing_node(std::shared_ptr< uint8
     }
 }
 
-template < typename K, typename V >
-Node Btree< K, V >::clone_temp_node(NodeCore const& src) {
-    // Ask the backend to allocate a fresh node of the same type, then overwrite with src's data.
-    Node clone = underlying_->create_node(src.is_leaf());
-    clone->overwrite(src);
-    return clone;
-}
-
 } // namespace homestore

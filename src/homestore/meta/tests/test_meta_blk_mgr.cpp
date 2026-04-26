@@ -44,6 +44,8 @@
 #include "managers.h"
 
 using namespace homestore;
+using namespace iomanager;
+using sisl::IOBuffer;
 
 static constexpr uint64_t DEV_SIZE = 256 * 1024 * 1024;      // 256 MB per device
 static constexpr uint64_t META_VDEV_SIZE = 64 * 1024 * 1024; // 64 MB for meta vdev
@@ -656,8 +658,8 @@ int main(int argc, char* argv[]) {
     SISL_OPTIONS_LOAD(argc, argv);
     sisl::logging::SetLogger("test_meta_blk_mgr");
     ::testing::InitGoogleTest(&argc, argv);
-    init_iomgr(2);
+    iomanager::init_iomgr(2);
     int rc = RUN_ALL_TESTS();
-    stop_iomgr();
+    iomanager::stop_iomgr();
     return rc;
 }

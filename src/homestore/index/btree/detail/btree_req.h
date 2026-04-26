@@ -62,10 +62,10 @@ public:
 
     BtreeTraversalState< K >& search_state() { return search_state_; }
     const BtreeKeyRange< K >& input_range() const { return search_state_.input_range(); }
-    void shift_working_range(K&& start_key, bool start_incl) {
-        search_state_.shift_working_range(std::move(start_key), start_incl);
+    void next_working_range_from(K&& start_key, bool start_incl) {
+        search_state_.next_working_range_from(std::move(start_key), start_incl);
     }
-    void shift_working_range() { search_state_.shift_working_range(); }
+    void next_working_range() { search_state_.next_working_range(); }
     const BtreeKeyRange< K >& working_range() const { return search_state_.working_range(); }
 
     const K& first_key() const { return search_state_.first_key(); }
@@ -208,7 +208,7 @@ public:
     void advance() { ++offset_; }
 
     // For interior traversal: key range covering all remaining entries up to the current trimmed boundary.
-    // Start shifts right as advance() is called; end is trimmed per-leaf and reset by shift_working_range().
+    // Start shifts right as advance() is called; end is trimmed per-leaf and reset by next_working_range().
     BtreeKeyRange< K > working_range() const { return BtreeKeyRange< K >{entries_[offset_].first, end_key_}; }
 
     // Trim the end boundary to a child's upper key before descending into that leaf.
@@ -216,13 +216,13 @@ public:
 
     // Reset the end boundary to the last entry after finishing a leaf so the next sibling
     // sees the full remaining range.
-    void shift_working_range() { end_key_ = entries_.back().first; }
+    void next_working_range() { end_key_ = entries_.back().first; }
 
     std::vector< entry_t > entries_;
     BtreePutType put_type_;
     PutFilter* filter_{nullptr};
     size_t offset_{0};
-    K end_key_{}; ///< current upper boundary; trimmed per leaf, reset by shift_working_range()
+    K end_key_{}; ///< current upper boundary; trimmed per leaf, reset by next_working_range()
     PutStats stats_{};
 };
 

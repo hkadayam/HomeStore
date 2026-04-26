@@ -75,6 +75,7 @@ folly::coro::Task< void > StreamBase::destroy() {
     chunks_.make_and_exchange(std::vector< shared< Chunk > >{});
 
     for (auto& chunk : old_list) {
+        co_await remove_chunk_mblk(chunk->chunk_id());
         co_await vdev_->shrink(ChunkToShrink::Specific, chunk->chunk_id());
     }
 }
@@ -116,10 +117,6 @@ folly::coro::Task< void > StreamBase::expand_to(size_t n) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// init_chunk_mblk
-// ─────────────────────────────────────────────────────────────────────────────
-
 folly::coro::Task< void > StreamBase::init_chunk_mblk(const shared< Chunk >& chunk) {
     const uint32_t cid = chunk->chunk_id();
     auto name = fmt::format("{}_{}_{}_{}_{}", dev_name_, stream_type_name(), stream_id_, cid, blk_size_);
@@ -127,6 +124,24 @@ folly::coro::Task< void > StreamBase::init_chunk_mblk(const shared< Chunk >& chu
 
     auto lock = co_await mblk_mutex_.co_scoped_lock();
     chunk_mblks_.emplace(cid, std::move(blk));
+}
+
+folly::coro::Task< void > StreamBase::remove_chunk_mblk(uint32_t chunk_id) {
+    MetaBlk blk;
+    {
+        auto lock = co_await mblk_mutex_.co_scoped_lock();
+        auto it = chunk_mblks_.find(chunk_id);
+        if (it == chunk_mblks_.end()) co_return;
+        blk = std::move(it->second);
+        chunk_mblks_.erase(it);
+    }
+    co_await meta_client_.remove_meta_blk(blk);
+}
+
+void StreamBase::install_chunks(std::vector< shared< Chunk > > chunks) {
+    std::sort(chunks.begin(), chunks.end(),
+              [](const auto& a, const auto& b) { return a->vdev_order() < b->vdev_order(); });
+    chunks_.make_and_exchange(std::move(chunks));
 }
 
 folly::coro::Task< void > StreamBase::truncate_before(size_t nchunks) {
@@ -146,8 +161,9 @@ folly::coro::Task< void > StreamBase::truncate_before(size_t nchunks) {
     std::vector< shared< Chunk > > new_list(old_list.begin() + static_cast< ptrdiff_t >(nchunks), old_list.end());
     chunks_.make_and_exchange(new_list);
 
-    // Now release the removed chunks via shrink.
+    // Now release the removed chunks: drop their MetaBlks then return them to the vdev.
     for (size_t i = 0; i < nchunks; ++i) {
+        co_await remove_chunk_mblk(old_list[i]->chunk_id());
         co_await vdev_->shrink(ChunkToShrink::Specific, old_list[i]->chunk_id());
     }
 }

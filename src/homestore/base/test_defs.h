@@ -44,8 +44,8 @@
 #define CORO_TEST_F(fixture, name)                                                                                     \
     folly::coro::Task< void > fixture##_##name##_coro(fixture& self);                                                  \
     TEST_F(fixture, name) {                                                                                            \
-        homestore::iomgr().spawn_and_block(                                                                            \
-            homestore::ReactorTarget::any(),                                                                           \
+        iomgr().spawn_and_block(                                                                                       \
+            iomanager::ReactorTarget::any(),                                                                           \
             [this]() -> folly::coro::Task< void > { co_await fixture##_##name##_coro(*this); }());                     \
     }                                                                                                                  \
     folly::coro::Task< void > fixture##_##name##_coro([[maybe_unused]] fixture& self)

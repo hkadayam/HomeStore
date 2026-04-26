@@ -116,6 +116,10 @@ struct InmemPortion {
     bool sweep_in_progress_{false};
     std::optional< blk_num_t > estimated_free_blks_;
     mutable std::mutex mtx_;
+    // Set by blkalloc::SweepService when this portion is queued for refill; cleared after the
+    // refill task runs. Prevents the same portion from being double-queued by concurrent
+    // alloc-path nudges and the periodic ticker.
+    std::atomic< bool > enqueued_{false};
 
     InmemPortion(blk_num_t start, blk_num_t end, blk_num_t max_cached_blks, chunk_num_t chunk_id) :
             start_blk_{start}, end_blk_{end}, slab_cache_{max_cached_blks, chunk_id}, sweep_cursor_{start} {}

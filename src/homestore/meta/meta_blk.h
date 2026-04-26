@@ -28,7 +28,6 @@
 #include "common/defs.h"                // shared<>, unique<>, to_u32
 #include "base/homestore_assert.hpp"    // HS_SUBMOD_LOG
 
-#include "iomanager/drive_interface.hpp" // IOBuffer
 #include <sisl/fds/buffer.h>            // ByteArray, make_byte_array
 
 namespace homestore {
@@ -198,6 +197,7 @@ public:
     folly::coro::Task< sisl::ByteView > read();
 
     const MetaBlk& meta_blk() const { return meta_blk_; }
+    MetaBlk& meta_blk() { return meta_blk_; }
     shared< MetaClient > meta_client() const { return client_; }
 
 private:

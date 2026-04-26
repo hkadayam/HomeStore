@@ -65,20 +65,38 @@ folly::coro::Task< void > BlobDevManager::create() {
 
 namespace {
 
-// Attempt to parse a MetaBlk name of the form "<dev>_<type_name>_<stream_id>_<chunk_id>".
+// Parsed MetaBlk name.  Two supported forms:
+//   Per-chunk (RawBlk/AppendBlk): "<dev>_<type>_<stream_id>_<chunk_id>_<blk_size>"      (is_sb=false)
+//   Per-stream sb (AppendByte):   "<dev>_appendbyte_sb_<stream_id>"                     (is_sb=true)
 struct ParsedMblkName {
     std::string dev_name;
     StreamType stream_type;
     uint64_t stream_id;
-    uint32_t chunk_id;
-    uint32_t blk_size{0}; // 0 means use vdev default (backward compat with old names)
+    bool is_sb{false};    // true for the single per-stream sb MetaBlk
+    uint32_t chunk_id{0}; // valid only when !is_sb
+    uint32_t blk_size{0}; // valid only when !is_sb (0 means use vdev default)
 };
 
 std::optional< ParsedMblkName > parse_mblk_name(std::string_view name) {
+    // Per-stream sb form: "<dev>_appendbyte_sb_<stream_id>".
+    {
+        constexpr std::string_view sb_suffix = "_appendbyte_sb_";
+        auto pos = name.rfind(sb_suffix);
+        if (pos != std::string_view::npos) {
+            std::string_view dev = name.substr(0, pos);
+            std::string_view sid_part = name.substr(pos + sb_suffix.size());
+            uint64_t stream_id{};
+            auto rc = std::from_chars(sid_part.data(), sid_part.data() + sid_part.size(), stream_id);
+            if (rc.ec == std::errc{} && rc.ptr == sid_part.data() + sid_part.size()) {
+                return ParsedMblkName{std::string{dev}, StreamType::AppendByte, stream_id, /*is_sb=*/true};
+            }
+        }
+    }
+
+    // Per-chunk form: "<dev>_<type>_<stream_id>_<chunk_id>_<blk_size>".
     static const std::pair< std::string_view, StreamType > kPatterns[] = {
         {"_rawblk_", StreamType::RawBlk},
         {"_appendblk_", StreamType::AppendBlk},
-        {"_appendbyte_", StreamType::AppendByte},
     };
 
     for (auto& [suffix, stype] : kPatterns) {
@@ -88,7 +106,7 @@ std::optional< ParsedMblkName > parse_mblk_name(std::string_view name) {
         }
 
         std::string_view dev = name.substr(0, pos);
-        // Remainder after the suffix is "<stream_id>_<chunk_id>".
+        // Remainder after the suffix is "<stream_id>_<chunk_id>_<blk_size>".
         std::string_view rest = name.substr(pos + suffix.size());
 
         auto sep = rest.find('_');
@@ -104,18 +122,24 @@ std::optional< ParsedMblkName > parse_mblk_name(std::string_view name) {
 
         std::string_view after_sid = rest.substr(sep + 1);
         auto sep2 = after_sid.find('_');
-        if (sep2 == std::string_view::npos) { continue; }
+        if (sep2 == std::string_view::npos) {
+            continue;
+        }
 
         uint32_t chunk_id{};
         auto rc2 = std::from_chars(after_sid.data(), after_sid.data() + sep2, chunk_id);
-        if (rc2.ec != std::errc{}) { continue; }
+        if (rc2.ec != std::errc{}) {
+            continue;
+        }
 
         std::string_view bs_part = after_sid.substr(sep2 + 1);
         uint32_t blk_size{0};
         auto rc3 = std::from_chars(bs_part.data(), bs_part.data() + bs_part.size(), blk_size);
-        if (rc3.ec != std::errc{}) { continue; }
+        if (rc3.ec != std::errc{}) {
+            continue;
+        }
 
-        return ParsedMblkName{std::string{dev}, stype, stream_id, chunk_id, blk_size};
+        return ParsedMblkName{std::string{dev}, stype, stream_id, /*is_sb=*/false, chunk_id, blk_size};
     }
     return std::nullopt;
 }
@@ -126,12 +150,13 @@ folly::coro::Task< void > BlobDevManager::load() {
     LOGINFO("BlobDevManager: starting recovery scan");
     auto mgr = shared< BlobDevManager >(new BlobDevManager{co_await meta_mgr().register_client("BlobDevManager")});
 
-    // Per-device recovery accumulator, keyed by (stream_type, stream_id, chunk_id).
+    // Per-device recovery accumulator.
     using StreamMblkMap = BlobDev::StreamMblkMap;
+    using AppendByteSbMap = BlobDev::AppendByteSbMap;
     struct DevRecovery {
         StreamMblkMap raw_blk_mblks;
         StreamMblkMap append_blk_mblks;
-        StreamMblkMap append_byte_mblks;
+        AppendByteSbMap append_byte_sbs;
     };
 
     std::unordered_map< std::string, DevRecovery > dev_map;
@@ -143,8 +168,8 @@ folly::coro::Task< void > BlobDevManager::load() {
                 co_return;
             }
 
-            LOGDEBUG("Recovered MetaBlk '{}' dev={} stream_id={} chunk_id={}", blk.name(), parsed->dev_name,
-                     parsed->stream_id, parsed->chunk_id);
+            LOGDEBUG("Recovered MetaBlk '{}' dev={} stream_id={} chunk_id={} is_sb={}", blk.name(), parsed->dev_name,
+                     parsed->stream_id, parsed->chunk_id, parsed->is_sb);
 
             auto vdev = device_mgr().get_vdev(parsed->dev_name);
             if (!vdev) {
@@ -152,6 +177,16 @@ folly::coro::Task< void > BlobDevManager::load() {
                 co_return;
             }
 
+            DevRecovery& dev = dev_map[parsed->dev_name];
+
+            if (parsed->is_sb) {
+                // Single per-stream sb MetaBlk (AppendByteStream) — no chunk lookup here; chunk_ids are inside the
+                // sb payload and resolved when the stream itself loads.
+                dev.append_byte_sbs[parsed->stream_id] = BlobDev::AppendByteSbInfo{std::move(blk), std::move(data)};
+                co_return;
+            }
+
+            // Per-chunk MetaBlk — validate the chunk still exists.
             auto chunk = vdev->get_chunk(parsed->chunk_id);
             if (!chunk) {
                 LOGERROR("MetaBlk '{}' references chunk_id={} not found in VDev '{}' — skipping", blk.name(),
@@ -159,7 +194,6 @@ folly::coro::Task< void > BlobDevManager::load() {
                 co_return;
             }
 
-            DevRecovery& dev = dev_map[parsed->dev_name];
             auto entry = std::make_pair(std::move(blk), std::move(data));
             auto populate = [&](StreamMblkMap& m) {
                 auto& info = m[parsed->stream_id];
@@ -174,7 +208,7 @@ folly::coro::Task< void > BlobDevManager::load() {
                 populate(dev.append_blk_mblks);
                 break;
             case StreamType::AppendByte:
-                populate(dev.append_byte_mblks);
+                // Per-chunk form is not produced for AppendByte — fall through without populating.
                 break;
             }
             co_return;
@@ -191,11 +225,11 @@ folly::coro::Task< void > BlobDevManager::load() {
         }
 
         LOGINFO("loading BlobDev '{}' — raw_blk={} append_blk={} append_byte={} stream(s)", dev_name,
-                recovery.raw_blk_mblks.size(), recovery.append_blk_mblks.size(), recovery.append_byte_mblks.size());
+                recovery.raw_blk_mblks.size(), recovery.append_blk_mblks.size(), recovery.append_byte_sbs.size());
 
         auto device = std::make_shared< BlobDev >(dev_name, vdev, mgr->meta_client_);
         co_await device->load(std::move(recovery.raw_blk_mblks), std::move(recovery.append_blk_mblks),
-                              std::move(recovery.append_byte_mblks));
+                              std::move(recovery.append_byte_sbs));
 
         {
             std::lock_guard lk{mgr->devices_mutex_};
@@ -254,7 +288,8 @@ void BlobDevManager::shutdown() {
 // CPCallbacks
 // ─────────────────────────────────────────────────────────────────────────────
 
-void BlobDevManager::on_switchover_cp(CP* /*cur_cp*/, CP* /*new_cp*/) {}
+void BlobDevManager::on_switchover_cp(CP* /*cur_cp*/, CP* /*new_cp*/) {
+}
 
 folly::coro::Task< bool > BlobDevManager::cp_flush(CP* cp) {
     std::unordered_map< std::string, shared< BlobDev > > devs;

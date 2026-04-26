@@ -169,7 +169,9 @@ struct VDevInfo {
     uint32_t vdev_id{0};                       //   0
     uint32_t num_mirrors{0};                   //   4
     uint32_t blk_size{0};                      //   8
-    uint32_t chunk_size{0};                    //  12
+    uint32_t initial_chunk_size{0};            //  12  Size used for chunks created at vdev init time and the default
+                                               //      size for expand() calls that don't override.  Per-chunk size
+                                               //      may differ for chunks added later; check chunk->size().
     uint8_t slot_allocated{0};                 //  16
     uint8_t failed{0};                         //  17
     uint8_t hs_dev_type{0};                    //  18  (HSDevType as u8)

@@ -1,364 +1,286 @@
-/*********************************************************************************
- * Modifications Copyright 2017-2019 eBay Inc.
- *
+/***************************************************************************
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *    https://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software distributed
- * under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
- * CONDITIONS OF ANY KIND, either express or implied. See the License for the
- * specific language governing permissions and limitations under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
  *
- *********************************************************************************/
-#include <iterator>
-#include <string>
+ * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
+ ***************************************************************************/
+
+#include "logstore/log_store.h"
+
+#include <algorithm>
+#include <cstring>
+#include <stdexcept>
 
 #include <fmt/format.h>
-#include <iomgr/iomgr.hpp>
-#include <sisl/fds/thread_factory.h>
+#include <folly/coro/Sleep.h>
 
-#include <homestore/homestore.hpp>
-#include <homestore/logstore_service.hpp>
-#include "common/homestore_assert.hpp"
-#include "log_dev.hpp"
+#include "common/defs.h"
+#include "meta/meta_client.h"
 
 namespace homestore {
 
-#define THIS_LOGSTORE_LOG(level, msg, ...) HS_SUBMOD_LOG(level, logstore, , "log_store", m_fq_name, msg, __VA_ARGS__)
-#define THIS_LOGSTORE_PERIODIC_LOG(level, msg, ...)                                                                    \
-    HS_PERIODIC_DETAILED_LOG(level, logstore, "log_store", m_fq_name, , , msg, __VA_ARGS__)
+// ─────────────────────────────────────────────────────────────────────────────
+// Construction / factories
+// ─────────────────────────────────────────────────────────────────────────────
 
-HomeLogStore::HomeLogStore(std::shared_ptr< LogDev > logdev, logstore_id_t id, bool append_mode,
-                           logstore_seq_num_t start_lsn) :
-        m_store_id{id},
-        m_logdev{logdev},
-        m_records{"HomeLogStoreRecords", start_lsn - 1},
-        m_append_mode{append_mode},
-        m_start_lsn{start_lsn},
-        m_next_lsn{start_lsn},
-        m_tail_lsn{start_lsn - 1},
-        m_fq_name{fmt::format("{} log_dev={}", id, logdev->get_id())},
-        m_metrics{logstore_service().metrics()} {}
-
-void HomeLogStore::write_async(logstore_req* req, const log_req_comp_cb_t& cb) {
-    HS_LOG_ASSERT((cb || m_comp_cb), "Expected either cb is not null or default cb registered");
-    req->cb = (cb ? cb : m_comp_cb);
-    req->start_time = Clock::now();
-
-#ifndef NDEBUG
-    if (req->seq_num < start_lsn()) {
-        THIS_LOGSTORE_LOG(ERROR, "Assert: Writing lsn={} lesser than start_lsn={}", req->seq_num, start_lsn());
-        HS_DBG_ASSERT(0, "Assertion");
-    }
-#endif
-    m_records.create(req->seq_num);
-    COUNTER_INCREMENT(m_metrics, logstore_append_count, 1);
-    HISTOGRAM_OBSERVE(m_metrics, logstore_record_size, req->data.size());
-    m_logdev->append_async(m_store_id, req->seq_num, req->data, static_cast< void* >(req));
-}
-
-void HomeLogStore::write_async(logstore_seq_num_t seq_num, const sisl::IoBlob& b, void* cookie,
-                               const log_write_comp_cb_t& cb) {
-    // Form an internal request and issue the write
-    auto* req = logstore_req::make(this, seq_num, b);
-    req->cookie = cookie;
-
-    write_async(req, [cb](logstore_req* req, logdev_key written_lkey) {
-        if (cb) { cb(req->seq_num, req->data, written_lkey, req->cookie); }
-        logstore_req::free(req);
-    });
-}
-
-logstore_seq_num_t HomeLogStore::append_async(const sisl::IoBlob& b, void* cookie, const log_write_comp_cb_t& cb) {
-    HS_DBG_ASSERT_EQ(m_append_mode, true, "append_async can be called only on append only mode");
-    const auto seq_num = m_next_lsn.fetch_add(1, std::memory_order_acq_rel);
-    write_async(seq_num, b, cookie, cb);
-    return seq_num;
-}
-
-void HomeLogStore::write_and_flush(logstore_seq_num_t seq_num, const sisl::IoBlob& b) {
-    HS_LOG_ASSERT(iomanager.am_i_sync_io_capable(),
-                  "Write and flush is a blocking IO, which can't run in this thread, please reschedule to a fiber");
-    if (seq_num > m_next_lsn.load(std::memory_order_relaxed)) m_next_lsn.store(seq_num + 1, std::memory_order_relaxed);
-    write_async(seq_num, b, nullptr /* cookie */, nullptr /* cb */);
-    m_logdev->flush_under_guard();
-}
-
-log_buffer HomeLogStore::read_sync(logstore_seq_num_t seq_num) {
-    HS_LOG_ASSERT(iomanager.am_i_sync_io_capable(),
-                  "Read sync is a blocking IO, which can't run in this thread, reschedule to a fiber");
-
-    // If seq_num has not been flushed yet, but issued, then we flush them before reading
-    auto const s = m_records.status(seq_num);
-    if (s.is_out_of_range || s.is_hole) {
-        throw std::out_of_range("key not valid since it has been truncated");
-    } else if (!s.is_completed) {
-        THIS_LOGSTORE_LOG(TRACE, "Reading lsn={}:{} before flushed, doing flush first", m_store_id, seq_num);
-        m_logdev->flush_under_guard();
+LogStore::LogStore(shared< LogStream > stream, MetaBlkWrapper&& mb) :
+        stream_{std::move(stream)}, meta_blk_{std::move(mb)} {
+    sisl::ByteView sb_payload = meta_blk_.read();
+    if (sb_payload.size() < sizeof(LogStoreSb)) {
+        throw std::runtime_error(fmt::format("LogStore::load: sb payload too small on {}", dev_name));
     }
 
-    const auto record = m_records.at(seq_num);
-    const logdev_key ld_key = record.m_dev_key;
-    if (!ld_key.is_valid()) {
-        THIS_LOGSTORE_LOG(ERROR, "ld_key not valid {}", seq_num);
-        throw std::out_of_range("key not valid");
+    const auto* sb = r_cast< const LogStoreSb* >(sb_payload.bytes());
+    store_id_ = sb->store_id;
+    append_mode_ = (sb->append_mode != 0);
+    start_lsn_ = sb->start_lsn;
+
+    std::vector< logid_range > ranges;
+    ranges.reserve(s->n_rollback_ranges);
+    for (uint32_t i = 0; i < s->n_rollback_ranges; ++i) {
+        ranges.push_back(s->rollback_ranges()[i]);
+    }
+    records_ = StreamTracker{"LogStore", start_lsn - 1};
+    rollback_ranges_ = std::move(ranges);
+}
+
+std::string LogStore::sb_mblk_name(const std::string& dev, logstore_id_t sid) {
+    return fmt::format("{}_logstore_sb_{}", dev, sid);
+}
+
+folly::coro::Task< shared< LogStore > > LogStore::create(logstore_id_t sid, MetaClient& meta_client,
+                                                         const std::string& dev_name, shared< LogStream > stream,
+                                                         bool is_append_mode) {
+    auto mb = MetaBlkWrapper::create(meta_client, fmt::format("LogStore_{}", sid));
+    LogStoreSb sb;
+    sb.store_id = sid;
+    sb.append_mode = is_append_mode;
+    sb.start_lsn = 0;
+    sb.n_rollback_ranges = 0;
+
+    co_await mb.write(to_u8ptr(&sb), sizeof(sb));
+    co_return std::make_shared< LogStore >(std::move(stream), std::move(mb));
+}
+
+folly::coro::Task< shared< LogStore > > LogStore::load(shared< LogStream > stream, MetaBlkWrapper&& mb) {
+    co_return std::make_shared< LogStore >(std::move(stream), std::move(mb));
+}
+
+void LogStore::open(log_replay_cb handler) {
+    handler_ = std::move(handler);
+    is_open_.store(true, std::memory_order_release);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Append-mode API
+// ─────────────────────────────────────────────────────────────────────────────
+
+lsn_t LogStore::quick_append(const sisl::IoBlob& data) {
+    const lsn_t lsn = tail_lsn_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    stream_->append(this, lsn, data);
+    return lsn;
+}
+
+folly::coro::Task< lsn_t > LogStore::append_and_flush(const sisl::IoBlob& data) {
+    const lsn_t lsn = quick_append(data);
+
+    // Wait for a brief time to allow coalescing multiple writes.
+    co_await folly::coro::sleep(flush_coalesce_wait_);
+    if (records_.status(lsn).is_completed) {
+        // Some other append, has flushed ours, so return
+        co_return lsn;
     }
 
-    const auto start_time = Clock::now();
-    COUNTER_INCREMENT(m_metrics, logstore_read_count, 1);
-    const auto b = m_logdev->read(ld_key);
-    HISTOGRAM_OBSERVE(m_metrics, logstore_read_latency, get_elapsed_time_us(start_time));
-    return b;
+    // Flush and post flush we should have created lsn record
+    co_await stream_->flush();
+    co_return lsn;
 }
 
-void HomeLogStore::on_write_completion(logstore_req* req, const logdev_key& ld_key, const logdev_key& flush_ld_key) {
-    // Logstore supports out-of-order lsn writes, in that case we need to mark the truncation key for this lsn as the
-    // one which is being written by the higher lsn. This is to ensure that we don't truncate higher lsn's logdev_key
-    // when we truncate the lower lsns.
-    //
-    // out-of-order means we can write lsns in any order and flush them, say we have
-    //-> Write lsn=1
-    //-> Write lsn=4
-    //-> Write lsn=2
-    // and can flush. When we check for contiguous completion or recovery we get upto lsn=2. The moment we have
-    // lsn=3, 4 also will be visible.
-    // This is an additional feature outside of a typical logstore, to allow external replication engine to control the
-    // logstore. This feature isn't used by RAFT, as we start logstores in append_only mode.
+// ─────────────────────────────────────────────────────────────────────────────
+// Non-append-mode API
+// ─────────────────────────────────────────────────────────────────────────────
 
-    // TODO: In case of out-of-order lsns, it needs to read the records of the tail_lsn and get their truncation key.
-    // This involves a read lock and an atomic operation. We can optimize this in case if the ld_key is updated for the
-    // same batch.
-    logdev_key trunc_key;
-    if (m_tail_lsn < req->seq_num) {
-        m_tail_lsn = req->seq_num;
-        trunc_key = flush_ld_key;
-    } else {
-        // this means out-of-order happens. for example , if lsn=1, 4 are written and flushed , they will be flushed in
-        // LogGroup1. when lsn=2 , 3 is written and flushed , they will be flushed in LogGroup2. the m_log_dev_offset of
-        // LogGroup2 is larger than that of LogGroup1. now , if we want to truncate to lsn 3, we can not remove logGroup
-        // 1 from logDev, since that will not only remove lsn 1 but also will remove lsn 4. so we set the m_trunc_key of
-        // lsn 2 and 3 to the same as lsn 4(tail_lsn).when truncation is shecduled, the safe truncation ld_key of this
-        // logstore will be the m_trunc_key of lsn 4, which will keep LogGroup 1 from being removed.
-        trunc_key = m_records.at(m_tail_lsn).m_trunc_key;
+void LogStore::quick_write(lsn_t lsn, const sisl::IoBlob& data) {
+    HS_REL_ASSERT(!append_mode_, "quick_write on append-mode LogStore (store_id={})", store_id_);
+    stream_->append(this, lsn, data);
+}
+
+folly::coro::Task< void > LogStore::write_and_flush(lsn_t lsn, const sisl::IoBlob& data) {
+    quick_write(lsn, data);
+    co_await flush_upto(lsn);
+}
+
+void LogStore::fill_gap(lsn_t lsn) {
+    HS_REL_ASSERT(!append_mode_, "fill_gap on append-mode LogStore (store_id={})", store_id_);
+    records_.create(lsn, LogStoreRecord{});
+    lsn_t cur = next_lsn_.load(std::memory_order_relaxed);
+    while (cur < lsn + 1 && !next_lsn_.compare_exchange_weak(cur, lsn + 1, std::memory_order_release)) {}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Read / flush / truncate / rollback
+// ─────────────────────────────────────────────────────────────────────────────
+
+folly::coro::Task< sisl::ByteView > LogStore::read(lsn_t lsn) {
+    if (lsn < start_lsn_.load(std::memory_order_acquire) || lsn >= tail_lsn_.load(std::memory_order_acquire)) {
+        co_return sisl::ByteView{};
     }
-
-    atomic_update_max(m_next_lsn, req->seq_num + 1, std::memory_order_acq_rel);
-    // Upon completion, create the mapping between seq_num and log dev key
-    m_records.update(req->seq_num, [&ld_key, &trunc_key](logstore_record& rec) -> bool {
-        rec.m_dev_key = ld_key;
-        rec.m_trunc_key = trunc_key;
-        return true;
-    });
-}
-
-void HomeLogStore::on_log_found(logstore_seq_num_t seq_num, const logdev_key& ld_key, const logdev_key& flush_ld_key,
-                                log_buffer buf) {
-    if (seq_num < m_start_lsn) { return; }
-
-    logdev_key trunc_key;
-    if (m_tail_lsn < seq_num) {
-        m_tail_lsn = seq_num;
-        trunc_key = flush_ld_key;
-    } else {
-        trunc_key = m_records.at(m_tail_lsn).m_trunc_key;
+    co_await flush_upto(lsn);
+    if (lsn > tail_lsn_.load(std::memory_order_acquire)) {
+        co_return sisl::ByteView{};
     }
-
-    // Create the mapping between seq_num and log dev key
-    m_records.create_and_complete(seq_num, logstore_record(ld_key, trunc_key));
-
-    atomic_update_max(m_next_lsn, seq_num + 1, std::memory_order_acq_rel);
-
-    if (m_found_cb != nullptr) { m_found_cb(seq_num, buf, nullptr); }
+    const stream_key key = records_.at(lsn).dev_key;
+    co_return co_await stream_->read(key);
 }
 
-void HomeLogStore::truncate(logstore_seq_num_t upto_lsn, bool in_memory_truncate_only) {
-    if (upto_lsn < m_start_lsn) { return; }
-    flush();
-#ifndef NDEBUG
-    auto cs = get_contiguous_completed_seq_num(0);
-    if (upto_lsn > cs) {
-        THIS_LOGSTORE_LOG(WARN,
-                          "Truncation issued on seq_num={} outside of contiguous completions={}, "
-                          "still proceeding to truncate",
-                          upto_lsn, cs);
+folly::coro::Task< void > LogStore::flush() {
+    co_await stream_->flush();
+}
+
+folly::coro::Task< void > LogStore::truncate(lsn_t upto_lsn, bool in_memory_only) {
+    auto lock = co_await stream_->flush_lock().co_scoped_lock();
+    const lsn_t s = start_lsn_.load(std::memory_order_acquire);
+    if (upto_lsn < s) {
+        co_return;
     }
-
-#endif
-
-    // In normal write and compact path, upto_lsn is expected to be no larger than m_tail_lsn after the flush.
-    // So upto_lsn > m_tail_lsn is expected to exist only in baseline resync path.
-    // In baseline resync path, we truncate all entries up to upto_lsn, and update m_tail_lsn and m_next_lsn
-    // to make sure logstore's idx is always = raft's idx - 1.
-    if (upto_lsn > m_tail_lsn) {
-        THIS_LOGSTORE_LOG(WARN,
-                          "Truncating issued on lsn={} which is greater than tail_lsn={}",
-                          upto_lsn, m_tail_lsn.load(std::memory_order_relaxed));
-        // update m_tail_lsn if it is less than upto_lsn
-        auto current_tail_lsn = m_tail_lsn.load(std::memory_order_relaxed);
-        while (current_tail_lsn < upto_lsn &&
-               !m_tail_lsn.compare_exchange_weak(current_tail_lsn, upto_lsn, std::memory_order_relaxed)) {}
-
-        // update m_next_lsn if it is less than upto_lsn + 1
-        auto current_next_lsn = m_next_lsn.load(std::memory_order_relaxed);
-        while (current_next_lsn < upto_lsn + 1 &&
-               !m_next_lsn.compare_exchange_weak(current_next_lsn, upto_lsn + 1, std::memory_order_relaxed)) {}
-
-        // insert an empty record to make sure m_records has enough size to truncate
-        logdev_key empty_ld_key;
-        m_records.create_and_complete(upto_lsn, logstore_record(empty_ld_key, empty_ld_key));
-    } else {
-        m_trunc_ld_key = m_records.at(upto_lsn).m_trunc_key;
-        THIS_LOGSTORE_LOG(TRACE, "Truncating logstore upto lsn={} , m_trunc_ld_key index {} offset {}", upto_lsn,
-                          m_trunc_ld_key.idx, m_trunc_ld_key.dev_offset);
+    lsn_t t = tail_lsn_.load(std::memory_order_acquire);
+    if (upto_lsn > t) {
+        upto_lsn = t;
     }
-    m_records.truncate(upto_lsn);
-    m_start_lsn.store(upto_lsn + 1);
-    if (!in_memory_truncate_only) { m_logdev->truncate(); }
+    records_.truncate(upto_lsn);
+    start_lsn_.store(upto_lsn + 1, std::memory_order_release);
+    co_await persist_sb();
+    (void)in_memory_only;
 }
 
-std::tuple< logstore_seq_num_t, logdev_key, logstore_seq_num_t > HomeLogStore::truncate_info() const {
-    auto const trunc_lsn = m_start_lsn.load(std::memory_order_relaxed) - 1;
-    auto const tail_lsn = m_tail_lsn.load(std::memory_order_relaxed);
+folly::coro::Task< bool > LogStore::rollback(lsn_t to_lsn) {
+    while (true) {
+        co_await stream_->flush();
+        auto lock = co_await stream_->flush_lock().co_scoped_lock();
 
-    // If the store is empty, return out_of_bound_ld_key as trunc_ld_key, allowing the caller to truncate freely.
-    // Otherwise, return the actual trunc_ld_key.
-    return (trunc_lsn == tail_lsn) ? std::make_tuple(trunc_lsn, logdev_key::out_of_bound_ld_key(), tail_lsn)
-                                   : std::make_tuple(trunc_lsn, m_trunc_ld_key, tail_lsn);
+        if (to_lsn < start_lsn_.load(std::memory_order_acquire)) {
+            co_return false;
+        }
+        const lsn_t cur_tail = tail_lsn_.load(std::memory_order_acquire);
+        if (to_lsn >= cur_tail) {
+            co_return true;
+        }
+
+        const logid_t cur_tail_logid = records_.at(cur_tail).dev_key.log_id;
+        if (stream_->next_log_id() != cur_tail_logid + 1) {
+            continue;
+        }
+
+        const logid_t from_logid = records_.at(to_lsn + 1).dev_key.log_id;
+        const logid_t to_logid = cur_tail_logid;
+        rollback_ranges_.emplace_back(from_logid, to_logid);
+        records_.rollback(to_lsn);
+        tail_lsn_.store(to_lsn, std::memory_order_release);
+        next_lsn_.store(to_lsn + 1, std::memory_order_release);
+        co_await persist_sb();
+        co_return true;
+    }
 }
 
-void HomeLogStore::fill_gap(logstore_seq_num_t seq_num) {
-    HS_DBG_ASSERT_EQ(m_records.status(seq_num).is_hole, true, "Attempted to fill gap lsn={} which has valid data",
-                     seq_num);
+// ─────────────────────────────────────────────────────────────────────────────
+// Callbacks from LogStream
+// ─────────────────────────────────────────────────────────────────────────────
 
-    logdev_key empty_ld_key;
-    m_records.create_and_complete(seq_num, logstore_record(empty_ld_key, empty_ld_key));
+void LogStore::on_write_completion(lsn_t lsn, const stream_key& key) {
+    uint64_t trunc_stream_offset{key.group_stream_offset};
+    if (!append_mode) {
+        lsn_t cur_tail = tail_lsn_.load(std::memory_order_acquire);
+        if (lsn > cur_tail) {
+            // lsn flushed bigger than current tail, so it is in-order, just add truncable stream offset to cur group
+            while (lsn > cur_tail && !tail_lsn_.compare_exchange_weak(cur_tail, lsn, std::memory_order_acq_rel)) {}
+        } else {
+            trunc_stream_offset = records_.at(cur_tail).trunc_stream_offset;
+        }
+    }
+    records_.create(lsn, key.log_id, key.record_stream_offset, trunc_stream_offset);
 }
 
-nlohmann::json HomeLogStore::dump_log_store(const log_dump_req& dump_req) {
-    nlohmann::json json_dump{}; // create root object
-    json_dump["store_id"] = this->m_store_id;
-
-    int64_t start_idx = std::max(dump_req.start_seq_num, start_lsn());
-
-    // must use move operator= operation instead of move copy constructor
-    nlohmann::json json_records = nlohmann::json::array();
-    m_records.foreach_all_completed(
-        start_idx, [this, &dump_req, &json_records](int64_t, homestore::logstore_record const& rec) -> bool {
-            nlohmann::json json_val = nlohmann::json::object();
-            serialized_log_record record_header;
-
-            const auto log_buffer = m_logdev->read(rec.m_dev_key);
-            m_logdev->read_record_header(rec.m_dev_key, record_header);
-            try {
-                json_val["size"] = uint32_cast(record_header.size);
-                json_val["offset"] = uint32_cast(record_header.offset);
-                json_val["is_inlined"] = uint32_cast(record_header.get_inlined());
-                json_val["lsn"] = uint64_cast(record_header.store_seq_num);
-                json_val["store_id"] = s_cast< logstore_id_t >(record_header.store_id);
-            } catch (const std::exception& ex) { THIS_LOGSTORE_LOG(ERROR, "Exception in json dump- {}", ex.what()); }
-
-            if (dump_req.verbosity_level == homestore::log_dump_verbosity::CONTENT) {
-                const uint8_t* b = log_buffer.bytes();
-                const std::vector< uint8_t > bv(b, b + log_buffer.size());
-                auto content = nlohmann::json::binary_t(bv);
-                json_val["content"] = std::move(content);
-            }
-            json_records.emplace_back(std::move(json_val));
-            return true;
-        });
-
-    json_dump["log_records"] = std::move(json_records);
-    return json_dump;
-}
-
-void HomeLogStore::foreach (int64_t start_idx, const std::function< bool(logstore_seq_num_t, log_buffer) >& cb) {
-    m_records.foreach_all_completed(start_idx, [&](int64_t cur_idx, homestore::logstore_record& record) -> bool {
-        auto log_buf = m_logdev->read(record.m_dev_key);
-        return cb(cur_idx, log_buf);
-    });
-}
-
-logstore_seq_num_t HomeLogStore::get_contiguous_issued_seq_num(logstore_seq_num_t from) const {
-    return (logstore_seq_num_t)m_records.active_upto(from + 1);
-}
-
-logstore_seq_num_t HomeLogStore::get_contiguous_completed_seq_num(logstore_seq_num_t from) const {
-    return (logstore_seq_num_t)m_records.completed_upto(from + 1);
-}
-
-void HomeLogStore::flush(logstore_seq_num_t upto_lsn) {
-    if (!m_logdev->allow_explicit_flush()) {
-        HS_LOG_ASSERT(false,
-                      "Explicit flush is turned off or calling flush on wrong thread for this logdev, ignoring flush");
+void LogStore::on_log_found(lsn_t lsn, const stream_key& key, const sisl::ByteView& data) {
+    if (lsn < start_lsn_.load(std::memory_order_acquire)) {
         return;
     }
-
-    m_logdev->flush_under_guard();
+    if (in_rollback_range(key.log_id)) {
+        return;
+    }
+    stream_key trunc_key{};
+    const lsn_t cur_tail = tail_lsn_.load(std::memory_order_acquire);
+    if (cur_tail < lsn) {
+        tail_lsn_.store(lsn, std::memory_order_release);
+        trunc_key = key;
+    } else {
+        trunc_key = records_.at(cur_tail).trunc_key;
+    }
+    records_.create(lsn, LogStoreRecord{key, trunc_key});
+    lsn_t cur_next = next_lsn_.load(std::memory_order_relaxed);
+    while (cur_next < lsn + 1 && !next_lsn_.compare_exchange_weak(cur_next, lsn + 1, std::memory_order_release)) {}
+    if (handler_) {
+        handler_(lsn, data);
+    }
 }
 
-bool HomeLogStore::rollback(logstore_seq_num_t to_lsn) {
-    //Fast path
-    if (to_lsn == m_tail_lsn.load()) {
-	return true;
+// ─────────────────────────────────────────────────────────────────────────────
+// Accessors / helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::optional< uint64_t > LogStore::head_stream_offset() const {
+    const lsn_t s = start_lsn_.load(std::memory_order_acquire);
+    const lsn_t t = tail_lsn_.load(std::memory_order_acquire);
+    if (s > t) {
+        return std::nullopt;
     }
+    return records_.at(s).trunc_key.group_stream_offset;
+}
 
-    if (to_lsn > m_tail_lsn.load() || to_lsn < m_start_lsn.load()) {
-        HS_LOG_ASSERT(false, "Attempted to rollback to {} which is not in the range of [{}, {}]", to_lsn, m_start_lsn.load(), m_tail_lsn.load());
-        return false;
-    }
-
-    THIS_LOGSTORE_LOG(INFO, "Rolling back to {}, tail {}", to_lsn, m_tail_lsn.load());
-    bool do_flush{false};
-    do {
-        {
-            std::unique_lock lg = m_logdev->flush_guard();
-            if (m_tail_lsn + 1 < m_next_lsn.load()) {
-                // We should flush any outstanding writes before we proceed with rollback
-                THIS_LOGSTORE_LOG(INFO,
-                                  "Rollback is issued while while there are some oustanding writes, tail_lsn={}, "
-                                  "next_lsn={}, will flush and retry rollback",
-                                  m_tail_lsn.load(std::memory_order_relaxed),
-                                  m_next_lsn.load(std::memory_order_relaxed));
-                do_flush = true;
-            } else {
-                do_flush = false;
-                logid_range_t logid_range =
-                    std::make_pair(m_records.at(to_lsn + 1).m_dev_key.idx,
-                                   m_records.at(m_tail_lsn).m_dev_key.idx); // Get the logid range to rollback
-
-                // Update the next_lsn and tail lsn back to to_lsn and also rollback all stream records and now on, we
-                // can't access any lsns beyond to_lsn
-                m_next_lsn.store(to_lsn + 1, std::memory_order_release); // Rollback the next append lsn
-                m_tail_lsn = to_lsn;
-                m_records.rollback(to_lsn);
-
-                // Rollback the log_ids in the range, for this log store (which persists this info in its superblk)
-                m_logdev->rollback(m_store_id, logid_range);
-            }
+bool LogStore::in_rollback_range(logid_t log_id) const {
+    for (auto const& r : rollback_ranges_) {
+        if (log_id >= r.first && log_id <= r.second) {
+            return true;
         }
-        if (do_flush) m_logdev->flush_under_guard();
-    } while (do_flush);
-
-    return true;
+    }
+    return false;
 }
 
-nlohmann::json HomeLogStore::get_status(int verbosity) const {
-    nlohmann::json js;
-    js["append_mode"] = m_append_mode;
-    js["start_lsn"] = m_start_lsn.load(std::memory_order_relaxed);
-    js["next_lsn"] = m_next_lsn.load(std::memory_order_relaxed);
-    js["tail_lsn"] = m_tail_lsn.load(std::memory_order_relaxed);
-    js["logstore_records"] = m_records.get_status(verbosity);
-    js["logstore_sb_first_lsn"] = m_logdev->log_dev_meta().store_superblk(m_store_id).m_first_seq_num;
-    return js;
+folly::coro::Task< void > LogStore::flush_upto(lsn_t upto_lsn) {
+    if (tail_lsn_.load(std::memory_order_acquire) >= upto_lsn) {
+        co_return;
+    }
+    co_await folly::coro::sleep(flush_coalesce_wait_);
+    if (tail_lsn_.load(std::memory_order_acquire) >= upto_lsn) {
+        co_return;
+    }
+    co_await stream_->flush();
+    for (int i = 0; i < max_flush_retries && tail_lsn_.load(std::memory_order_acquire) < upto_lsn; ++i) {
+        co_await folly::coro::sleep(flush_retry_wait_);
+    }
 }
 
-logstore_superblk logstore_superblk::default_value() { return logstore_superblk{-1}; }
-void logstore_superblk::init(logstore_superblk& meta) { meta.m_first_seq_num = 0; }
-void logstore_superblk::clear(logstore_superblk& meta) { meta.m_first_seq_num = -1; }
-bool logstore_superblk::is_valid(const logstore_superblk& meta) { return meta.m_first_seq_num >= 0; }
+folly::coro::Task< void > LogStore::persist_sb() {
+    const uint32_t n = to_u32(rollback_ranges_.size());
+    const size_t bytes = LogStoreSb::size_for(n);
+    auto buf = sisl::make_byte_array(to_u32(bytes));
+    auto* sb = r_cast< LogStoreSb* >(buf->bytes());
+    sb->store_id = store_id_;
+    sb->append_mode = append_mode_ ? 1 : 0;
+    sb->start_lsn = start_lsn_.load(std::memory_order_acquire);
+    sb->n_rollback_ranges = n;
+    if (n > 0) {
+        std::memcpy(sb->rollback_ranges(), rollback_ranges_.data(), n * sizeof(logid_range));
+    }
+    co_await meta_client_.write_meta_blk(sb_mblk_, buf);
+}
 
 } // namespace homestore

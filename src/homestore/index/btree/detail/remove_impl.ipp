@@ -100,18 +100,18 @@ BtreeTask< BtreeStatus > Btree< K, V >::do_remove(Node my_node, ReqT& req) {
 #endif
 
         if constexpr (std::is_same_v< ReqT, BtreeSingleRemoveRequest >) {
-            auto const [found, idx] = my_node->find(req.key(), nullptr, false);
+            auto const [found, idx] = my_node->find(req.key());
             BT_NODE_LOG(TRACE, my_node, "do_remove leaf single: key={} found={} idx={}", req.key().to_string(), found,
                         idx);
             if (found) {
                 if (req.outval_) {
-                    auto status = CO_AWAIT read_from_node(my_node, idx, *s_cast< V* >(req.outval_));
+                    auto status = CO_AWAIT node_ops_.leaf_read_value(my_node, idx, *req.outval_);
                     if (status != BtreeStatus::success) {
                         BT_NODE_LOG(ERROR, my_node, "do_remove leaf: read_from_node failed at idx={}", idx);
                         CO_RETURN status;
                     }
                 }
-                remove_from_node(my_node, idx);
+                node_ops_.leaf_remove_kv(my_node, idx);
                 ++removed_count;
                 modified = true;
             }
@@ -125,7 +125,7 @@ BtreeTask< BtreeStatus > Btree< K, V >::do_remove(Node my_node, ReqT& req) {
                 while (idx <= end_idx) {
                     auto decision = CO_AWAIT apply_remove_filter(my_node, idx, req.filter_);
                     if (decision == RemoveFilterDecision::Remove) {
-                        remove_from_node(my_node, idx);
+                        node_ops_.leaf_remove_kv(my_node, idx);
                         if (end_idx == 0) {
                             break;
                         }
@@ -140,7 +140,7 @@ BtreeTask< BtreeStatus > Btree< K, V >::do_remove(Node my_node, ReqT& req) {
                 BT_NODE_LOG(TRACE, my_node, "do_remove leaf range: no match in working range");
             }
             req.removed_count_ += removed_count;
-            req.shift_working_range();
+            req.next_working_range();
         } else if constexpr (std::is_same_v< ReqT, BtreeRemoveAnyRequest< K > >) {
             uint32_t start_idx{0};
             uint32_t end_idx{0};
@@ -152,13 +152,13 @@ BtreeTask< BtreeStatus > Btree< K, V >::do_remove(Node my_node, ReqT& req) {
                     my_node->read_nth_key(idx, *req.outkey_, true);
                 }
                 if (req.outval_) {
-                    auto status = CO_AWAIT read_from_node(my_node, idx, *s_cast< V* >(req.outval_));
+                    auto status = CO_AWAIT node_ops_.leaf_read_value(my_node, idx, *req.outval_);
                     if (status != BtreeStatus::success) {
                         BT_NODE_LOG(ERROR, my_node, "do_remove leaf any: read_from_node failed at idx={}", idx);
                         CO_RETURN status;
                     }
                 }
-                remove_from_node(my_node, idx);
+                node_ops_.leaf_remove_kv(my_node, idx);
                 ++removed_count;
                 modified = true;
             } else {
@@ -179,7 +179,13 @@ BtreeTask< BtreeStatus > Btree< K, V >::do_remove(Node my_node, ReqT& req) {
         } else {
             BT_NODE_LOG(TRACE, my_node, "do_remove leaf: nothing removed");
         }
-        CO_RETURN modified ? BtreeStatus::success : BtreeStatus::key_not_found;
+        // Range removes are idempotent: a leaf with no matches in its working range is "already clean", not an error,
+        // so the interior loop continues to the next sibling that may still hold matches.
+        if constexpr (std::is_same_v< ReqT, BtreeRangeRemoveRequest< K > >) {
+            CO_RETURN BtreeStatus::success;
+        } else {
+            CO_RETURN modified ? BtreeStatus::success : BtreeStatus::key_not_found;
+        }
         // RAII: my_node destructor unlocks
     }
 
@@ -192,7 +198,7 @@ retry_inner:
 
     // Determine child index range to visit.
     if constexpr (std::is_same_v< ReqT, BtreeSingleRemoveRequest >) {
-        auto const [found, idx] = my_node->find(req.key(), nullptr, false);
+        auto const [found, idx] = my_node->find(req.key());
         ASSERT_IS_VALID_INTERIOR_CHILD_INDX(found, idx, my_node.operator->());
         end_idx = start_idx = idx;
     } else if constexpr (std::is_same_v< ReqT, BtreeRangeRemoveRequest< K > >) {
@@ -281,13 +287,14 @@ retry_inner:
 #ifndef NDEBUG
         if (child->total_entries()) {
             if (curr_idx != my_node->total_entries()) {
-                BT_NODE_DBG_ASSERT_LE(child->get_last_key< K >().compare(my_node->get_nth_key< K >(curr_idx, false)), 0,
-                                      my_node.operator->());
+                BT_NODE_DBG_ASSERT_LE(
+                    child->template get_last_key< K >().compare(my_node->template get_nth_key< K >(curr_idx, false)), 0,
+                    my_node.operator->());
             }
             if (curr_idx > 0) {
                 BT_NODE_DBG_ASSERT_GT(
-                    child->get_first_key< K >().compare(my_node->get_nth_key< K >(curr_idx - 1, false)), 0,
-                    my_node.operator->());
+                    child->template get_first_key< K >().compare(my_node->template get_nth_key< K >(curr_idx - 1, false)),
+                    0, my_node.operator->());
             }
         }
 #endif
@@ -363,7 +370,7 @@ BtreeTask< RemoveFilterDecision > Btree< K, V >::apply_remove_filter(Node const&
     }
 
     V old_val;
-    auto status = CO_AWAIT read_from_node(node, idx, old_val);
+    auto status = CO_AWAIT node_ops_.leaf_read_value(node, idx, old_val);
     if (status != BtreeStatus::success) {
         BT_LOG(ERROR, "apply_remove_filter: read_from_node failed status={}", status);
         DEBUG_ASSERT(false, "apply_remove_filter: failed to read value for filter");
@@ -402,51 +409,65 @@ BtreeTask< BtreeStatus > Btree< K, V >::merge_nodes(Node const& parent_node, Nod
         CO_RETURN BtreeStatus::merge_not_required;
     }
 
-    // ── Phase 2: Pack leftmost + old_nodes into new_nodes (greedy fill) ─────
+    // ── Phase 2: Pack leftmost + old_nodes greedily.  leftmost itself is the first fill target; any overflow goes into
+    // fresh siblings collected in new_nodes.  Before touching leftmost's contents we swap its phys_node_buf_ for a
+    // fresh backend-allocated working copy, saving the original in saved_buf for rollback on abort.  No memcpy on the
+    // commit path — leftmost simply keeps the working buf; saved_buf drops its refcount.
     auto const node_count = 1 + old_nodes.size();
-    NodeList new_nodes;
-    new_nodes.reserve(node_count);
-    new_nodes.push_back(clone_temp_node(*leftmost_node));
+    NodeList new_nodes; // extras only (does not include leftmost)
+    new_nodes.reserve(old_nodes.size());
+
+    auto saved_buf = leftmost_node->phys_node_buf_;
+    {
+        auto working_buf = underlying_->allocate_node_buf();
+        std::memcpy(working_buf.get(), saved_buf.get(), bt_cfg_.node_size());
+        leftmost_node->phys_node_buf_ = std::move(working_buf);
+    }
+
+    // Current fill target: leftmost until the first overflow, then the most recent new_nodes entry.
+    auto cur_node = [&]() -> Node const& { return new_nodes.empty() ? leftmost_node : new_nodes.back(); };
 
     BT_NODE_LOG(TRACE, parent_node,
-                "merge_nodes phase2: cloned leftmost entries={}, packing {} old nodes into ideal_fill={}",
-                new_nodes.back()->total_entries(), old_nodes.size(), bt_cfg_.ideal_fill_size());
+                "merge_nodes phase2: leftmost entries={}, packing {} old nodes into ideal_fill={}",
+                leftmost_node->total_entries(), old_nodes.size(), bt_cfg_.ideal_fill_size());
 
     uint32_t src_cursor{0};
     for (size_t oi = 0; oi < old_nodes.size(); ++oi) {
         auto& old_node = old_nodes[oi];
         src_cursor = 0;
         while (src_cursor < old_node->total_entries()) {
-            auto before = new_nodes.back()->total_entries();
-            new_nodes.back()->append_copy_in_upto_size(*old_node, src_cursor, bt_cfg_.ideal_fill_size());
+            auto before = cur_node()->total_entries();
+            cur_node()->append_copy_in_upto_size(*old_node, src_cursor, bt_cfg_.ideal_fill_size());
             BT_NODE_LOG(TRACE, parent_node,
-                        "merge_nodes phase2: old[{}] src_cursor={}/{} -> new_nodes[{}] entries {}->{}", oi, src_cursor,
-                        old_node->total_entries(), new_nodes.size() - 1, before, new_nodes.back()->total_entries());
+                        "merge_nodes phase2: old[{}] src_cursor={}/{} -> slot[{}] entries {}->{}", oi, src_cursor,
+                        old_node->total_entries(), new_nodes.size(), before, cur_node()->total_entries());
             if (src_cursor < old_node->total_entries()) {
                 new_nodes.push_back(leftmost_node->is_leaf() ? create_leaf_node() : create_interior_node());
             }
         }
         if (old_node->has_valid_edge()) {
-            new_nodes.back()->set_edge_id(old_node->edge_id());
+            node_ops_.set_edge_link(cur_node(), NodeLink{old_node->edge_id()});
         }
     }
 
-    // Drop trailing empty new node (can happen when old_nodes were all empty)
-    if (new_nodes.back()->total_entries() == 0 && !new_nodes.back()->has_valid_edge()) {
+    // Drop trailing empty extra (leftmost itself is never "dropped" — if it ends up empty+no-edge the all-empty
+    // branch in phase 4 handles it via sibling collapse).
+    if (!new_nodes.empty() && new_nodes.back()->is_empty()) {
         BT_NODE_LOG(TRACE, parent_node, "merge_nodes phase2: dropping trailing empty new_node");
         remove_node(std::move(new_nodes.back()));
         new_nodes.pop_back();
     }
 
-    BT_NODE_LOG(DEBUG, parent_node, "merge_nodes phase2 done: {} old nodes -> {} new nodes (was {})", old_nodes.size(),
+    BT_NODE_LOG(DEBUG, parent_node, "merge_nodes phase2 done: {} old nodes -> 1+{} slots (was {})", old_nodes.size(),
                 new_nodes.size(), node_count);
 
     // ── Phase 3: Decide whether merging is beneficial ───────────────────────
-    auto cleanup = [&](NodeList& nodes) {
-        for (auto& n : nodes) {
+    auto abort_and_restore = [&]() {
+        leftmost_node->phys_node_buf_ = std::move(saved_buf);
+        for (auto& n : new_nodes) {
             remove_node(std::move(n));
         }
-        nodes.clear();
+        new_nodes.clear();
     };
 
     // If we couldn't copy all entries from the last old node, abort.
@@ -454,33 +475,33 @@ BtreeTask< BtreeStatus > Btree< K, V >::merge_nodes(Node const& parent_node, Nod
         BT_NODE_LOG(DEBUG, parent_node,
                     "merge_nodes phase3: couldn't fit last old node (cursor={} < entries={}), aborting", src_cursor,
                     old_nodes.back()->total_entries());
-        cleanup(new_nodes);
+        abort_and_restore();
         CO_RETURN BtreeStatus::merge_not_required;
     }
 
-    // No reduction in node count — not worth it.
-    if (new_nodes.size() >= node_count) {
-        BT_NODE_LOG(DEBUG, parent_node, "merge_nodes phase3: no reduction ({} new >= {} old+1), aborting",
-                    new_nodes.size(), node_count);
-        cleanup(new_nodes);
+    // No reduction in slot count — not worth it.  Result slots = 1 (leftmost) + new_nodes.size().
+    if (new_nodes.size() + 1 >= node_count) {
+        BT_NODE_LOG(DEBUG, parent_node, "merge_nodes phase3: no reduction (1+{} >= {}), aborting", new_nodes.size(),
+                    node_count);
+        abort_and_restore();
         CO_RETURN BtreeStatus::merge_not_required;
     }
 
     // ── Phase 4: Commit the merge ───────────────────────────────────────────
-    BT_NODE_LOG(TRACE, parent_node, "merge_nodes phase4: committing, new_nodes.size={}", new_nodes.size());
+    BT_NODE_LOG(TRACE, parent_node, "merge_nodes phase4: committing, 1+{} slots", new_nodes.size());
 
-    // All nodes were empty (e.g. after a range remove wiped entire leaves).  Collapse the siblings onto
-    // leftmost and shift the separator at end_idx onto leftmost's entry so parent keeps the old upper
-    // bound for this range.  If end_idx is the edge slot, there is nothing to shift.
-    if (new_nodes.empty()) {
+    // All entries vanished (e.g. range remove wiped whole leaves): leftmost ends up empty+no-edge and no extras got
+    // created.  Collapse the siblings onto leftmost and shift the separator at end_idx onto leftmost's entry so parent
+    // keeps the old upper bound for this range.  If end_idx is the edge slot, there is nothing to shift.
+    if (new_nodes.empty() && leftmost_node->is_empty()) {
         BT_NODE_LOG(DEBUG, parent_node, "merge_nodes: all nodes empty, collapsing {} siblings into leftmost",
                     old_nodes.size());
         if (end_idx < parent_node->total_entries()) {
             K end_key = parent_node->get_nth_key< K >(end_idx, /*copy=*/true);
-            parent_node->remove(start_idx + 1, start_idx + to_u32(old_nodes.size()));
-            parent_node->update(start_idx, end_key);
+            node_ops_.remove_children(parent_node, start_idx + 1, start_idx + to_u32(old_nodes.size()));
+            node_ops_.update_key(parent_node, start_idx, end_key);
         } else {
-            parent_node->remove(start_idx + 1, start_idx + to_u32(old_nodes.size()));
+            node_ops_.remove_children(parent_node, start_idx + 1, start_idx + to_u32(old_nodes.size()));
         }
         leftmost_node->set_next_node(old_nodes.back()->next_node());
     } else {
@@ -491,39 +512,41 @@ BtreeTask< BtreeStatus > Btree< K, V >::merge_nodes(Node const& parent_node, Nod
             old_last_key = parent_node->get_nth_key< K >(end_idx, true /* copy */);
         }
 
-        leftmost_node->overwrite(*new_nodes[0]);
-        remove_node(std::move(new_nodes[0]));
-
-        auto const extra_new = to_u32(new_nodes.size() - 1);
-        parent_node->remove(start_idx + extra_new + 1, start_idx + to_u32(old_nodes.size()));
+        auto const extra_new = to_u32(new_nodes.size());
+        node_ops_.remove_children(parent_node, start_idx + extra_new + 1, start_idx + to_u32(old_nodes.size()));
 
         auto next_id = old_nodes.back()->next_node();
         auto parent_idx = start_idx + extra_new;
-        for (auto i = new_nodes.size(); i-- > 1;) {
+        for (auto i = new_nodes.size(); i-- > 0;) {
             new_nodes[i]->set_next_node(next_id);
-            parent_node->update(parent_idx,
-                                old_last_key.has_value() ? *old_last_key : new_nodes[i]->get_last_key< K >(),
-                                NodeLink{new_nodes[i]->node_id()});
+            node_ops_.update_child(parent_node, parent_idx,
+                                   old_last_key.has_value() ? *old_last_key : new_nodes[i]->get_last_key< K >(),
+                                   NodeLink{new_nodes[i]->node_id()});
             old_last_key.reset();
             next_id = new_nodes[i]->node_id();
             --parent_idx;
         }
 
         leftmost_node->set_next_node(next_id);
-        parent_node->update(start_idx, old_last_key.has_value() ? *old_last_key : leftmost_node->get_last_key< K >(),
-                            NodeLink{leftmost_node->node_id()});
+        node_ops_.update_child(parent_node, start_idx,
+                               old_last_key.has_value() ? *old_last_key : leftmost_node->get_last_key< K >(),
+                               NodeLink{leftmost_node->node_id()});
         old_last_key.reset();
 
-        for (size_t i = 1; i < new_nodes.size(); ++i) {
-            write_node(new_nodes[i]);
+        for (auto& n : new_nodes) {
+            write_node(n);
         }
     }
 
     write_node(leftmost_node);
     write_node(parent_node);
-    cleanup(old_nodes);
+    auto const merged_count = old_nodes.size();
+    for (auto& n : old_nodes) {
+        remove_node(std::move(n));
+    }
+    old_nodes.clear();
 
-    BT_NODE_LOG(DEBUG, parent_node, "merge_nodes: merged {} siblings into {} nodes at idx [{}-{}]", old_nodes.size(),
+    BT_NODE_LOG(DEBUG, parent_node, "merge_nodes: merged {} siblings into 1+{} nodes at idx [{}-{}]", merged_count,
                 new_nodes.size(), start_idx, end_idx);
     COUNTER_INCREMENT(metrics_, btree_merge_count, 1);
     CO_RETURN BtreeStatus::success;

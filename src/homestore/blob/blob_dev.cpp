@@ -226,7 +226,7 @@ folly::coro::Task< shared< AppendByteStream > > BlobDev::create_append_byte_stre
 // ─────────────────────────────────────────────────────────────────────────────
 
 folly::coro::Task< void > BlobDev::load(StreamMblkMap&& raw_blk, StreamMblkMap&& append_blk,
-                                        StreamMblkMap&& append_byte) {
+                                        AppendByteSbMap&& append_byte) {
     uint64_t max_sid = 0;
 
     for (auto& [sid, info] : raw_blk) {
@@ -240,8 +240,8 @@ folly::coro::Task< void > BlobDev::load(StreamMblkMap&& raw_blk, StreamMblkMap&&
         max_sid = std::max(max_sid, sid);
     }
     for (auto& [sid, info] : append_byte) {
-        append_byte_streams_[sid] =
-            co_await AppendByteStream::load(sid, meta_client_, dev_name_, vdev_, std::move(info.chunk_mblks));
+        append_byte_streams_[sid] = co_await AppendByteStream::load(sid, meta_client_, dev_name_, vdev_,
+                                                                    std::move(info.sb), std::move(info.payload));
         max_sid = std::max(max_sid, sid);
     }
 

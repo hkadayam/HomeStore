@@ -17,12 +17,16 @@
 #include <homestore/blk.h>
 #include <homestore/checkpoint/cp_mgr.h>
 #include <homestore/index/btree/detail/btree_internal.h>
+#include "sisl/fds/id_reserver.h"
 
-#include "iomanager/drive_interface.hpp" // IOBuffer
 #include "meta/meta_blk.h"
+#include "meta/meta_client.h"
 
 namespace homestore {
+class BlobDev;
 class BtreeBase;
+template < typename K, typename V >
+class Btree;
 struct OverflowEntry;
 
 // ──────────────────────────────────────── COWBtreeSuperBlock ─────────────────────────────────────────────────────────
@@ -74,16 +78,35 @@ public:
     std::vector< COWBtreeSuperBlock const* > list_persisted_btrees() const;
 
     template < typename K, typename V >
-    folly::coro::Task< shared< BtreeBase > > create_cow_btree(BtreeConfig const& cfg, shared< BlobDev > blob_dev,
-                                                              sisl::Blob const& user_sb = {});
+    folly::coro::Task< shared< Btree< K, V > > > create_cow_btree(BtreeConfig const& cfg, shared< BlobDev > blob_dev,
+                                                                  sisl::Blob const& user_sb = {});
 
     template < typename K, typename V >
-    shared< BtreeBase > load_cow_btree(BtreeConfig const& cfg, COWBtreeSuperBlock const& sb);
+    folly::coro::Task< shared< Btree< K, V > > > load_cow_btree(BtreeConfig const& cfg, shared< BlobDev > blob_dev,
+                                                                COWBtreeSuperBlock const& sb);
 
     folly::coro::Task< void > destroy_cow_btree(cshared< BtreeBase >& base);
 
+    // ── Incremental map size accounting
+    // Tracks total bytes currently held in the incr_map streams across all COWBtree instances.  COWBtree calls
+    // incr_map_appended() after each successful incr_cp_flush() (delta = post-flush tail_offset - pre-flush) and
+    // incr_map_truncated() after each full_cp_flush() truncates its incr stream (delta = pre-truncate tail_offset). The
+    // per-CP "should we go full?" decision is computed once in the manager (see CPCallbacksImpl::cp_flush) and passed
+    // to each btree as a suggestion via COWBtree::cp_flush(cp, suggest_incremental).
+    void incr_map_appended(uint64_t bytes) noexcept {
+        incr_map_total_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    void incr_map_truncated(uint64_t bytes) noexcept {
+        incr_map_total_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
+    }
+    uint64_t incr_map_total_bytes() const noexcept { return incr_map_total_bytes_.load(std::memory_order_relaxed); }
+
 private:
     COWBtreeManager();
+
+    // Computed once per CP by the manager — not exposed to btrees.  Returns true when accumulated incr_map bytes
+    // exceed the configured percent of fast-dev capacity, indicating the next CP should do a full_map_flush.
+    bool should_force_full_flush() const;
 
     class CPCallbacksImpl : public CPCallbacks {
     public:
@@ -107,13 +130,16 @@ private:
     shared< sisl::TwoQEvictor > evictor_;
     shared< NodeCache > node_cache_;
     shared< OverflowCache > overflow_cache_;
+    shared< MetaClient > meta_client_;
 
     std::mutex tracking_mtx_;
     std::vector< shared< BtreeBase > > tracked_btrees_;
     std::vector< PersistedBtreeInfo > pending_btrees_;
-    std::atomic< uint32_t > next_ordinal_{0};
-    unique< CPCallbacksImpl > cp_callbacks_;
-    uint32_t num_incremental_flushes_{0};
+    sisl::IDReserver ordinal_reserver_;
+    shared< CPCallbacksImpl > cp_callbacks_;
+
+    // Sum of incr_map stream sizes across all live COWBtrees.  Compared against incr_map_max_bytes() each CP.
+    std::atomic< uint64_t > incr_map_total_bytes_{0};
 };
 
 } // namespace homestore

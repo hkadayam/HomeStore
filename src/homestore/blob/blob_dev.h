@@ -74,8 +74,16 @@ public:
         ChunkMblkMap chunk_mblks;
     };
 
-    /// Per-stream recovery data grouped by stream_id.
+    /// Per-stream recovery data grouped by stream_id (for per-chunk-mblk stream types: RawBlk, AppendBlk).
     using StreamMblkMap = std::map< uint64_t, StreamRecoveryInfo >;
+
+    /// Per-stream recovery for AppendByteStream: a single sb MetaBlk + its payload per stream.  No per-chunk MetaBlks
+    /// — chunk list lives in the sb payload.
+    struct AppendByteSbInfo {
+        MetaBlk sb;
+        sisl::ByteView payload;
+    };
+    using AppendByteSbMap = std::map< uint64_t, AppendByteSbInfo >;
 
     // ── Creation ─────────────────────────────────────────────────────────────
 
@@ -99,9 +107,9 @@ public:
     // ── Recovery load ─────────────────────────────────────────────────────────
 
     /// Load previously-persisted streams from recovered data.
-    /// Each StreamMblkMap is keyed by stream_id → (chunk_id → MetaBlk + payload).
-    /// Empty map = no streams of that type.
-    folly::coro::Task< void > load(StreamMblkMap&& raw_blk, StreamMblkMap&& append_blk, StreamMblkMap&& append_byte);
+    /// RawBlk and AppendBlk use per-chunk MetaBlks grouped by stream_id (StreamMblkMap).
+    /// AppendByte uses a single per-stream sb MetaBlk (AppendByteSbMap).
+    folly::coro::Task< void > load(StreamMblkMap&& raw_blk, StreamMblkMap&& append_blk, AppendByteSbMap&& append_byte);
 
     /// After all streams are loaded, remove any VDev chunks not owned by any stream (orphans left by a crash before
     /// MetaBlk was written).

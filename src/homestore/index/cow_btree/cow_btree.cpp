@@ -1,23 +1,24 @@
 #include <cstring>
 
-#include <sisl/fds/buffer.hpp>
+#include <sisl/fds/buffer.h>
 
 #include <homestore/index/btree/detail/btree_node.h>
 #include <homestore/index/btree/btree_base.h>
 
+#include "base/homestore_config.hpp"
+#include "base/homestore_utils.hpp"
 #include "blob/append_blk_stream.h"
 #include "blob/append_byte_stream.h"
+#include "blob/blob_dev.h"
 #include "blob/raw_blk_stream.h"
 #include "index/cow_btree/cow_btree.h"
-#include "index/index_cp.h"
-#include "common/homestore_config.hpp"
-#include "common/homestore_utils.hpp"
 
 namespace homestore {
 
-#define COWBT_LOG(level, ...) HS_DETAILED_LOG(level, btree, "btree", base_btree_.bt_config().name(), __VA_ARGS__)
-#define COWBT_CP_LOG(level, cp_id, ...)                                                                                \
-    HS_PERIODIC_DETAILED_LOG(level, btree, "btree", base_btree_.bt_config().name(), "cp", cp_id, __VA_ARGS__)
+using sisl::IOBuffer;
+
+#define COWBT_LOG(level, msg, ...) SPECIFIC_BT_LOG(level, (*base_btree_), msg, ##__VA_ARGS__)
+#define COWBT_CP_LOG(level, cp_id, msg, ...) SPECIFIC_BT_LOG(level, (*base_btree_), "[cp={}] " msg, cp_id, ##__VA_ARGS__)
 
 // bnodeid_t layout: [ordinal(31 bits)][overflow_bit(1 bit)][node_number(32 bits)]
 // Overflow bit is bit 32 (the lowest bit of the upper half).
@@ -46,14 +47,17 @@ COWBtreeSuperBlock& COWBtree::mutable_super_blk() {
     return *r_cast< COWBtreeSuperBlock* >(mblk_.meta_blk().inline_data());
 }
 
-folly::coro::Task< unique< COWBtree > > COWBtree::create(shared< BlobDev > blob_dev, MetaBlkWrapper&& mblk,
-                                                         shared< NodeCache > node_cache,
+folly::coro::Task< shared< COWBtree > > COWBtree::create(COWBtreeManager& mgr, shared< BlobDev > blob_dev,
+                                                         MetaBlkWrapper&& mblk, shared< NodeCache > node_cache,
                                                          shared< OverflowCache > overflow_cache) {
-    auto node_s = co_await blob_dev->create_append_blk_stream(HS_DYNAMIC_CONFIG(btree->node_chunk_size));
-    auto overflow_s = co_await blob_dev->create_raw_blk_stream(HS_DYNAMIC_CONFIG(btree->overflow_chunk_size));
-    auto incr_map_s = co_await blob_dev->create_append_byte_stream(HS_DYNAMIC_CONFIG(btree->map_chunk_size), false);
-    auto full_map_1 = co_await blob_dev->create_append_byte_stream(HS_DYNAMIC_CONFIG(btree->map_chunk_size), false);
-    auto full_map_2 = co_await blob_dev->create_append_byte_stream(HS_DYNAMIC_CONFIG(btree->map_chunk_size), false);
+    auto node_s = co_await blob_dev->create_append_blk_stream(HS_DYNAMIC_CONFIG(btree->cow_node_chunk_size));
+    auto overflow_s = co_await blob_dev->create_raw_blk_stream(HS_DYNAMIC_CONFIG(btree->cow_overflow_chunk_size));
+    auto incr_map_s =
+        co_await blob_dev->create_append_byte_stream(HS_DYNAMIC_CONFIG(btree->cow_incr_map_chunk_size), false);
+    auto full_map_1 =
+        co_await blob_dev->create_append_byte_stream(HS_DYNAMIC_CONFIG(btree->cow_full_map_chunk_size), false);
+    auto full_map_2 =
+        co_await blob_dev->create_append_byte_stream(HS_DYNAMIC_CONFIG(btree->cow_full_map_chunk_size), false);
 
     auto& sb = *r_cast< COWBtreeSuperBlock* >(mblk.meta_blk().inline_data());
     sb.node_stream_id = node_s->stream_id();
@@ -65,21 +69,27 @@ folly::coro::Task< unique< COWBtree > > COWBtree::create(shared< BlobDev > blob_
 
     co_await mblk.write(to_cu8ptr(&sb), sizeof(COWBtreeSuperBlock));
 
-    co_return unique< COWBtree >(
-        new COWBtree(std::move(blob_dev), std::move(mblk), std::move(node_cache), std::move(overflow_cache)));
+    // Fresh streams — incr_map is empty, no accounting seed needed.
+    co_return shared< COWBtree >(
+        new COWBtree(mgr, std::move(blob_dev), std::move(mblk), std::move(node_cache), std::move(overflow_cache)));
 }
 
-folly::coro::Task< unique< COWBtree > > COWBtree::load(shared< BlobDev > blob_dev, MetaBlkWrapper&& mblk,
-                                                       shared< NodeCache > node_cache,
+folly::coro::Task< shared< COWBtree > > COWBtree::load(COWBtreeManager& mgr, shared< BlobDev > blob_dev,
+                                                       MetaBlkWrapper&& mblk, shared< NodeCache > node_cache,
                                                        shared< OverflowCache > overflow_cache) {
-    auto cow = unique< COWBtree >(
-        new COWBtree(std::move(blob_dev), std::move(mblk), std::move(node_cache), std::move(overflow_cache)));
+    auto cow = shared< COWBtree >(
+        new COWBtree(mgr, std::move(blob_dev), std::move(mblk), std::move(node_cache), std::move(overflow_cache)));
     co_await cow->recover();
+
+    // Seed the manager-level incr_map accumulator with bytes already on disk so the threshold check is accurate
+    // immediately after recovery.
+    mgr.incr_map_appended(cow->incr_map_stream_->tail_offset());
     co_return cow;
 }
 
-COWBtree::COWBtree(shared< BlobDev > blob_dev, MetaBlkWrapper&& mblk, shared< NodeCache > node_cache,
-                   shared< OverflowCache > overflow_cache) :
+COWBtree::COWBtree(COWBtreeManager& mgr, shared< BlobDev > blob_dev, MetaBlkWrapper&& mblk,
+                   shared< NodeCache > node_cache, shared< OverflowCache > overflow_cache) :
+        mgr_{mgr},
         blob_dev_{std::move(blob_dev)},
         node_cache_{std::move(node_cache)},
         overflow_cache_{std::move(overflow_cache)},
@@ -102,34 +112,50 @@ COWBtree::COWBtree(shared< BlobDev > blob_dev, MetaBlkWrapper&& mblk, shared< No
     }
 }
 
-void COWBtree::destroy() {
+folly::coro::Task< void > COWBtree::destroy() {
     bnodeid_map_.clear();
-    // TODO: destroy node_stream_ (releases all chunks back to vdev), destroy overflow_stream_,
-    // truncate incr_map and full_map streams.  Cache entries become stale and will be evicted naturally.
+
+    // Release all chunks held by each stream back to the underlying VDev. Cache entries (node_cache_,
+    // overflow_cache_) become stale and will be evicted naturally — no explicit invalidation needed.
+    co_await node_stream_->destroy();
+    co_await overflow_stream_->destroy();
+    co_await incr_map_stream_->destroy();
+    co_await full_map_streams_[0]->destroy();
+    co_await full_map_streams_[1]->destroy();
+
+    // Drop the per-btree MetaBlk holding the COWBtreeSuperBlock.
+    co_await mblk_.meta_client()->remove_meta_blk(mblk_.meta_blk());
 
     for (auto& session : cp_sessions_) {
         session->finish();
     }
+    co_return;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UnderlyingBtree interface
 // ─────────────────────────────────────────────────────────────────────────────
+std::shared_ptr< uint8_t > COWBtree::allocate_node_buf() {
+    return sisl::AlignedSharedPtr< uint8_t, sisl::Buftag::btree_node >::make_sized(base_btree_->node_size(),
+                                                                                   node_stream_->block_size());
+}
+
 Node COWBtree::create_node(bool is_leaf) {
     bnodeid_t const id = generate_node_id();
 
-    auto buf = sisl::AlignedSharedPtr< uint8_t, sisl::Buftag::btree_node >::make_sized(base_btree_->node_size(),
-                                                                                       node_stream_->block_size());
+    auto buf = allocate_node_buf();
     auto core = base_btree_->construct_fresh_node(std::move(buf), id, is_leaf);
 
-    auto cache_handle = node_cache_->insert(id, core, sisl::CacheHint::HOT);
+    auto cache_handle = node_cache_->insert(id, std::move(core), sisl::CacheHint::HOT);
     HS_REL_ASSERT(cache_handle, "create_node: cache insert failed for node_id={}", id);
-    return Node::construct(COWNodeHandle{std::move(cache_handle)}, LockType::Write);
+    COWNodeHandle handle{std::move(cache_handle)};
+    return Node::construct_new(handle, LockType::Write);
 }
 
-BtreeResult< Node > COWBtree::read_node(bnodeid_t id, LockType lock_type) const {
+BtreeResult< Node > COWBtree::read_node(bnodeid_t id, LockType lock_type) {
     if (auto h = node_cache_->find(id); h) {
-        CO_RETURN CO_AWAIT Node::async_construct(COWNodeHandle{std::move(h)}, lock_type);
+        COWNodeHandle handle{std::move(h)};
+        CO_RETURN CO_AWAIT Node::construct_existing(handle, lock_type);
     }
 
     // Get the mapping of nodeid -> blkid
@@ -153,14 +179,15 @@ BtreeResult< Node > COWBtree::read_node(bnodeid_t id, LockType lock_type) const 
         HS_REL_ASSERT(h, "read_node: cache insert and find both failed for node_id={}", id);
     }
 
-    auto node = CO_AWAIT Node::async_construct(COWNodeHandle{std::move(h)}, lock_type);
+    COWNodeHandle handle{std::move(h)};
+    auto node = CO_AWAIT Node::construct_existing(handle, lock_type);
     if (node.lock_type() == LockType::Write) {
         auto status = prepare_for_write(node);
         if (status != BtreeStatus::success) {
             CO_RETURN folly::makeUnexpected(status);
         }
     }
-    CO_RETURN std::move(node);
+    CO_RETURN node;
 }
 
 void COWBtree::write_node(const Node& node) {
@@ -257,22 +284,22 @@ BtreeStatus COWBtree::write_overflow(const sisl::ByteArray& buf, BlkId& out_blki
     return BtreeStatus::success;
 }
 
-folly::coro::Task< BtreeStatus > COWBtree::read_overflow(const BlkId& blkid, sisl::ByteArray& out_buf) const {
+BtreeTask< BtreeStatus > COWBtree::read_overflow(const BlkId& blkid, sisl::ByteArray& out_buf) const {
     if (auto h = overflow_cache_->find(blkid); h) {
         out_buf = h.value().buf;
-        co_return BtreeStatus::success;
+        CO_RETURN BtreeStatus::success;
     }
 
     auto const blk_sz = overflow_stream_->block_size();
     auto ba = sisl::make_byte_array(blkid.blk_count() * blk_sz, blk_sz, sisl::Buftag::btree_node);
-    auto ec = co_await overflow_stream_->read(*ba, blkid);
+    auto ec = CO_AWAIT overflow_stream_->read(*ba, blkid);
     if (ec) {
-        co_return BtreeStatus::node_read_failed;
+        CO_RETURN BtreeStatus::node_read_failed;
     }
 
     overflow_cache_->insert(blkid, OverflowEntry{blkid, ba}, sisl::CacheHint::COLD);
     out_buf = std::move(ba);
-    co_return BtreeStatus::success;
+    CO_RETURN BtreeStatus::success;
 }
 
 BtreeStatus COWBtree::delete_overflow(const BlkId& blkid) {
@@ -325,8 +352,8 @@ void COWBtree::add_to_remove_overflow_list(const BlkId& blkid) {
 template < typename OnNodeFlushed >
 folly::coro::Task< void > flush_dirty_nodes(COWBtree& bt, CP* cp, OnNodeFlushed&& on_flushed) {
     auto executor = co_await folly::coro::co_current_executor;
-    std::vector< folly::SemiFuture< void > > flush_futs;
-    CPSession* session = bt.cp_session(cp->id());
+    std::vector< folly::SemiFuture< folly::Unit > > flush_futs;
+    auto* session = bt.cp_session(cp->id());
 
     // Write all dirty nodes to node_stream_, update bnode_map, call on_node per entry.
     // We update bnode_map before confirming the write landed on disk — safe because FlushNodeEntry cache handles keep
@@ -340,7 +367,7 @@ folly::coro::Task< void > flush_dirty_nodes(COWBtree& bt, CP* cp, OnNodeFlushed&
         }
 
         auto const compact_id = to_compact_nodeid(node.node_id());
-        auto const compact_blkid = CompactBlkId{*bid};
+        auto const compact_blkid = COWBtree::CompactBlkId{*bid};
         bt.bnodeid_map_.update(compact_id, compact_blkid);
 
         on_flushed(compact_id, compact_blkid);
@@ -354,7 +381,7 @@ folly::coro::Task< void > flush_dirty_nodes(COWBtree& bt, CP* cp, OnNodeFlushed&
 
 template < typename OnNodeDeleted >
 folly::coro::Task< void > flush_deleted_nodes(COWBtree& bt, CP* cp, OnNodeDeleted&& on_deleted) {
-    CPSession* session = bt.cp_session(cp->id());
+    auto* session = bt.cp_session(cp->id());
 
     // Invalidate deleted nodes.
     for (auto compact_id : session->deleted_nodes_) {
@@ -370,7 +397,7 @@ folly::coro::Task< void > flush_deleted_nodes(COWBtree& bt, CP* cp, OnNodeDelete
 }
 
 folly::coro::Task< void > flush_overflow_nodes(COWBtree& bt, CP* cp) {
-    CPSession* session = bt.cp_session(cp->id());
+    auto* session = bt.cp_session(cp->id());
 
     // Write dirty overflow blocks.
     for (auto const& handle : session->dirty_overflow_blks_) {
@@ -383,21 +410,25 @@ folly::coro::Task< void > flush_overflow_nodes(COWBtree& bt, CP* cp) {
     for (auto const& blkid : session->deleted_overflow_blks_) {
         co_await bt.overflow_stream_->invalidate(cp, blkid);
     }
+    co_return;
 }
 
 bool COWBtree::is_dirty(cp_id_t cp_id) const {
     auto const* session = cp_sessions_[cp_id % CPManager::max_concurent_cps].get();
     return (session->cp_id_ == cp_id) &&
-        (!session->modified_nodes_.empty() || !session->deleted_nodes_.empty() ||
-         !session->dirty_overflow_blks_.empty() || !session->deleted_overflow_blks_.empty());
+        (session->modified_nodes_.size() > 0 || session->deleted_nodes_.size() > 0 ||
+         session->dirty_overflow_blks_.size() > 0 || session->deleted_overflow_blks_.size() > 0);
 }
 
-folly::coro::Task< void > COWBtree::cp_flush(CP* cp) {
-    // Determine if this CP for this btree has to be full flush or incremental flush
+folly::coro::Task< void > COWBtree::cp_flush(CP* cp, bool suggest_incremental) {
+    // Manager pre-computes whether the global incr_map size threshold has been crossed and passes that as a
+    // suggestion via suggest_incremental.  Currently we always honor the suggestion; a future btree-local override
+    // (e.g. force full when this btree's last_full_map_cp_id is too far behind) would tweak `incr_flush` here.
     CPSession* session = cp_session(cp->id());
-    bool incr_flush = true; // TODO: determine based on updates_since_last_flush threshold
+    bool const incr_flush = suggest_incremental;
 
-    COWBT_CP_LOG(INFO, cp->id(), "CP flush starting, mode={}", incr_flush ? "incremental" : "full");
+    COWBT_CP_LOG(INFO, cp->id(), "CP flush starting, mode={} (suggested={})", incr_flush ? "incremental" : "full",
+                 suggest_incremental ? "incremental" : "full");
     if (incr_flush) {
         co_await incr_cp_flush(cp);
     } else {
@@ -409,14 +440,15 @@ folly::coro::Task< void > COWBtree::cp_flush(CP* cp) {
 }
 
 folly::coro::Task< bool > COWBtree::incr_cp_flush(CP* cp) {
-    CPSession* session = cp_session(cp->id());
+    auto* session = cp_session(cp->id());
 
-    if (session->modified_nodes_.empty() && session->deleted_nodes_.empty() && session->dirty_overflow_blks_.empty() &&
-        session->deleted_overflow_blks_.empty()) {
+    if (session->modified_nodes_.size() == 0 && session->deleted_nodes_.size() == 0 &&
+        session->dirty_overflow_blks_.size() == 0 && session->deleted_overflow_blks_.size() == 0) {
         COWBT_CP_LOG(INFO, cp->id(), "Nothing to flush — no dirty/deleted nodes or overflow");
         co_return false;
     }
 
+    auto const cur_tail_offset = incr_map_stream_->tail_offset();
     auto const new_root = session->new_root_id_.exchange(empty_bnodeid);
     auto const modified_count = session->modified_nodes_.size();
     auto const deleted_count = session->deleted_nodes_.size();
@@ -424,6 +456,10 @@ folly::coro::Task< bool > COWBtree::incr_cp_flush(CP* cp) {
     COWBT_CP_LOG(INFO, cp->id(), "Incr flush started: modified={} deleted={} dirty_overflow={} deleted_overflow={}",
                  modified_count, deleted_count, session->dirty_overflow_blks_.size(),
                  session->deleted_overflow_blks_.size());
+
+    // Snapshot the incr_map stream's pre-flush tail so we can report bytes appended to the manager (for the global
+    // incr_map size threshold).
+    auto const incr_map_pre_offset = incr_map_stream_->tail_offset();
 
     // Step 1 - Flush overflow blocks first — nodes may reference overflow blkids, so overflow must be on disk first.
     co_await flush_overflow_nodes(*this, cp);
@@ -439,7 +475,7 @@ folly::coro::Task< bool > COWBtree::incr_cp_flush(CP* cp) {
     // Journal record buffer — one IncrMapNodeRecord per contiguous blkid run.
     static constexpr uint32_t kMaxRecordBufSize = IncrMapNodeRecord::size(1024);
     alignas(8) uint8_t record_buf[kMaxRecordBufSize];
-    auto* cur_record = r_cast< IncrMapNodeRecord* >(nullptr);
+    IncrMapNodeRecord* cur_record = nullptr;
     uint32_t num_node_records = 0;
     uint32_t crc = 0;
 
@@ -486,8 +522,13 @@ folly::coro::Task< bool > COWBtree::incr_cp_flush(CP* cp) {
 
     bnodeid_map_.updates_since_last_flush_.fetch_add(session->modified_nodes_.size() + session->deleted_nodes_.size());
 
-    COWBT_CP_LOG(INFO, cp->id(), "Incr flush complete: node_records={} updates={} deletes={} crc={:#x}",
-                 num_node_records, modified_count, deleted_count, crc);
+    // Report bytes appended to the manager so the global incr_map size threshold is tracked accurately.
+    auto const incr_map_appended = incr_map_stream_->tail_offset() - incr_map_pre_offset;
+    mgr_.incr_map_appended(incr_map_appended);
+
+    COWBT_CP_LOG(INFO, cp->id(),
+                 "Incr flush complete: node_records={} updates={} deletes={} crc={:#x} incr_map_appended={}",
+                 num_node_records, modified_count, deleted_count, crc, incr_map_appended);
     co_return true;
 }
 
@@ -528,15 +569,18 @@ folly::coro::Task< void > COWBtree::full_cp_flush(CP* cp) {
     mutable_super_blk().last_full_map_cp_id = cp->id();
     co_await mblk_.write(to_cu8ptr(&super_blk()), sizeof(COWBtreeSuperBlock));
 
-    // Swap: the passive stream is now stale; truncate and release its chunks.
+    // Swap: the passive stream is now stale; truncate up to its tail so all chunks get released (head==tail triggers
+    // the fresh-start reset inside truncate).
     active_full_map_.store(active_idx ^ 1, std::memory_order_release);
-    co_await passive_stream.truncate(true /* release_chunks */);
+    co_await passive_stream.truncate(passive_stream.tail_offset());
 
     // Truncate the incremental map stream — all deltas are covered by the full map.
-    co_await incr_map_stream_->truncate(false /* keep chunks for reuse */);
+    auto const incr_map_truncated_bytes = incr_map_stream_->tail_offset();
+    co_await incr_map_stream_->truncate(incr_map_stream_->tail_offset());
+    mgr_.incr_map_truncated(incr_map_truncated_bytes);
 
     bnodeid_map_.updates_since_last_flush_.store(0);
-    COWBT_CP_LOG(INFO, cp->id(), "Full map flush complete");
+    COWBT_CP_LOG(INFO, cp->id(), "Full map flush complete: incr_map_truncated={}", incr_map_truncated_bytes);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -603,7 +647,7 @@ folly::coro::Task< void > COWBtree::recover_full_map(cp_id_t cur_cp_id) {
         if (hdr.cp_id >= cur_cp_id || hdr.cp_id != last_full_cp) {
             COWBT_LOG(INFO, "Truncating full_map stream[{}] with cp_id={} (last_full_cp={}, cur_cp_id={})", idx,
                       hdr.cp_id, last_full_cp, cur_cp_id);
-            co_await stream.truncate(true);
+            co_await stream.truncate(stream.tail_offset());
             continue;
         }
 
@@ -629,7 +673,7 @@ folly::coro::Task< void > COWBtree::recover_full_map(cp_id_t cur_cp_id) {
         active_full_map_.store(recovered_idx ^ 1, std::memory_order_relaxed);
         auto& stale = *full_map_streams_[recovered_idx ^ 1];
         if (stale.tail_offset() > 0) {
-            co_await stale.truncate(true);
+            co_await stale.truncate(stale.tail_offset());
         }
     }
 }
@@ -637,7 +681,7 @@ folly::coro::Task< void > COWBtree::recover_full_map(cp_id_t cur_cp_id) {
 folly::coro::Task< IOBuffer > COWBtree::read_from_incr_stream(uint64_t offset, size_t len) {
     if (offset + len > incr_map_stream_->tail_offset()) {
         HS_REL_ASSERT(false, "Expected atleast {} bytes after offset={}, but got eof, tail_offset={}", len, offset,
-                      incr_map_stream_->tail_offset);
+                      incr_map_stream_->tail_offset());
     }
     auto [ec, buf] = co_await incr_map_stream_->read(offset, len);
     HS_REL_ASSERT(!ec, "read_from_incr_stream: failed to read from incr_map_stream_ at offset={}", offset);

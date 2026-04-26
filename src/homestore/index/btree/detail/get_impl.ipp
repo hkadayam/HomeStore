@@ -22,12 +22,12 @@ template < typename ReqT >
 BtreeTask< BtreeStatus > Btree< K, V >::do_get(Node my_node, ReqT& greq) {
     if (my_node->is_leaf()) {
         if constexpr (std::is_same_v< BtreeSingleGetRequest, ReqT >) {
-            auto const [found, idx] = my_node->find(greq.key(), nullptr, false);
+            auto const [found, idx] = my_node->find(greq.key());
             if (!found) {
                 CO_RETURN BtreeStatus::key_not_found;
             }
 
-            auto status = CO_AWAIT read_from_node(my_node, idx, *s_cast< V* >(greq.outval_));
+            auto status = CO_AWAIT node_ops_.leaf_read_value(my_node, idx, *greq.outval_);
             if (status != BtreeStatus::success) {
                 CO_RETURN status;
             }
@@ -60,7 +60,7 @@ BtreeTask< BtreeStatus > Btree< K, V >::do_get(Node my_node, ReqT& greq) {
                 my_node->read_nth_key(idx, *greq.outkey_, true);
             }
 
-            auto status = CO_AWAIT read_from_node(my_node, idx, *s_cast< V* >(greq.outval_));
+            auto status = CO_AWAIT node_ops_.leaf_read_value(my_node, idx, *greq.outval_);
             if (status != BtreeStatus::success) {
                 CO_RETURN status;
             }
@@ -73,22 +73,19 @@ BtreeTask< BtreeStatus > Btree< K, V >::do_get(Node my_node, ReqT& greq) {
     }
 
     // Interior node: find child and descend.
-    NodeLink child_id;
+    bool found{false};
+    uint32_t idx{0};
     if constexpr (std::is_same_v< BtreeGetAnyRequest< K >, ReqT >) {
-        auto const [found, idx] = my_node->find(greq.range_.start_key(), &child_id, false);
-        ASSERT_IS_VALID_INTERIOR_CHILD_INDX(found, idx, my_node.operator->());
-        if (greq.route_tracing_) {
-            append_route_trace(greq, my_node, BtreeEvent::READ, idx, idx);
-        }
-    } else if constexpr (std::is_same_v< BtreeSingleGetRequest, ReqT >) {
-        auto const [found, idx] = my_node->find(greq.key(), &child_id, false);
-        ASSERT_IS_VALID_INTERIOR_CHILD_INDX(found, idx, my_node.operator->());
-        if (greq.route_tracing_) {
-            append_route_trace(greq, my_node, BtreeEvent::READ, idx, idx);
-        }
+        std::tie(found, idx) = my_node->find(greq.range_.start_key());
+    } else {
+        std::tie(found, idx) = my_node->find(greq.key());
+    }
+    ASSERT_IS_VALID_INTERIOR_CHILD_INDX(found, idx, my_node.operator->());
+    if (greq.route_tracing_) {
+        append_route_trace(greq, my_node, BtreeEvent::READ, idx, idx);
     }
 
-    auto child_result = CO_AWAIT(underlying_->read_node(child_id.id(), LockType::Read));
+    auto child_result = CO_AWAIT(get_child_node(my_node, idx, LockType::Read));
     if (!child_result.hasValue()) {
         CO_RETURN child_result.error();
     }

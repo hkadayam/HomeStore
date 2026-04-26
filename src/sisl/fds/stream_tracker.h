@@ -41,7 +41,7 @@ public:
     ~StreamTrackerMetrics() { deregister_me_from_farm(); }
 };
 
-template < typename T, bool AutoTruncate = false >
+template < typename T, bool AutoTruncate = false, bool TrackCompletion = true >
 class StreamTracker {
 public:
     static constexpr size_t alloc_blk_size = 10000;
@@ -51,10 +51,12 @@ public:
     static_assert(std::is_trivially_copyable< T >::value, "Cannot use StreamTracker for non-trivally copyable classes");
 
     StreamTracker(const char* name = "StreamTracker", int64_t start_idx = -1) :
-            comp_slot_bits_(alloc_blk_size), active_slot_bits_(alloc_blk_size), metrics_(name) {
-        slot_ref_idx_ = start_idx + 1;
-        slot_data_ = (T*)std::calloc(alloc_blk_size, sizeof(T));
-        alloced_slots_ = alloc_blk_size;
+            slot_ref_idx_(start_idx + 1),
+            slot_data_(static_cast< T* >(std::calloc(alloc_blk_size, sizeof(T)))),
+            alloced_slots_(alloc_blk_size),
+            active_slot_bits_(alloc_blk_size),
+            comp_slot_bits_(TrackCompletion ? alloc_blk_size : 0),
+            metrics_(name) {
         GAUGE_UPDATE(metrics_, stream_tracker_mem_size, (alloced_slots_ * sizeof(T)));
     }
 
@@ -67,6 +69,7 @@ public:
 
     template < class... Args >
     int64_t create_and_complete(int64_t idx, Args&&... args) {
+        static_assert(TrackCompletion, "create_and_complete requires TrackCompletion=true");
         return do_update(idx, null_processor, true /* replace */, std::forward< Args >(args)...);
     }
 
@@ -82,9 +85,11 @@ public:
     }
 
     void complete(int64_t start_idx, int64_t end_idx) {
-        std::shared_lock holder(lock_);
-        auto start_bit = start_idx - slot_ref_idx_;
-        comp_slot_bits_.set_bits(start_bit, end_idx - start_idx + 1);
+        if constexpr (TrackCompletion) {
+            std::shared_lock holder(lock_);
+            auto start_bit = start_idx - slot_ref_idx_;
+            comp_slot_bits_.set_bits(start_bit, end_idx - start_idx + 1);
+        }
     }
 
     void rollback(int64_t new_end_idx) {
@@ -95,7 +100,9 @@ public:
 
         auto new_end_bit = new_end_idx - slot_ref_idx_;
         active_slot_bits_.reset_bits(new_end_bit + 1, active_slot_bits_.size() - new_end_bit - 1);
-        comp_slot_bits_.reset_bits(new_end_bit + 1, comp_slot_bits_.size() - new_end_bit - 1);
+        if constexpr (TrackCompletion) {
+            comp_slot_bits_.reset_bits(new_end_bit + 1, comp_slot_bits_.size() - new_end_bit - 1);
+        }
     }
 
     T& at(int64_t idx) const {
@@ -124,12 +131,20 @@ public:
             ret.is_out_of_range = true;
         } else {
             size_t nbit = idx - slot_ref_idx_;
-            if (comp_slot_bits_.get_bitval(nbit)) {
-                ret.is_completed = true;
-            } else if (active_slot_bits_.get_bitval(nbit)) {
-                ret.is_active = true;
+            if constexpr (TrackCompletion) {
+                if (comp_slot_bits_.get_bitval(nbit)) {
+                    ret.is_completed = true;
+                } else if (active_slot_bits_.get_bitval(nbit)) {
+                    ret.is_active = true;
+                } else {
+                    ret.is_hole = true;
+                }
             } else {
-                ret.is_hole = true;
+                if (active_slot_bits_.get_bitval(nbit)) {
+                    ret.is_active = true;
+                } else {
+                    ret.is_hole = true;
+                }
             }
         }
         return ret;
@@ -145,22 +160,33 @@ public:
     }
 
     size_t truncate() {
-        if (AutoTruncate && (cmpltd_count_since_last_truncate_.load(std::memory_order_acquire) == 0)) {
-            return 0;
+        if constexpr (AutoTruncate) {
+            if (cmpltd_count_since_last_truncate_.load(std::memory_order_acquire) == 0) { return 0; }
         }
 
         std::unique_lock holder(lock_);
-        auto first_incomplete_bit = comp_slot_bits_.get_next_reset_bit(0);
-        if (first_incomplete_bit == AtomicBitset::npos) {
-            first_incomplete_bit = alloced_slots_;
-        } else if (first_incomplete_bit == 0) {
-            return slot_ref_idx_ - 1;
+        if constexpr (TrackCompletion) {
+            auto first_incomplete_bit = comp_slot_bits_.get_next_reset_bit(0);
+            if (first_incomplete_bit == AtomicBitset::npos) {
+                first_incomplete_bit = alloced_slots_;
+            } else if (first_incomplete_bit == 0) {
+                return slot_ref_idx_ - 1;
+            }
+            return do_truncate(first_incomplete_bit);
+        } else {
+            // Without completion tracking, truncate all active slots
+            auto first_inactive_bit = active_slot_bits_.get_next_reset_bit(0);
+            if (first_inactive_bit == AtomicBitset::npos) {
+                first_inactive_bit = alloced_slots_;
+            } else if (first_inactive_bit == 0) {
+                return slot_ref_idx_ - 1;
+            }
+            return do_truncate(first_inactive_bit);
         }
-        return do_truncate(first_incomplete_bit);
     }
 
     size_t do_truncate(int64_t upto_bit) {
-        comp_slot_bits_.shrink_head(upto_bit);
+        if constexpr (TrackCompletion) { comp_slot_bits_.shrink_head(upto_bit); }
         active_slot_bits_.shrink_head(upto_bit);
 
         data_skip_count_ += upto_bit;
@@ -175,12 +201,19 @@ public:
         return slot_ref_idx_ - 1;
     }
 
-    void foreach_contiguous_completed(int64_t start_idx, const auto& cb) { _foreach_contiguous(start_idx, true, cb); }
+    void foreach_contiguous_completed(int64_t start_idx, const auto& cb) {
+        static_assert(TrackCompletion, "foreach_contiguous_completed requires TrackCompletion=true");
+        _foreach_contiguous(start_idx, true, cb);
+    }
     void foreach_contiguous_active(int64_t start_idx, const auto& cb) { _foreach_contiguous(start_idx, false, cb); }
-    void foreach_all_completed(int64_t start_idx, const auto& cb) { _foreach_all(start_idx, true, cb); }
+    void foreach_all_completed(int64_t start_idx, const auto& cb) {
+        static_assert(TrackCompletion, "foreach_all_completed requires TrackCompletion=true");
+        _foreach_all(start_idx, true, cb);
+    }
     void foreach_all_active(int64_t start_idx, const auto& cb) { _foreach_all(start_idx, false, cb); }
 
     int64_t completed_upto(int64_t search_hint_idx = 0) const {
+        static_assert(TrackCompletion, "completed_upto requires TrackCompletion=true");
         std::shared_lock holder(lock_);
         return _upto(true /* completed */, search_hint_idx);
     }
@@ -193,7 +226,7 @@ public:
     nlohmann::json get_status(const int verbosity) const {
         nlohmann::json js;
         js["start"] = slot_ref_idx_;
-        js["completed_upto"] = completed_upto();
+        if constexpr (TrackCompletion) { js["completed_upto"] = completed_upto(); }
         js["active_upto"] = active_upto();
 
         if (verbosity == 2) {
@@ -241,8 +274,8 @@ private:
         }
 
         if (processor(*data)) {
-            comp_slot_bits_.set_bit(nbit);
-            if (AutoTruncate) {
+            if constexpr (TrackCompletion) { comp_slot_bits_.set_bit(nbit); }
+            if constexpr (AutoTruncate) {
                 if (cmpltd_count_since_last_truncate_.fetch_add(1, std::memory_order_acq_rel) >= truncate_on_count_) {
                     need_truncate = true;
                 }
@@ -277,7 +310,7 @@ private:
         data_skip_count_ = 0;
 
         active_slot_bits_.resize(new_count);
-        comp_slot_bits_.resize(new_count);
+        if constexpr (TrackCompletion) { comp_slot_bits_.resize(new_count); }
 
         GAUGE_UPDATE(metrics_, stream_tracker_mem_size, (alloced_slots_ * sizeof(T)));
     }
@@ -322,14 +355,21 @@ private:
     T* get_slot_data(int64_t nbit) const { return &(slot_data_[nbit + data_skip_count_]); }
 
 private:
-    mutable folly::SharedMutexWritePriority lock_;
-    sisl::AtomicBitset comp_slot_bits_;
-    sisl::AtomicBitset active_slot_bits_;
+    // Hot on every append (read-only except on rare truncation/resize)
+    int64_t slot_ref_idx_{0};
     T* slot_data_{nullptr};
     size_t data_skip_count_{0};
     size_t alloced_slots_{0};
+
+    // Lock — separate from above since exclusive acquire (rare) modifies it
+    mutable folly::SharedMutexWritePriority lock_;
+
+    // Bitsets — accessed via pointer indirection (words are in separate allocation)
+    sisl::AtomicBitset active_slot_bits_;
+    sisl::AtomicBitset comp_slot_bits_; // size=0 when TrackCompletion=false
+
+    // Cold: AutoTruncate-only, metrics
     std::atomic< size_t > cmpltd_count_since_last_truncate_{0};
-    int64_t slot_ref_idx_{0};
     uint32_t truncate_on_count_{1000};
     StreamTrackerMetrics metrics_;
 };

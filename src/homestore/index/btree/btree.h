@@ -21,6 +21,7 @@
 #include "homestore/index/btree/btree_base.h"
 #include "homestore/index/btree/btree_kv.h"
 #include "homestore/index/btree/detail/btree_req.h"
+#include "homestore/index/btree/detail/node_ops.ipp"
 
 namespace homestore {
 
@@ -282,15 +283,6 @@ private:
     /////////////////////////////// Internal Node Management Methods ////////////////////////////////////
     virtual unique< NodeCore > construct_fresh_node(std::shared_ptr< uint8_t > buf, bnodeid_t id, bool is_leaf);
     virtual unique< NodeCore > construct_existing_node(std::shared_ptr< uint8_t > buf, bnodeid_t id);
-    virtual Node clone_temp_node(NodeCore const& node) override;
-
-    //////////////////////////// Node value helpers (overflow-transparent) /////////////////////////////////
-    BtreeTask< BtreeStatus > read_from_node(Node const& node, uint32_t idx, V& out_val) const;
-    BtreeTask< BtreeStatus > update_in_node(Node const& node, uint32_t idx, BtreeValue const& val);
-    BtreeTask< BtreeStatus > insert_in_node(Node const& node, uint32_t idx, BtreeKey const& key, BtreeValue const& val);
-    void remove_from_node(Node const& node, uint32_t idx);
-    void free_if_overflow(Node const& node, uint32_t idx);
-    bool has_room_in_node(Node const& node, BtreePutType put_type, uint32_t key_size, uint32_t val_size) const;
 
     /////////////////////////////////// Helper Methods ///////////////////////////////////////
     BtreeTask< BtreeStatus > post_order_traversal(LockType acq_lock, const auto& cb);
@@ -309,14 +301,15 @@ private:
 protected:
     mutable BtreeSharedMutex btree_lock_;
     std::atomic< bool > destroyed_{false};
+    NodeOps< K, V > node_ops_;
 
 #ifdef BTREE_ASYNC_MODE
-    // folly::coro::SharedMutex in async mode exposes co_lock_shared / co_lock awaitables.
+    // folly::coro::SharedMutex in async mode: use scoped variants so CO_AWAIT yields a RAII guard.
     auto lock_tree_shared() const {
-        return btree_lock_.co_lock_shared();
+        return btree_lock_.co_scoped_lock_shared();
     }
     auto lock_tree_excl() const {
-        return btree_lock_.co_lock();
+        return btree_lock_.co_scoped_lock();
     }
 #else
     // Sync mode: plain folly::SharedMutex; wrap in shared_lock/unique_lock.

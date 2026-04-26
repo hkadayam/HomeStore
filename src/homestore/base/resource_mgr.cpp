@@ -13,155 +13,125 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
-#include <homestore/homestore.hpp>
-#include <homestore/logstore_service.hpp>
-#include <homestore/checkpoint/cp_mgr.h>
-#include <iomgr/iomgr_flip.hpp>
 #include "resource_mgr.hpp"
-#include "homestore_assert.hpp"
 
-#ifdef REPLICATION_SUPPORT
-#include <homestore/replication_service.hpp>
-#include "replication/repl_dev/raft_repl_dev.h"
+#include <unistd.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
 #endif
-namespace homestore {
-ResourceMgr& resource_mgr() { return hs()->resource_mgr(); }
 
-void ResourceMgr::start(uint64_t total_cap) {
-    m_total_cap = total_cap;
-    start_timer();
+#include <sisl/logging/logging.h>
+
+#include "homestore_config.hpp"
+#include "managers.h"
+
+namespace homestore {
+
+static uint64_t total_system_memory() {
+#ifdef __linux__
+    long pages = ::sysconf(_SC_PHYS_PAGES);
+    long page_size = ::sysconf(_SC_PAGE_SIZE);
+    if (pages <= 0 || page_size <= 0)
+        return 0;
+    return to_u64(pages) * to_u64(page_size);
+#elif defined(__APPLE__)
+    uint64_t mem = 0;
+    size_t sz = sizeof(mem);
+    if (::sysctlbyname("hw.memsize", &mem, &sz, nullptr, 0) != 0)
+        return 0;
+    return mem;
+#else
+    return 0;
+#endif
+}
+
+void ResourceMgr::start(uint64_t dev_capacity, std::optional< uint64_t > mem_cap) {
+    const uint64_t resolved_mem_cap =
+        mem_cap.value_or((total_system_memory() * HS_DYNAMIC_CONFIG(resource_limits.sys_mem_use_percent)) / 100);
+    const uint64_t cache_size = (resolved_mem_cap * HS_DYNAMIC_CONFIG(resource_limits.cache_size_percent)) / 100;
+
+    LOGINFO("ResourceMgr starting: dev_capacity={} mem_cap={} (caller_provided={}) cache_size={}", dev_capacity,
+            resolved_mem_cap, mem_cap.has_value(), cache_size);
+
+    Managers::init_resource_mgr(shared< ResourceMgr >{new ResourceMgr{dev_capacity, resolved_mem_cap, cache_size}});
 }
 
 void ResourceMgr::stop() {
-    LOGINFO("Cancel resource manager timer.");
-    if (m_res_audit_timer_hdl != iomgr::null_timer_handle) { iomanager.cancel_timer(m_res_audit_timer_hdl); }
-    m_res_audit_timer_hdl = iomgr::null_timer_handle;
+    Managers::reset_resource_mgr();
 }
 
-//
-// 1. Conceptually in rare case truncate itself can't guarantee the space is freed up upto satisfy resource manager.
-// e.g. multiple log stores on this same descriptor and one
-//    logstore lagging really behind and not able to truncate much space. Doing multiple truncation won't help in this
-//    case.
-// 2. And any write on any other descriptor will trigger a high_watermark_check, and if it were to trigger critial
-//    alert on this vdev, truncation will be made immediately on all descriptors;
-// 3. If still no space can be freed, there is nothing we can't here to back pressure to above layer by rejecting log
-//    writes on this descriptor;
-//
-void ResourceMgr::trigger_truncate() {
+#if 0
+// ─────────────────────────────────────────────────────────────────────────────
+// Legacy implementations — kept for reference while the new model is brought up.
+// ─────────────────────────────────────────────────────────────────────────────
+
+void ResourceMgrLegacy::trigger_truncate() {
     if (hs()->has_repl_data_service()) {
-        /*
-         * DO NOT NEED : raft will truncate logs.
-         * // first make sure all repl dev's underlying raft log store make corresponding reservation during
-         * // truncate -- set the safe truncate boundary for each raft log store;
-         * hs()->repl_service().iterate_repl_devs([](cshared< ReplDev >& rd) {
-         *     // lock is already taken by repl service layer;
-         *     std::dynamic_pointer_cast< RaftReplDev >(rd)->truncate(
-         *     HS_DYNAMIC_CONFIG(resource_limits.raft_logstore_reserve_threshold));
-         *  });
-         */
-        // next do device truncate which go through all logdevs and truncate them;
         hs()->logstore_service().device_truncate();
     }
-
-    // TODO: add device_truncate callback to audit how much space was freed per each LogDev and add related
-    // metrics;
 }
 
-void ResourceMgr::start_timer() {
+void ResourceMgrLegacy::start_timer() {
     auto const res_mgr_timer_ms = HS_DYNAMIC_CONFIG(resource_limits.resource_audit_timer_ms);
-    LOGINFO("resource audit timer is set to {} usec", res_mgr_timer_ms);
-    if (res_mgr_timer_ms == 0) {
-        LOGINFO("resource audit timer is set to 0, so not starting timer");
-        return;
-    }
-
+    if (res_mgr_timer_ms == 0) return;
     m_res_audit_timer_hdl = iomanager.schedule_global_timer(
-        res_mgr_timer_ms * 1000 * 1000, true /* recurring */, nullptr /* cookie */, iomgr::reactor_regex::all_worker,
-        [this](void*) {
-            // all resource timely audit routine should arrive here;
-            this->trigger_truncate();
-        },
-        true /* wait_to_schedule */);
+        res_mgr_timer_ms * 1000 * 1000, true, nullptr, iomgr::reactor_regex::all_worker,
+        [this](void*) { trigger_truncate(); }, true);
 }
 
-//////////////////////// Index Resource Tracking ////////////////////////////////////
-/* monitor memory used to store seqid --> data mapping during recovery */
-void ResourceMgr::inc_mem_used_in_recovery(int size) {
+void ResourceMgrLegacy::inc_mem_used_in_recovery(int size) {
     m_memory_used_in_recovery.fetch_add(size, std::memory_order_relaxed);
 }
-void ResourceMgr::dec_mem_used_in_recovery(int size) {
+void ResourceMgrLegacy::dec_mem_used_in_recovery(int size) {
     m_memory_used_in_recovery.fetch_sub(size, std::memory_order_relaxed);
 }
-
-bool ResourceMgr::can_add_mem_in_recovery(int size) const {
-    if (cur_mem_used_in_recovery() + size > get_mem_used_in_recovery_limit()) {
-        return false;
-    } else {
-        return true;
-    }
+bool ResourceMgrLegacy::can_add_mem_in_recovery(int size) const {
+    return cur_mem_used_in_recovery() + size <= get_mem_used_in_recovery_limit();
+}
+int64_t ResourceMgrLegacy::cur_mem_used_in_recovery() const {
+    return m_memory_used_in_recovery.load(std::memory_order_relaxed);
+}
+int64_t ResourceMgrLegacy::get_mem_used_in_recovery_limit() const {
+    return (HS_DYNAMIC_CONFIG(resource_limits.memory_in_recovery_precent) * HS_STATIC_CONFIG(input.app_mem_size)) / 100;
 }
 
-int64_t ResourceMgr::cur_mem_used_in_recovery() const {
-    return (m_memory_used_in_recovery.load(std::memory_order_relaxed));
+bool ResourceMgrLegacy::check_journal_descriptor_size(uint64_t used_size) const {
+    return used_size >= get_journal_descriptor_size_limit();
 }
-
-int64_t ResourceMgr::get_mem_used_in_recovery_limit() const {
-    return ((HS_DYNAMIC_CONFIG(resource_limits.memory_in_recovery_precent) * HS_STATIC_CONFIG(input.app_mem_size)) /
-            100);
-}
-
-/* get cache size */
-uint64_t ResourceMgr::get_cache_size() const {
-    return ((HS_STATIC_CONFIG(input.io_mem_size()) * HS_DYNAMIC_CONFIG(resource_limits.cache_size_percent)) / 100);
-}
-
-bool ResourceMgr::check_journal_descriptor_size(const uint64_t used_size) const {
-    return (used_size >= get_journal_descriptor_size_limit());
-}
-
-/* monitor journal vdev size */
-bool ResourceMgr::check_journal_vdev_size(const uint64_t used_size, const uint64_t total_size) {
+bool ResourceMgrLegacy::check_journal_vdev_size(uint64_t used_size, uint64_t total_size) {
     if (m_journal_vdev_exceed_cb) {
         const uint32_t used_pct = (100 * used_size / total_size);
         if (used_pct >= get_journal_vdev_size_limit()) {
-            m_journal_vdev_exceed_cb(used_size, used_pct >= get_journal_vdev_size_critical_limit() /* is_critical */);
-            HS_LOG_EVERY_N(WARN, base, 50, "high watermark hit, used percentage: {}, high watermark percentage: {}",
-                           used_pct, get_journal_vdev_size_limit());
+            m_journal_vdev_exceed_cb(used_size, used_pct >= get_journal_vdev_size_critical_limit());
             return true;
         }
     }
     return false;
 }
-
-void ResourceMgr::register_journal_vdev_exceed_cb(exceed_limit_cb_t cb) { m_journal_vdev_exceed_cb = std::move(cb); }
-
-uint32_t ResourceMgr::get_journal_descriptor_size_limit() const {
+void ResourceMgrLegacy::register_journal_vdev_exceed_cb(exceed_limit_cb_t cb) {
+    m_journal_vdev_exceed_cb = std::move(cb);
+}
+uint32_t ResourceMgrLegacy::get_journal_descriptor_size_limit() const {
     return HS_DYNAMIC_CONFIG(resource_limits.journal_descriptor_size_threshold_mb) * 1024 * 1024;
 }
-
-uint32_t ResourceMgr::get_journal_vdev_size_critical_limit() const {
+uint32_t ResourceMgrLegacy::get_journal_vdev_size_critical_limit() const {
     return HS_DYNAMIC_CONFIG(resource_limits.journal_vdev_size_percent_critical);
 }
-
-uint32_t ResourceMgr::get_journal_vdev_size_limit() const {
+uint32_t ResourceMgrLegacy::get_journal_vdev_size_limit() const {
     return HS_DYNAMIC_CONFIG(resource_limits.journal_vdev_size_percent);
 }
 
-/* monitor chunk size */
-void ResourceMgr::check_chunk_free_size_and_trigger_cp(uint64_t free_size, uint64_t alloc_size) {}
-
-uint32_t ResourceMgr::get_dirty_buf_qd() const { return m_flush_dirty_buf_q_depth; }
-
-void ResourceMgr::increase_dirty_buf_qd() {
+void ResourceMgrLegacy::check_chunk_free_size_and_trigger_cp(uint64_t /*free_size*/, uint64_t /*alloc_size*/) {}
+uint32_t ResourceMgrLegacy::get_dirty_buf_qd() const { return m_flush_dirty_buf_q_depth; }
+void ResourceMgrLegacy::increase_dirty_buf_qd() {
     auto qd = m_flush_dirty_buf_q_depth.load();
     if (qd < max_qd_multiplier * HS_DYNAMIC_CONFIG(generic.cache_max_throttle_cnt)) {
-        auto const nd = m_flush_dirty_buf_q_depth.fetch_add(2 * qd) + (2 * qd);
-        HS_PERIODIC_LOG(INFO, base, "q depth increased to {}", nd);
+        m_flush_dirty_buf_q_depth.fetch_add(2 * qd);
     }
 }
-
-void ResourceMgr::reset_dirty_buf_qd() {
+void ResourceMgrLegacy::reset_dirty_buf_qd() {
     m_flush_dirty_buf_q_depth = HS_DYNAMIC_CONFIG(generic.cache_max_throttle_cnt);
 }
+#endif // 0
+
 } // namespace homestore

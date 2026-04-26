@@ -38,6 +38,8 @@
 #include <homestore/checkpoint/cp.h>
 
 using namespace homestore;
+using namespace iomanager;
+using sisl::IOBuffer;
 
 SISL_OPTION_GROUP(test_cp_mgr,
                   (num_records, "", "num_records", "number of record to test",
@@ -367,8 +369,8 @@ int main(int argc, char* argv[]) {
     sisl::logging::SetLogger("test_cp_mgr");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
 
-    homestore::init_iomgr(2);
+    iomanager::init_iomgr(2);
     auto ret = RUN_ALL_TESTS();
-    homestore::stop_iomgr();
+    iomanager::stop_iomgr();
     return ret;
 }

@@ -29,6 +29,8 @@
 
 namespace homestore {
 
+using sisl::IOBuffer;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constructor and Factory
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,7 +59,7 @@ folly::coro::Task< shared< AppendBlkStream > > AppendBlkStream::load(uint64_t st
         vdev->load_blk_allocator(cid, entry.second.extract());
     }
 
-    const uint64_t chunk_sz = vdev->chunk_size_bytes();
+    const uint64_t chunk_sz = vdev->initial_chunk_size();
     auto stream = shared< AppendBlkStream >{
         new AppendBlkStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_sz, blk_size, std::move(mblks)}};
     co_return stream;
@@ -158,7 +160,7 @@ folly::coro::Task< BlkId > AppendBlkStream::append(CP* cp, uint16_t segment_id, 
 
     // First try a quick append
     CPSession& session = cp_session(cp->id());
-    auto result = do_quick_append(session, segment_id, /*new_wu=*/nullptr, std::move(buf));
+    auto result = do_quick_append(session, segment_id, /*new_wu=*/nullptr, buf);
     if (result) {
         co_return *result;
     }

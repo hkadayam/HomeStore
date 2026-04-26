@@ -829,6 +829,9 @@ int main(int argc, char* argv[]) {
     sisl::logging::SetLogger("test_blkalloc");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
     folly::Init folly_init(&argc, &argv, folly::InitOptions{}.useGFlags(false));
+    HomeStoreDynamicConfig::init_settings_default();
+    init_sweep_service();
     const int result{RUN_ALL_TESTS()};
+    shutdown_sweep_service();
     return result;
 }

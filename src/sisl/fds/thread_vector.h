@@ -119,6 +119,15 @@ public:
         clear_snapshot();
     }
 
+    // Release the drained snapshot_ without touching TLS.  Callers that drain via begin(true) and process via next()
+    // should use this instead of clear() to avoid losing pushes that arrived after the drain completed.
+    void clear_snapshot() {
+        for (auto* tvec : snapshot_) {
+            delete tvec;
+        }
+        snapshot_.clear();
+    }
+
     size_t size() {
         size_t sz{0};
         for (auto const* tvec : snapshot_) {
@@ -128,7 +137,9 @@ public:
             std::shared_lock< folly::SharedMutex > guard{drain_mutex_};
             for (auto& accessor : tl_vec_.accessAllThreads()) {
                 auto* v = accessor.get();
-                if (v) { sz += v->size(); }
+                if (v) {
+                    sz += v->size();
+                }
             }
             {
                 std::unique_lock lg{zombie_mutex_};
@@ -145,21 +156,13 @@ private:
         auto* v = tl_vec_.get();
         if (!v) {
             auto* owner = this;
-            tl_vec_.reset(new std::vector< T >(),
-                          [owner](std::vector< T >* vec, folly::TLPDestructionMode) {
-                              std::unique_lock lg{owner->zombie_mutex_};
-                              owner->zombies_.push_back(vec);
-                          });
+            tl_vec_.reset(new std::vector< T >(), [owner](std::vector< T >* vec, folly::TLPDestructionMode) {
+                std::unique_lock lg{owner->zombie_mutex_};
+                owner->zombies_.push_back(vec);
+            });
             v = tl_vec_.get();
         }
         return *v;
-    }
-
-    void clear_snapshot() {
-        for (auto* tvec : snapshot_) {
-            delete tvec;
-        }
-        snapshot_.clear();
     }
 
     struct ThreadVectorTag {};

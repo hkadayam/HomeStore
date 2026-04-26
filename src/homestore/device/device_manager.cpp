@@ -70,9 +70,8 @@ shared< DeviceManager > DeviceManager::create(std::vector< DevInfo >&& devs, IOF
     return mgr;
 }
 
-folly::coro::Task< shared< DeviceManager > > DeviceManager::create_and_format(std::vector< DevInfo >&& devs,
-                                                                              IOFlag data_open_flags,
-                                                                              IOFlag fast_open_flags) {
+folly::coro::Task< shared< DeviceManager > >
+DeviceManager::create_and_format(std::vector< DevInfo >&& devs, IOFlag data_open_flags, IOFlag fast_open_flags) {
     auto mgr = create(std::move(devs), data_open_flags, fast_open_flags);
     co_await mgr->format_devices();
     co_await mgr->commit_formatting();
@@ -186,6 +185,10 @@ folly::coro::Task< void > DeviceManager::load_devices() {
 }
 
 folly::coro::Task< void > DeviceManager::close_devices() {
+    // Stop the sweep service before tearing down devices: the ticker thread holds weak_ptrs into per-allocator
+    // SegmentManagers, and dereferencing them after PhysicalDev/Chunk teardown is a use-after-free.
+    blkalloc::shutdown_sweep_service();
+
     std::vector< shared< PhysicalDev > > pdevs;
     {
         std::lock_guard lg{state_mutex_};
@@ -394,8 +397,9 @@ folly::coro::Task< void > DeviceManager::load_vdevs() {
     std::vector< uint32_t > stale_slot_vdev_ids;
     std::unordered_set< uint32_t > loaded_vdev_ids;
 
-    // Build vdev_id → pdev mapping: for each vdev, pick a pdev that has its chunks. VDevInfo is written to the vdev's
-    // backing pdevs, so we must read from one of those — not from an arbitrary first_pdev.
+    // Build vdev_id → pdev mapping from chunks.  VDevInfo is written only to the vdev's backing pdevs (not mirrored to
+    // every pdev like the slot bitmap), so a vdev with zero chunks on disk can't be located from chunks alone.  For
+    // those, scan all pdevs at VDevInfo::vdev_info_offset(vdev_id) and use the one whose vinfo is allocated.
     std::unordered_map< uint32_t, shared< PhysicalDev > > vdev_to_pdev;
     for (auto& [vdev_id, chunks] : all_vdev_chunks) {
         if (!chunks.empty()) {
@@ -403,25 +407,48 @@ folly::coro::Task< void > DeviceManager::load_vdevs() {
         }
     }
 
-    // Read VDevInfo for each active slot from the appropriate pdev.
+    auto read_vinfo_from = [](const shared< PhysicalDev >& pdev,
+                              uint32_t vdev_id) -> folly::coro::Task< std::optional< VDevInfo > > {
+        const uint64_t off = VDevInfo::vdev_info_offset(vdev_id);
+        IOBuffer buf{to_u32(VDevInfo::SIZE)};
+        if (auto ec = co_await pdev->read_super_block(buf, off); ec) {
+            co_return std::nullopt;
+        }
+        VDevInfo v{};
+        std::memcpy(&v, buf.bytes(), VDevInfo::SIZE);
+        co_return v;
+    };
+
+    // Read VDevInfo for each active slot, scanning all pdevs as a fallback for vdevs with no chunks.
     for (auto [range_start, range_end] : active_ranges) {
         for (uint32_t vdev_id = range_start; vdev_id <= range_end; ++vdev_id) {
-            // Find a pdev that backs this vdev. If no chunks exist, the vdev was created but never got chunks — read
-            // from the first pdev as a fallback (the bitmap write goes to all pdevs).
-            auto pdev_it = vdev_to_pdev.find(vdev_id);
-            auto& read_pdev = (pdev_it != vdev_to_pdev.end()) ? pdev_it->second : first_pdev;
+            VDevInfo vinfo{};
+            bool found = false;
 
-            const uint64_t read_off = VDevInfo::vdev_info_offset(vdev_id);
-            IOBuffer vinfo_buf{to_u32(VDevInfo::SIZE)};
-            if (auto ec2 = co_await read_pdev->read_super_block(vinfo_buf, read_off); ec2) {
-                throw std::system_error(ec2, fmt::format("Failed to read VDevInfo for vdev_id={}", vdev_id));
+            if (auto it = vdev_to_pdev.find(vdev_id); it != vdev_to_pdev.end()) {
+                // Fast path: read from a pdev we know backs this vdev via its chunks.
+                auto v = co_await read_vinfo_from(it->second, vdev_id);
+                if (v && v->is_allocated()) {
+                    vinfo = *v;
+                    found = true;
+                }
             }
 
-            VDevInfo vinfo{};
-            std::memcpy(&vinfo, vinfo_buf.bytes(), VDevInfo::SIZE);
+            if (!found) {
+                // Slow path: vdev has no chunks (or the fast-path pdev's vinfo isn't valid).  Scan all pdevs for a
+                // valid vinfo at this vdev_id's slot.
+                for (auto& p : all_pdevs) {
+                    auto v = co_await read_vinfo_from(p, vdev_id);
+                    if (v && v->is_allocated()) {
+                        vinfo = *v;
+                        found = true;
+                        break;
+                    }
+                }
+            }
 
-            if (!vinfo.is_allocated()) {
-                LOGWARN("Found stale-slot VDev id={} (bitmap set but slot_allocated=0)", vdev_id);
+            if (!found) {
+                LOGWARN("Found stale-slot VDev id={} (bitmap set but no pdev has a valid vdev_info)", vdev_id);
                 stale_slot_vdev_ids.push_back(vdev_id);
                 continue;
             }

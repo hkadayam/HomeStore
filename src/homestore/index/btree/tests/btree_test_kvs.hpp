@@ -52,14 +52,12 @@ static std::string gen_random_string(size_t len, uint32_t preamble = std::numeri
         str += ss.str();
     }
 
-    static thread_local std::random_device rd{};
-    static thread_local std::default_random_engine re{rd()};
     std::uniform_int_distribution< size_t > rand_char{0, alphanum.size() - 1};
     if (len < str.size()) {
         len = str.size();
     }
     for (size_t i{0}; i < len - str.size(); ++i) {
-        str += alphanum[rand_char(re)];
+        str += alphanum[rand_char(g_re)];
     }
     return str;
 }

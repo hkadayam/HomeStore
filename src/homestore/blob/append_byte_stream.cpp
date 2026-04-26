@@ -18,23 +18,32 @@
 #include <cstring>
 #include <stdexcept>
 
+#include <fmt/format.h>
+
 #include "blob/append_byte_stream.h"
 #include "blob/blob_dev.h"
 #include "device/chunk.h"
 #include "device/virtual_dev.h"
 #include "managers.h"
+#include "meta/meta_client.h"
 
 namespace homestore {
+
+using sisl::IOBuffer;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Private constructor
 // ─────────────────────────────────────────────────────────────────────────────
 
 AppendByteStream::AppendByteStream(uint64_t stream_id, MetaClient& meta_client, std::string dev_name,
-                                   const shared< VirtualDev >& vdev, uint64_t chunk_size, bool concurrent_safe,
-                                   ChunkMblkMap&& mblks) :
-        StreamBase{stream_id, vdev, meta_client, std::move(dev_name), chunk_size, 0, std::move(mblks)},
-        concurrent_safe_{concurrent_safe} {}
+                                   const shared< VirtualDev >& vdev, uint64_t chunk_size, bool concurrent_safe) :
+        StreamBase{stream_id, vdev, meta_client, std::move(dev_name), chunk_size, 0, {} /* no per-chunk mblks */},
+        concurrent_safe_{concurrent_safe} {
+}
+
+std::string AppendByteStream::sb_mblk_name(const std::string& dev, uint64_t stream_id) {
+    return fmt::format("{}_appendbyte_sb_{}", dev, stream_id);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // create / load
@@ -46,46 +55,67 @@ folly::coro::Task< shared< AppendByteStream > > AppendByteStream::create(uint64_
                                                                          uint64_t chunk_size, bool concurrent_safe) {
     auto stream = shared< AppendByteStream >{
         new AppendByteStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_size, concurrent_safe}};
+
+    // Allocate the single per-stream sb MetaBlk.  Its payload is written with the initial empty state below.
+    stream->sb_mblk_ = co_await meta_client.create_meta_blk(sb_mblk_name(dev_name, stream_id), std::nullopt);
+    co_await stream->persist_stream_sb();
+
+    // Ensure at least one chunk exists so the stream has somewhere to write on first append.
     co_await stream->expand_to(0);
     co_return stream;
 }
 
 folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(uint64_t stream_id, MetaClient& meta_client,
                                                                        const std::string& dev_name,
-                                                                       const shared< VirtualDev >& vdev,
-                                                                       ChunkMblkMap&& mblks, bool concurrent_safe) {
-    // Sum bytes_written from each recovered payload to reconstruct tail_offset.
-    uint64_t recovered_tail = 0;
-    for (auto& [cid, entry] : mblks) {
-        if (entry.second.size() >= sizeof(AppendByteChunkMeta)) {
-            const auto* meta = r_cast< const AppendByteChunkMeta* >(entry.second.bytes());
-            recovered_tail += meta->bytes_written;
-        }
+                                                                       const shared< VirtualDev >& vdev, MetaBlk&& sb,
+                                                                       sisl::ByteView sb_payload,
+                                                                       bool concurrent_safe) {
+    // Parse {chunk_size, head, tail, chunk_ids} from the stream sb payload.  The sb is always written by create()
+    // and persist_stream_sb(), so any stream that was created should have a valid payload here.
+    if (sb_payload.size() < sizeof(AppendByteStreamSb)) {
+        throw std::runtime_error(fmt::format("AppendByteStream::load: sb payload too small for stream {} on {}",
+                                              stream_id, dev_name));
+    }
+    const auto* s = r_cast< const AppendByteStreamSb* >(sb_payload.bytes());
+    if (s->chunk_size == 0) {
+        throw std::runtime_error(fmt::format("AppendByteStream::load: sb has chunk_size=0 for stream {} on {}",
+                                              stream_id, dev_name));
+    }
+    const uint64_t chunk_sz = s->chunk_size;
+    const uint64_t recovered_head = s->head_offset;
+    const uint64_t recovered_tail = s->tail_offset;
+    std::vector< uint32_t > chunk_ids;
+    chunk_ids.reserve(s->n_chunks);
+    for (uint32_t i = 0; i < s->n_chunks; ++i) {
+        chunk_ids.push_back(s->chunk_ids()[i]);
     }
 
-    const uint64_t chunk_sz = vdev->chunk_size_bytes();
-    auto stream = shared< AppendByteStream >{new AppendByteStream{stream_id, meta_client, std::string{dev_name}, vdev,
-                                                                   chunk_sz, concurrent_safe, std::move(mblks)}};
+    auto stream = shared< AppendByteStream >{
+        new AppendByteStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_sz, concurrent_safe}};
+    stream->sb_mblk_ = std::move(sb);
+    stream->head_offset_ = recovered_head;
     stream->tail_offset_ = recovered_tail;
+    stream->offset_in_first_chunk_ = recovered_head % chunk_sz;
 
-    // If the recovered tail is not block-aligned, read the partial tail block from disk so subsequent appends can
-    // continue from the exact byte offset within that block.
+    // Look up chunks from the vdev by their ids and install into the stream.  StreamBase::install_chunks sorts
+    // them by vdev_order before publishing.
+    std::vector< shared< Chunk > > chunks;
+    chunks.reserve(chunk_ids.size());
+    for (auto cid : chunk_ids) {
+        if (auto c = vdev->get_chunk(cid)) { chunks.push_back(std::move(c)); }
+    }
+    stream->install_chunks(std::move(chunks));
+
+    // If the recovered tail is not block-aligned, read the partial tail block from disk and inject its valid bytes
+    // into flush_buf_ so the next append/flush carries them forward (same mechanism flush() uses for the live case).
     const uint32_t blk_sz = stream->block_size();
     if (recovered_tail > 0 && (recovered_tail % blk_sz) != 0) {
-        const size_t tail_chunk_idx = to_size((recovered_tail - 1) / chunk_sz);
-        const uint64_t tail_in_chunk = ((recovered_tail - 1) % chunk_sz) + 1;
-        const uint32_t blk_offset = to_u32(((tail_in_chunk - 1) / blk_sz) * blk_sz);
-        const uint32_t sub_blk_used = to_u32(tail_in_chunk - blk_offset);
-
-        chunk_num_t cid{};
-        {
-            auto acc = stream->chunks();
-            cid = s_cast< chunk_num_t >((*acc)[tail_chunk_idx]->chunk_id());
-        }
-
-        auto [ec, rbuf] = co_await stream->read_blocks(cid, blk_offset / blk_sz, 1);
+        const uint32_t partial = recovered_tail % blk_sz;
+        auto [cid, offset_in_chunk] = stream->resolve(recovered_tail - partial);
+        auto [ec, rbuf] = co_await stream->read_blocks(cid, to_u32(offset_in_chunk / blk_sz), 1);
         if (!ec) {
-            stream->tail_block_ = TailBlock{std::move(rbuf), tail_chunk_idx, blk_offset, sub_blk_used};
+            stream->flush_buf_.start_offset = recovered_tail - partial;
+            stream->flush_buf_.builder.append(sisl::Blob{rbuf.bytes(), partial});
         }
     }
 
@@ -97,18 +127,11 @@ folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(uint64_t 
 // ─────────────────────────────────────────────────────────────────────────────
 
 uint64_t AppendByteStream::do_append(const sisl::Blob& data) {
-    // Seed from tail_block_ on first append of this flush buffer.
-    if (flush_buf_.builder.empty() && tail_block_) {
-        auto tb = std::move(*tail_block_);
-        tail_block_.reset();
-        flush_buf_.start_offset = tail_offset_ - tb.valid_bytes;
-        flush_buf_.builder.append(sisl::Blob{tb.buf.bytes(), tb.valid_bytes});
-    }
-
+    // Any partial-tail-block bytes from the prior flush (or load) are already sitting in flush_buf_ with its
+    // start_offset set to the block-aligned position.  If flush_buf_ is empty, we're starting fresh at tail_offset_.
     if (flush_buf_.builder.empty()) {
         flush_buf_.start_offset = tail_offset_;
     }
-
     flush_buf_.builder.append(data);
     auto const offset = tail_offset_;
     tail_offset_ += data.size();
@@ -127,30 +150,41 @@ uint64_t AppendByteStream::append(const sisl::Blob& data) {
 // truncate
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > AppendByteStream::truncate(bool release_chunks) {
-    tail_offset_ = 0;
-    tail_block_.reset();
-    flush_buf_.reset();
+folly::coro::Task< void > AppendByteStream::truncate(uint64_t upto_offset) {
+    upto_offset = std::min(upto_offset, tail_offset_);
+    if (upto_offset <= head_offset_)
+        co_return;
 
-    if (release_chunks) {
-        {
-            auto lock = co_await mblk_mutex_.co_scoped_lock();
-            for (auto& [cid, mblk] : chunk_mblks_) {
-                co_await meta_client_.remove_meta_blk(mblk);
-            }
-            chunk_mblks_.clear();
-        }
-        co_await destroy();
-    } else {
-        AppendByteChunkMeta meta{0};
-        auto meta_buf = sisl::make_byte_array(sizeof(AppendByteChunkMeta));
-        std::memcpy(meta_buf->bytes(), &meta, sizeof(meta));
-
-        auto lock = co_await mblk_mutex_.co_scoped_lock();
-        for (auto& [cid, mblk] : chunk_mblks_) {
-            co_await meta_client_.write_meta_blk(mblk, meta_buf);
-        }
+    // Release chunks fully before upto_offset.  Each chunk spans chunk_size() bytes; releasable count is the number
+    // of chunks whose end <= upto_offset, i.e. (upto_offset - head_offset_ + offset_in_first_chunk_) / chunk_size().
+    const size_t n_release = nth_chunk(upto_offset);
+    if (n_release > 0) {
+        co_await truncate_before(n_release);
     }
+
+    head_offset_ = upto_offset;
+    offset_in_first_chunk_ = head_offset_ % chunk_size();
+
+    // Fresh-start mode: stream is logically empty (head == tail).  Release any remaining chunk (the one holding the
+    // partial tail) and reset positions to 0 so the next append starts a brand-new stream.  Both LogStream (no
+    // records left) and cow_btree (reusable stream) rely on this.
+    if (head_offset_ == tail_offset_) {
+        // Stream is logically empty — release all chunks except the last one (kept as an anchor), reset positions
+        // to 0.  Keeping one chunk means the stream is immediately usable for new appends without a chunk alloc and
+        // guarantees non-zero chunk count for users that rely on it.  The stream's sb MetaBlk survives regardless.
+        const size_t n = num_chunks();
+        if (n > 1) {
+            co_await truncate_before(n - 1);
+        }
+        head_offset_ = 0;
+        tail_offset_ = 0;
+        offset_in_first_chunk_ = 0;
+        flush_buf_.reset();
+        co_await persist_stream_sb();
+        co_return;
+    }
+
+    co_await persist_stream_sb();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -158,20 +192,13 @@ folly::coro::Task< void > AppendByteStream::truncate(bool release_chunks) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 folly::coro::Task< std::pair< std::error_code, IOBuffer > > AppendByteStream::read(uint64_t byte_offset, size_t len) {
-    const size_t chunk_idx = to_size(byte_offset / chunk_size());
-    const uint64_t offset_in_chunk = byte_offset % chunk_size();
+    if (byte_offset < head_offset_ || byte_offset + len > tail_offset_) {
+        co_return {std::make_error_code(std::errc::invalid_argument), IOBuffer{}};
+    }
+    auto [cid, offset_in_chunk] = resolve(byte_offset);
     const uint32_t blk_num = to_u32(offset_in_chunk / block_size());
     const blk_count_t nblks =
         s_cast< blk_count_t >((offset_in_chunk + len + block_size() - 1) / block_size() - to_u64(blk_num));
-
-    chunk_num_t cid{};
-    {
-        auto acc = chunks();
-        if (chunk_idx >= acc->size()) {
-            co_return {std::make_error_code(std::errc::invalid_argument), IOBuffer{}};
-        }
-        cid = s_cast< chunk_num_t >((*acc)[chunk_idx]->chunk_id());
-    }
 
     co_return co_await read_blocks(cid, blk_num, nblks);
 }
@@ -189,7 +216,8 @@ AppendByteStream::read_blocks(chunk_num_t cid, uint32_t blk_num, blk_count_t nbl
 // ─────────────────────────────────────────────────────────────────────────────
 
 AppendByteStream::ReadCursor::ReadCursor(AppendByteStream& stream, uint64_t start, uint64_t end) :
-        stream_{stream}, pos_{start}, end_{end} {}
+        stream_{stream}, pos_{start}, end_{end} {
+}
 
 AppendByteStream::ReadCursor AppendByteStream::open_cursor(uint64_t start_offset) const {
     return ReadCursor{const_cast< AppendByteStream& >(*this), start_offset, tail_offset()};
@@ -200,149 +228,178 @@ AppendByteStream::ReadCursor AppendByteStream::open_cursor(uint64_t start_offset
 }
 
 folly::coro::Task< std::pair< IOBuffer, uint32_t > > AppendByteStream::ReadCursor::next(size_t max_bytes) {
-    if (pos_ >= end_) { co_return {IOBuffer{}, 0}; }
+    if (pos_ >= end_) {
+        co_return {IOBuffer{}, 0};
+    }
 
+    auto [cid, offset_in_chunk] = stream_.resolve(pos_);
     const uint32_t blk_sz = stream_.block_size();
-    const uint64_t csz = stream_.chunk_size();
+    const uint64_t remaining_in_chunk = stream_.chunk_size() - offset_in_chunk;
+    const uint64_t read_len = std::min({to_u64(max_bytes), end_ - pos_, remaining_in_chunk});
 
-    const uint64_t remaining = end_ - pos_;
-    const uint64_t offset_in_chunk = pos_ % csz;
-    const uint64_t remaining_in_chunk = csz - offset_in_chunk;
-    const uint64_t read_len = std::min({to_u64(max_bytes), remaining, remaining_in_chunk});
-
-    const size_t chunk_idx = to_size(pos_ / csz);
     const uint32_t blk_num = to_u32(offset_in_chunk / blk_sz);
     const blk_count_t nblks =
         s_cast< blk_count_t >((offset_in_chunk + read_len + blk_sz - 1) / blk_sz - to_u64(blk_num));
     const uint32_t valid = to_u32(read_len);
 
-    chunk_num_t cid{};
-    {
-        auto acc = stream_.chunks();
-        if (chunk_idx >= acc->size()) { co_return {IOBuffer{}, 0}; }
-        cid = s_cast< chunk_num_t >((*acc)[chunk_idx]->chunk_id());
-    }
-
     auto [ec, buf] = co_await stream_.read_blocks(cid, blk_num, nblks);
-    if (ec) { co_return {IOBuffer{}, 0}; }
+    if (ec) {
+        co_return {IOBuffer{}, 0};
+    }
 
     pos_ += valid;
     co_return {std::move(buf), valid};
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// flush
-// ─────────────────────────────────────────────────────────────────────────────
-
 folly::coro::Task< bool > AppendByteStream::flush() {
-    // Swap the buffer under mutex so no appender is mid-write.
     FlushBuffer old_buf;
-    {
-        std::lock_guard lg{append_mutex_};
+    std::vector< sisl::IOBuffer > bufs;
+    uint64_t total = 0;
+
+    // Under lock: swap the buffer, drain it, and if the last buf has a partial (non-block-aligned) tail, inject
+    // those bytes into the NEW flush_buf_ so the next flush carries them forward, then zero-pad the last buf in
+    // place so every buf in the `bufs` list is block-aligned from here on.
+    auto do_swap_and_carry = [&]() {
         std::swap(old_buf, flush_buf_);
+        total = old_buf.builder.total_bytes();
+        bufs = old_buf.builder.move_all_bufs();
+
+        if (bufs.empty()) {
+            return;
+        }
+
+        auto& last_buf = bufs.back();
+        const uint32_t partial = last_buf.size() % block_size();
+        if (partial == 0) {
+            return;
+        }
+
+        // Seed the next flush_buf_ with the partial tail bytes.  start_offset is the block-aligned stream
+        // position where they land; next append/emplace continues from there.
+        flush_buf_.start_offset = old_buf.start_offset + total - partial;
+        flush_buf_.builder.append(sisl::Blob{last_buf.bytes() + last_buf.size() - partial, partial});
+
+        // Zero-pad the last buf up to the block boundary so this flush writes a full block.
+        const uint32_t pad = block_size() - partial;
+        std::memset(last_buf.bytes() + last_buf.size(), 0, pad);
+        last_buf.set_size(last_buf.size() + pad);
+    };
+
+    if (concurrent_safe_) {
+        std::lock_guard lg{append_mutex_};
+        do_swap_and_carry();
+    } else {
+        do_swap_and_carry();
     }
 
-    uint64_t const total = old_buf.builder.total_bytes();
-    if (total == 0) { co_return true; }
+    if (bufs.empty()) {
+        co_return true;
+    }
 
-    const uint32_t blk_sz = block_size();
-    const uint64_t csz = chunk_size();
+    // After the tail-carry step, total rounded up to block boundary is exactly what we're writing.
     uint64_t stream_offset = old_buf.start_offset;
+    const uint64_t total_to_write = sisl::round_up(total, block_size());
+    co_await expand_to(nth_chunk(stream_offset + total_to_write - 1));
 
-    // Expand chunks to cover the full range of data.
-    const size_t last_chunk_idx = to_size((stream_offset + total - 1) / csz);
-    co_await expand_to(last_chunk_idx);
-
-    // Track high-water mark per chunk for MetaBlk persistence.
-    std::unordered_map< uint32_t, uint64_t > chunk_bytes_written;
-
-    // Collect buffers from the builder, then write each to disk.  Each buffer may span a chunk boundary.
-    std::vector< sisl::IoBlobSafe > bufs;
-    old_buf.builder.consume([&bufs](sisl::IoBlobSafe&& buf) { bufs.push_back(std::move(buf)); });
+    // Every buf is block-aligned now.  Walk them, writing directly; only split on chunk-straddle (one wbuf copy
+    // per straddling buf).
+    auto [chunk_id, offset_in_chunk] = resolve(stream_offset);
+    uint64_t remain_in_chunk = chunk_size() - offset_in_chunk;
+    blk_num_t cur_blk_num = offset_in_chunk / block_size();
 
     for (auto& buf : bufs) {
         uint32_t buf_offset = 0;
-        uint32_t const buf_used = buf.size(); // set by consume() to the used byte count
-
-        while (buf_offset < buf_used) {
-            const size_t chunk_idx = to_size(stream_offset / csz);
-            const uint64_t offset_in_chunk = stream_offset % csz;
-            const uint64_t remaining_in_chunk = csz - offset_in_chunk;
-            const uint32_t write_len = to_u32(std::min(to_u64(buf_used - buf_offset), remaining_in_chunk));
-
-            chunk_num_t cid{};
-            {
-                auto acc = chunks();
-                cid = s_cast< chunk_num_t >((*acc)[chunk_idx]->chunk_id());
+        while (buf_offset < buf.size()) {
+            if (remain_in_chunk == 0) {
+                chunk_id = lookup_chunk_id(nth_chunk(stream_offset));
+                cur_blk_num = 0;
+                remain_in_chunk = chunk_size();
             }
 
-            const uint32_t blk_num = to_u32(offset_in_chunk / blk_sz);
-            const blk_count_t nblks =
-                s_cast< blk_count_t >((offset_in_chunk + write_len + blk_sz - 1) / blk_sz - to_u64(blk_num));
-            const uint32_t aligned_sz = to_u32(nblks) * blk_sz;
+            const uint32_t write_len = to_u32(std::min(to_u64(buf.size() - buf_offset), remain_in_chunk));
+            const uint16_t nblks = to_u16(write_len / block_size());
 
-            // Common case: entire buffer fits in one chunk — write directly (zero-pad tail to block alignment).
-            if (buf_offset == 0 && write_len == buf_used) {
-                if (aligned_sz > write_len) {
-                    std::memset(buf.bytes() + write_len, 0, aligned_sz - write_len);
-                }
-                buf.set_size(aligned_sz);
-                co_await vdev().write(buf, BlkId{blk_num, nblks, cid});
+            if ((buf_offset == 0) && (write_len == buf.size())) {
+                // Whole buf fits in this chunk — write it directly.
+                co_await vdev().write(buf, BlkId{cur_blk_num, nblks, chunk_id});
             } else {
-                // Chunk boundary crossing — copy this chunk's portion into a separate aligned buffer.
-                IOBuffer wbuf{aligned_sz, blk_sz};
+                // Chunk-straddle: copy this chunk's slice into a fresh aligned buffer.  All quantities are
+                // block-aligned so no padding is involved.
+                IOBuffer wbuf{write_len, block_size()};
                 std::memcpy(wbuf.bytes(), buf.bytes() + buf_offset, write_len);
-                if (aligned_sz > write_len) {
-                    std::memset(wbuf.bytes() + write_len, 0, aligned_sz - write_len);
-                }
-                co_await vdev().write(wbuf, BlkId{blk_num, nblks, cid});
+                co_await vdev().write(wbuf, BlkId{cur_blk_num, nblks, chunk_id});
             }
-
-            auto& hw = chunk_bytes_written[cid];
-            hw = std::max(hw, offset_in_chunk + write_len);
 
             buf_offset += write_len;
             stream_offset += write_len;
+            remain_in_chunk -= write_len;
+            cur_blk_num += nblks;
         }
     }
 
-    // Cache the partial tail block for the next flush.
-    const uint64_t total_end = old_buf.start_offset + total;
-    if ((total_end % blk_sz) != 0) {
-        const size_t tail_chunk_idx = to_size((total_end - 1) / csz);
-        const uint64_t tail_in_chunk = ((total_end - 1) % csz) + 1;
-        const uint32_t blk_offset = to_u32(((tail_in_chunk - 1) / blk_sz) * blk_sz);
-        const uint32_t sub_blk_used = to_u32(tail_in_chunk - blk_offset);
+    co_await persist_flush_metadata();
+    co_return true;
+}
 
-        // Re-read the partial block from disk (we just wrote it).
-        chunk_num_t cid{};
-        {
-            auto acc = chunks();
-            cid = s_cast< chunk_num_t >((*acc)[tail_chunk_idx]->chunk_id());
+// ─────────────────────────────────────────────────────────────────────────────
+// Metadata persistence
+// ─────────────────────────────────────────────────────────────────────────────
+
+folly::coro::Task< void > AppendByteStream::persist_flush_metadata() {
+    co_await persist_stream_sb();
+}
+
+folly::coro::Task< void > AppendByteStream::persist_stream_sb() {
+    // Snapshot the current chunk list (chunk_ids).
+    std::vector< uint32_t > cids;
+    {
+        auto acc = chunks();
+        cids.reserve(acc->size());
+        for (auto const& c : *acc) {
+            cids.push_back(c->chunk_id());
         }
-        auto [ec, rbuf] = co_await read_blocks(cid, blk_offset / blk_sz, 1);
-        if (!ec) {
-            tail_block_ = TailBlock{std::move(rbuf), tail_chunk_idx, blk_offset, sub_blk_used};
-        }
-    } else {
-        tail_block_.reset();
     }
 
-    // Persist bytes_written MetaBlk for dirtied chunks.
-    if (chunk_bytes_written.empty()) { co_return true; }
+    const size_t payload_bytes = AppendByteStreamSb::size_for(to_u32(cids.size()));
+    auto buf = sisl::make_byte_array(to_u32(payload_bytes));
+    auto* sb = reinterpret_cast< AppendByteStreamSb* >(buf->bytes());
+    sb->chunk_size = chunk_size();
+    sb->head_offset = head_offset_;
+    sb->tail_offset = tail_offset_;
+    sb->n_chunks = to_u32(cids.size());
+    std::memcpy(sb->chunk_ids(), cids.data(), cids.size() * sizeof(uint32_t));
 
     auto lock = co_await mblk_mutex_.co_scoped_lock();
-    for (auto& [cid, bytes_written] : chunk_bytes_written) {
-        auto it = chunk_mblks_.find(cid);
-        if (it == chunk_mblks_.end()) { continue; }
+    co_await meta_client_.write_meta_blk(sb_mblk_, buf);
+}
 
-        AppendByteChunkMeta meta{bytes_written};
-        auto meta_buf = sisl::make_byte_array(sizeof(AppendByteChunkMeta));
-        std::memcpy(meta_buf->bytes(), &meta, sizeof(meta));
-        co_await meta_client_.write_meta_blk(it->second, meta_buf);
-    }
+folly::coro::Task< void > AppendByteStream::init_chunk_mblk(const shared< Chunk >& /*chunk*/) {
+    // No per-chunk MetaBlk for appendbyte streams; the chunk list lives in the stream sb.  Update it now that the
+    // chunk list grew.
+    co_await persist_stream_sb();
+}
 
-    co_return true;
+folly::coro::Task< void > AppendByteStream::remove_chunk_mblk(uint32_t /*chunk_id*/) {
+    // No per-chunk MetaBlk to remove; just refresh the stream sb with the new (shrunken) chunk list.
+    co_await persist_stream_sb();
+}
+
+chunk_num_t AppendByteStream::lookup_chunk_id(size_t nth_chunk) {
+    auto acc = chunks();
+    return s_cast< chunk_num_t >((*acc)[nth_chunk]->chunk_id());
+}
+
+std::pair< chunk_num_t, uint64_t > AppendByteStream::resolve(uint64_t byte_offset) {
+    // Distance from chunk 0's start = (byte_offset - head_offset_) + offset_in_first_chunk_.
+    const uint64_t rel = byte_offset - head_offset_ + offset_in_first_chunk_;
+    auto acc = chunks();
+    return {s_cast< chunk_num_t >((*acc)[to_size(rel / chunk_size())]->chunk_id()), rel % chunk_size()};
+}
+
+size_t AppendByteStream::nth_chunk(uint64_t byte_offset) {
+    // Distance from chunk 0's start = (byte_offset - head_offset_) + offset_in_first_chunk_.
+    const uint64_t rel = byte_offset - head_offset_ + offset_in_first_chunk_;
+    return to_size(rel / chunk_size());
 }
 
 } // namespace homestore

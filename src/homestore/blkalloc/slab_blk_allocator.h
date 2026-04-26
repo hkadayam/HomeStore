@@ -16,13 +16,10 @@
 
 #include <array>
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <sisl/metrics/metrics.h>
@@ -31,6 +28,7 @@
 
 #include <homestore/blk.h>
 #include "bitmap_blk_allocator.h"
+#include "sweep_service.h"
 #include "segment_manager.h"
 #include "base/homestore_assert.hpp"
 #include "base/homestore_config.hpp"
@@ -39,8 +37,8 @@ namespace homestore {
 namespace blkalloc {
 
 enum class AllocMode : uint8_t {
-    CompactAlloc,  // entire capacity fits in slab; no inmem_bm_; no sweep thread; ondisk_bm_ when persistent
-    ExpandedAlloc, // large capacity; slab cache backed by inmem_bm_ + ondisk_bm_; background sweep thread
+    CompactAlloc,  // entire capacity fits in slab; no inmem_bm_; no sweep registration; ondisk_bm_ when persistent
+    ExpandedAlloc, // large capacity; slab cache backed by inmem_bm_ + ondisk_bm_; registers with sweep service
 };
 
 // Per-slab cache sizing: max entries and refill-trigger threshold.
@@ -70,14 +68,16 @@ struct SlabBlkAllocConfig : public BlkAllocConfig {
         const blk_num_t num_portions = std::max< blk_num_t >((capacity_ - 1) / blks_per_portion_ + 1, 1u);
         const float refill_pct = HS_DYNAMIC_CONFIG(blkallocator.slab_refill_threshold_pct);
 
-        // Auto-populate slab distribution from defaults if not configured.
+        // Auto-populate slab distribution from defaults if not configured. Flatbuffers does not allow
+        // vector defaults in the schema, so the canonical default lives in
+        // HomeStoreDynamicConfig::default_slab_distribution() and we copy it into the settings factory
+        // here on first use.
         auto const& dist = HS_DYNAMIC_CONFIG(blkallocator.slab_distribution);
         if (dist.empty()) {
             HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
                 auto& slab_pct_dist = s.blkallocator.slab_distribution;
                 if (slab_pct_dist.empty()) {
-                    static constexpr std::array< double, 9 > defaults{15.0, 7.0,  7.0,  6.0, 10.0,
-                                                                      10.0, 10.0, 10.0, 25.0};
+                    auto const& defaults = HomeStoreDynamicConfig::default_slab_distribution();
                     slab_pct_dist.insert(slab_pct_dist.begin(), defaults.begin(), defaults.end());
                 }
             });
@@ -190,15 +190,9 @@ private:
     // Populates slab caches from ondisk_bm_ (persistent) or all blocks (non-persistent). Called from constructor.
     void load();
 
-    // Background sweep thread: wakes up on request or periodically; calls fill_cache_for_portion()
-    // for all portions whose slab is below the refill threshold.
-    void sweep_worker();
-
     // Uses BitmapBlkAllocator::scan_free_blks() to fill a portion's slab cache from inmem_bm_.
+    // Used as the refill callback registered with blkalloc::SweepService.
     void fill_cache_for_portion(InmemPortion& portion);
-
-    // Signals the sweep thread; if wait_for_blks > 0, blocks until that many blks are cached.
-    void request_sweep(blk_count_t wait_for_blks = 0);
 
     SlabBlkAllocConfig cfg_;
     SegmentManager seg_mgr_;
@@ -210,12 +204,9 @@ private:
 
     std::atomic< int64_t > alloced_blk_count_{0};
 
-    std::thread sweep_thread_;
-    std::mutex sweep_mutex_;
-    std::condition_variable sweep_cv_;
-    bool sweep_stop_{false};
-    bool sweep_requested_{false};
-    blk_num_t sweep_blks_added_{0};
+    // Registration with the module-scoped sweep service; null for CompactAlloc (no background refill needed).
+    // Destroying the handle drains any in-flight refill workers targeting this allocator's portions.
+    std::shared_ptr< SweepService::AllocatorHandle > sweep_handle_;
 };
 
 } // namespace blkalloc

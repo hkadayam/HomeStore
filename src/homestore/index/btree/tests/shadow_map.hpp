@@ -59,9 +59,12 @@ public:
     void range_update(const K& start_key, uint32_t count, const V& new_val) {
         std::lock_guard lock{mutex_};
         auto const start_it = map_.lower_bound(start_key);
+        LOGTRACEMOD(btree, "shadow_range_update start_key={} count={} new_val={}",
+                    start_key.to_string(), count, new_val.to_string());
         auto it = start_it;
         uint32_t c = 0;
         while ((it != map_.end()) && (++c <= count)) {
+            LOGTRACEMOD(btree, "  shadow_update key={} c={}", it->first.to_string(), c);
             it->second = new_val;
             ++it;
         }

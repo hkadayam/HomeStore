@@ -123,6 +123,7 @@ public:
 
     BtreeStatus update(uint32_t idx, const BtreeKey& key, const BtreeValue& val) override {
         DEBUG_ASSERT_LE(idx, this->total_entries());
+        LOGTRACEMOD(btree, "update {}:{}", key.to_string(), val.to_string());
 
         if (idx == this->total_entries()) {
             DEBUG_ASSERT_EQ(this->is_leaf(), false);

@@ -87,10 +87,8 @@ public:
     VDevParameters dynamic_params(const std::string& name) const {
         VDevParameters p;
         p.vdev_name = name;
-        p.vdev_size = 0;
-        p.num_chunks = 0;
-        p.chunk_size = 0;
-        p.incremental_chunk_size = CHUNK_SIZE;
+        p.initial_chunk_size = CHUNK_SIZE;
+        p.initial_num_chunks = 0;
         p.blk_size = BLK_SIZE;
         p.dev_type = HSDevType::Data;
         p.multi_pdev_opts = MultiPDevOpts::SingleFirstPDev;

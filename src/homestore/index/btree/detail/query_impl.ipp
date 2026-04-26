@@ -45,7 +45,7 @@ BtreeTask< BtreeStatus > Btree< K, V >::do_query(BtreeQueryRequest< K >& qreq,
                 if (out_last_key.compare(qreq.input_range().end_key()) >= 0) {
                     ret = BtreeStatus::success;
                 }
-                qreq.shift_working_range(std::move(out_last_key), false);
+                qreq.next_working_range_from(std::move(out_last_key), false);
             }
         } else {
             DEBUG_ASSERT_NE(ret, BtreeStatus::has_more, "Query returned has_more, but no values added");
@@ -106,14 +106,13 @@ BtreeTask< BtreeStatus > Btree< K, V >::do_sweep_query(Node my_node, BtreeQueryR
     }
 
     // Interior: find child and descend.
-    NodeLink child_id;
-    auto const [found, idx] = my_node->find(qreq.first_key(), &child_id, false);
+    auto const [found, idx] = my_node->find(qreq.first_key());
     ASSERT_IS_VALID_INTERIOR_CHILD_INDX(found, idx, my_node.operator->());
     if (qreq.route_tracing_) {
         append_route_trace(qreq, my_node, BtreeEvent::READ, idx, idx);
     }
 
-    auto child_result = CO_AWAIT(underlying_->read_node(child_id.id(), LockType::Read));
+    auto child_result = CO_AWAIT(get_child_node(my_node, idx, LockType::Read));
     my_node.release();
     if (!child_result.hasValue()) {
         CO_RETURN child_result.error();
@@ -138,8 +137,8 @@ BtreeTask< BtreeStatus > Btree< K, V >::do_traversal_query(Node my_node, BtreeQu
         CO_RETURN ret;
     }
 
-    auto const [start_found, start_idx] = my_node->find(qreq.first_key(), nullptr, false);
-    auto [end_found, end_idx] = my_node->find(qreq.input_range().end_key(), nullptr, false);
+    auto const [start_found, start_idx] = my_node->find(qreq.first_key());
+    auto [end_found, end_idx] = my_node->find(qreq.input_range().end_key());
 
     if (start_idx == my_node->total_entries() && !my_node->has_valid_edge()) {
         CO_RETURN ret;
@@ -198,7 +197,7 @@ BtreeTask< uint32_t > Btree< K, V >::query_leaf_entries(Node const& node, BtreeQ
         }
 
         V val;
-        auto status = CO_AWAIT read_from_node(node, idx, val);
+        auto status = CO_AWAIT node_ops_.leaf_read_value(node, idx, val);
         if (status == BtreeStatus::success) {
             K key = node->get_nth_key< K >(idx, true);
             if (!qreq.filter() || qreq.filter()->check_kv(key, val) == GetFilterDecision::Include) {

@@ -17,7 +17,6 @@
 
 #include <fmt/format.h>
 #include <sisl/logging/logging.h>
-#include <sisl/fds/thread_factory.h>
 #include <sisl/fds/rcu.h>
 
 #include "slab_blk_allocator.h"
@@ -63,20 +62,18 @@ SlabBlkAllocator::SlabBlkAllocator(SlabBlkAllocConfig const& cfg, std::optional<
         }
     }
 
-    // Sweep thread is created here but not triggered until recovery_completed(), so that any blocks reserved via
-    // commit_blk() are marked in inmem_bm_ before the sweep scans for free blocks.
-    sweep_thread_ = sisl::named_thread("blkalloc_sweep_" + name_, [this]() { sweep_worker(); });
+    // Register with the module-scoped sweep service. The service is allowed to fire refill tasks
+    // immediately, but recovery_completed() is what triggers the first proactive refill — until then,
+    // the periodic ticker may already enqueue if needs_refill() is true (harmless: refill writes only
+    // into inmem_bm_, and any reserved blocks have been committed via commit() before we get here).
+    sweep_handle_ = sweep_service().register_allocator(
+        seg_mgr_, [this](InmemPortion& portion) { fill_cache_for_portion(portion); }, name_);
 }
 
 SlabBlkAllocator::~SlabBlkAllocator() {
-    if (sweep_thread_.joinable()) {
-        {
-            std::unique_lock< std::mutex > lk{sweep_mutex_};
-            sweep_stop_ = true;
-            sweep_cv_.notify_all();
-        }
-        sweep_thread_.join();
-    }
+    // Drop the handle first — its destructor sets alive_=false and waits for in-flight refill workers
+    // targeting this allocator's portions to drain. Only then is it safe to destroy inmem_bm_/seg_mgr_.
+    sweep_handle_.reset();
     // Clean up in case recovery_completed() was never called (e.g. error path).
     delete recovering_;
 }
@@ -119,64 +116,18 @@ void SlabBlkAllocator::load() {
     }
 }
 
-// ---- sweep ----
-
-void SlabBlkAllocator::sweep_worker() {
-    while (true) {
-        {
-            std::unique_lock< std::mutex > lk{sweep_mutex_};
-            sweep_cv_.wait_for(lk, std::chrono::milliseconds(HS_DYNAMIC_CONFIG(blkallocator.slab_refill_frequency_ms)),
-                               [this]() { return sweep_requested_ || sweep_stop_; });
-            if (sweep_stop_)
-                break;
-            sweep_requested_ = false;
-        }
-
-        if (!cfg_.use_slab_cache_) {
-            continue;
-        }
-
-        blk_num_t blks_added{0};
-        for (auto& seg : seg_mgr_.segments()) {
-            for (auto& p_ptr : seg.portions_) {
-                InmemPortion& portion = *p_ptr;
-                if (portion.slab_cache_.needs_refill()) {
-                    fill_cache_for_portion(portion);
-                    blks_added += portion.slab_cache_.total_cached_blks();
-                }
-            }
-        }
-
-        BLKALLOC_LOG(DEBUG, "sweep: refilled total_cached_blks={}", blks_added);
-
-        {
-            std::unique_lock< std::mutex > lk{sweep_mutex_};
-            sweep_blks_added_ = blks_added;
-            sweep_cv_.notify_all();
-        }
-    }
-}
+// ---- sweep callback ----
 
 // Refill the slab cache for one portion from inmem_bm_. Consumed blocks are marked (num_consumed > 0)
 // so the bitmap tracks them as in-cache and they won't be double-allocated.
+// Invoked by blkalloc::SweepService workers on this allocator's sweep_handle_.
 void SlabBlkAllocator::fill_cache_for_portion(InmemPortion& portion) {
+    if (!cfg_.use_slab_cache_) return;
     inmem_bm_->scan_free_blks(portion, [&portion](BlkId const& bid) -> std::pair< bool, blk_count_t > {
         auto [status, remaining] = portion.slab_cache_.try_free(bid);
         const blk_count_t consumed = bid.blk_count() - remaining.blk_count();
         return {consumed > 0, consumed};
     });
-}
-
-void SlabBlkAllocator::request_sweep(blk_count_t wait_for_blks) {
-    {
-        std::unique_lock< std::mutex > lk{sweep_mutex_};
-        sweep_requested_ = true;
-        sweep_cv_.notify_all();
-    }
-    if (wait_for_blks > 0) {
-        std::unique_lock< std::mutex > lk{sweep_mutex_};
-        sweep_cv_.wait(lk, [&]() { return sweep_blks_added_ >= wait_for_blks || !sweep_requested_ || sweep_stop_; });
-    }
 }
 
 // ---- alloc ----
@@ -234,8 +185,8 @@ BlkAllocStatus SlabBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const&
                 }
 
                 if (status == BlkAllocStatus::SUCCESS) {
-                    if (inmem_bm_ && portion.slab_cache_.needs_refill()) {
-                        request_sweep();
+                    if (inmem_bm_ && sweep_handle_ && portion.slab_cache_.needs_refill()) {
+                        sweep_service().request_refill(*sweep_handle_, portion);
                     }
                     // Return excess blocks (from break-up that couldn't fit back into slab) to bitmap.
                     if (inmem_bm_ && !excess.empty()) {
@@ -385,7 +336,18 @@ void SlabBlkAllocator::recovery_completed() {
     bool* old = sisl::Rcu::xchg_pointer(&recovering_, static_cast< bool* >(nullptr));
     sisl::Rcu::synchronize();
     delete old;
-    request_sweep();
+
+    // Trigger immediate refill of every portion below threshold instead of waiting for the next periodic
+    // tick. All requests are LOW priority — the periodic ticker would do the same eventually.
+    if (!sweep_handle_) return;
+    for (auto& seg : seg_mgr_.segments()) {
+        for (auto& p_ptr : seg.portions_) {
+            InmemPortion& portion = *p_ptr;
+            if (portion.slab_cache_.needs_refill()) {
+                sweep_service().request_refill(*sweep_handle_, portion);
+            }
+        }
+    }
 }
 
 // ---- query ----

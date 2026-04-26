@@ -24,6 +24,8 @@ class MetaBlkManager;
 class DeviceManager;
 class CPManager;
 class BlobDevManager;
+class COWBtreeManager;
+class ResourceMgr;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Managers
@@ -39,16 +41,22 @@ class BlobDevManager;
 // ─────────────────────────────────────────────────────────────────────────────
 class Managers {
 public:
-    static void init_meta_mgr(shared< MetaBlkManager > mgr)     { s_meta_mgr_ = std::move(mgr); }
-    static void init_device_mgr(shared< DeviceManager > mgr)    { s_device_mgr_ = std::move(mgr); }
-    static void init_cp_mgr(shared< CPManager > mgr)            { s_cp_mgr_ = std::move(mgr); }
+    static void init_meta_mgr(shared< MetaBlkManager > mgr) { s_meta_mgr_ = std::move(mgr); }
+    static void init_device_mgr(shared< DeviceManager > mgr) { s_device_mgr_ = std::move(mgr); }
+    static void init_cp_mgr(shared< CPManager > mgr) { s_cp_mgr_ = std::move(mgr); }
     static void init_blob_dev_mgr(shared< BlobDevManager > mgr) { s_blob_dev_mgr_ = std::move(mgr); }
+    static void init_cow_btree_mgr(shared< COWBtreeManager > mgr) { s_cow_btree_mgr_ = std::move(mgr); }
+    static void init_resource_mgr(shared< ResourceMgr > mgr) { s_resource_mgr_ = std::move(mgr); }
+
+    static void reset_resource_mgr() { s_resource_mgr_.reset(); }
 
     static void reset() {
         s_meta_mgr_.reset();
         s_device_mgr_.reset();
         s_cp_mgr_.reset();
         s_blob_dev_mgr_.reset();
+        s_cow_btree_mgr_.reset();
+        s_resource_mgr_.reset();
     }
 
 private:
@@ -56,34 +64,60 @@ private:
     friend DeviceManager& device_mgr();
     friend CPManager& cp_mgr();
     friend BlobDevManager& blob_dev_mgr();
+    friend COWBtreeManager& cow_btree_mgr();
+    friend ResourceMgr& resource_mgr();
 
     inline static shared< MetaBlkManager > s_meta_mgr_;
-    inline static shared< DeviceManager >  s_device_mgr_;
-    inline static shared< CPManager >      s_cp_mgr_;
+    inline static shared< DeviceManager > s_device_mgr_;
+    inline static shared< CPManager > s_cp_mgr_;
     inline static shared< BlobDevManager > s_blob_dev_mgr_;
+    inline static shared< COWBtreeManager > s_cow_btree_mgr_;
+    inline static shared< ResourceMgr > s_resource_mgr_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Free-function accessors — call after the matching init_*() has returned.
 // ─────────────────────────────────────────────────────────────────────────────
 inline MetaBlkManager& meta_mgr() {
-    if (!Managers::s_meta_mgr_) { throw std::logic_error{"meta_mgr() called before init_meta_mgr()"}; }
+    if (!Managers::s_meta_mgr_) {
+        throw std::logic_error{"meta_mgr() called before init_meta_mgr()"};
+    }
     return *Managers::s_meta_mgr_;
 }
 
 inline DeviceManager& device_mgr() {
-    if (!Managers::s_device_mgr_) { throw std::logic_error{"device_mgr() called before init_device_mgr()"}; }
+    if (!Managers::s_device_mgr_) {
+        throw std::logic_error{"device_mgr() called before init_device_mgr()"};
+    }
     return *Managers::s_device_mgr_;
 }
 
 inline CPManager& cp_mgr() {
-    if (!Managers::s_cp_mgr_) { throw std::logic_error{"cp_mgr() called before init_cp_mgr()"}; }
+    if (!Managers::s_cp_mgr_) {
+        throw std::logic_error{"cp_mgr() called before init_cp_mgr()"};
+    }
     return *Managers::s_cp_mgr_;
 }
 
 inline BlobDevManager& blob_dev_mgr() {
-    if (!Managers::s_blob_dev_mgr_) { throw std::logic_error{"blob_dev_mgr() called before init_blob_dev_mgr()"}; }
+    if (!Managers::s_blob_dev_mgr_) {
+        throw std::logic_error{"blob_dev_mgr() called before init_blob_dev_mgr()"};
+    }
     return *Managers::s_blob_dev_mgr_;
+}
+
+inline COWBtreeManager& cow_btree_mgr() {
+    if (!Managers::s_cow_btree_mgr_) {
+        throw std::logic_error{"cow_btree_mgr() called before init_cow_btree_mgr()"};
+    }
+    return *Managers::s_cow_btree_mgr_;
+}
+
+inline ResourceMgr& resource_mgr() {
+    if (!Managers::s_resource_mgr_) {
+        throw std::logic_error{"resource_mgr() called before ResourceMgr::start()"};
+    }
+    return *Managers::s_resource_mgr_;
 }
 
 } // namespace homestore

@@ -442,6 +442,13 @@ public:
     }
 };
 
+// ── IOBuffer ──────────────────────────────────────────────────────────────────
+// Public alias for IoBlobSafe — the canonical aligned heap buffer used across the IO path
+// (drive_interface, virtual_dev, blob streams, meta service). Lives here rather than in
+// iomanager/drive_interface.hpp so callers that only need the type don't drag in folly::coro.
+
+using IOBuffer = IoBlobSafe;
+
 // ── ByteArray / ByteView ──────────────────────────────────────────────────────
 
 using ByteArrayImpl = IoBlobSafe;
@@ -583,24 +590,54 @@ struct LargeBufBuilder {
 public:
     LargeBufBuilder() = default;
     explicit LargeBufBuilder(uint32_t buf_capacity, uint32_t alignment = 512, Buftag tag = Buftag::common) :
-            buf_capacity_{buf_capacity}, alignment_{alignment}, tag_{tag} {}
+            buf_capacity_{buf_capacity}, alignment_{alignment}, tag_{tag} {
+        bufs_.reserve(16);
+    }
 
     void append(Blob const& data) {
         auto const* src = data.cbytes();
         uint32_t remaining = data.size();
 
         while (remaining > 0) {
-            if (bufs_.empty() || last_used_ >= buf_capacity_) {
+            if (bufs_.empty() || cur_offset_ >= buf_capacity_) {
+                if (!bufs_.empty())
+                    bufs_.back().set_size(cur_offset_); // close prior partially-filled buf
                 bufs_.emplace_back(buf_capacity_, alignment_, tag_);
-                last_used_ = 0;
+                cur_offset_ = 0;
             }
-            uint32_t const space = buf_capacity_ - last_used_;
+            uint32_t const space = buf_capacity_ - cur_offset_;
             uint32_t const copy_len = std::min(remaining, space);
-            std::memcpy(bufs_.back().bytes() + last_used_, src, copy_len);
-            last_used_ += copy_len;
+            std::memcpy(bufs_.back().bytes() + cur_offset_, src, copy_len);
+            cur_offset_ += copy_len;
             src += copy_len;
             remaining -= copy_len;
         }
+    }
+
+    // Reserve `size` contiguous bytes in a buffer and invoke fill(sisl::Blob) to populate them.  Returns without the
+    // caller having to memcpy from any source.  If the current buf can't fit, starts a new one sized to
+    // max(default_capacity, size) — so oversized emplaces get their own dedicated buf.
+    template < typename FillFn >
+    void emplace(uint32_t size, FillFn&& fill) {
+        if (bufs_.empty() || size > (buf_capacity_ > cur_offset_ ? buf_capacity_ - cur_offset_ : 0)) {
+            if (!bufs_.empty())
+                bufs_.back().set_size(cur_offset_); // close prior partially-filled buf
+            bufs_.emplace_back(std::max(buf_capacity_, size), alignment_, tag_);
+            cur_offset_ = 0;
+        }
+        uint8_t* ptr = bufs_.back().bytes() + cur_offset_;
+        std::forward< FillFn >(fill)(Blob{ptr, size});
+        cur_offset_ += size;
+    }
+
+    // Move all buffers out as a vector; the last (partially filled) buffer's size is set to the used byte count.  All
+    // earlier buffers already carry size == buf_capacity_ from construction.  Builder is empty after this call.
+    std::vector< IoBlobSafe > move_all_bufs() {
+        if (!bufs_.empty()) {
+            bufs_.back().set_size(cur_offset_);
+        }
+        cur_offset_ = 0;
+        return std::move(bufs_);
     }
 
     // Consume the builder: moves each buffer out to cb with its size set to the used byte count.
@@ -608,31 +645,33 @@ public:
     template < typename Cb >
     void consume(Cb&& cb) {
         for (size_t i = 0; i < bufs_.size(); ++i) {
-            uint32_t const used = (i + 1 < bufs_.size()) ? buf_capacity_ : last_used_;
+            uint32_t const used = (i + 1 < bufs_.size()) ? buf_capacity_ : cur_offset_;
             if (used > 0) {
                 bufs_[i].set_size(used);
                 cb(std::move(bufs_[i]));
             }
         }
         bufs_.clear();
-        last_used_ = 0;
+        cur_offset_ = 0;
     }
 
     uint64_t total_bytes() const {
-        if (bufs_.empty()) { return 0; }
-        return (bufs_.size() - 1) * uint64_cast(buf_capacity_) + last_used_;
+        if (bufs_.empty()) {
+            return 0;
+        }
+        return (bufs_.size() - 1) * uint64_cast(buf_capacity_) + cur_offset_;
     }
 
-    bool empty() const { return bufs_.empty() || (bufs_.size() == 1 && last_used_ == 0); }
+    bool empty() const { return bufs_.empty() || (bufs_.size() == 1 && cur_offset_ == 0); }
 
     void clear() {
         bufs_.clear();
-        last_used_ = 0;
+        cur_offset_ = 0;
     }
 
 private:
     std::vector< IoBlobSafe > bufs_;
-    uint32_t last_used_{0};
+    uint32_t cur_offset_{0};
     uint32_t buf_capacity_{256 * 4096}; // default 1 MB
     uint32_t alignment_{512};
     Buftag tag_{Buftag::common};

@@ -25,6 +25,8 @@
 
 namespace homestore {
 
+using sisl::IOBuffer;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Factory methods: create/load
 // ──────────────────────────────────────────────────────────────────────────────
@@ -198,7 +200,13 @@ folly::coro::Task< void > MetaClient::remove_meta_blk(const MetaBlk& mblk) {
 
     const BlkId key = mblk.blkid;
     auto it = state_->meta_blks.find(key);
-    if (it == state_->meta_blks.end()) { throw std::runtime_error{"MetaClient::remove_meta_blk: block not found"}; }
+    if (it == state_->meta_blks.end()) {
+        // Block was allocated (create_meta_blk) but never committed to the chain via write_meta_blk — just free its
+        // allocated storage on the vdev.  This is a valid state for subclasses that lazily persist MetaBlks.
+        MetaBlk tmp = mblk;
+        co_await tmp.free(*meta_vdev_);
+        co_return;
+    }
 
     // Extract the block from the map.
     MetaBlk removed = std::move(it->second);

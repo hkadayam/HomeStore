@@ -392,7 +392,7 @@ private:
                 // Command line has device list, use that
                 auto const devs = SISL_OPTIONS["device_list"].as< std::vector< std::string > >();
                 for (uint32_t i{0}; i < devs.size(); ++i) {
-                    // iomgr::DriveInterface::emulate_drive_type(name, iomgr::drive_type::block_hdd);
+                    // iomanager::DriveInterface::emulate_drive_type(name, iomgr::drive_type::block_hdd);
                     // First device is fast device
                     m_token.devs_.emplace_back(devs[i],
                                                (i == 0) ? homestore::HSDevType::Fast : homestore::HSDevType::Data);

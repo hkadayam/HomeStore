@@ -29,7 +29,6 @@
 #include <homestore/blk.h>               // BlkId, BlkAllocStatus, blk_count_t, blk_alloc_hints
 #include "homestore/base/homestore_decl.h" // shared<>, unique<>
 #include "blob/stream_base.h"              // StreamBase, CPSessionBase, cp_id_t, CPManager::max_concurent_cps
-#include "iomanager/drive_interface.hpp" // IOBuffer
 
 namespace homestore {
 
@@ -135,7 +134,7 @@ public:
     /// Invalidate (free) a previously-appended block.  Marks owning chunk dirty.
     void invalidate(CP* cp, const BlkId& bid);
 
-    folly::coro::Task< std::error_code > read(IOBuffer& buf, const BlkId& bid);
+    folly::coro::Task< std::error_code > read(sisl::IOBuffer& buf, const BlkId& bid);
 
     // ── CP hooks ──────────────────────────────────────────────────────────────
 

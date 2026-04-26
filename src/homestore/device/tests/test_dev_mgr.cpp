@@ -116,9 +116,8 @@ CORO_TEST_F(DevMgrTest, CreateVdevStriped) {
 
     VDevParameters params;
     params.vdev_name = "striped_vdev";
-    params.vdev_size = CHUNK_SIZE * self.num_devs_;
-    params.num_chunks = to_u32(self.num_devs_);
-    params.chunk_size = CHUNK_SIZE;
+    params.initial_chunk_size = CHUNK_SIZE;
+    params.initial_num_chunks = to_u32(self.num_devs_);
     params.blk_size = BLK_SIZE;
     params.dev_type = HSDevType::Data;
     params.multi_pdev_opts = MultiPDevOpts::AllPDevStriped;
@@ -150,9 +149,8 @@ CORO_TEST_F(DevMgrTest, CreateMultipleVdevs) {
     for (int i = 0; i < 3; ++i) {
         VDevParameters params;
         params.vdev_name = fmt::format("vdev_{}", i);
-        params.vdev_size = CHUNK_SIZE;
-        params.num_chunks = 1;
-        params.chunk_size = CHUNK_SIZE;
+        params.initial_chunk_size = CHUNK_SIZE;
+        params.initial_num_chunks = 1;
         params.blk_size = BLK_SIZE;
         params.dev_type = HSDevType::Data;
         params.multi_pdev_opts = MultiPDevOpts::SingleFirstPDev;
@@ -177,9 +175,8 @@ CORO_TEST_F(DevMgrTest, DestroyVdev) {
 
     VDevParameters params;
     params.vdev_name = "to_destroy";
-    params.vdev_size = CHUNK_SIZE;
-    params.num_chunks = 1;
-    params.chunk_size = CHUNK_SIZE;
+    params.initial_chunk_size = CHUNK_SIZE;
+    params.initial_num_chunks = 1;
     params.blk_size = BLK_SIZE;
     params.dev_type = HSDevType::Data;
     params.multi_pdev_opts = MultiPDevOpts::SingleFirstPDev;
@@ -258,10 +255,8 @@ CORO_TEST_F(DevMgrTest, DynamicChunkCreation) {
 
         VDevParameters params;
         params.vdev_name = "dynamic_chunks";
-        params.vdev_size = 0;
-        params.num_chunks = 0;
-        params.chunk_size = 0;
-        params.incremental_chunk_size = CHUNK_SIZE;
+        params.initial_chunk_size = CHUNK_SIZE;
+        params.initial_num_chunks = 0;
         params.blk_size = BLK_SIZE;
         params.dev_type = HSDevType::Data;
         params.multi_pdev_opts = MultiPDevOpts::SingleFirstPDev;

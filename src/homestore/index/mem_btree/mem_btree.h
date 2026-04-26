@@ -1,10 +1,13 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 
 #include <folly/concurrency/ConcurrentHashMap.h>
 
+#include "sisl/fds/thread_vector.h"
 #include "homestore/index/btree/btree_base.h"
 #include "homestore/index/btree/detail/btree_node.h"
 
@@ -39,24 +42,32 @@ private:
 static_assert(sizeof(MemNodeHandle) <= Node::kStorageBytes,
               "MemNodeHandle exceeds Node::kStorageBytes — increase kStorageBytes");
 
-// ─────────────────────────────────────────────────────────────────────────────
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // MemBtree — in-memory UnderlyingBtree backend.
 //
-// Node ownership: each allocated NodeCore is heap-owned by a unique_ptr stored in a folly::ConcurrentHashMap keyed by
-// the raw NodeCore*.  The bnodeid_t of a node is just reinterpret_cast(NodeCore*), so read_node() is a zero-cost
-// pointer reinterpret — no hashtable lookup on the hot path.  The map exists purely so:
-//   - MemBtree destruction frees every node the tree ever allocated.
-//   - remove_node() can drop the owning unique_ptr.
-// This mirrors the Rust memdb design (pointer-as-id) while remaining safe in C++ without GC.
-// ─────────────────────────────────────────────────────────────────────────────
+// Node ownership — split across three structures to keep create_node / remove_node lock-free on the hot path while
+// deferring actual destruction to a single drainer thread (see MemBtreeDrainer):
+//   - nodes_ : std::map<bnodeid_t, unique<NodeCore>>.  Owning registry, touched ONLY by the drainer (no lock needed).
+//   - pending_creates_ : ThreadVector<NodeCore*>.  create_node() moves the nodecore; the drainer adopts it into
+//                        nodes_ via unique_ptr ctor.  Ambient ownership between push and adoption.
+//   - pending_removes_ : CIV<NodeCore*>.  remove_node() pushes the raw pointer here; the drainer later erases the
+//                        matching entry from nodes_, destroying the unique_ptr.
+//
+// The bnodeid_t of a node is just reinterpret_cast(NodeCore*), so read_node() remains a zero-cost pointer reinterpret
+// with no map lookup on the hot path.
+//
+// Synchronization: drain_sync_mtx_ is a shared_mutex — pushers take it shared (near-atomic cost, no contention among
+// pushers since CIV is thread-local internally); the drainer takes it exclusive, which briefly excludes pushers while
+// it walks & clears the CIVs.
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 class MemBtree : public UnderlyingBtree {
 public:
-    MemBtree() = default;
+    MemBtree();
     MemBtree(MemBtree const&) = delete;
     MemBtree& operator=(MemBtree const&) = delete;
     MemBtree(MemBtree&&) = delete;
     MemBtree& operator=(MemBtree&&) = delete;
-    ~MemBtree() override = default; // nodes_ unique_ptrs free all NodeCores automatically
+    ~MemBtree() override;
 
     // Sync factory — allocates a MemBtree, wires it into a Btree<K,V>, and returns the tree.  Caller must include
     // <homestore/index/btree/btree.ipp> so the Btree<K,V> template body is visible at the call site.
@@ -67,26 +78,31 @@ public:
     void bind_to(BtreeBase* base) override { base_btree_ = base; }
 
     Node create_node(bool is_leaf) override;
-    BtreeResult< Node > read_node(bnodeid_t id, LockType lock_type) const override;
+    BtreeResult< Node > read_node(bnodeid_t id, LockType lock_type) override;
     void write_node(Node const& /*node*/) override {}
     BtreeStatus prepare_for_write(Node const& /*node*/) override { return BtreeStatus::success; }
     void remove_node(Node const& node) override;
     void on_root_changed(Node const& /*root*/) override {}
     uint64_t space_occupied() const override;
+    std::shared_ptr< uint8_t > allocate_node_buf() override {
+        return std::shared_ptr< uint8_t >{new uint8_t[base_btree_->node_size()](), std::default_delete< uint8_t[] >{}};
+    }
 
     // ── Overflow support (in-memory) ─────────────────────────────────────────
     BtreeStatus write_overflow(sisl::ByteArray const& buf, BlkId& out_blkid) override;
     BtreeTask< BtreeStatus > read_overflow(BlkId const& blkid, sisl::ByteArray& out_buf) const override;
     BtreeStatus delete_overflow(BlkId const& blkid) override;
 
+    // Called by MemBtreeDrainer — applies pending ops to nodes_.
+    void drain();
+
 private:
     BtreeBase* base_btree_{nullptr};
 
-    // Ownership map: unique_ptr owns each live NodeCore.  Keyed by raw NodeCore* (= bnodeid_t after cast).
-    // ConcurrentHashMap permits concurrent insert/erase without a mutex.
-    folly::ConcurrentHashMap< NodeCore*, unique< NodeCore > > nodes_;
+    std::map< bnodeid_t, unique< NodeCore > > nodes_;
+    sisl::ThreadVector< unique< NodeCore > > pending_creates_;
+    sisl::ThreadVector< NodeCore* > pending_removes_;
 
-    // In-memory overflow storage.  BlkId is synthesized from a monotonic counter; the ByteArray is heap-owned.
     mutable folly::ConcurrentHashMap< uint64_t, sisl::ByteArray > overflow_store_;
     std::atomic< uint64_t > overflow_next_id_{1};
 };

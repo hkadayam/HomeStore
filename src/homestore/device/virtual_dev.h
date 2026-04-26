@@ -56,10 +56,15 @@ ENUM(ChunkToShrink, uint8_t,
 // Creation parameters for a new VirtualDev.
 struct VDevParameters {
     std::string vdev_name;
-    uint64_t vdev_size{0};
-    uint32_t num_chunks{0};
-    uint64_t chunk_size{0};
-    uint64_t incremental_chunk_size{0};
+
+    /// Required, > 0.  Size of each chunk created at vdev init time and the default size for expand() calls
+    /// that do not override.  Persisted in VDevInfo so recovery picks it up.
+    uint64_t initial_chunk_size{0};
+
+    /// 0 = no preallocation; chunks are created lazily via expand().
+    /// > 0 = create this many chunks of size initial_chunk_size at create time.
+    uint32_t initial_num_chunks{0};
+
     uint32_t blk_size{4096};
     HSDevType dev_type{HSDevType::Data};
     MultiPDevOpts multi_pdev_opts{MultiPDevOpts::SingleFirstPDev};
@@ -179,7 +184,6 @@ public:
     HSDevType hs_dev_type() const { return hs_dev_type_; }
     BlkAllocatorType allocator_type() const { return allocator_type_; }
     ChunkSelectorType chunk_selector_type() const { return chunk_selector_type_; }
-    uint64_t incremental_chunk_size() const { return incremental_chunk_size_; }
     uint64_t size() const;
     uint64_t num_chunks() const;
 
@@ -202,7 +206,10 @@ public:
     /// Recovery: load block allocator for a single chunk from its on-disk bitmap buffer.
     void load_blk_allocator(uint32_t chunk_id, const sisl::ByteArray& buffer);
 
-    uint64_t chunk_size_bytes() const;
+    /// The chunk size persisted in the vdev's VDevInfo.  Used for chunks created at init time and as the default
+    /// size for expand() when callers don't pass an explicit size.  Per-chunk size may differ for chunks added via
+    /// expand(custom_size); use chunk->size() when the actual chunk's size is needed.
+    uint64_t initial_chunk_size() const;
     VDevInfo get_vdev_info() const;
 
     size_t num_chunks_actual() const;
@@ -259,7 +266,6 @@ private:
     BlkAllocatorType allocator_type_;
     ChunkSelectorType chunk_selector_type_;
     bool persist_blk_alloced_;
-    uint64_t incremental_chunk_size_;
     std::vector< shared< PhysicalDev > > pdevs_; // physical devices backing this vdev
 
     // ── Mutable state (RCU) ───────────────────────────────────────────────────

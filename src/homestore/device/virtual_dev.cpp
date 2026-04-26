@@ -46,7 +46,6 @@ VirtualDev::VirtualDev(VDevInfo info, std::vector< shared< PhysicalDev > > pdevs
         allocator_type_{static_cast< BlkAllocatorType >(info.alloc_type)},
         chunk_selector_type_{static_cast< ChunkSelectorType >(info.chunk_sel_type)},
         persist_blk_alloced_{info.persist_blk_alloced != 0},
-        incremental_chunk_size_{to_u64(info.chunk_size)},
         pdevs_{std::move(pdevs)},
         mutable_state_() {
     VDevMutableState initial{};
@@ -67,19 +66,14 @@ folly::coro::Task< unique< VirtualDev > > VirtualDev::create(VDevParameters&& pa
     }
 
     auto selected_pdevs = pick_pdevs(pdevs, params.multi_pdev_opts);
-    adjust_vdev_params(params); // Normalise params (no-op when num_chunks == 0).
+    adjust_vdev_params(params);
 
-    if (params.num_chunks == 0) {
-        LOGINFO("New VirtualDev={} id={} (no initial chunks)", params.vdev_name, vdev_id);
-    } else {
-        LOGINFO("New VirtualDev={} size={} id={} chunks={} chunk_size={}", params.vdev_name, params.vdev_size, vdev_id,
-                params.num_chunks, params.chunk_size);
-    }
+    LOGINFO("New VirtualDev={} id={} initial_chunk_size={} initial_num_chunks={}", params.vdev_name, vdev_id,
+            params.initial_chunk_size, params.initial_num_chunks);
 
-    // Build VDevInfo from (possibly adjusted) params
     VDevInfo vinfo{};
     vinfo.vdev_id = vdev_id;
-    vinfo.chunk_size = to_u32(params.chunk_size);
+    vinfo.initial_chunk_size = to_u32(params.initial_chunk_size);
     vinfo.blk_size = params.blk_size;
     vinfo.num_mirrors = params.num_mirrors;
     vinfo.slot_allocated = 0x01;
@@ -96,7 +90,7 @@ folly::coro::Task< unique< VirtualDev > > VirtualDev::create(VDevParameters&& pa
         vdev->chunk_pool_.emplace(*params.chunk_pool_limit);
     }
 
-    // Distribute chunks across pdevs proportionally by capacity.
+    // Distribute initial chunks across pdevs proportionally by capacity.
     const uint64_t total_size = [vdev = vdev.get()]() {
         uint64_t s = 0;
         for (auto& p : vdev->pdevs_) {
@@ -107,25 +101,32 @@ folly::coro::Task< unique< VirtualDev > > VirtualDev::create(VDevParameters&& pa
 
     uint32_t total_created = 0;
     for (size_t pi = 0; pi < vdev->pdevs_.size(); ++pi) {
-        if (total_created >= params.num_chunks) { break; }
+        if (total_created >= params.initial_num_chunks) {
+            break;
+        }
         auto& pdev = vdev->pdevs_[pi];
 
-        uint32_t n = to_u32(params.num_chunks * (to_double(pdev->data_size()) / to_double(total_size)));
+        uint32_t n = to_u32(params.initial_num_chunks * (to_double(pdev->data_size()) / to_double(total_size)));
 
         // First pdev picks up any chunks lost to rounding so that chunk IDs stay small.
-        if (n == 0 && total_created == 0) { n = 1; }
-        n = std::min(n, params.num_chunks - total_created);
-        if (n == 0) { continue; }
+        if (n == 0 && total_created == 0) {
+            n = 1;
+        }
+        n = std::min(n, params.initial_num_chunks - total_created);
+        if (n == 0) {
+            continue;
+        }
 
-        auto chunks = co_await pdev->create_chunks(vdev_id, n, params.chunk_size, /*start_ordinal=*/total_created);
+        auto chunks =
+            co_await pdev->create_chunks(vdev_id, n, params.initial_chunk_size, /*start_ordinal=*/total_created);
         vdev->on_chunks_added(std::move(chunks), /*newly_created=*/true);
         total_created += n;
     }
 
-    // Write the newly minted vdev info
     co_await vdev->write_vdev_info();
 
-    LOGINFO("VirtualDev={} size={} created", params.vdev_name, params.vdev_size);
+    LOGINFO("VirtualDev={} created with {} initial chunks (chunk_size={})", params.vdev_name, total_created,
+            params.initial_chunk_size);
     co_return vdev;
 }
 
@@ -363,7 +364,9 @@ BlkAllocStatus VirtualDev::commit_blk(const BlkId& bid) {
 void VirtualDev::recovery_completed() {
     auto state = load_state();
     for (auto& [_, c] : state->all_chunks) {
-        if (c->has_blk_allocator()) { c->blk_allocator_mutable()->recovery_completed(); }
+        if (c->has_blk_allocator()) {
+            c->blk_allocator_mutable()->recovery_completed();
+        }
     }
 }
 
@@ -434,8 +437,8 @@ uint64_t VirtualDev::size() const {
 uint64_t VirtualDev::num_chunks() const {
     return load_state()->total_chunk_num;
 }
-uint64_t VirtualDev::chunk_size_bytes() const {
-    return load_state()->vdev_info.chunk_size;
+uint64_t VirtualDev::initial_chunk_size() const {
+    return load_state()->vdev_info.initial_chunk_size;
 }
 VDevInfo VirtualDev::get_vdev_info() const {
     return load_state()->vdev_info;
@@ -448,41 +451,17 @@ void VirtualDev::adjust_vdev_params(VDevParameters& p) {
     constexpr uint64_t MIN_CHUNK_SIZE = 16ull * 1024 * 1024;
     constexpr uint32_t MAX_CHUNKS_IN_SYSTEM = 65535;
 
-    // Empty dynamic vdev starting with no chunks — nothing to adjust.
-    if (p.num_chunks == 0) {
-        return;
+    if (p.initial_chunk_size == 0) {
+        throw std::invalid_argument("initial_chunk_size must be > 0 for vdev: " + p.vdev_name);
     }
+    p.initial_chunk_size = std::max(p.initial_chunk_size, MIN_CHUNK_SIZE);
+    p.initial_chunk_size = ((p.initial_chunk_size + p.blk_size - 1) / p.blk_size) * p.blk_size;
 
-    if (p.vdev_size == 0) {
-        throw std::invalid_argument("VDev size cannot be 0: " + p.vdev_name);
+    if (p.initial_chunk_size > Chunk::MAX_CHUNK_SIZE) {
+        throw std::invalid_argument("initial_chunk_size exceeds MAX_CHUNK_SIZE for vdev: " + p.vdev_name);
     }
-
-    const uint64_t max_num_chunks = std::min(to_u64(p.vdev_size / MIN_CHUNK_SIZE), to_u64(MAX_CHUNKS_IN_SYSTEM));
-
-    if (p.num_chunks != 0) {
-        const uint32_t min_chunks = to_u32((p.vdev_size - 1) / to_u64(Chunk::MAX_CHUNK_SIZE) + 1);
-        p.num_chunks = std::max(p.num_chunks, min_chunks);
-        p.num_chunks = std::min(p.num_chunks, to_u32(max_num_chunks));
-        const uint64_t unit = to_u64(p.num_chunks) * p.blk_size;
-        p.vdev_size = (p.vdev_size / unit) * unit;
-        p.chunk_size = p.vdev_size / p.num_chunks;
-    } else if (p.chunk_size != 0) {
-        p.chunk_size = std::max(p.chunk_size, MIN_CHUNK_SIZE);
-        p.chunk_size = ((p.chunk_size + p.blk_size - 1) / p.blk_size) * p.blk_size;
-        p.vdev_size = (p.vdev_size / p.chunk_size) * p.chunk_size;
-        p.num_chunks = to_u32(p.vdev_size / p.chunk_size);
-    } else {
-        throw std::invalid_argument("Both num_chunks and chunk_size are 0 for vdev: " + p.vdev_name);
-    }
-
-    if (p.vdev_size % p.chunk_size != 0) {
-        throw std::invalid_argument("vdev_size not a multiple of chunk_size for vdev: " + p.vdev_name);
-    }
-    if (p.chunk_size < MIN_CHUNK_SIZE) {
-        throw std::invalid_argument("chunk_size < 16 MB for vdev: " + p.vdev_name);
-    }
-    if (p.num_chunks > MAX_CHUNKS_IN_SYSTEM) {
-        throw std::invalid_argument("num_chunks > MAX_CHUNKS_IN_SYSTEM for vdev: " + p.vdev_name);
+    if (p.initial_num_chunks > MAX_CHUNKS_IN_SYSTEM) {
+        throw std::invalid_argument("initial_num_chunks > MAX_CHUNKS_IN_SYSTEM for vdev: " + p.vdev_name);
     }
 }
 
@@ -621,7 +600,7 @@ folly::coro::Task< std::pair< shared< Chunk >, bool > > VirtualDev::get_or_creat
                                     std::to_string(current_count));
     }
 
-    auto chunk = co_await expand(incremental_chunk_size_);
+    auto chunk = co_await expand(initial_chunk_size());
     co_return std::make_pair(std::move(chunk), true);
 }
 

@@ -254,14 +254,14 @@ public:
 
     // Shift working range start to current end_key (exclusive) and reset end to full input_range end.
     // Used after each leaf so the next sibling sees the right remaining range.
-    void shift_working_range() {
+    void next_working_range() {
         working_range_.set_start_key(std::move(working_range_.end_key_), false);
         working_range_.end_key_ = input_range_.end_key();
         working_range_.end_incl_ = input_range_.is_end_inclusive();
     }
 
     // Shift working range start to a specific key (e.g. last_failed_key from multi_put).
-    void shift_working_range(K&& start_key, bool start_incl) {
+    void next_working_range_from(K&& start_key, bool start_incl) {
         working_range_.set_start_key(std::move(start_key), start_incl);
         working_range_.end_key_ = input_range_.end_key();
         working_range_.end_incl_ = input_range_.is_end_inclusive();

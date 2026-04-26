@@ -133,10 +133,22 @@ protected:
     folly::coro::Mutex mblk_mutex_;
     std::unordered_map< uint32_t, MetaBlk > chunk_mblks_;
 
-private:
     /// Allocate a MetaBlk for the given chunk and store it in chunk_mblks_. Called automatically by expand_to() for
-    /// each newly added chunk.
-    folly::coro::Task< void > init_chunk_mblk(const shared< Chunk >& chunk);
+    /// each newly added chunk.  Subclasses that don't use per-chunk mblks (e.g. AppendByteStream/LogStream which
+    /// maintain a single per-stream mblk carrying the chunk list) can override this to update their own mblk.
+    virtual folly::coro::Task< void > init_chunk_mblk(const shared< Chunk >& chunk);
+
+    /// Remove the MetaBlk for the given chunk_id (mirror of init_chunk_mblk).  Called automatically by truncate_before()
+    /// and destroy() for every released chunk.  Subclasses can override alongside init_chunk_mblk.
+    virtual folly::coro::Task< void > remove_chunk_mblk(uint32_t chunk_id);
+
+    /// Install a pre-loaded chunk list on the stream.  Sorts by vdev_order and atomically installs into chunks_.
+    /// Used by load paths where chunks are recovered by looking up chunk_ids from the subclass's stream sb rather
+    /// than via the per-chunk MetaBlk ChunkMblkMap.  Must be called during single-threaded load, before any
+    /// concurrent access starts.
+    void install_chunks(std::vector< shared< Chunk > > chunks);
+
+private:
 
     uint64_t stream_id_;
     shared< VirtualDev > vdev_;

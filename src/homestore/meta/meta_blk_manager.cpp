@@ -25,15 +25,17 @@
 
 namespace homestore {
 
+using sisl::IOBuffer;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // create
 // ──────────────────────────────────────────────────────────────────────────────
 folly::coro::Task< void > MetaBlkManager::create(uint64_t vdev_size) {
     VDevParameters params;
     params.vdev_name = "meta_vdev";
-    params.vdev_size = vdev_size;
     params.blk_size = 512;
-    params.num_chunks = 1;
+    params.initial_chunk_size = vdev_size; // single chunk holding the whole meta vdev
+    params.initial_num_chunks = 1;
     params.dev_type = HSDevType::Fast;
     params.multi_pdev_opts = MultiPDevOpts::AllPDevStriped;
     params.alloc_type = BlkAllocatorType::SlabExtend;

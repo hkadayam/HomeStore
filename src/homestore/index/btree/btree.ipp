@@ -23,7 +23,6 @@
 #include <sisl/logging/logging.h>
 
 #include "homestore/index/btree/btree.h"
-#include "homestore/index/btree/detail/node_value_helpers.ipp"
 #include "homestore/index/btree/detail/btree_common.ipp"
 #include "homestore/index/btree/detail/btree_node_mgr.ipp"
 #include "homestore/index/btree/detail/mutate_impl.ipp"
@@ -34,7 +33,7 @@
 namespace homestore {
 template < typename K, typename V >
 Btree< K, V >::Btree(BtreeConfig const& cfg, cshared< UnderlyingBtree >& underlying_btree, bnodeid_t root_node_id) :
-        BtreeBase::BtreeBase(cfg, underlying_btree) {
+        BtreeBase::BtreeBase(cfg, underlying_btree), node_ops_(this->bt_cfg_, *this->underlying_) {
     if (root_node_id == empty_bnodeid) {
         // Fresh boot — allocate the root leaf and let the backend know (e.g. to persist the super-block in COWBtree).
         create_root_node();

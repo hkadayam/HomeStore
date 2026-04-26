@@ -201,7 +201,7 @@ public:
             }
             bool upserted_all{false};
 
-            auto [found, idx] = this->find(cur_key, nullptr, false);
+            auto [found, idx] = this->find(cur_key);
             do {
                 auto x = cur_key.compare(keys.end_key());
                 if ((x > 0) || ((x == 0) && !keys.is_end_inclusive())) {
@@ -299,7 +299,7 @@ public:
             }
             uint32_t num_removed{0};
 
-            auto [_, idx] = this->find(cur_key, nullptr, false);
+            auto [_, idx] = this->find(cur_key);
             while (idx < this->total_entries()) {
                 cur_key = BtreeNode::get_nth_key< K >(idx, false);
                 auto x = cur_key.compare(keys.end_key());

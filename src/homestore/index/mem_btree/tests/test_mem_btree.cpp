@@ -30,6 +30,8 @@
 #include "homestore/index/btree/tests/btree_test_helper.hpp"
 
 using namespace homestore;
+using namespace iomanager;
+using sisl::IOBuffer;
 
 SISL_OPTION_GROUP(
     test_mem_btree,

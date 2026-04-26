@@ -14,11 +14,58 @@
  *
  *********************************************************************************/
 #pragma once
-#include <atomic>
-#include <sisl/metrics/metrics.h>
-#include "homestore_config.hpp"
+
+#include <cstdint>
+#include <optional>
+
+#include "common/defs.h" // shared<>
 
 namespace homestore {
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ResourceMgr
+//
+// Single source of truth for the process-wide IO and memory budgets. Created during HomeStore startup once
+// DeviceManager has reported total device capacity; either the caller passes an explicit memory cap or it is
+// derived from system memory using resource_limits.sys_mem_use_percent.
+//
+// Currently only the cache budget is exposed. Other resource-tracking responsibilities (recovery memory, journal
+// vdev watermarks, dirty-buffer queue depth, free-blk accounting) are intentionally commented out below until the
+// new model needs them.
+// ──────────────────────────────────────────────────────────────────────────────
+class ResourceMgr {
+public:
+    /// Construct, install into Managers, and compute the cache budget.
+    ///
+    /// dev_capacity: total capacity across all PhysicalDevs as reported by DeviceManager::total_capacity().
+    /// mem_cap:      optional memory budget for the homestore process. When std::nullopt, derived as
+    ///               (system_total_memory * resource_limits.sys_mem_use_percent / 100).
+    ///
+    /// cache_size = mem_cap * resource_limits.cache_size_percent / 100.
+    static void start(uint64_t dev_capacity, std::optional< uint64_t > mem_cap = std::nullopt);
+
+    /// Drop the singleton.
+    static void stop();
+
+    uint64_t dev_capacity() const { return dev_capacity_; }
+    uint64_t mem_cap() const { return mem_cap_; }
+    uint64_t cache_size() const { return cache_size_; }
+
+private:
+    ResourceMgr(uint64_t dev_capacity, uint64_t mem_cap, uint64_t cache_size) :
+            dev_capacity_{dev_capacity}, mem_cap_{mem_cap}, cache_size_{cache_size} {}
+
+    const uint64_t dev_capacity_;
+    const uint64_t mem_cap_;
+    const uint64_t cache_size_;
+};
+
+#if 0
+// ─────────────────────────────────────────────────────────────────────────────
+// Legacy ResourceMgr surface — kept here for reference while the new model is
+// brought up. Re-enable individual pieces as they get wired into the new layering.
+// ─────────────────────────────────────────────────────────────────────────────
+
 class RsrcMgrMetrics : public sisl::MetricsGroup {
 public:
     explicit RsrcMgrMetrics() : sisl::MetricsGroup("resource_mgr", "resource_mgr") {
@@ -31,104 +78,44 @@ public:
                          sisl::PublishAs::Gauge);
         register_me_to_farm();
     }
-
-    RsrcMgrMetrics(const RsrcMgrMetrics&) = delete;
-    RsrcMgrMetrics(RsrcMgrMetrics&&) noexcept = delete;
-    RsrcMgrMetrics& operator=(const RsrcMgrMetrics&) = delete;
-    RsrcMgrMetrics& operator=(const RsrcMgrMetrics&&) noexcept = delete;
     ~RsrcMgrMetrics() { deregister_me_from_farm(); }
 };
 
 typedef std::function< void(int64_t /* dirty_buf_cnt */, bool /* critical */) > exceed_limit_cb_t;
 const uint32_t max_qd_multiplier = 32;
 
-class ResourceMgr {
+class ResourceMgrLegacy {
 public:
-    void start(uint64_t total_cap);
-    void stop();
-
-    /* monitor memory used to store seqid --> data mapping during recovery */
     void inc_mem_used_in_recovery(int size);
     void dec_mem_used_in_recovery(int size);
-
     bool can_add_mem_in_recovery(int size) const;
     int64_t cur_mem_used_in_recovery() const;
     int64_t get_mem_used_in_recovery_limit() const;
 
-    /* get cache size */
-    uint64_t get_cache_size() const;
-
-    /**
-     * @brief Checks if the journal virtual device (vdev) size is within the specified limits.
-     *
-     * This function compares the used size of the journal vdev with the total size of the vdev
-     * and returns true if the used size is within the limits, and false otherwise.
-     *
-     * If it exceeds the limit, it will call the callback function registered with register_journal_vdev_exceed_cb().
-     *
-     * @param used_size The used size of the journal vdev.
-     * @param total_size The total size of the journal vdev.
-     * @return true if the used size is exceeding the limits, false if not exceeding limit or caller didn't registered
-     * any callback (caller not interested).
-     */
-    bool check_journal_vdev_size(const uint64_t used_size, const uint64_t total_size);
-
-    /**
-     * @brief Checks if the given used size is within the acceptable range for the journal descriptor.
-     *
-     * This function checks if the used size of the journal descriptor is within the acceptable range.
-     * The acceptable range is determined by the implementation of the resource manager.
-     *
-     * @param used_size The used size of the journal descriptor.
-     * @return true if the used size is exceeding the acceptable range, false otherwise.
-     */
-    bool check_journal_descriptor_size(const uint64_t used_size) const;
-
-    /**
-     * Registers a callback function to be called when the journal virtual device exceeds its limit.
-     *
-     * @param cb The callback function to be registered.
-     */
+    bool check_journal_vdev_size(uint64_t used_size, uint64_t total_size);
+    bool check_journal_descriptor_size(uint64_t used_size) const;
     void register_journal_vdev_exceed_cb(exceed_limit_cb_t cb);
-
     uint32_t get_journal_vdev_size_limit() const;
     uint32_t get_journal_vdev_size_critical_limit() const;
     uint32_t get_journal_descriptor_size_limit() const;
 
-    /* monitor chunk size */
     void check_chunk_free_size_and_trigger_cp(uint64_t free_size, uint64_t alloc_size);
-
     uint32_t get_dirty_buf_qd() const;
-
     void increase_dirty_buf_qd();
-
     void reset_dirty_buf_qd();
-
-    /**
-     * Triggers the truncation process.
-     * This function is responsible for initiating the truncation process.
-     */
     void trigger_truncate();
 
 private:
-    /**
-     * Starts resource manager resource audit timer.
-     */
     void start_timer();
 
-private:
-    std::atomic< int64_t > m_hs_fb_size; // free size
-    std::atomic< int64_t > m_hs_ab_cnt;  // alloc count
+    std::atomic< int64_t > m_hs_fb_size;
+    std::atomic< int64_t > m_hs_ab_cnt;
     std::atomic< int64_t > m_memory_used_in_recovery;
     std::atomic< uint32_t > m_flush_dirty_buf_q_depth{64};
-    uint64_t m_total_cap;
-
-    // TODO: make it event_cb
     exceed_limit_cb_t m_journal_vdev_exceed_cb;
     RsrcMgrMetrics m_metrics;
-
     iomgr::timer_handle_t m_res_audit_timer_hdl{iomgr::null_timer_handle};
 };
+#endif // 0
 
-extern ResourceMgr& resource_mgr();
 } // namespace homestore

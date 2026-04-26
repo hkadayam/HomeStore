@@ -71,7 +71,9 @@ struct HomeStoreStaticConfig {
     }
 };
 
-[[maybe_unused]] static bool is_data_drive_hdd() { return HomeStoreStaticConfig::instance().hdd_drive_present; }
+[[maybe_unused]] static bool is_data_drive_hdd() {
+    return HomeStoreStaticConfig::instance().hdd_drive_present;
+}
 
 class HomeStoreDynamicConfig {
 public:
@@ -83,7 +85,7 @@ public:
 
     static void init_settings_default() {
         // Non-scalar defaults are now self-initialized by their respective subsystems (e.g. SlabBlkAllocConfig
-        // auto-populates free_blk_slab_distribution). This method is retained for any future overrides.
+        // auto-populates slab_distribution). This method is retained for any future overrides.
     }
 };
 } // namespace homestore

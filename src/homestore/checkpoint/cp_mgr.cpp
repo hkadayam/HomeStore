@@ -34,27 +34,30 @@
 
 namespace homestore {
 
+using namespace iomanager;
+using sisl::IOBuffer;
+
 ////////////////////////////////////////////////////////////////////////////
-// CPGuard — per-coroutine CP stack via RequestContext
+// CPGuard — per-thread CP stack owned by CPManager
 ////////////////////////////////////////////////////////////////////////////
 
-// Per-coroutine stack stored in the current RequestContext (saved/restored on every co_await).
-class CPStackData : public folly::RequestData {
-public:
-    std::stack< CP* > stack;
-    bool hasCallback() override { return false; }
-};
+// Cached pointer to the calling thread's ThreadStackInfo.  Lives for the program's lifetime per thread, but is
+// re-checked against the current manager so a stale entry from a destroyed manager is replaced transparently.
+static thread_local CPManager::ThreadStackInfo* t_cp_info_{nullptr};
 
-folly::RequestToken CPGuard::s_token{"homestore.cp_stack"};
+std::stack< CP* >& CPManager::thread_stack() {
+    if (t_cp_info_ && t_cp_info_->mgr == this) { return t_cp_info_->stk; }
 
-std::stack< CP* >& CPGuard::cp_stack() {
-    auto ctx = folly::RequestContext::get();
-    auto* data = static_cast< CPStackData* >(ctx->getContextData(s_token));
-    if (!data) {
-        ctx->setContextData(s_token, std::make_unique< CPStackData >());
-        data = static_cast< CPStackData* >(ctx->getContextData(s_token));
+    // Slow path: first touch from this thread for this manager (or previous manager was destroyed).
+    auto info = std::make_unique< ThreadStackInfo >();
+    info->mgr = this;
+    auto* raw = info.get();
+    {
+        std::lock_guard lg{owned_stacks_mtx_};
+        owned_stacks_.push_back(std::move(info));
     }
-    return data->stack;
+    t_cp_info_ = raw;
+    return raw->stk;
 }
 
 ////////////////////////////////////////////////////////////////////////////
@@ -350,7 +353,7 @@ CPGuard::CPGuard(CPManager* mgr) {
         return;
     }
 
-    auto& stk = cp_stack();
+    auto& stk = mgr->thread_stack();
     if (stk.empty()) {
         cp_ = mgr->cp_io_enter();
     } else {
@@ -362,8 +365,9 @@ CPGuard::CPGuard(CPManager* mgr) {
 }
 
 CPGuard::~CPGuard() {
-    if (pushed_ && !cp_stack().empty()) {
-        cp_stack().pop();
+    if (pushed_ && cp_) {
+        auto& stk = cp_->cp_mgr_->thread_stack();
+        if (!stk.empty()) { stk.pop(); }
     }
     if (cp_) {
         cp_->cp_mgr_->cp_io_exit(cp_);
@@ -393,7 +397,7 @@ CP* CPGuard::operator->() {
 
 CP* CPGuard::get() {
     if (!pushed_ && cp_) {
-        cp_stack().push(cp_);
+        cp_->cp_mgr_->thread_stack().push(cp_);
         pushed_ = true;
     }
     return cp_;

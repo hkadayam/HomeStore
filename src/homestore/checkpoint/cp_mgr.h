@@ -123,27 +123,26 @@ private:
     CP* cp_{nullptr};
     bool pushed_{false};
 
-    // s_token is a pre-computed key used to store the CP stack in the current coroutine's RequestContext.
-    // RequestContext is saved and restored across every co_await, giving per-coroutine isolation: coroutine A's
-    // stack is invisible to coroutine B even when both run on the same OS thread.
+    // The per-thread stack lives on CPManager (see CPManager::thread_stack()).  Tying it to the manager's
+    // lifetime — instead of to a thread_local or a long-lived RequestContext — guarantees that destroying the
+    // manager (e.g. between gtest runs) drops every per-thread stack with it, so the next manager never sees
+    // dangling CP* entries from the previous one.
     //
-    // The stack (not just a single CP pointer) is necessary so that nested CPGuards within a synchronous call chain
-    // all reuse the outermost CP, even if a CP switch happened after the outermost guard was taken.
+    // The stack (not just a single CP pointer) is necessary so that nested CPGuards within a synchronous call
+    // chain all reuse the outermost CP, even if a CP switch happened after the outermost guard was taken.
     //
     // CPGuard must NOT be held across a co_await: doing so keeps enter_cnt_ non-zero across the suspension,
     // which stalls any pending CP flush until the coroutine resumes and releases the guard.
-    static folly::RequestToken s_token;
-    static std::stack< CP* >& cp_stack();
 
 public:
     CPGuard(CPManager* mgr);
-    virtual ~CPGuard();
+    ~CPGuard();
 
     CPGuard(const CPGuard& other);
-    virtual CPGuard operator=(const CPGuard& other);
+    CPGuard operator=(const CPGuard& other);
 
-    virtual CP* operator->();
-    virtual CP* get();
+    CP* operator->();
+    CP* get();
 };
 
 VENUM(CPTriggerReason, uint8_t,
@@ -189,6 +188,28 @@ private:
     folly::Baton<> cp_timer_done_baton_;
 
 public:
+    // Per-thread CP stacks owned by this manager.  CPGuard pushes/pops on the stack for the calling thread; the
+    // owned_stacks_ vector's lifetime equals the manager's, so destroying the manager (e.g. between gtest runs that
+    // recreate it) drops every thread's stack and the next manager starts with empty stacks for all threads.
+    //
+    // The mutex protects only the once-per-(thread × manager) slow path that allocates a new entry.  Steady state
+    // CPGuard creation hits a thread_local fast path in thread_stack() with no locking.
+    struct ThreadStackInfo {
+        CPManager* mgr;
+        std::stack< CP* > stk;
+    };
+
+    /// Returns the CP stack owned by this manager for the calling thread, allocating it on first touch.
+    /// Hot path: one TLS load + one pointer compare.  Slow path (first call from this thread for this manager,
+    /// or after the previous manager was destroyed): take owned_stacks_mtx_ to allocate a new entry.
+    std::stack< CP* >& thread_stack();
+
+private:
+    std::vector< std::unique_ptr< ThreadStackInfo > > owned_stacks_;
+    std::mutex owned_stacks_mtx_;
+
+public:
+
     /// Factory: construct and self-register via Managers::init_cp_mgr(). Call start() separately after recovery.
     static shared< CPManager > create();
 

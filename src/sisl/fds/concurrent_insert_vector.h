@@ -46,7 +46,9 @@ public:
 
         iterator() : next_thread{std::numeric_limits< size_t >::max()} {}
         iterator(std::vector< std::vector< T > const* > v) : per_thread_vectors{std::move(v)} {
-            if (per_thread_vectors.empty()) { next_thread = std::numeric_limits< size_t >::max(); }
+            if (per_thread_vectors.empty()) {
+                next_thread = std::numeric_limits< size_t >::max();
+            }
         }
 
         void operator++() {
@@ -55,7 +57,9 @@ public:
                 ++next_thread;
                 next_id_in_thread = 0;
             }
-            if (next_thread >= per_thread_vectors.size()) { next_thread = std::numeric_limits< size_t >::max(); }
+            if (next_thread >= per_thread_vectors.size()) {
+                next_thread = std::numeric_limits< size_t >::max();
+            }
         }
 
         void operator+=(int64_t count) {
@@ -70,7 +74,9 @@ public:
                     next_id_in_thread = 0;
                 }
             }
-            if (next_thread >= per_thread_vectors.size()) { next_thread = std::numeric_limits< size_t >::max(); }
+            if (next_thread >= per_thread_vectors.size()) {
+                next_thread = std::numeric_limits< size_t >::max();
+            }
         }
 
         bool operator==(iterator const& other) const {
@@ -111,12 +117,16 @@ public:
         std::vector< std::vector< T > const* > ptrs;
         ptrs.reserve(8);
         for (auto& vec : tl_vec_.accessAllThreads()) {
-            if (!vec.empty()) { ptrs.push_back(&vec); }
+            if (!vec.empty()) {
+                ptrs.push_back(&vec);
+            }
         }
         {
             std::unique_lock lg{zombie_mutex_};
             for (auto* v : zombies_) {
-                if (!v->empty()) { ptrs.push_back(v); }
+                if (!v->empty()) {
+                    ptrs.push_back(v);
+                }
             }
         }
         return iterator{std::move(ptrs)};
@@ -171,11 +181,10 @@ private:
         auto* v = tl_vec_.get();
         if (!v) {
             auto* owner = this;
-            tl_vec_.reset(new std::vector< T >(),
-                          [owner](std::vector< T >* vec, folly::TLPDestructionMode) {
-                              std::unique_lock lg{owner->zombie_mutex_};
-                              owner->zombies_.push_back(vec);
-                          });
+            tl_vec_.reset(new std::vector< T >(), [owner](std::vector< T >* vec, folly::TLPDestructionMode) {
+                std::unique_lock lg{owner->zombie_mutex_};
+                owner->zombies_.push_back(vec);
+            });
             v = tl_vec_.get();
         }
         return *v;

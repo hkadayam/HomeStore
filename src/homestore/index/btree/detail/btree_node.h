@@ -27,6 +27,7 @@
 #include "homestore/crc.h"
 #include "sisl/fds/enum.h"
 #include "sisl/fds/obj_life_counter.h"
+#include "base/homestore_assert.hpp" // HS_REL_ASSERT
 #include "homestore/index/btree/btree_async.h"
 #include "homestore/index/btree/detail/btree_internal.h"
 #include "homestore/index/btree/btree_kv.h"
@@ -38,6 +39,14 @@ namespace homestore {
 ENUM(LockType, uint8_t, None, Read, Write, ReadInteriorWriteLeaf)
 
 class NodeCore : public sisl::ObjLifeCounter< NodeCore > {
+    // NodeOps is the only allowed entry point for V-sensitive / role-sensitive node operations.
+    // Btree core code goes through node_ops_; raw node->insert/update/remove/etc. are protected
+    // and only NodeOps can call them.  BtreeBase is friended for its non-templated get_child_node
+    // (which reads NodeLink values directly — V-agnostic at the interior level).
+    template < typename K, typename V >
+    friend class NodeOps;
+    friend class BtreeBase;
+
 public:
     static constexpr uint8_t BTREE_NODE_VERSION = 1;
     static constexpr uint8_t BTREE_NODE_MAGIC = 0xab;
@@ -66,8 +75,8 @@ public:
             auto sedge = (edge_id == empty_bnodeid) ? "" : fmt::format(" edge={}", edge_id);
             return fmt::format("magic={} version={} csum={} node_id={} nentries={} node_type={} is_leaf={} "
                                "deleted?={} gen={} modified_cp_id={}{}{} level={}",
-                               magic, version, checksum, node_id, nentries, node_type, leaf, node_deleted,
-                               node_gen, modified_cp_id, snext, sedge, level);
+                               magic, version, checksum, node_id, nentries, node_type, leaf, node_deleted, node_gen,
+                               modified_cp_id, snext, sedge, level);
         }
 
         std::string to_compact_string() const {
@@ -142,37 +151,16 @@ public:
         return true;
     }
 
-    /// @brief Finds the index of the entry with the specified key in the node.
-    ///
-    /// This method performs a binary search on the node to find the index of the entry with the specified key.
-    /// If the key is not found in the node, the method returns the index of the first entry greater than the key.
-    ///
-    /// @param key The key to search for.
-    /// @param outval [optional] A pointer to a BtreeValue object to store the value associated with the key.
-    /// @param copy_val If outval is non-null, is the value deserialized from node needs to be copy of the btree
-    /// internal buffer. Safest option is to set this true, it is ok to set it false, if find() is called and value is
-    /// accessed and used before subsequent node modification.
-    /// @return A pair of values representing the result of the search.
-    ///         The first value is a boolean indicating whether the key was found in the node.
-    ///         The second value is an integer representing the index of the entry with the specified key or the index
-    ///         of the first entry greater than the key.
-    std::pair< bool, uint32_t > find(BtreeKey const& key, BtreeValue* outval, bool copy_val) const {
+public:
+    /// @brief Finds the index of the entry with the specified key in the node.  Routed via NodeOps.
+    /// @return (found, idx) — idx is either the entry's slot or where it would be inserted.
+    std::pair< bool, uint32_t > find(BtreeKey const& key) const {
         LOGMSG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC, "Magic mismatch on btree_node {}",
                          get_persistent_header_const()->to_string());
 
         auto [found, idx] = bsearch_node(key);
-        if (idx == total_entries()) {
-            if (!has_valid_edge() || is_leaf()) {
-                DEBUG_ASSERT_EQ(found, false);
-                return std::make_pair(found, idx);
-            }
-            if (outval) {
-                *((NodeLink*)outval) = get_edge_value();
-            }
-        } else {
-            if (outval) {
-                get_nth_value(idx, outval, copy_val);
-            }
+        if (idx == total_entries() && (!has_valid_edge() || is_leaf())) {
+            DEBUG_ASSERT_EQ(found, false);
         }
         return std::make_pair(found, idx);
     }
@@ -219,42 +207,30 @@ public:
         return true;
     }
 
-    virtual BtreeStatus insert(const BtreeKey& key, const BtreeValue& val) {
-        const auto [found, idx] = find(key, nullptr, false);
-        DEBUG_ASSERT(!is_leaf() || (!found), "Invalid node"); // We do not support duplicate keys yet
-        insert(idx, key, val);
-        DEBUG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC, "{}", get_persistent_header_const()->to_string());
-        return BtreeStatus::success;
+    // Node-local key-based helpers. Used by test_btree_node (white-box node mechanics); Btree core goes
+    // through NodeOps instead.  No overflow handling — test paths don't exercise overflow values.
+    virtual bool update_kv(const BtreeKey& key, const BtreeValue& val, BtreeValue* outval) {
+        const auto [found, idx] = find(key);
+        if (found) {
+            if (outval) {
+                get_nth_value(idx, outval, true);
+            }
+            update(idx, val);
+            LOGMSG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC, "{}", get_persistent_header_const()->to_string());
+        }
+        return found;
     }
 
-    virtual bool remove_one(const BtreeKey& key, BtreeKey* outkey, BtreeValue* outval) {
-        const auto [found, idx] = find(key, outval, true);
+    virtual bool remove_kv(const BtreeKey& key, BtreeKey* outkey, BtreeValue* outval) {
+        const auto [found, idx] = find(key);
         if (found) {
             if (outkey) {
                 read_nth_key(idx, *outkey, true);
             }
+            if (outval) {
+                get_nth_value(idx, outval, true);
+            }
             remove(idx);
-            LOGMSG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC, "{}", get_persistent_header_const()->to_string());
-        }
-        return found;
-    }
-
-    template < typename K >
-    bool remove_any(const BtreeKeyRange< K >& range, BtreeKey* outkey, BtreeValue* outval) {
-        const auto [found, idx] = get_any(range, outkey, outval, true, true);
-        if (found) {
-            remove(idx);
-            LOGMSG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC, "{}", get_persistent_header_const()->to_string());
-        }
-        return found;
-    }
-
-    /* Update the key and value pair and after update if outkey and outval are non-nullptr, it fills them with
-     * the key and value it just updated respectively */
-    virtual bool update_one(const BtreeKey& key, const BtreeValue& val, BtreeValue* outval) {
-        const auto [found, idx] = find(key, outval, true);
-        if (found) {
-            update(idx, val);
             LOGMSG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC, "{}", get_persistent_header_const()->to_string());
         }
         return found;
@@ -299,19 +275,6 @@ public:
             }
         }
         return true;
-    }
-
-    virtual NodeLink get_edge_value() const {
-        return NodeLink{edge_id()};
-    }
-
-    virtual void set_edge_value(const BtreeValue& v) {
-        // v is always a NodeLink for edge slots (edges store child node ids, not user values).
-        set_edge_id(s_cast< NodeLink const& >(v).id());
-    }
-
-    void invalidate_edge() {
-        set_edge_id(empty_bnodeid);
     }
 
     uint32_t total_entries() const {
@@ -368,8 +331,22 @@ public:
         return str;
     }
 
-public:
-    // Public method which needs to be implemented by variants
+protected:
+    virtual NodeLink get_edge_value() const {
+        return NodeLink{edge_id()};
+    }
+
+    virtual void set_edge_value(const BtreeValue& v) {
+        // v is always a NodeLink for edge slots (edges store child node ids, not user values).
+        set_edge_id(s_cast< NodeLink const& >(v).id());
+    }
+
+    void invalidate_edge() {
+        set_edge_id(empty_bnodeid);
+    }
+
+protected:
+    // V-sensitive mutators — only NodeOps (friend) can invoke. Variants override these.
     virtual BtreeStatus insert(uint32_t ind, const BtreeKey& key, const BtreeValue& val) = 0;
     virtual void remove(uint32_t ind) {
         remove(ind, ind);
@@ -379,6 +356,14 @@ public:
     virtual BtreeStatus update(uint32_t ind, const BtreeValue& val) = 0;
     virtual BtreeStatus update(uint32_t ind, const BtreeKey& key) = 0;
     virtual BtreeStatus update(uint32_t ind, const BtreeKey& key, const BtreeValue& val) = 0;
+    virtual void get_nth_value(uint32_t ind, BtreeValue* out_val, bool copy) const = 0;
+    virtual bool is_nth_value_overflow(uint32_t /*ind*/) const {
+        return false;
+    }
+
+public:
+    // Pure space accounting — V-agnostic; safe to call directly from Btree core.
+    virtual bool has_room_for_put(BtreePutType put_type, uint32_t key_size, uint32_t value_size) const = 0;
 
     virtual uint32_t move_out_to_right_by_entries(NodeCore& other_node, uint32_t nentries) = 0;
     virtual uint32_t move_out_to_right_by_size(NodeCore& other_node, uint32_t size) = 0;
@@ -406,17 +391,12 @@ public:
 #endif
 
     virtual uint32_t available_size() const = 0;
-    virtual bool has_room_for_put(BtreePutType put_type, uint32_t key_size, uint32_t value_size) const = 0;
     virtual uint32_t get_entries_size(uint32_t start_idx, uint32_t end_idx) const = 0;
 
     virtual int compare_nth_key(const BtreeKey& cmp_key, uint32_t ind) const = 0;
     virtual void read_nth_key(uint32_t ind, BtreeKey& out_key, bool copykey) const = 0;
     virtual uint32_t get_nth_key_size(uint32_t ind) const = 0;
-    virtual void get_nth_value(uint32_t ind, BtreeValue* out_val, bool copy) const = 0;
     virtual uint32_t get_nth_value_size(uint32_t ind) const = 0;
-    virtual bool is_nth_value_overflow(uint32_t /*ind*/) const {
-        return false;
-    }
     virtual uint32_t get_nth_obj_size(uint32_t ind) const {
         return get_nth_key_size(ind) + get_nth_value_size(ind);
     }
@@ -428,48 +408,19 @@ public:
 
     virtual std::string to_dot_keys() const = 0;
 
-protected:
-    std::pair< bool, uint32_t > bsearch_node(const BtreeKey& key) const {
-        DEBUG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC);
-        auto [found, idx] = bsearch(-1, total_entries(), key);
-        if (found) {
-            DEBUG_ASSERT_LT(idx, total_entries());
-        }
-
-        return std::make_pair(found, idx);
-    }
-
-    std::pair< bool, uint32_t > bsearch(int start, int end, const BtreeKey& key) const {
-        int mid = 0;
-        bool found{false};
-        uint32_t end_of_search_index{0};
-
-        if ((end - start) <= 1) {
-            return std::make_pair(found, end_of_search_index);
-        }
-        while ((end - start) > 1) {
-            mid = start + (end - start) / 2;
-            DEBUG_ASSERT(mid >= 0 && mid < int_cast(total_entries()), "Invalid mid={}", mid);
-            int x = compare_nth_key(key, mid);
-            if (x == 0) {
-                found = true;
-                end = mid;
-                break;
-            } else if (x > 0) {
-                end = mid;
-            } else {
-                start = mid;
-            }
-        }
-
-        return std::make_pair(found, end);
-    }
-
 public:
     /// Returns a shared_ptr copy — caller holds shared ownership until done.
     /// CoW backends can replace phys_node_buf_ underneath; old buffer lives until all copies are dropped.
     std::shared_ptr< uint8_t > share_phys_node_buf() const {
         return phys_node_buf_;
+    }
+
+    /// CoW accessors: return a shared owner of the current buffer; install a fresh buffer in place.
+    std::shared_ptr< uint8_t > get_phys_buf() const {
+        return phys_node_buf_;
+    }
+    void set_phys_buf(std::shared_ptr< uint8_t > buf) {
+        phys_node_buf_ = std::move(buf);
     }
 
     PersistentHeader* get_persistent_header() {
@@ -592,15 +543,9 @@ public:
     bnodeid_t edge_id() const {
         return get_persistent_header_const()->edge_id;
     }
-    void set_edge_id(bnodeid_t edge) {
-        get_persistent_header()->edge_id = edge;
-    }
 
     NodeLink edge_as_val() const {
         return NodeLink{edge_id()};
-    }
-    void set_edge(const NodeLink& id) {
-        set_edge_id(id.id());
     }
 
     bool has_valid_edge() const {
@@ -610,8 +555,58 @@ public:
         return (edge_id() != empty_bnodeid);
     }
 
+    // True when the node carries no data at all: no entries and (for interior nodes) no edge child.  An "empty" node
+    // in this sense is equivalent to a dropped slot.
+    bool is_empty() const {
+        return (total_entries() == 0) && !has_valid_edge();
+    }
+
     void set_modified_cp_id(int64_t id) {
         get_persistent_header()->modified_cp_id = id;
+    }
+
+protected:
+    void set_edge_id(bnodeid_t edge) {
+        get_persistent_header()->edge_id = edge;
+    }
+    void set_edge(const NodeLink& id) {
+        set_edge_id(id.id());
+    }
+
+    std::pair< bool, uint32_t > bsearch_node(const BtreeKey& key) const {
+        DEBUG_ASSERT_EQ(magic(), BTREE_NODE_MAGIC);
+        auto [found, idx] = bsearch(-1, total_entries(), key);
+        if (found) {
+            DEBUG_ASSERT_LT(idx, total_entries());
+        }
+
+        return std::make_pair(found, idx);
+    }
+
+    std::pair< bool, uint32_t > bsearch(int start, int end, const BtreeKey& key) const {
+        int mid = 0;
+        bool found{false};
+        uint32_t end_of_search_index{0};
+
+        if ((end - start) <= 1) {
+            return std::make_pair(found, end_of_search_index);
+        }
+        while ((end - start) > 1) {
+            mid = start + (end - start) / 2;
+            DEBUG_ASSERT(mid >= 0 && mid < int_cast(total_entries()), "Invalid mid={}", mid);
+            int x = compare_nth_key(key, mid);
+            if (x == 0) {
+                found = true;
+                end = mid;
+                break;
+            } else if (x > 0) {
+                end = mid;
+            } else {
+                start = mid;
+            }
+        }
+
+        return std::make_pair(found, end);
     }
 };
 
@@ -654,20 +649,27 @@ public:
         return (lt == LockType::ReadInteriorWriteLeaf) ? (is_leaf ? LockType::Write : LockType::Read) : lt;
     }
 
-    static Node construct(NodeHandle& src, LockType lt) {
+    /// Sync construct for newly-created nodes. Acquire is guaranteed uncontended (the NodeCore was just made and
+    /// no other thread can possibly know about it yet), so try_lock always succeeds — works in both sync and async
+    /// modes (folly::SharedMutex and folly::coro::SharedMutexFair both expose try_lock/try_lock_shared).
+    static Node construct_new(NodeHandle& src, LockType lt) {
         Node n;
         src.move_to(n.storage_);
         n.handle_ = r_cast< NodeHandle* >(n.storage_);
         n.lock_type_ = resolve_node_lock_type(lt, n.handle_->get()->is_leaf());
         if (n.lock_type_ == LockType::Read) {
-            n.handle_->get()->lock_.lock_shared();
+            HS_REL_ASSERT(n.handle_->get()->lock_.try_lock_shared(),
+                          "construct_new: try_lock_shared on fresh node failed (contended?)");
         } else if (n.lock_type_ == LockType::Write) {
-            n.handle_->get()->lock_.lock();
+            HS_REL_ASSERT(n.handle_->get()->lock_.try_lock(),
+                          "construct_new: try_lock on fresh node failed (contended?)");
         }
         return n;
     }
 
-    static BtreeTask< Node > async_construct(NodeHandle& src, LockType lt) {
+    /// Async construct for existing nodes loaded from cache/disk — may block on the underlying lock.
+    /// Returns BtreeTask<Node> so it works in both sync and async modes.
+    static BtreeTask< Node > construct_existing(NodeHandle& src, LockType lt) {
         Node n;
         src.move_to(n.storage_);
         n.handle_ = r_cast< NodeHandle* >(n.storage_);

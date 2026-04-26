@@ -27,7 +27,6 @@
 #include <homestore/blk.h>              // BlkId
 #include "common/defs.h" // shared<>, unique<>, cshared<>
 
-#include "iomanager/drive_interface.hpp" // IOBuffer
 #include "meta/meta_blk.h"         // MetaBlk
 #include "meta/meta_client_info.h" // MetaClientInfo
 

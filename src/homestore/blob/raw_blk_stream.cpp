@@ -29,6 +29,8 @@
 
 namespace homestore {
 
+using sisl::IOBuffer;
+
 // ─────────────────────────────────────────────────────────────────────────────
 //                              Factory and Constructor
 // ─────────────────────────────────────────────────────────────────────────────
@@ -51,7 +53,7 @@ folly::coro::Task< shared< RawBlkStream > > RawBlkStream::load(uint64_t stream_i
         vdev->load_blk_allocator(cid, entry.second.extract());
     }
 
-    const uint64_t chunk_sz = vdev->chunk_size_bytes();
+    const uint64_t chunk_sz = vdev->initial_chunk_size();
     auto stream = shared< RawBlkStream >{
         new RawBlkStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_sz, blk_size, std::move(mblks)}};
     co_return stream;

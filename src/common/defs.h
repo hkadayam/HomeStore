@@ -71,38 +71,39 @@ using cintrusive = const boost::intrusive_ptr< T >;
 //   to_vptr(p)    reinterpret_cast< void* >
 //   to_cvptr(p)   reinterpret_cast< const void* >
 
-#define r_cast    reinterpret_cast
-#define s_cast    static_cast
-#define d_cast    dynamic_cast
-#define dp_cast   std::dynamic_pointer_cast
-#define sp_cast   std::static_pointer_cast
+#define r_cast reinterpret_cast
+#define s_cast static_cast
+#define d_cast dynamic_cast
+#define dp_cast std::dynamic_pointer_cast
+#define sp_cast std::static_pointer_cast
 
-#define to_i64(v)    static_cast< int64_t >(v)
-#define to_u64(v)    static_cast< uint64_t >(v)
-#define to_u32(v)    static_cast< uint32_t >(v)
-#define to_i32(v)    static_cast< int32_t >(v)
-#define to_u16(v)    static_cast< uint16_t >(v)
-#define to_i16(v)    static_cast< int16_t >(v)
-#define to_u8(v)     static_cast< uint8_t >(v)
-#define to_int(v)    static_cast< int >(v)
-#define to_size(v)   static_cast< size_t >(v)
+#define to_i64(v) static_cast< int64_t >(v)
+#define to_u64(v) static_cast< uint64_t >(v)
+#define to_u32(v) static_cast< uint32_t >(v)
+#define to_i32(v) static_cast< int32_t >(v)
+#define to_u16(v) static_cast< uint16_t >(v)
+#define to_i16(v) static_cast< int16_t >(v)
+#define to_u8(v) static_cast< uint8_t >(v)
+#define to_int(v) static_cast< int >(v)
+#define to_size(v) static_cast< size_t >(v)
 #define to_double(v) static_cast< double >(v)
+#define to_float(v) static_cast< float >(v)
 
-#define to_u8ptr(p)  reinterpret_cast< uint8_t* >(p)
+#define to_u8ptr(p) reinterpret_cast< uint8_t* >(p)
 #define to_cu8ptr(p) reinterpret_cast< const uint8_t* >(p)
-#define to_cptr(p)   reinterpret_cast< char* >(p)
-#define to_ccptr(p)  reinterpret_cast< const char* >(p)
-#define to_vptr(p)   reinterpret_cast< void* >(p)
-#define to_cvptr(p)  reinterpret_cast< const void* >(p)
+#define to_cptr(p) reinterpret_cast< char* >(p)
+#define to_ccptr(p) reinterpret_cast< const char* >(p)
+#define to_vptr(p) reinterpret_cast< void* >(p)
+#define to_cvptr(p) reinterpret_cast< const void* >(p)
 
 // Legacy aliases for existing code.
-#define uintptr_cast   reinterpret_cast< uint8_t* >
-#define voidptr_cast   reinterpret_cast< void* >
+#define uintptr_cast reinterpret_cast< uint8_t* >
+#define voidptr_cast reinterpret_cast< void* >
 #define c_voidptr_cast reinterpret_cast< const void* >
-#define charptr_cast   reinterpret_cast< char* >
+#define charptr_cast reinterpret_cast< char* >
 #define c_charptr_cast reinterpret_cast< const char* >
-#define int_cast       static_cast< int >
-#define uint32_cast    static_cast< uint32_t >
-#define int64_cast     static_cast< int64_t >
-#define uint64_cast    static_cast< uint64_t >
-#define size_cast      static_cast< size_t >
+#define int_cast static_cast< int >
+#define uint32_cast static_cast< uint32_t >
+#define int64_cast static_cast< int64_t >
+#define uint64_cast static_cast< uint64_t >
+#define size_cast static_cast< size_t >

@@ -47,7 +47,6 @@ private:
     sisl::Bitset existing_keys_;
     sisl::Bitset working_keys_;
     std::uniform_int_distribution< uint32_t > rand_start_key_generator_;
-    std::random_device rd_;
 
 public:
     RangeScheduler(uint32_t num_keys) : existing_keys_{num_keys}, working_keys_{num_keys} {
@@ -122,7 +121,7 @@ private:
             throw std::out_of_range("All keys are being worked on right now");
         }
 
-        uint32_t const search_start = rand_start_key_generator_(rd_);
+        uint32_t const search_start = rand_start_key_generator_(g_re);
         auto bb = existing_keys_.get_next_contiguous_n_reset_bits(search_start, max_keys);
         if (bb.nbits && working_keys_.is_bits_reset(bb.start_bit, bb.nbits)) {
             uint32_t const start = uint32_cast(bb.start_bit);
@@ -139,7 +138,7 @@ private:
             return std::pair(UINT32_MAX, UINT32_MAX);
         }
 
-        uint32_t const search_start = rand_start_key_generator_(rd_);
+        uint32_t const search_start = rand_start_key_generator_(g_re);
         auto [s, count] = get_next_contiguous_set_bits(existing_keys_, search_start, max_keys);
 
         if (count && working_keys_.is_bits_reset(s, count)) {
@@ -153,7 +152,7 @@ private:
     }
 
     std::pair< uint32_t, uint32_t > try_pick_random_non_working_keys(uint32_t max_keys) {
-        uint32_t const search_start = rand_start_key_generator_(rd_);
+        uint32_t const search_start = rand_start_key_generator_(g_re);
         auto bb = working_keys_.get_next_contiguous_n_reset_bits(search_start, max_keys);
 
         if (bb.nbits) {

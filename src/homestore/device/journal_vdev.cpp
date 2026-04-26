@@ -45,7 +45,7 @@ JournalVirtualDev::JournalVirtualDev(DeviceManager& dmgr, const vdev_info& vinfo
         ChunkPool::Params{HS_DYNAMIC_CONFIG(generic.journal_chunk_pool_capacity),
                           [this]() {
                               m_init_private_data->created_at = get_time_since_epoch_ms();
-                              m_init_private_data->end_of_chunk = m_vdev_info.chunk_size;
+                              m_init_private_data->end_of_chunk = m_vdev_info.initial_chunk_size;
                               sisl::Blob private_blob{r_cast< uint8_t* >(m_init_private_data.get()),
                                                       sizeof(JournalChunkPrivate)};
                               return private_blob;

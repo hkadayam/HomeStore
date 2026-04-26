@@ -44,6 +44,8 @@
 #include "blob/raw_blk_stream.h"
 
 using namespace homestore;
+using namespace iomanager;
+using sisl::IOBuffer;
 
 SISL_OPTION_GROUP(test_raw_blk_stream,
                   (num_io, "", "num_io", "number of IO operations per test",
@@ -99,7 +101,7 @@ public:
 
         // Create a BlobDev backed by a dynamic VDev (chunks grow on demand).
         VDevParameters params;
-        params.incremental_chunk_size = CHUNK_SIZE;
+        params.initial_chunk_size = CHUNK_SIZE;
         params.blk_size = BLK_SIZE;
         params.dev_type = HSDevType::Data;
         params.alloc_type = BlkAllocatorType::SlabCompact;
@@ -1039,8 +1041,8 @@ int main(int argc, char* argv[]) {
     sisl::logging::SetLogger("test_raw_blk_stream");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
 
-    homestore::init_iomgr(2);
+    iomanager::init_iomgr(2);
     auto ret = RUN_ALL_TESTS();
-    homestore::stop_iomgr();
+    iomanager::stop_iomgr();
     return ret;
 }

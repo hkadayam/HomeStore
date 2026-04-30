@@ -26,6 +26,7 @@ class CPManager;
 class BlobDevManager;
 class COWBtreeManager;
 class ResourceMgr;
+class LogStoreManager;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Managers
@@ -47,6 +48,7 @@ public:
     static void init_blob_dev_mgr(shared< BlobDevManager > mgr) { s_blob_dev_mgr_ = std::move(mgr); }
     static void init_cow_btree_mgr(shared< COWBtreeManager > mgr) { s_cow_btree_mgr_ = std::move(mgr); }
     static void init_resource_mgr(shared< ResourceMgr > mgr) { s_resource_mgr_ = std::move(mgr); }
+    static void init_log_store_mgr(shared< LogStoreManager > mgr) { s_log_store_mgr_ = std::move(mgr); }
 
     static void reset_resource_mgr() { s_resource_mgr_.reset(); }
 
@@ -57,6 +59,7 @@ public:
         s_blob_dev_mgr_.reset();
         s_cow_btree_mgr_.reset();
         s_resource_mgr_.reset();
+        s_log_store_mgr_.reset();
     }
 
 private:
@@ -66,6 +69,7 @@ private:
     friend BlobDevManager& blob_dev_mgr();
     friend COWBtreeManager& cow_btree_mgr();
     friend ResourceMgr& resource_mgr();
+    friend LogStoreManager& log_store_mgr();
 
     inline static shared< MetaBlkManager > s_meta_mgr_;
     inline static shared< DeviceManager > s_device_mgr_;
@@ -73,6 +77,7 @@ private:
     inline static shared< BlobDevManager > s_blob_dev_mgr_;
     inline static shared< COWBtreeManager > s_cow_btree_mgr_;
     inline static shared< ResourceMgr > s_resource_mgr_;
+    inline static shared< LogStoreManager > s_log_store_mgr_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -118,6 +123,13 @@ inline ResourceMgr& resource_mgr() {
         throw std::logic_error{"resource_mgr() called before ResourceMgr::start()"};
     }
     return *Managers::s_resource_mgr_;
+}
+
+inline LogStoreManager& log_store_mgr() {
+    if (!Managers::s_log_store_mgr_) {
+        throw std::logic_error{"log_store_mgr() called before init_log_store_mgr()"};
+    }
+    return *Managers::s_log_store_mgr_;
 }
 
 } // namespace homestore

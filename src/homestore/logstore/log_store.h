@@ -43,7 +43,7 @@ using logid_range = std::pair< logid_t, logid_t >; // [from_log_id, to_log_id], 
 // ─────────────────────────────────────────────────────────────────────────────
 // Persisted per-store sb (single MetaBlk per LogStore: "<dev>_logstore_sb_<store_id>")
 //
-// Layout: { store_id, append_mode, start_lsn, n_rollback_ranges, rollback_ranges[n_rollback_ranges] }.  The
+// Layout: { store_id, append_mode, head_lsn, n_rollback_ranges, rollback_ranges[n_rollback_ranges] }.  The
 // trailing array is variable-size — same trick as AppendByteStreamSb's chunk_ids[].
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma pack(1)
@@ -51,7 +51,7 @@ struct LogStoreSb {
     logstore_id_t store_id{0};
     uint8_t append_mode{0};
     uint8_t _reserved[3]{};
-    lsn_t start_lsn{0};
+    lsn_t head_lsn{0};
     uint32_t n_rollback_ranges{0};
     // followed by logid_range rollback_ranges[n_rollback_ranges]
 
@@ -81,6 +81,8 @@ struct LogStoreRecord {
             trunc_stream_offset{trunc_stream_offset} {}
 
     LogStoreRecord() = default;
+    LogStoreRecord(logid_t lid, uint64_t record_off, uint64_t trunc_off) :
+            log_id{lid}, record_stream_offset{record_off}, trunc_stream_offset{trunc_off} {}
 };
 static_assert(std::is_trivially_copyable_v< LogStoreRecord >, "StreamTracker requires trivially copyable T");
 
@@ -93,8 +95,8 @@ using log_replay_cb = std::function< void(lsn_t lsn, const sisl::ByteView& data)
 // LogStore
 //
 // One per logical client of a shared LogStream.  Lifecycle (managed by LogStoreManager):
-//   1. create(stream, sid, append_mode)        → fresh; sb persisted with start_lsn=0, no rollback ranges.
-//   2. load(stream, sb_payload)                → parses sb (start_lsn + rollback ranges); records empty.
+//   1. create(stream, sid, append_mode)        → fresh; sb persisted with head_lsn=0, no rollback ranges.
+//   2. load(stream, sb_payload)                → parses sb (head_lsn + rollback ranges); records empty.
 //   3. open(handler)                           → attaches replay handler.
 //   4. mgr.recover()                           → triggers LogStream::recover; on_log_found per record.
 //   5. Normal append/read/truncate/rollback usable.
@@ -118,18 +120,12 @@ public:
     LogStore& operator=(LogStore&&) = delete;
     ~LogStore() = default;
 
-    /// Per-store sb MetaBlk name: "<dev>_logstore_sb_<store_id>".
-    static std::string sb_mblk_name(const std::string& dev, logstore_id_t sid);
-
     // ── Factories (called by LogStoreManager) ────────────────────────────────
 
-    static folly::coro::Task< shared< LogStore > > create(logstore_id_t sid, MetaClient& meta_client,
-                                                          const std::string& dev_name, shared< LogStream > stream,
-                                                          bool append_mode);
+    static folly::coro::Task< shared< LogStore > > create(logstore_id_t sid, shared< MetaClient > meta_client,
+                                                          shared< LogStream > stream, bool append_mode);
 
-    static folly::coro::Task< shared< LogStore > > load(MetaClient& meta_client, const std::string& dev_name,
-                                                        shared< LogStream > stream, MetaBlk&& sb,
-                                                        sisl::ByteView sb_payload);
+    static folly::coro::Task< shared< LogStore > > load(shared< LogStream > stream, MetaBlkWrapper&& mb);
 
     // ── Open / state ─────────────────────────────────────────────────────────
 
@@ -137,7 +133,7 @@ public:
     /// replay callbacks.  Transitions store to opened state.
     void open(log_replay_cb handler);
 
-    bool is_open() const { return is_open_.load(std::memory_order_acquire); }
+    bool is_open() const { return s_cast< bool >(handler_); }
 
     bool is_append_mode() const { return append_mode_; }
 
@@ -165,13 +161,13 @@ public:
 
     /// Read the data bytes for `lsn`.  Internally awaits flush_upto(lsn) so records_ is populated, then resolves
     /// the dev_key and reads via the underlying LogStream.  Returns an empty ByteView if lsn is outside
-    /// [start_lsn, next_lsn).
+    /// [head_lsn, next_lsn).
     folly::coro::Task< sisl::ByteView > read(lsn_t lsn);
 
     /// Drains pending records (via stream_->flush()) until tail_lsn_ >= upto_lsn or bounded retry exhausted.
     folly::coro::Task< void > flush();
 
-    /// Advance start_lsn to upto_lsn+1.  Evicts records [<= upto_lsn] from records_, captures the trunc_key for
+    /// Advance head_lsn to upto_lsn+1.  Evicts records [<= upto_lsn] from records_, captures the trunc_key for
     /// the manager's cross-store min aggregation, persists the new sb.  in_memory_only=true skips the manager
     /// notification (used when the manager itself is driving truncate).
     folly::coro::Task< void > truncate(lsn_t upto_lsn, bool in_memory_only = false);
@@ -189,31 +185,28 @@ public:
 
     /// Same trunc_key derivation as on_write_completion.  Inserts the record with both keys (recovery path
     /// doesn't reserve via create() at append time), advances tail_lsn_ and next_lsn_, fires the replay handler.
-    /// Skips records below start_lsn_ or inside any persisted rollback range.
+    /// Skips records below head_lsn_ or inside any persisted rollback range.
     void on_log_found(lsn_t lsn, const stream_key& key, const sisl::ByteView& data);
 
     // ── Accessors ────────────────────────────────────────────────────────────
 
     logstore_id_t store_id() const { return store_id_; }
-    lsn_t start_lsn() const { return start_lsn_.load(std::memory_order_acquire); }
+    uint64_t stream_id() const { return stream_->stream_id(); }
+    lsn_t head_lsn() const { return head_lsn_.load(std::memory_order_acquire); }
     lsn_t tail_lsn() const { return tail_lsn_.load(std::memory_order_acquire); }
-    lsn_t next_lsn() const { return next_lsn_.load(std::memory_order_acquire); }
+    lsn_t flushed_upto() const;
 
-    /// Returns the safest stream byte offset this store can be truncated to (== records_.at(start_lsn_).trunc_key
-    /// .group_stream_offset).  std::nullopt when the store is empty (start_lsn > tail_lsn) — this store does not
+    /// Returns the safest stream byte offset this store can be truncated to (== records_.at(head_lsn_).trunc_key
+    /// .group_stream_offset).  std::nullopt when the store is empty (head_lsn > tail_lsn) — this store does not
     /// constrain the cross-store min aggregation in that case.
-    std::optional< uint64_t > head_stream_offset() const;
+    std::optional< uint64_t > min_trunc_stream_offset() const;
 
     const shared< LogStream >& stream() const { return stream_; }
 
+    LogStore(shared< LogStream > stream, MetaBlkWrapper&& mb, logstore_id_t sid, bool is_append_mode,
+             lsn_t head_lsn, std::vector< logid_range > rollback_ranges);
+
 private:
-    LogStore(logstore_id_t sid, MetaClient& meta_client, std::string dev_name, shared< LogStream > stream,
-             lsn_t start_lsn, bool append_mode, std::vector< logid_range > rollback_ranges);
-
-    /// Wait for tail_lsn_ to reach upto_lsn.  Fast-path returns immediately if already there; otherwise sleeps
-    /// for a coalescing window, polls, triggers stream_->flush() if needed, bounded retry on out-of-order gaps.
-    folly::coro::Task< void > flush_upto(lsn_t upto_lsn);
-
     /// True if log_id falls inside any persisted rollback range.  Read by on_log_found during single-threaded
     /// recovery; written by rollback() under stream_->flush_lock().  No lock needed.
     bool in_rollback_range(logid_t log_id) const;
@@ -221,19 +214,15 @@ private:
     /// Serialise current state into the sb mblk.  Caller holds stream_->flush_lock().
     folly::coro::Task< void > persist_sb();
 
-    /// Common write path called by quick_append and quick_write.  Reserve slot, enqueue into stream.
-    void do_write(lsn_t lsn, const sisl::IoBlob& data);
-
     logstore_id_t store_id_{0};
-    MetaClient& meta_client_;
-    std::string dev_name_;
     shared< LogStream > stream_;
+    MetaBlkWrapper meta_blk_;
     bool append_mode_{false};
 
-    std::atomic< lsn_t > start_lsn_{0};
+    std::atomic< lsn_t > head_lsn_{0};
     std::atomic< lsn_t > tail_lsn_{-1}; // -1 == empty
+    mutable std::atomic< lsn_t > prev_contiguous_lsn_hint_{-1};
 
-    std::atomic< bool > is_open_{false};
     log_replay_cb handler_{};
 
     sisl::StreamTracker< LogStoreRecord, /*AutoTruncate=*/false, /*TrackCompletion=*/false > records_;
@@ -241,8 +230,6 @@ private:
     // Mutated only by rollback() under stream_->flush_lock(); read by on_log_found during single-threaded
     // recovery (which runs before any rollback can fire).  No additional synchronisation needed.
     std::vector< logid_range > rollback_ranges_;
-
-    MetaBlk sb_mblk_;
 
     std::chrono::microseconds flush_coalesce_wait_{50};
     std::chrono::microseconds flush_retry_wait_{10};

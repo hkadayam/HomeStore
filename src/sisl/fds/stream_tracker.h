@@ -19,6 +19,7 @@
 #include <mutex>
 #include <shared_mutex>
 
+#include <folly/Expected.h>
 #include <folly/SharedMutex.h>
 #include <sisl/metrics/metrics_group_impl.h>
 #include <sisl/metrics/metrics.h>
@@ -27,6 +28,12 @@
 #include "common/defs.h"
 
 namespace sisl {
+
+enum class StreamTrackerError : uint8_t {
+    OutOfRange, // idx < slot_ref_idx_ — already truncated past
+    NotActive,  // in range but active bit not set (hole, or not yet created)
+};
+
 class StreamTrackerMetrics : public MetricsGroup {
 public:
     explicit StreamTrackerMetrics(const char* inst_name) : MetricsGroupWrapper("StreamTracker", inst_name) {
@@ -116,6 +123,21 @@ public:
             throw std::out_of_range("Slot idx is not in range");
         }
         return *get_slot_data(nbit);
+    }
+
+    /// Non-throwing variant of at().  Returns a pointer to the slot if it exists and is active; otherwise an
+    /// error indicating whether the idx was out-of-range or in-range-but-not-active.  Caller can branch on the
+    /// error if it cares; otherwise just check has_value().
+    folly::Expected< T*, StreamTrackerError > try_at(int64_t idx) const noexcept {
+        std::shared_lock holder(lock_);
+        if (idx < slot_ref_idx_) {
+            return folly::makeUnexpected(StreamTrackerError::OutOfRange);
+        }
+        size_t nbit = idx - slot_ref_idx_;
+        if (nbit >= alloced_slots_ || !active_slot_bits_.get_bitval(nbit)) {
+            return folly::makeUnexpected(StreamTrackerError::NotActive);
+        }
+        return get_slot_data(nbit);
     }
 
     auto status(int64_t idx) const {

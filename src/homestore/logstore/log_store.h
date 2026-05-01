@@ -16,7 +16,6 @@
 #pragma once
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -231,9 +230,6 @@ private:
     // recovery (which runs before any rollback can fire).  No additional synchronisation needed.
     std::vector< logid_range > rollback_ranges_;
 
-    std::chrono::microseconds flush_coalesce_wait_{50};
-    std::chrono::microseconds flush_retry_wait_{10};
-    static constexpr int max_flush_retries = 100;
 };
 
 } // namespace homestore

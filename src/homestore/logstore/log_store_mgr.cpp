@@ -25,6 +25,7 @@
 #include <sisl/logging/logging.h>
 
 #include "base/homestore_assert.hpp"
+#include "base/homestore_config.hpp" // HS_DYNAMIC_CONFIG
 #include "common/defs.h"
 #include "device/device_manager.h"
 #include "managers.h"
@@ -32,12 +33,6 @@
 #include "meta/meta_client.h"
 
 namespace homestore {
-
-// chunk_size for the logstore vdev — until HS_CONFIG carries this explicitly, hard-coded at 64 MB which matches
-// the typical logdev chunk granularity.  TODO: pull from HS_DYNAMIC_CONFIG(logstore.chunk_size) once that field
-// is added to the .fbs schema.
-static constexpr uint64_t kLogStoreChunkSize = 64ull * 1024 * 1024;
-static constexpr uint32_t kLogStoreInitialNumChunks = 4;
 
 static constexpr std::string_view kLogStoreSbPrefix = "LogStore_";
 
@@ -59,18 +54,21 @@ folly::coro::Task< void > LogStoreManager::create() {
 
     auto meta_client = co_await meta_mgr().register_client("LogStoreManager");
 
+    const uint64_t chunk_size = HS_DYNAMIC_CONFIG(logstore.chunk_size);
+    const uint32_t initial_num_chunks = HS_DYNAMIC_CONFIG(logstore.initial_num_chunks);
+
     VDevParameters params{};
     params.vdev_name = kVdevName;
-    params.initial_chunk_size = kLogStoreChunkSize;
-    params.initial_num_chunks = kLogStoreInitialNumChunks;
+    params.initial_chunk_size = chunk_size;
+    params.initial_num_chunks = initial_num_chunks;
     auto vdev = co_await device_mgr().create_vdev(std::move(params));
 
-    auto stream = co_await LogStream::create(/*stream_id=*/0, *meta_client, kVdevName, vdev, kLogStoreChunkSize);
+    auto stream = co_await LogStream::create(/*stream_id=*/0, *meta_client, kVdevName, vdev, chunk_size);
 
     auto mgr =
         shared< LogStoreManager >(new LogStoreManager{std::move(meta_client), std::move(vdev), std::move(stream)});
     Managers::init_log_store_mgr(mgr);
-    LOGINFO("LogStoreManager: ready (chunk_size={} initial_chunks={})", kLogStoreChunkSize, kLogStoreInitialNumChunks);
+    LOGINFO("LogStoreManager: ready (chunk_size={} initial_chunks={})", chunk_size, initial_num_chunks);
 }
 
 folly::coro::Task< void > LogStoreManager::load() {

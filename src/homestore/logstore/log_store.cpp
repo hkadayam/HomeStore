@@ -24,6 +24,7 @@
 #include <folly/coro/Sleep.h>
 
 #include "base/homestore_assert.hpp"
+#include "base/homestore_config.hpp" // HS_DYNAMIC_CONFIG
 #include "common/defs.h"
 #include "meta/meta_client.h"
 
@@ -106,7 +107,7 @@ folly::coro::Task< lsn_t > LogStore::append_and_flush(const sisl::IoBlob& data) 
     const lsn_t lsn = quick_append(data);
 
     // Wait for a brief time to allow coalescing multiple writes.
-    co_await folly::coro::sleep(flush_coalesce_wait_);
+    co_await folly::coro::sleep(std::chrono::microseconds{HS_DYNAMIC_CONFIG(logstore.flush_coalesce_wait_us)});
     do {
         if (records_.status(lsn).is_active) {
             co_return lsn;
@@ -135,7 +136,7 @@ folly::coro::Task< void > LogStore::write_and_flush(lsn_t lsn, const sisl::IoBlo
     quick_write(lsn, data);
 
     // Wait for a brief time to allow coalescing multiple writes.
-    co_await folly::coro::sleep(flush_coalesce_wait_);
+    co_await folly::coro::sleep(std::chrono::microseconds{HS_DYNAMIC_CONFIG(logstore.flush_coalesce_wait_us)});
     do {
         if (records_.status(lsn).is_active) {
             co_return;

@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <type_traits>
 
 #include <folly/coro/Mutex.h>
@@ -146,7 +147,7 @@ static_assert(std::is_trivially_copyable_v< LogRecord >, "StreamTracker requires
 // head_offset until the chain breaks (magic mismatch / CRC mismatch / zero block).  This lets LogStream skip a sb
 // write on every flush; only chunk-list changes and explicit truncate calls persist the sb.
 // ─────────────────────────────────────────────────────────────────────────────
-class LogStream : public AppendByteStream {
+class LogStream : public AppendByteStream, public std::enable_shared_from_this< LogStream > {
 public:
     static folly::coro::Task< shared< LogStream > > create(uint64_t stream_id, MetaClient& meta_client,
                                                            const std::string& dev_name,
@@ -195,6 +196,12 @@ public:
         return AppendByteStream::truncate(key.group_stream_offset);
     }
 
+    /// Spawns the recurring time-based auto-flush timer on any reactor.  Capture is via weak_from_this(), so
+    /// LogStream destruction does NOT block on this timer — the next sleep wake-up sees a null weak.lock() and
+    /// the coroutine exits.  Called from the create() / load() factories once the shared_ptr is constructed.
+    /// Safe to call only once per LogStream.
+    void start_flush_timer();
+
     /// MetaBlk-name component used by StreamBase::init_chunk_mblk and BlobDevManager parsing.
     std::string_view stream_type_name() const override { return "logstream"; }
 
@@ -223,7 +230,18 @@ private:
     /// flush buffer.  Updates last_crc_.  Returns the stream byte offset where the log_group_header lands.
     uint64_t build_and_emplace_group(logid_t from_idx, logid_t upto_idx);
 
-    static constexpr int max_flush_loops = 4;
+    /// Recovery torn-write detection: scan up to recovery_max_blks_read_for_additional_check blocks past
+    /// `bad_off` looking for a still-valid LogGroup (magic + cur_crc self-validated; prev_crc skipped because
+    /// we don't know the chain across the gap).  Returns the offset of the found group, or std::nullopt if no
+    /// valid group is found in the lookahead window (legitimate tail) or the config is 0 (legacy behavior).
+    /// Caller (recover()) treats Some(off) as a fatal corruption signal and throws.
+    folly::coro::Task< std::optional< uint64_t > > probe_for_torn_write(uint64_t bad_off);
+
+    /// Inline capacity for the per-flush small_vector of emplaced groups.  The actual cap is
+    /// HS_DYNAMIC_CONFIG(logstore.max_flush_loops) (hotswap, default 4) — pick the inline capacity high enough
+    /// to cover the common case without heap spill; small_vector falls back to heap if the hotswap pushes the
+    /// cap higher than this.
+    static constexpr int kFlushGroupsInlineCapacity = 8;
 
     std::unique_ptr< sisl::StreamTracker< LogRecord, /*AutoTruncate=*/false, /*TrackCompletion=*/false > > log_records_;
     std::atomic< logid_t > log_id_{0};
@@ -233,6 +251,12 @@ private:
 
     logid_t last_flush_idx_{-1};
     crc32_t last_crc_{hs_init_crc_32};
+
+    /// Steady-clock microseconds since epoch of the last successful flush.  Read by the auto-flush timer to
+    /// decide if max_time_between_flush_us has elapsed; written by flush() after AppendByteStream::flush()
+    /// returns.  Initialized to 0 so the first tick after the first append flushes promptly even if pending
+    /// payload is below flush_threshold_size.
+    std::atomic< int64_t > last_flush_time_us_{0};
 };
 
 } // namespace homestore

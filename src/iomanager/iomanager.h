@@ -115,9 +115,10 @@ public:
     // Async sleep using the current EventBase timer.
     folly::coro::Task< void > sleep(std::chrono::milliseconds dur);
 
-private:
     // Resolves a ReactorTarget to the concrete EventBase* for dispatch.
     folly::EventBase* resolve_target(ReactorTarget target) const;
+
+private:
 
     size_t num_reactors_{0};
     std::unique_ptr< folly::EventBaseManager > ebm_; // owns the per-thread EventBases

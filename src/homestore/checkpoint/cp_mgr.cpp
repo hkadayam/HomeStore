@@ -13,8 +13,6 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
-#include <folly/coro/Sleep.h>
-#include <folly/coro/WithCancellation.h>
 #include <folly/io/async/EventBaseManager.h>
 #include <folly/io/async/Request.h>
 #include <sisl/fds/rcu.h>
@@ -87,19 +85,13 @@ folly::coro::Task< void > CPManager::start(bool first_time_boot) {
 }
 
 void CPManager::start_timer() {
-    LOGINFO("cp timer is set to {} usec", HS_DYNAMIC_CONFIG(generic.cp_timer_us));
-    cp_timer_started_ = true;
-    spawn_detached(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
-        const auto interval = std::chrono::microseconds(HS_DYNAMIC_CONFIG(generic.cp_timer_us));
-        while (true) {
-            try {
-                co_await folly::coro::co_withCancellation(cp_timer_cancel_src_.getToken(),
-                                                          folly::coro::sleep(interval));
-            } catch (const folly::OperationCancelled&) { break; }
-            trigger_cp_flush(false, CPTriggerReason::Timer);
-        }
-        cp_timer_done_baton_.post();
-    });
+    const auto interval = std::chrono::microseconds(HS_DYNAMIC_CONFIG(generic.cp_timer_us));
+    LOGINFO("cp timer is set to {} usec", interval.count());
+    cp_timer_.start(ReactorTarget::any(), interval, iomanager::TimerKind::Recurring,
+                    [this]() -> folly::coro::Task< void > {
+                        trigger_cp_flush(false, CPTriggerReason::Timer);
+                        co_return;
+                    });
 }
 
 void CPManager::create_first_cp() {
@@ -111,9 +103,7 @@ void CPManager::create_first_cp() {
 folly::coro::Task< void > CPManager::shutdown() {
     // Request cancellation of the periodic timer (non-blocking). The timer coroutine will exit on its own.
     folly::SemiFuture< bool > wd_done = folly::SemiFuture< bool >::makeEmpty();
-    if (cp_timer_started_) {
-        cp_timer_cancel_src_.requestCancellation();
-    }
+    cp_timer_.request_stop();
 
     // Request the watchdog to stop (non-blocking). We co_await its completion after the flush.
     if (wd_cp_) {
@@ -140,9 +130,7 @@ folly::coro::Task< void > CPManager::shutdown() {
 
     // Wait for watchdog and timer coroutines to exit before tearing down state.
     if (wd_done.valid()) { co_await std::move(wd_done); }
-    if (cp_timer_started_) {
-        cp_timer_done_baton_.wait();
-    }
+    co_await cp_timer_.stop();
 
     // Don't reset wd_cp_ here: the co_await awaiter above still holds a Future
     // referencing done_promise_'s Core. Destroying wd_cp_ would drop the

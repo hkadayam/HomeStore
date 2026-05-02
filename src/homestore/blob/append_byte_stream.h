@@ -51,6 +51,10 @@ struct AppendByteStreamSb {
     uint64_t head_offset{0};
     uint64_t tail_offset{0};
     uint32_t n_chunks{0};
+    // chain_seed is used by LogStream to root its CRC chain at a per-stream-epoch random value, so stale on-disk
+    // groups from a recycled chunk (or from before a truncate-all) fail prev_crc validation against the current
+    // seed and recovery stops cleanly at the first stale group.  Other AppendByteStream subclasses ignore it.
+    uint32_t chain_seed{0};
     // followed by uint32_t chunk_ids[n_chunks]
 
     uint32_t* chunk_ids() { return reinterpret_cast< uint32_t* >(this + 1); }
@@ -223,16 +227,22 @@ private:
     /// do not call across a co_await.
     std::pair< chunk_num_t, uint64_t > resolve(uint64_t byte_offset);
 
-private:
+protected:
+    // ── Cursor / sb state ─────────────────────────────────────────────────────
+    // Promoted to protected so subclasses (LogStream) can rewrite head/tail during recovery and restore the sb
+    // MetaBlk handle in their own load() factory.  Direct manipulation is intentionally restricted to the parent
+    // and its subclasses; callers go through truncate(), append(), flush(), etc.
     uint64_t tail_offset_{0};
     uint64_t head_offset_{0};           // head of the logical byte stream; advances on truncate
     uint64_t offset_in_first_chunk_{0}; // offset within the first chunk where head starts
+    MetaBlk sb_mblk_;                   // the stream's single sb MetaBlk, created at stream construction (or recovered at load)
+    uint32_t chain_seed_{0};            // see AppendByteStreamSb::chain_seed — written/read by persist_stream_sb / load
+
+private:
     bool concurrent_safe_;
     std::mutex append_mutex_; // used only when concurrent_safe_ is true; protects tail_offset_, flush_buf_,
                               // head_offset_
     FlushBuffer flush_buf_;
-
-    MetaBlk sb_mblk_; // the stream's single sb MetaBlk, created at stream construction (or recovered at load)
 };
 
 } // namespace homestore

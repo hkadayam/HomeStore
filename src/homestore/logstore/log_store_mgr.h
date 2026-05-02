@@ -67,7 +67,7 @@ public:
     /// (caller must invoke recover() after open_log_store calls so on_log_found dispatch can find handlers).
     static folly::coro::Task< void > load();
 
-    void shutdown();
+    folly::coro::Task< void > shutdown();
 
     // ── Accessors ────────────────────────────────────────────────────────────
 

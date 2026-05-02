@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <random>
 #include <stdexcept>
 
 #include <chrono>
@@ -23,9 +24,9 @@
 #include <fmt/format.h>
 #include <folly/coro/Sleep.h>
 #include <folly/small_vector.h>
+#include "sisl/fds/utils.h" // Clock, get_elapsed_time_us
 
 #include "logstore/log_stream.h"
-#include "logstore/log_store.h"
 #include "base/homestore_config.hpp" // HS_DYNAMIC_CONFIG
 #include "common/defs.h"
 #include "device/chunk.h"
@@ -35,6 +36,17 @@
 #include "meta/meta_client.h"
 
 namespace homestore {
+
+// Per-stream log helper.  The "sid" tag lets a busy multi-stream log be filtered to one stream's lifecycle.
+#define LSTREAM_LOG(level, msg, ...) HS_SUBMOD_LOG(level, logstream, , "sid", stream_id(), msg, ##__VA_ARGS__)
+
+// Generate a fresh non-zero 32-bit chain seed.  Non-zero so it's distinguishable from the default-initialized
+// AppendByteStreamSb::chain_seed{0} on the recovery path of a stream that was never created with this code.
+static uint32_t fresh_chain_seed() {
+    static thread_local std::mt19937 rng{std::random_device{}()};
+    std::uniform_int_distribution< uint32_t > dist{1, std::numeric_limits< uint32_t >::max()};
+    return dist(rng);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Construction / factories
@@ -53,7 +65,13 @@ std::string LogStream::sb_mblk_name(const std::string& dev, uint64_t stream_id) 
 folly::coro::Task< shared< LogStream > > LogStream::create(uint64_t stream_id, MetaClient& meta_client,
                                                            const std::string& dev_name,
                                                            const shared< VirtualDev >& vdev, uint64_t chunk_size) {
+    LOGINFOMOD(logstream, "create: sid={} dev={} chunk_size={}", stream_id, dev_name, chunk_size);
     auto stream = shared< LogStream >{new LogStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_size}};
+
+    // Seed the chain at a non-zero random value so recovery can distinguish stale on-disk groups (recycled chunk,
+    // pre-truncate-all data) from this stream's epoch.  Set BEFORE persist_stream_sb so the initial sb carries it.
+    stream->chain_seed_ = fresh_chain_seed();
+    stream->last_crc_ = stream->chain_seed_;
 
     // Allocate the per-stream sb MetaBlk and persist initial empty state.
     stream->sb_mblk_ = co_await meta_client.create_meta_blk(sb_mblk_name(dev_name, stream_id), std::nullopt);
@@ -62,6 +80,7 @@ folly::coro::Task< shared< LogStream > > LogStream::create(uint64_t stream_id, M
     // Pre-allocate one chunk so the first append has somewhere to land.
     co_await stream->expand_to(0);
     stream->start_flush_timer();
+    LOGTRACEMOD(logstream, "create: sid={} ready, num_chunks={}", stream_id, stream->num_chunks());
     co_return stream;
 }
 
@@ -85,11 +104,15 @@ folly::coro::Task< shared< LogStream > > LogStream::load(uint64_t stream_id, Met
         chunk_ids.push_back(s->chunk_ids()[i]);
     }
 
+    LOGINFOMOD(logstream, "load: sid={} dev={} chunk_size={} head_offset={} n_chunks={} chain_seed={:#x}", stream_id,
+               dev_name, chunk_sz, recovered_head, s->n_chunks, s->chain_seed);
     auto stream = shared< LogStream >{new LogStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_sz}};
     stream->sb_mblk_ = std::move(sb);
     stream->head_offset_ = recovered_head;
     stream->offset_in_first_chunk_ = recovered_head % chunk_sz;
-    // tail_offset_, last_crc_, log_id_, last_flush_idx_ are all populated by recover() — called separately by the
+    stream->chain_seed_ = s->chain_seed;
+    stream->last_crc_ = s->chain_seed; // root the chain at the persisted seed; recover() will advance it
+    // tail_offset_, log_id_, last_flush_idx_ are all populated by recover() — called separately by the
     // manager once every LogStore has been opened so on_log_found dispatch can find its target.
 
     std::vector< shared< Chunk > > chunks;
@@ -101,24 +124,24 @@ folly::coro::Task< shared< LogStream > > LogStream::load(uint64_t stream_id, Met
     stream->install_chunks(std::move(chunks));
 
     stream->start_flush_timer();
+    LOGTRACEMOD(logstream, "load: sid={} installed {} chunks", stream_id, stream->num_chunks());
     co_return stream;
 }
 
-logid_t LogStream::append(LogStore* store, lsn_t lsn, const sisl::IoBlob& data) {
+logid_t LogStream::append(LogStreamClient* client, lsn_t lsn, const sisl::IoBlob& data) {
     const logid_t idx = log_id_.fetch_add(1, std::memory_order_acq_rel);
     const auto sz = to_i64(data.size());
     const int64_t prev = pending_flush_size_.fetch_add(sz, std::memory_order_relaxed);
-    log_records_->create(idx, LogRecord{data, store, lsn});
+    log_records_->create(idx, LogRecord{data, client, lsn});
 
     // Size-based auto-flush: only the appender that takes pending_flush_size_ from below threshold to >=
     // threshold spawns the detached flush.  Subsequent appenders that observe an already-above-threshold value
     // skip the spawn — flush() decrements the counter on success, naturally re-arming the next crossing.
     const int64_t threshold = to_i64(HS_DYNAMIC_CONFIG(logstore.flush_threshold_size));
     if (prev < threshold && (prev + sz) >= threshold) {
-        iomanager::spawn_detached(iomanager::ReactorTarget::any(),
-                                  [self = shared_from_this()]() -> folly::coro::Task< void > {
-                                      co_await self->flush();
-                                  });
+        iomanager::spawn_detached(
+            iomanager::ReactorTarget::any(),
+            [self = shared_from_this()]() -> folly::coro::Task< void > { co_await self->flush(); });
     }
     return idx;
 }
@@ -154,6 +177,8 @@ folly::coro::Task< void > LogStream::flush() {
         co_return; // nothing newly emplaced
     }
 
+    LSTREAM_LOG(TRACE, "flush: emplaced {} group(s), tail_off={}", emplaced.size(), tail_offset());
+
     // Single underlying write of everything emplaced above.  Throws on failure; the tracker is left populated and
     // completion firing is skipped — a flush-write failure is fatal at this layer.
     co_await AppendByteStream::flush();
@@ -167,58 +192,55 @@ folly::coro::Task< void > LogStream::flush() {
         uint64_t rec_off = g.group_offset + sizeof(log_group_header);
         for (logid_t i = g.from_idx; i <= g.upto_idx; ++i) {
             auto& rec = log_records_->at(i);
-            rec.store->on_write_completion(rec.lsn, stream_key{i, rec_off, g.group_offset});
+            rec.client->on_write_completion(rec.lsn, stream_key{i, rec_off, g.group_offset});
             rec_off += sizeof(log_record_header) + rec.data.size();
             flushed_bytes += to_i64(rec.data.size());
         }
     }
     pending_flush_size_.fetch_sub(flushed_bytes, std::memory_order_relaxed);
+
     // Stamp the flush time AFTER the write succeeded — the auto-flush timer reads this to gate the
     // max_time_between_flush_us check, so we never want to advance it for an aborted flush.
-    last_flush_time_us_.store(std::chrono::duration_cast< std::chrono::microseconds >(
-                                  std::chrono::steady_clock::now().time_since_epoch())
-                                  .count(),
-                              std::memory_order_relaxed);
+    last_flush_time_.store(Clock::now(), std::memory_order_relaxed);
     log_records_->truncate(last_flush_idx_);
 }
 
 void LogStream::start_flush_timer() {
-    // Detached coroutine that wakes every flush_timer_frequency_us and decides whether to flush based on
-    // (a) any pending payload (pending_flush_size_ > 0) and (b) max_time_between_flush_us elapsed since the
-    // last successful flush.  Both knobs are hot-swappable; the loop re-reads them each tick.
-    //
-    // Cancellation: weak_from_this() — the LogStream's destruction does NOT block on this timer.  The next
-    // wake-up sees a null weak.lock() and the coroutine exits cleanly.  We drop the strong ref before each
-    // sleep so the dtor only ever has to wait at most for one in-flight flush().
-    iomanager::spawn_detached(
-        iomanager::ReactorTarget::any(),
-        [weak = weak_from_this()]() -> folly::coro::Task< void > {
-            while (true) {
-                auto self = weak.lock();
-                if (!self) co_return;
-                const auto freq_us = HS_DYNAMIC_CONFIG(logstore.flush_timer_frequency_us);
-                self.reset();
-                co_await folly::coro::sleep(std::chrono::microseconds(freq_us));
+    flush_timer_.start(iomanager::ReactorTarget::any(),
+                       std::chrono::microseconds(HS_DYNAMIC_CONFIG(logstore.flush_timer_frequency_us)),
+                       iomanager::TimerKind::Recurring, [this]() -> folly::coro::Task< void > {
+                           // Cheap pre-check: skip if no pending bytes.  pending_flush_size_ is decremented by
+                           // flush() on success, so >0 means records haven't reached disk yet.
+                           if (pending_flush_size_.load(std::memory_order_acquire) <= 0) {
+                               co_return;
+                           }
+                           if (get_elapsed_time_us(last_flush_time_.load(std::memory_order_relaxed)) >=
+                               HS_DYNAMIC_CONFIG(logstore.max_time_between_flush_us)) {
+                               co_await flush();
+                           }
+                       });
+}
 
-                self = weak.lock();
-                if (!self) co_return;
+folly::coro::Task< void > LogStream::stop() {
+    co_await flush_timer_.stop();
+}
 
-                // Cheap pre-check: nothing to flush if no pending bytes.  pending_flush_size_ is decremented
-                // by flush() after a successful write, so >0 means there are records that haven't reached
-                // disk yet.
-                if (self->pending_flush_size_.load(std::memory_order_acquire) <= 0) continue;
+folly::coro::Task< void > LogStream::truncate(const stream_key& key) {
+    co_await AppendByteStream::truncate(key.group_stream_offset);
 
-                const auto now_us = std::chrono::duration_cast< std::chrono::microseconds >(
-                                        std::chrono::steady_clock::now().time_since_epoch())
-                                        .count();
-                const int64_t last_us = self->last_flush_time_us_.load(std::memory_order_relaxed);
-                const auto max_elapsed_us =
-                    static_cast< int64_t >(HS_DYNAMIC_CONFIG(logstore.max_time_between_flush_us));
-                if ((now_us - last_us) >= max_elapsed_us) {
-                    co_await self->flush();
-                }
-            }
-        });
+    // Truncate-all path: AppendByteStream collapses head==tail to (0,0).  Bump chain_seed_ so any stale on-disk
+    // groups left in the anchor chunk fail recovery's first-group prev_crc check.  Reset chain state and persist
+    // the sb again to land the new seed on disk.
+    if (head_offset_ == 0 && tail_offset_ == 0) {
+        const uint32_t old_seed = chain_seed_;
+        chain_seed_ = fresh_chain_seed();
+        last_crc_ = chain_seed_;
+        last_flush_idx_ = -1;
+        log_id_.store(0, std::memory_order_relaxed);
+
+        LSTREAM_LOG(INFO, "truncate-all: bumped chain_seed {:#x} -> {:#x}", old_seed, chain_seed_);
+        co_await persist_stream_sb();
+    }
 }
 
 uint64_t LogStream::build_and_emplace_group(logid_t from_idx, logid_t upto_idx) {
@@ -244,7 +266,7 @@ uint64_t LogStream::build_and_emplace_group(logid_t from_idx, logid_t upto_idx) 
             const auto& rec = log_records_->at(i);
             auto* rhdr = r_cast< log_record_header* >(p);
             rhdr->log_id = i;
-            rhdr->store_id = rec.store->store_id();
+            rhdr->store_id = rec.client->store_id();
             rhdr->store_lsn = rec.lsn;
             rhdr->size = rec.data.size();
             p += sizeof(log_record_header);
@@ -290,21 +312,27 @@ folly::coro::Task< sisl::ByteView > LogStream::read(const stream_key& key) {
     // Wrap the IOBuffer into a shared ByteArray (no buffer copy — just a wrapper alloc) so the returned view owns
     // its underlying storage; the caller can retain or drop it as it pleases.
     auto ba = sisl::make_byte_array(std::move(data_buf));
-    co_return sisl::ByteView{std::move(ba), data_offset % block_size(), data_size};
+    co_return sisl::ByteView{std::move(ba), to_u32(data_offset % block_size()), data_size};
 }
 
 folly::coro::Task< void > LogStream::recover(lookup_store_fn lookup) {
+    LSTREAM_LOG(INFO, "recover: walking chain from head_offset={}", head_offset_);
     // Walk forward from head_offset_ as a chain of LogGroups.  For each candidate group: read its header, validate
     // magic and group_size, read the full group, validate prev_crc + cur_crc against the running chain, then dispatch
     // each record to its owning store via on_log_found.  Stop at the first invalid group; tail_offset_ is set to
     // where the next group would have started.
 
-    // The first surviving group at head_offset_ may legitimately have a prev_crc that doesn't match
-    // hs_init_crc_32 — truncation cuts the chain at the head boundary.  Skip the prev_crc check on the first
-    // iteration; the first group's own cur_crc validates its integrity.  Subsequent groups chain-validate normally.
-    crc32_t expected_prev_crc = 0;
-    bool first_group = true;
+    // First-group prev_crc handling depends on where head is:
+    //   • head == 0 (fresh stream, or after truncate-all): expect prev_crc == chain_seed_.  Stale data from a
+    //     prior epoch / recycled chunk has a different seed and fails immediately.
+    //   • head != 0 (after partial truncate): the new first group's prev_crc was set at flush time to the prior
+    //     group's cur_crc, which we no longer have.  Skip the check on iteration 0; subsequent groups still
+    //     chain-validate.
+    bool skip_prev_crc_check = (head_offset_ != 0);
+    crc32_t expected_prev_crc = chain_seed_;
     uint64_t cursor = head_offset_;
+    uint32_t groups_recovered = 0;
+    uint32_t records_recovered = 0;
 
     while (true) {
         // AppendByteStream::read clamps to tail_offset_; set tail optimistically to "end of chunks" so reads can
@@ -350,15 +378,21 @@ folly::coro::Task< void > LogStream::recover(lookup_store_fn lookup) {
         const uint8_t* group_bytes = group_ba->cbytes() + group_in_buf;
         const auto* footer = r_cast< const log_group_footer* >(group_bytes + group_size - sizeof(log_group_footer));
 
-        // Validate CRC chain: prev_crc must match expected (skipped on first group — see expected_prev_crc init).
-        // cur_crc must always match recomputed.
-        if (!first_group && footer->prev_crc != expected_prev_crc) {
+        // Validate CRC chain.  Skip prev_crc on the iteration-0 partial-truncate case (see flag init above);
+        // every other iteration must chain to the prior group's cur_crc.  cur_crc is always recomputed.
+        if (!skip_prev_crc_check && footer->prev_crc != expected_prev_crc) {
+            LSTREAM_LOG(WARN, "recover: prev_crc mismatch at off={} (expected={:#x} got={:#x}) — chain ends here",
+                        cursor, expected_prev_crc, footer->prev_crc);
             tail_offset_ = prev_tail;
             break;
         }
+        skip_prev_crc_check = false;
         const uint64_t covered_len = group_size - sizeof(log_group_footer);
         const crc32_t computed = crc32_ieee(hs_init_crc_32, group_bytes, covered_len);
         if (footer->cur_crc != computed) {
+            LSTREAM_LOG(ERROR,
+                        "recover: cur_crc mismatch at off={} (expected={:#x} got={:#x}) — probing for torn write",
+                        cursor, computed, footer->cur_crc);
             tail_offset_ = prev_tail;
             break;
         }
@@ -371,9 +405,9 @@ folly::coro::Task< void > LogStream::recover(lookup_store_fn lookup) {
             const uint64_t rec_stream_offset = cursor + off_in_group;
             const uint32_t data_off_in_buf = group_in_buf + off_in_group + sizeof(log_record_header);
 
-            if (auto* store = lookup ? lookup(rhdr->store_id) : nullptr) {
+            if (auto* client = lookup ? lookup(rhdr->store_id) : nullptr) {
                 sisl::ByteView data_view{group_ba, data_off_in_buf, rhdr->size};
-                store->on_log_found(rhdr->store_lsn, stream_key{rhdr->log_id, rec_stream_offset, cursor}, data_view);
+                client->on_log_found(rhdr->store_lsn, stream_key{rhdr->log_id, rec_stream_offset, cursor}, data_view);
             }
             // else: orphan record — store_id was never opened; manager handles cleanup.
 
@@ -382,39 +416,47 @@ folly::coro::Task< void > LogStream::recover(lookup_store_fn lookup) {
             }
             last_flush_idx_ = std::max(last_flush_idx_, rhdr->log_id);
             off_in_group += sizeof(log_record_header) + rhdr->size;
+            ++records_recovered;
         }
+        ++groups_recovered;
 
         // Advance chain.
         expected_prev_crc = footer->cur_crc;
         last_crc_ = footer->cur_crc;
-        first_group = false;
         cursor += group_size;
         tail_offset_ = prev_tail; // restore; next iteration recomputes if needed
     }
 
     // Final tail is where the first invalid (or missing) group would have started.
     tail_offset_ = cursor;
+    LSTREAM_LOG(INFO, "recover: done — {} groups, {} records, tail_offset={} log_id={}", groups_recovered,
+                records_recovered, tail_offset_, log_id_.load());
 
-    // Torn-write detection: if any valid LogGroup exists within the lookahead window past `cursor`, then
-    // `cursor` is NOT the legitimate tail — a middle write was lost or corrupted.  Throw rather than
-    // silently truncating the stream to `cursor`, which would discard durable records.
-    if (auto found = co_await probe_for_torn_write(cursor)) {
-        throw std::runtime_error(fmt::format(
-            "LogStream::recover: torn middle write detected — chain break at stream offset {}, but a valid "
-            "LogGroup exists at offset {} (within {} block lookahead). Refusing to silently truncate; this "
-            "stream needs manual investigation.",
-            cursor, *found, HS_DYNAMIC_CONFIG(logstore.recovery_max_blks_read_for_additional_check)));
+    // Torn-write detection: only meaningful if we walked at least one group successfully — i.e. there was a
+    // live chain that then broke.  When groups_recovered == 0 the break is at the very first probe (head ==
+    // current cursor), which is the post-truncate-all leftover-data case (chain_seed rejected stale group #0);
+    // any downstream "valid" group is stale-from-prior-epoch, not a torn middle write.
+    if (groups_recovered > 0) {
+        if (auto found = co_await probe_for_torn_write(cursor)) {
+            LSTREAM_LOG(ERROR, "recover: torn middle write detected — chain break at off={}, valid group at off={}",
+                        cursor, *found);
+            throw std::runtime_error(fmt::format(
+                "LogStream::recover: torn middle write detected — chain break at stream offset {}, but a valid "
+                "LogGroup exists at offset {} (within {} block lookahead). Refusing to silently truncate; this "
+                "stream needs manual investigation.",
+                cursor, *found, HS_DYNAMIC_CONFIG(logstore.recovery_max_blks_read_for_additional_check)));
+        }
     }
 }
 
 folly::coro::Task< std::optional< uint64_t > > LogStream::probe_for_torn_write(uint64_t bad_off) {
     const uint32_t max_blocks = HS_DYNAMIC_CONFIG(logstore.recovery_max_blks_read_for_additional_check);
-    if (max_blocks == 0) co_return std::nullopt;
+    if (max_blocks == 0)
+        co_return std::nullopt;
 
-    const uint32_t bsize = block_size();
     // Round bad_off UP to the next strict block boundary; the partial block at bad_off itself is part of the
     // damage and is skipped.  We're looking for downstream evidence of a *different* good group.
-    const uint64_t probe_start = ((bad_off + bsize) / bsize) * bsize;
+    const uint64_t probe_start = ((bad_off + block_size()) / block_size()) * block_size();
 
     // Optimistically bump tail_offset_ to end-of-allocated-chunks so AppendByteStream::read can probe past
     // the recovered tail.  Restored before return regardless of outcome.
@@ -425,32 +467,40 @@ folly::coro::Task< std::optional< uint64_t > > LogStream::probe_for_torn_write(u
 
     std::optional< uint64_t > found_off;
     for (uint32_t i = 0; i < max_blocks; ++i) {
-        const uint64_t probe = probe_start + to_u64(i) * bsize;
-        if (probe + sizeof(log_group_header) > optimistic_tail) break;
+        const uint64_t probe = probe_start + to_u64(i) * block_size();
+        if (probe + sizeof(log_group_header) > optimistic_tail)
+            break;
 
         auto [ec_h, hdr_buf] = co_await AppendByteStream::read(probe, sizeof(log_group_header));
-        if (ec_h) continue;
+        if (ec_h)
+            continue;
 
-        const uint32_t hdr_in_buf = probe % bsize;
+        const uint32_t hdr_in_buf = probe % block_size();
         const auto* hdr = r_cast< const log_group_header* >(hdr_buf.cbytes() + hdr_in_buf);
-        if (hdr->magic != LOG_GROUP_MAGIC) continue;
-        if (hdr->group_size < sizeof(log_group_header) + sizeof(log_group_footer)) continue;
-        if (probe + hdr->group_size > optimistic_tail) continue;
+        if (hdr->magic != LOG_GROUP_MAGIC)
+            continue;
+
+        if (hdr->group_size < sizeof(log_group_header) + sizeof(log_group_footer))
+            continue;
+
+        if (probe + hdr->group_size > optimistic_tail)
+            continue;
 
         // Magic + size sanity passed — read the full group and validate cur_crc.  We deliberately skip the
         // prev_crc check here: the chain across the torn region is broken by definition, so prev_crc would
         // not match expected.  cur_crc is self-contained and proves the group itself is intact.
         const uint32_t group_size = hdr->group_size;
         auto [ec_g, group_buf] = co_await AppendByteStream::read(probe, group_size);
-        if (ec_g) continue;
+        if (ec_g)
+            continue;
 
-        const uint32_t group_in_buf = probe % bsize;
+        const uint32_t group_in_buf = probe % block_size();
         auto group_ba = sisl::make_byte_array(std::move(group_buf));
         const uint8_t* group_bytes = group_ba->cbytes() + group_in_buf;
-        const auto* footer =
-            r_cast< const log_group_footer* >(group_bytes + group_size - sizeof(log_group_footer));
-        const uint64_t covered_len = group_size - sizeof(log_group_footer);
-        const crc32_t computed = crc32_ieee(hs_init_crc_32, group_bytes, covered_len);
+
+        const uint64_t actual_group_size = group_size - sizeof(log_group_footer);
+        const auto* footer = r_cast< const log_group_footer* >(group_bytes + actual_group_size);
+        const crc32_t computed = crc32_ieee(hs_init_crc_32, group_bytes, actual_group_size);
         if (footer->cur_crc == computed) {
             found_off = probe;
             break;

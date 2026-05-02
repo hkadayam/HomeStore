@@ -24,8 +24,11 @@
 
 #include <folly/coro/Mutex.h>
 #include <folly/coro/Task.h>
-#include <sisl/fds/buffer.h>
-#include <sisl/fds/stream_tracker.h>
+#include "sisl/fds/buffer.h"
+#include "sisl/fds/stream_tracker.h"
+#include "sisl/fds/utils.h" // Clock
+
+#include "iomanager/coro_timer.h"
 
 #include <homestore/crc.h>
 
@@ -34,7 +37,6 @@
 
 namespace homestore {
 
-class LogStore;
 class MetaClient;
 class VirtualDev;
 
@@ -45,10 +47,12 @@ using logid_t = int64_t;
 using logstore_id_t = uint32_t;
 using lsn_t = int64_t;
 
-/// Resolves a store_id to its owning LogStore during recovery.  Provided by LogStoreManager (which knows the
-/// opened-store map) and passed to LogStream::recover.  Returning nullptr signals an orphan record (store was never
-/// opened) — LogStream skips dispatch for it; the manager is responsible for orphan cleanup.
-using lookup_store_fn = std::function< LogStore*(logstore_id_t) >;
+class LogStreamClient;
+
+/// Resolves a store_id to its owning client during recovery.  Provided by the layer above (e.g. LogStoreManager,
+/// or a test harness) and passed to LogStream::recover.  Returning nullptr signals an orphan record (store was
+/// never opened) — LogStream skips dispatch for it; the layer above is responsible for orphan cleanup.
+using lookup_store_fn = std::function< LogStreamClient*(logstore_id_t) >;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // stream_key
@@ -119,17 +123,31 @@ static_assert(sizeof(log_record_header) == 24, "log_record_header must be 24 byt
 static_assert(sizeof(log_group_footer) == 8, "log_group_footer must be 8 bytes on disk");
 
 // ─────────────────────────────────────────────────────────────────────────────
+// LogStreamClient — the per-store callback surface LogStream knows about.  LogStore implements this; tests can
+// implement a shadow client that records every callback for verification without dragging in LogStore.  Methods
+// are non-coroutine and run inline from inside LogStream::flush() (on_write_completion) or LogStream::recover()
+// (on_log_found); implementations must not block.
+// ─────────────────────────────────────────────────────────────────────────────
+class LogStreamClient {
+public:
+    virtual ~LogStreamClient() = default;
+    virtual logstore_id_t store_id() const = 0;
+    virtual void on_write_completion(lsn_t lsn, const stream_key& key) = 0;
+    virtual void on_log_found(lsn_t lsn, const stream_key& key, const sisl::ByteView& data) = 0;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // In-memory: LogRecord (StreamTracker entry)
 //
 // One per appended record awaiting flush.  Holds a shallow IoBlob view of the caller's data buffer — the caller is
-// responsible for keeping the buffer alive until flush() returns.  Carries the owning LogStore* so on flush
-// completion we can dispatch on_write_completion directly without a store_id → store map lookup; store_id itself is
-// fetched via store->store_id() when filling the on-disk record header
+// responsible for keeping the buffer alive until flush() returns.  Carries the owning client* so on flush
+// completion we can dispatch on_write_completion directly without a store_id → client map lookup; store_id itself
+// is fetched via client->store_id() when filling the on-disk record header.
 // Trivially copyable for StreamTracker.
 // ─────────────────────────────────────────────────────────────────────────────
 struct LogRecord {
     sisl::IoBlob data{};
-    LogStore* store{nullptr};
+    LogStreamClient* client{nullptr};
     lsn_t lsn{0};
 };
 static_assert(std::is_trivially_copyable_v< LogRecord >, "StreamTracker requires trivially copyable T");
@@ -173,11 +191,11 @@ public:
     LogStream& operator=(LogStream&&) = delete;
     ~LogStream() override = default;
 
-    /// Append one record on behalf of a LogStore.  Synchronous, no I/O — record is stashed in the tracker for the
-    /// next flush().  Returns the assigned monotonic log_id.  The store pointer is cached in the LogRecord and used
-    /// during flush completion to fire store->on_write_completion directly (no demux).  Caller's data buffer must
+    /// Append one record on behalf of a client.  Synchronous, no I/O — record is stashed in the tracker for the
+    /// next flush().  Returns the assigned monotonic log_id.  The client pointer is cached in the LogRecord and used
+    /// during flush completion to fire client->on_write_completion directly (no demux).  Caller's data buffer must
     /// outlive the next flush().
-    logid_t append(LogStore* store, lsn_t lsn, const sisl::IoBlob& data);
+    logid_t append(LogStreamClient* client, lsn_t lsn, const sisl::IoBlob& data);
 
     /// Drain the tracker into 1+ LogGroups (loop while more contiguous-active records appear, capped at
     /// max_flush_loops), emplace each group into the parent buffer with CRC chaining, then call
@@ -192,15 +210,19 @@ public:
     /// Advance the stream's head to key.group_stream_offset (must be a LogGroup boundary — only stream_keys handed
     /// out by on_write_completion / on_log_found satisfy this) and persist the sb.  Releases any chunks fully before
     /// the new head.  Inherited semantics: head==tail keeps one chunk as anchor and resets positions to 0.
-    folly::coro::Task< void > truncate(const stream_key& key) {
-        return AppendByteStream::truncate(key.group_stream_offset);
-    }
+    /// When the truncate collapses the stream to empty, bumps chain_seed_ and re-persists the sb so any stale
+    /// on-disk groups left in the anchor chunk fail recovery's first-group prev_crc check on next restart.
+    folly::coro::Task< void > truncate(const stream_key& key);
 
-    /// Spawns the recurring time-based auto-flush timer on any reactor.  Capture is via weak_from_this(), so
-    /// LogStream destruction does NOT block on this timer — the next sleep wake-up sees a null weak.lock() and
-    /// the coroutine exits.  Called from the create() / load() factories once the shared_ptr is constructed.
-    /// Safe to call only once per LogStream.
+    /// Spawns the recurring time-based auto-flush timer on any reactor.  Cancelled via stop() — uses folly's
+    /// CancellationSource + Baton pattern (mirrors CPManager::start_timer).  Called from the create() / load()
+    /// factories once the shared_ptr is constructed.  Safe to call only once per LogStream.
     void start_flush_timer();
+
+    /// Cancels the flush timer and awaits its exit baton.  LogStoreManager::shutdown calls this before
+    /// resetting the shared_ptr.  Safe to call multiple times (subsequent calls no-op since the source is
+    /// already cancelled).
+    folly::coro::Task< void > stop();
 
     /// MetaBlk-name component used by StreamBase::init_chunk_mblk and BlobDevManager parsing.
     std::string_view stream_type_name() const override { return "logstream"; }
@@ -256,7 +278,9 @@ private:
     /// decide if max_time_between_flush_us has elapsed; written by flush() after AppendByteStream::flush()
     /// returns.  Initialized to 0 so the first tick after the first append flushes promptly even if pending
     /// payload is below flush_threshold_size.
-    std::atomic< int64_t > last_flush_time_us_{0};
+    std::atomic< Clock::time_point > last_flush_time_{};
+
+    iomanager::CoroTimer flush_timer_;
 };
 
 } // namespace homestore

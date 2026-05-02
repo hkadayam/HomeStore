@@ -23,14 +23,14 @@
 #include <sisl/metrics/metrics.h>
 #include <sisl/fds/enum.h>
 #include <sisl/fds/utils.h>
-#include <folly/CancellationToken.h>
 #include <folly/SharedMutex.h>
 #include <folly/coro/Task.h>
 #include <folly/futures/Future.h>
 #include <folly/futures/SharedPromise.h>
 #include <folly/io/async/AsyncTimeout.h>
 #include <folly/io/async/Request.h>
-#include <folly/synchronization/Baton.h>
+
+#include "iomanager/coro_timer.h"
 
 #include <homestore/meta/module_meta_blk.h>
 #include <homestore/checkpoint/cp.h>
@@ -182,10 +182,8 @@ private:
     bool pending_trigger_cp_{false};
     folly::SharedPromise< bool > pending_trigger_cp_comp_;
 
-    // Timer Related
-    bool cp_timer_started_{false};
-    folly::CancellationSource cp_timer_cancel_src_;
-    folly::Baton<> cp_timer_done_baton_;
+    // Periodic CP-trigger timer.
+    iomanager::CoroTimer cp_timer_;
 
 public:
     // Per-thread CP stacks owned by this manager.  CPGuard pushes/pops on the stack for the calling thread; the

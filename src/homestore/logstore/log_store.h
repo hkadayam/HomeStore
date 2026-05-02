@@ -111,13 +111,13 @@ using log_replay_cb = std::function< void(lsn_t lsn, const sisl::ByteView& data)
 //   • truncate, rollback acquire stream_->flush_lock() and hold through the sb persist.  Append unaffected.
 //   • Reads of records_ use StreamTracker's internal synchronisation; lsns are atomics.
 // ─────────────────────────────────────────────────────────────────────────────
-class LogStore {
+class LogStore : public LogStreamClient {
 public:
     LogStore(const LogStore&) = delete;
     LogStore& operator=(const LogStore&) = delete;
     LogStore(LogStore&&) = delete;
     LogStore& operator=(LogStore&&) = delete;
-    ~LogStore() = default;
+    ~LogStore() override = default;
 
     // ── Factories (called by LogStoreManager) ────────────────────────────────
 
@@ -180,16 +180,16 @@ public:
 
     /// Computes trunc_key (ascending: this record's own key; out-of-order: pinned to current tail's trunc_key),
     /// updates records_[lsn] with both keys, advances tail_lsn_ and next_lsn_ (atomic-update-max).
-    void on_write_completion(lsn_t lsn, const stream_key& key);
+    void on_write_completion(lsn_t lsn, const stream_key& key) override;
 
     /// Same trunc_key derivation as on_write_completion.  Inserts the record with both keys (recovery path
     /// doesn't reserve via create() at append time), advances tail_lsn_ and next_lsn_, fires the replay handler.
     /// Skips records below head_lsn_ or inside any persisted rollback range.
-    void on_log_found(lsn_t lsn, const stream_key& key, const sisl::ByteView& data);
+    void on_log_found(lsn_t lsn, const stream_key& key, const sisl::ByteView& data) override;
 
     // ── Accessors ────────────────────────────────────────────────────────────
 
-    logstore_id_t store_id() const { return store_id_; }
+    logstore_id_t store_id() const override { return store_id_; }
     uint64_t stream_id() const { return stream_->stream_id(); }
     lsn_t head_lsn() const { return head_lsn_.load(std::memory_order_acquire); }
     lsn_t tail_lsn() const { return tail_lsn_.load(std::memory_order_acquire); }
@@ -201,6 +201,10 @@ public:
     std::optional< uint64_t > min_trunc_stream_offset() const;
 
     const shared< LogStream >& stream() const { return stream_; }
+
+    /// Exposed so LogStoreManager::drop_unopened_stores can hand the underlying MetaBlk to
+    /// MetaClient::remove_meta_blk.  Not for general use.
+    const MetaBlk& sb_blk() const { return meta_blk_.meta_blk(); }
 
     LogStore(shared< LogStream > stream, MetaBlkWrapper&& mb, logstore_id_t sid, bool is_append_mode,
              lsn_t head_lsn, std::vector< logid_range > rollback_ranges);

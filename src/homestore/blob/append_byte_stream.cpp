@@ -96,6 +96,7 @@ folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(uint64_t 
     stream->head_offset_ = recovered_head;
     stream->tail_offset_ = recovered_tail;
     stream->offset_in_first_chunk_ = recovered_head % chunk_sz;
+    stream->chain_seed_ = s->chain_seed;
 
     // Look up chunks from the vdev by their ids and install into the stream.  StreamBase::install_chunks sorts
     // them by vdev_order before publishing.
@@ -367,6 +368,7 @@ folly::coro::Task< void > AppendByteStream::persist_stream_sb() {
     sb->head_offset = head_offset_;
     sb->tail_offset = tail_offset_;
     sb->n_chunks = to_u32(cids.size());
+    sb->chain_seed = chain_seed_;
     std::memcpy(sb->chunk_ids(), cids.data(), cids.size() * sizeof(uint32_t));
 
     auto lock = co_await mblk_mutex_.co_scoped_lock();

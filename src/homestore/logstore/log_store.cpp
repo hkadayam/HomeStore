@@ -331,9 +331,8 @@ folly::coro::Task< void > LogStore::persist_sb() {
     sb->append_mode = append_mode_ ? 1 : 0;
     sb->head_lsn = head_lsn_.load(std::memory_order_acquire);
     sb->n_rollback_ranges = n;
-    if (n > 0) {
-        std::memcpy(sb->rollback_ranges(), rollback_ranges_.data(), n * sizeof(logid_range));
-    }
+    // logid_range is std::pair, not trivially copyable — copy element-wise instead of memcpy.
+    std::copy(rollback_ranges_.begin(), rollback_ranges_.end(), sb->rollback_ranges());
     co_await meta_blk_.write(buf->cbytes(), sz);
 }
 

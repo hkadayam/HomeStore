@@ -52,7 +52,9 @@ LogStoreManager::LogStoreManager(shared< MetaClient > meta_client, shared< Virtu
 folly::coro::Task< void > LogStoreManager::create() {
     LOGINFO("LogStoreManager: first boot — creating fresh manager");
 
-    auto meta_client = co_await meta_mgr().register_client("LogStoreManager");
+    // register_client returns MetaClient by value (move-only).  Wrap in shared_ptr immediately so the same handle
+    // can be shared across LogStream + LogStoreManager + each LogStore created later.
+    auto meta_client = std::make_shared< MetaClient >(co_await meta_mgr().register_client("LogStoreManager"));
 
     const uint64_t chunk_size = HS_DYNAMIC_CONFIG(logstore.chunk_size);
     const uint32_t initial_num_chunks = HS_DYNAMIC_CONFIG(logstore.initial_num_chunks);
@@ -74,7 +76,7 @@ folly::coro::Task< void > LogStoreManager::create() {
 folly::coro::Task< void > LogStoreManager::load() {
     LOGINFO("LogStoreManager: starting recovery scan");
 
-    auto meta_client = co_await meta_mgr().register_client("LogStoreManager");
+    auto meta_client = std::make_shared< MetaClient >(co_await meta_mgr().register_client("LogStoreManager"));
 
     // 1. Scan MetaBlks for the LogStream sb (logstream_sb_<sid>) and per-store sbs (LogStore_<sid>).  We have a
     //    single stream so collect just its mblk; collect each per-store mblk indexed by store_id.
@@ -146,7 +148,10 @@ folly::coro::Task< void > LogStoreManager::load() {
     LOGINFO("LogStoreManager: loaded {} log_store(s)", mgr->log_stores_.size());
 }
 
-void LogStoreManager::shutdown() {
+folly::coro::Task< void > LogStoreManager::shutdown() {
+    if (log_stream_) {
+        co_await log_stream_->stop();
+    }
     {
         std::unique_lock lk{stores_mutex_};
         log_stores_.clear();
@@ -237,7 +242,7 @@ folly::coro::Task< void > LogStoreManager::drop_unopened_stores() {
         const auto sid = s->store_id();
         LOGWARN("LogStoreManager: dropping unopened log_store sid={}", sid);
         // Remove sb mblk so a subsequent restart won't re-discover this store.
-        co_await meta_client_->remove_meta_blk(fmt::format("{}{}", kLogStoreSbPrefix, sid));
+        co_await meta_client_->remove_meta_blk(s->sb_blk());
         std::unique_lock lk{stores_mutex_};
         log_stores_.erase(sid);
     }

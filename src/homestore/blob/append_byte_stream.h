@@ -25,7 +25,7 @@
 
 #include <folly/coro/Task.h>
 
-#include <homestore/blk.h>                 // BlkId, blk_count_t, chunk_num_t
+#include <homestore/base/blk.h>                 // BlkId, blk_count_t, chunk_num_t
 #include "homestore/base/homestore_decl.h" // shared<>, unique<>
 #include <sisl/fds/buffer.h>               // sisl::Blob, sisl::BufBuilder
 
@@ -192,6 +192,12 @@ protected:
 
     AppendByteStream(uint64_t stream_id, MetaClient& meta_client, std::string dev_name,
                      const shared< VirtualDev >& vdev, uint64_t chunk_size, bool concurrent_safe);
+
+    /// Set tail_offset_ to `tail` and prime flush_buf_ so the next append/flush continues from there without
+    /// clobbering on-disk bytes.  When `tail` is not block-aligned, reads back the partial-tail block from disk
+    /// and seeds flush_buf_ with its valid bytes.  Used by load() with the sb-recovered tail and by LogStream's
+    /// post-CRC-walk recover with the chain-discovered tail.
+    folly::coro::Task< void > resume_writes_at(uint64_t tail);
 
 private:
 

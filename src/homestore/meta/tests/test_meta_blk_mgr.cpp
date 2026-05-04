@@ -32,8 +32,8 @@
 #include "base/test_defs.h"
 
 #include "common/defs.h"
-#include "homestore/blk.h"
-#include "homestore/crc.h"
+#include "homestore/base/blk.h"
+#include "homestore/base/crc.h"
 #include "device/device_manager.h"
 #include "device/physical_dev.h"
 #include "device/virtual_dev.h"

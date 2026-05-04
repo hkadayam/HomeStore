@@ -25,7 +25,7 @@
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
 
-#include <homestore/blk.h>
+#include <homestore/base/blk.h>
 #include "common/defs.h"
 #include "segment_manager.h"
 

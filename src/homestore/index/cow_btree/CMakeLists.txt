@@ -13,7 +13,7 @@ target_sources(hs_cow_btree PRIVATE
 # so it picks up the async BtreeSharedMutex / NodeCore layout — a single shared hs_btree would ODR-clash with
 # the sync-mode mem_btree consumer.
 target_compile_definitions(hs_cow_btree PRIVATE BTREE_ASYNC_MODE)
-target_link_libraries(hs_cow_btree ${COMMON_DEPS})
+target_link_libraries(hs_cow_btree sisl_flip ${COMMON_DEPS})
 
 if(NOT DEFINED BUILD_TESTING OR BUILD_TESTING)
     add_subdirectory(tests)

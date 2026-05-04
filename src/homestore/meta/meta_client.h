@@ -24,7 +24,7 @@
 #include <folly/coro/Mutex.h>
 #include <folly/coro/Task.h>
 
-#include <homestore/blk.h>              // BlkId
+#include <homestore/base/blk.h>              // BlkId
 #include "common/defs.h" // shared<>, unique<>, cshared<>
 
 #include "meta/meta_blk.h"         // MetaBlk

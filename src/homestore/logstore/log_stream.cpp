@@ -427,8 +427,10 @@ folly::coro::Task< void > LogStream::recover(lookup_store_fn lookup) {
         tail_offset_ = prev_tail; // restore; next iteration recomputes if needed
     }
 
-    // Final tail is where the first invalid (or missing) group would have started.
-    tail_offset_ = cursor;
+    // Final tail is where the first invalid (or missing) group would have started.  Use AppendByteStream's
+    // resume_writes_at so flush_buf_ is primed with any partial-tail-block bytes (the next flush would otherwise
+    // clobber them by writing a fresh block at offset 0 within the partial block).
+    co_await resume_writes_at(cursor);
     LSTREAM_LOG(INFO, "recover: done — {} groups, {} records, tail_offset={} log_id={}", groups_recovered,
                 records_recovered, tail_offset_, log_id_.load());
 

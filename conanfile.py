@@ -23,26 +23,53 @@ class HomestoreConan(ConanFile):
                 "shared": ['True', 'False'],
                 "fPIC": ['True', 'False'],
                 "coverage": ['True', 'False'],
-                "sanitize": ['True', 'False'],
-                "testing" : ['full', 'min', 'off', 'epoll_mode', 'spdk_mode'],
+                "sanitize": ['auto', 'True', 'False'],
+                "testing" : ['full', 'min', 'off'],
+                "malloc_impl": ['libc', 'tcmalloc', 'jemalloc'],
             }
     default_options = {
                 'shared':       False,
                 'fPIC':         True,
                 'coverage':     False,
-                'sanitize':     False,
-                'testing':      'epoll_mode',
+                'sanitize':     'auto',
+                'testing':      'min',
+                'malloc_impl':  'jemalloc',
             }
 
     exports_sources = "cmake/*", "src/*", "CMakeLists.txt", "test_wrap.sh", "LICENSE"
     keep_imports = True
 
+    # ── Helpers — derive effective values without mutating self.options ─────────────────────────────────────────────
+    # Conan 2 forbids assigning to self.options.<x> after the recipe options have been frozen (which is by the time
+    # configure() runs).  These helpers compute the effective sanitize / malloc_impl on demand instead.
+    def _is_sanitize_on(self):
+        if str(self.options.sanitize) == 'True':
+            return True
+        if (str(self.options.sanitize) == 'auto'
+                and self.settings.build_type == "Debug"
+                and not self.options.coverage):
+            return True
+        return False
+
+    def _malloc_impl(self):
+        # ASAN intercepts malloc/free/new/delete and conflicts with tcmalloc/jemalloc which override the same
+        # symbols.  Force libc when sanitize is on, regardless of what the user requested.
+        if self._is_sanitize_on():
+            return 'libc'
+        return str(self.options.malloc_impl)
+
     def configure(self):
         if self.options.shared:
             self.options.rm_safe("fPIC")
-        if self.settings.build_type == "Debug":
-            if self.options.coverage and self.options.sanitize:
-                raise ConanInvalidConfiguration("Sanitizer does not work with Code Coverage!")
+
+        # sanitize is only valid for Debug builds.  Reject explicit True on Release/RelWithDebInfo so it cannot be
+        # turned on accidentally.
+        if str(self.options.sanitize) == 'True' and self.settings.build_type != "Debug":
+            raise ConanInvalidConfiguration(
+                "sanitize=True is only valid for build_type=Debug (got {})".format(self.settings.build_type))
+
+        if self._is_sanitize_on() and self.options.coverage:
+            raise ConanInvalidConfiguration("Sanitizer does not work with Code Coverage!")
 
     def build_requirements(self):
         self.test_requires("benchmark/1.8.2")
@@ -75,9 +102,16 @@ class HomestoreConan(ConanFile):
         # Tests require OpenSSL 3.x
         self.requires("openssl/[^3.1]", override=True)
 
+        # Memory allocation — _malloc_impl() folds in the ASAN auto-coerce.
+        impl = self._malloc_impl()
+        if impl == "tcmalloc":
+            self.requires("gperftools/2.15", transitive_headers=True)
+        elif impl == "jemalloc":
+            self.requires("jemalloc/5.3.0", transitive_headers=True)
+
     def layout(self):
         self.folders.source = "."
-        if self.options.get_safe("sanitize"):
+        if self._is_sanitize_on():
             self.folders.build = join("build", "Sanitized")
         elif self.options.get_safe("coverage"):
             self.folders.build = join("build", "Coverage")
@@ -107,10 +141,11 @@ class HomestoreConan(ConanFile):
         if self.settings.build_type == "Debug":
             if self.options.get_safe("coverage"):
                 tc.variables['BUILD_COVERAGE'] = 'ON'
-            elif self.options.get_safe("sanitize"):
+            elif self._is_sanitize_on():
                 tc.variables['MEMORY_SANITIZER_ON'] = 'ON'
         tc.variables["CONAN_PACKAGE_NAME"] = self.name
         tc.variables["CONAN_PACKAGE_VERSION"] = self.version
+        tc.variables["MALLOC_IMPL"] = self._malloc_impl()
         # On macOS with Unix Makefiles generator, cmake passes CMAKE_OSX_SYSROOT
         # literally to clang. Resolve the symbolic SDK name to a real path here so
         # the toolchain file contains an absolute path that clang can use.
@@ -146,10 +181,17 @@ class HomestoreConan(ConanFile):
         copy(self, "*.dll", self.build_folder, join(self.package_folder, "lib"), keep_path=False)
 
     def package_info(self):
-        if self.options.sanitize:
+        if self._is_sanitize_on():
             self.cpp_info.sharedlinkflags.append("-fsanitize=address")
             self.cpp_info.exelinkflags.append("-fsanitize=address")
             self.cpp_info.sharedlinkflags.append("-fsanitize=undefined")
             self.cpp_info.exelinkflags.append("-fsanitize=undefined")
+        impl = self._malloc_impl()
+        if impl == 'jemalloc':
+            self.cpp_info.defines.append("USE_JEMALLOC=1")
+            self.cpp_info.requires.extend(["jemalloc::jemalloc"])
+        elif impl == 'tcmalloc':
+            self.cpp_info.defines.append("USING_TCMALLOC=1")
+            self.cpp_info.requires.extend(["gperftools::gperftools"])
         if self.settings.os == "Linux":
             self.cpp_info.system_libs.append("aio")

@@ -8,7 +8,7 @@
 
 #include <folly/Expected.h>
 
-#include "homestore/blk.h"
+#include "homestore/base/blk.h"
 #include "homestore/checkpoint/cp_mgr.h"
 #include "sisl/fds/buffer.h"
 #include "sisl/fds/enum.h"

@@ -99,13 +99,6 @@ table Device {
 }
 
 table LogStore {
-    // VDev chunk size for the logstore vdev. Controls reservation granularity and the unit by which the
-    // underlying AppendByteStream extends/reclaims space.
-    chunk_size: uint64 = 67108864; // 64 MB
-
-    // Initial chunk count when the logstore vdev is first created. Grows on demand as the stream fills.
-    initial_num_chunks: uint32 = 4;
-
     // Auto-flush trigger #1 — accumulated unflushed bytes (excluding LogGroup framing overhead, ~20 B header
     // + 24 B/record). When pending bytes cross this threshold, the next quick_append schedules a flush.
     flush_threshold_size: uint64 = 4096 (hotswap); // 4KB

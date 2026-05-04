@@ -205,9 +205,8 @@ CORO_TEST_F(DevMgrTest, VdevPersistAcrossRestart) {
 
         VDevParameters p1;
         p1.vdev_name = "persist_a";
-        p1.vdev_size = CHUNK_SIZE;
-        p1.num_chunks = 1;
-        p1.chunk_size = CHUNK_SIZE;
+        p1.initial_chunk_size = CHUNK_SIZE;
+        p1.initial_num_chunks = 1;
         p1.blk_size = BLK_SIZE;
         p1.dev_type = HSDevType::Data;
         p1.multi_pdev_opts = MultiPDevOpts::SingleFirstPDev;

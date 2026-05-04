@@ -59,9 +59,9 @@ public:
     LogStoreManager& operator=(LogStoreManager&&) = delete;
     ~LogStoreManager() = default;
 
-    /// First-boot path: create the VDev (params pulled from HS_CONFIG), LogStream, and an empty
-    /// LogStoreManager.
-    static folly::coro::Task< void > create();
+    /// First-boot path: create the VDev (initial_num_chunks of chunk_size each, expand-on-demand thereafter),
+    /// the LogStream, and an empty LogStoreManager.  These params are format-time-only and not in dynamic config.
+    static folly::coro::Task< void > create(uint64_t chunk_size, uint32_t initial_num_chunks);
 
     /// Restart path: discover LogStream + LogStores from MetaBlks; does NOT walk the LogStream's CRC chain
     /// (caller must invoke recover() after open_log_store calls so on_log_found dispatch can find handlers).

@@ -23,7 +23,7 @@
 
 #include <folly/Expected.h>
 #include <folly/futures/Future.h>
-#include <homestore/homestore.hpp>
+#include <homestore/homestore.h>
 #include <homestore/replication_service.hpp>
 #include <homestore/replication/repl_dev.h>
 #include <homestore/checkpoint/cp_mgr.h>

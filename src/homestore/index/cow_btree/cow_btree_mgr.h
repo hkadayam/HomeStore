@@ -14,7 +14,7 @@
 #include "sisl/cache/two_q_evictor.h"
 
 #include "common/defs.h"
-#include <homestore/blk.h>
+#include <homestore/base/blk.h>
 #include <homestore/checkpoint/cp_mgr.h>
 #include <homestore/index/btree/detail/btree_internal.h>
 #include "sisl/fds/id_reserver.h"

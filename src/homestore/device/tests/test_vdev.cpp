@@ -26,7 +26,7 @@
 #include "iomanager/iomanager.h"
 #include "base/test_defs.h"
 
-#include "homestore/blk.h"
+#include "homestore/base/blk.h"
 #include "base/homestore_config.hpp"
 #include "device/device_manager.h"
 #include "device/physical_dev.h"
@@ -73,9 +73,8 @@ public:
     VDevParameters static_params(const std::string& name, uint32_t num_chunks = 4) const {
         VDevParameters p;
         p.vdev_name = name;
-        p.vdev_size = CHUNK_SIZE * num_chunks;
-        p.num_chunks = num_chunks;
-        p.chunk_size = CHUNK_SIZE;
+        p.initial_chunk_size = CHUNK_SIZE;
+        p.initial_num_chunks = num_chunks;
         p.blk_size = BLK_SIZE;
         p.dev_type = HSDevType::Data;
         p.multi_pdev_opts = MultiPDevOpts::AllPDevStriped;

@@ -27,7 +27,7 @@
 
 namespace homestore {
 
-static uint64_t total_system_memory() {
+uint64_t ResourceMgr::total_system_memory() {
 #ifdef __linux__
     long pages = ::sysconf(_SC_PHYS_PAGES);
     long page_size = ::sysconf(_SC_PAGE_SIZE);
@@ -46,8 +46,8 @@ static uint64_t total_system_memory() {
 }
 
 void ResourceMgr::start(uint64_t dev_capacity, std::optional< uint64_t > mem_cap) {
-    const uint64_t resolved_mem_cap =
-        mem_cap.value_or((total_system_memory() * HS_DYNAMIC_CONFIG(resource_limits.sys_mem_use_percent)) / 100);
+    const uint64_t resolved_mem_cap = mem_cap.value_or(
+        (ResourceMgr::total_system_memory() * HS_DYNAMIC_CONFIG(resource_limits.sys_mem_use_percent)) / 100);
     const uint64_t cache_size = (resolved_mem_cap * HS_DYNAMIC_CONFIG(resource_limits.cache_size_percent)) / 100;
 
     LOGINFO("ResourceMgr starting: dev_capacity={} mem_cap={} (caller_provided={}) cache_size={}", dev_capacity,

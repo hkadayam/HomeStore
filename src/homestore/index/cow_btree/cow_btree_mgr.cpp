@@ -1,5 +1,7 @@
 #include <folly/coro/Collect.h>
 
+#include <sisl/flip/flip.h>
+
 #include "index/cow_btree/cow_btree_mgr.h"
 #include "index/cow_btree/cow_btree.h"
 #include "base/homestore_config.hpp" // HS_DYNAMIC_CONFIG
@@ -125,6 +127,13 @@ folly::coro::Task< void > COWBtreeManager::destroy_cow_btree(cshared< BtreeBase 
 }
 
 bool COWBtreeManager::should_force_full_flush() const {
+    // Test-only override: when the "force_full_map_flush" flip is set, the next CP is forced to be a full-map flush
+    // regardless of the incr-map size threshold below.  Recovery tests use this to deterministically drive full vs
+    // incremental flush sequences.
+    if (flip::Flip::instance().test_flip("force_full_map_flush")) {
+        return true;
+    }
+
     auto cap = device_mgr().total_capacity_by_type(HSDevType::Fast);
     if (cap == 0) {
         cap = device_mgr().total_capacity_by_type(HSDevType::Data);

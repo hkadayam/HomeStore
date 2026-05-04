@@ -24,7 +24,7 @@
 #include <sisl/settings/settings.hpp>
 #include <iomgr/io_environment.hpp>
 #include <iomgr/iomgr_flip.hpp>
-#include <homestore/homestore.hpp>
+#include <homestore/homestore.h>
 #include <homestore/index_service.hpp>
 #include <homestore/replication_service.hpp>
 #include <homestore/checkpoint/cp_mgr.h>

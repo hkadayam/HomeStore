@@ -3,7 +3,7 @@
 #include <filesystem>
 #include <gtest/gtest.h>
 #include <iomgr/io_environment.hpp>
-#include <homestore/homestore.hpp>
+#include <homestore/homestore.h>
 
 #include "test_common/homestore_test_common.hpp"
 #include "replication/log_store/home_raft_log_store.h"

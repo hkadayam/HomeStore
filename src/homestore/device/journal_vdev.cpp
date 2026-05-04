@@ -22,7 +22,7 @@
 
 #include <sisl/logging/logging.h>
 #include <iomgr/iomgr_flip.hpp>
-#include <homestore/homestore.hpp>
+#include <homestore/homestore.h>
 #include <homestore/logstore_service.hpp>
 #include "device/chunk.h"
 #include "device/device.h"

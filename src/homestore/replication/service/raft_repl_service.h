@@ -25,7 +25,7 @@
 #include <sisl/fds/buffer.h>
 #include <sisl/logging/logging.h>
 
-#include <homestore/homestore.hpp>
+#include <homestore/homestore.h>
 #include <homestore/superblk_handler.hpp>
 #include "replication/service/generic_repl_svc.h"
 

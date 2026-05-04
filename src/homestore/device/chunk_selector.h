@@ -22,7 +22,7 @@
 #include <vector>
 
 #include "sisl/fds/enum.h"
-#include "homestore/blk.h" // blk_count_t, blk_alloc_hints
+#include "homestore/base/blk.h" // blk_count_t, blk_alloc_hints
 
 namespace homestore {
 

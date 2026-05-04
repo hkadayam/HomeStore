@@ -23,7 +23,7 @@
 
 #include <folly/coro/Task.h>
 
-#include <homestore/blk.h>              // BlkId, BlkAllocStatus, blk_count_t, blk_alloc_hints
+#include <homestore/base/blk.h>              // BlkId, BlkAllocStatus, blk_count_t, blk_alloc_hints
 #include "homestore/base/homestore_decl.h" // shared<>, unique<>
 #include <sisl/fds/concurrent_insert_vector.h>
 

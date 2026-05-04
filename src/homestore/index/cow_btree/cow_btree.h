@@ -6,7 +6,7 @@
 #include <vector>
 
 #include <sisl/cache/cache.h>
-#include <homestore/blk.h>
+#include <homestore/base/blk.h>
 #include <homestore/index/btree/btree_base.h>
 #include <homestore/checkpoint/cp_mgr.h>
 

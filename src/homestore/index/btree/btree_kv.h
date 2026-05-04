@@ -23,7 +23,7 @@
 
 #include <fmt/format.h>
 
-#include "homestore/blk.h"
+#include "homestore/base/blk.h"
 #include "homestore/base/homestore_assert.hpp"
 #include "sisl/fds/buffer.h"
 #include "homestore/index/btree/detail/btree_internal.h"

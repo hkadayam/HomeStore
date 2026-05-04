@@ -17,7 +17,7 @@
 #include "storage_engine_buffer.h"
 #include <sisl/fds/utils.h>
 #include "common/homestore_assert.hpp"
-#include <homestore/homestore.hpp>
+#include <homestore/homestore.h>
 #include <iomgr/iomgr_flip.hpp>
 
 using namespace homestore;

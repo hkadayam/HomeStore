@@ -24,7 +24,7 @@
 #include <folly/small_vector.h>
 
 #include "common/defs.h"
-#include "homestore/crc.h"
+#include "homestore/base/crc.h"
 #include "sisl/fds/enum.h"
 #include "sisl/fds/obj_life_counter.h"
 #include "base/homestore_assert.hpp" // HS_REL_ASSERT

@@ -31,7 +31,7 @@
 #include <sisl/options/options.h>
 #include <farmhash.h>
 
-#include <homestore/homestore.hpp>
+#include <homestore/homestore.h>
 #include <homestore/logstore_service.hpp>
 #include "common/homestore_utils.hpp"
 #include "common/homestore_assert.hpp"

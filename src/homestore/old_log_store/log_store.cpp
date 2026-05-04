@@ -20,7 +20,7 @@
 #include <iomgr/iomgr.hpp>
 #include <sisl/fds/thread_factory.h>
 
-#include <homestore/homestore.hpp>
+#include <homestore/homestore.h>
 #include <homestore/logstore_service.hpp>
 #include "common/homestore_assert.hpp"
 #include "log_dev.hpp"

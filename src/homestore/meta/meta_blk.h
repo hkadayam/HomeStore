@@ -23,8 +23,8 @@
 
 #include <folly/coro/Task.h>
 
-#include <homestore/blk.h>              // BlkId, BlkAllocStatus, blk_alloc_hints
-#include <homestore/crc.h>              // crc32_ieee
+#include <homestore/base/blk.h>              // BlkId, BlkAllocStatus, blk_alloc_hints
+#include <homestore/base/crc.h>              // crc32_ieee
 #include "common/defs.h"                // shared<>, unique<>, to_u32
 #include "base/homestore_assert.hpp"    // HS_SUBMOD_LOG
 

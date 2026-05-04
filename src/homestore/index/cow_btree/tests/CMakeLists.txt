@@ -25,3 +25,24 @@ target_link_libraries(test_cow_btree_io PRIVATE
     GTest::gtest
 )
 add_test(NAME CowBtreeIOTest COMMAND test_cow_btree_io)
+
+add_executable(test_cow_btree_local test_cow_btree_local.cpp)
+target_compile_definitions(test_cow_btree_local PRIVATE BTREE_ASYNC_MODE)
+target_link_libraries(test_cow_btree_local PRIVATE
+    hs_cow_btree
+    hs_blob
+    hs_checkpoint
+    hs_meta
+    hs_device
+    hs_blkalloc
+    hs_base
+    iomanager
+    sisl_cache
+    sisl_flip
+    sisl_metrics
+    sisl_settings
+    sisl_logging
+    ${COMMON_DEPS}
+    GTest::gtest
+)
+add_test(NAME CowBtreeLocalTest COMMAND test_cow_btree_local)

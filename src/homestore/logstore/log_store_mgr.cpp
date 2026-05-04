@@ -49,15 +49,13 @@ LogStoreManager::LogStoreManager(shared< MetaClient > meta_client, shared< Virtu
 // create / load / shutdown
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > LogStoreManager::create() {
-    LOGINFO("LogStoreManager: first boot — creating fresh manager");
+folly::coro::Task< void > LogStoreManager::create(uint64_t chunk_size, uint32_t initial_num_chunks) {
+    LOGINFO("LogStoreManager: first boot — creating fresh manager (chunk_size={} initial_num_chunks={})", chunk_size,
+            initial_num_chunks);
 
     // register_client returns MetaClient by value (move-only).  Wrap in shared_ptr immediately so the same handle
     // can be shared across LogStream + LogStoreManager + each LogStore created later.
     auto meta_client = std::make_shared< MetaClient >(co_await meta_mgr().register_client("LogStoreManager"));
-
-    const uint64_t chunk_size = HS_DYNAMIC_CONFIG(logstore.chunk_size);
-    const uint32_t initial_num_chunks = HS_DYNAMIC_CONFIG(logstore.initial_num_chunks);
 
     VDevParameters params{};
     params.vdev_name = kVdevName;

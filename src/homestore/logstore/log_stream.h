@@ -30,7 +30,7 @@
 
 #include "iomanager/coro_timer.h"
 
-#include <homestore/crc.h>
+#include <homestore/base/crc.h>
 
 #include "homestore/base/homestore_decl.h"
 #include "blob/append_byte_stream.h"

@@ -39,7 +39,6 @@
 #include <nlohmann/json.hpp>
 
 #include <sisl/logging/logging.h>
-#include <sisl/metrics/histogram_buckets.hpp>
 #include <sisl/metrics/metrics.h>
 
 #if defined(USING_TCMALLOC)
@@ -73,12 +72,9 @@ public:
         REGISTER_GAUGE(thread_cache_freelist_size, "Bytes in thread cache freelist");
         REGISTER_GAUGE(os_released_bytes, "Bytes released to OS");
 
-        REGISTER_HISTOGRAM(free_page_span_distribution, "Continuous pages in heap freelist(higher the better)",
-                           HistogramBucketsType(LinearUpto128Buckets));
-        REGISTER_HISTOGRAM(unmapped_page_span_distribution, "Continuous pages returned back to system",
-                           HistogramBucketsType(LinearUpto128Buckets));
-        REGISTER_HISTOGRAM(inuse_page_span_distribution, "Continuous pages which are being used by app",
-                           HistogramBucketsType(LinearUpto128Buckets));
+        REGISTER_HISTOGRAM(free_page_span_distribution, "Continuous pages in heap freelist(higher the better)");
+        REGISTER_HISTOGRAM(unmapped_page_span_distribution, "Continuous pages returned back to system");
+        REGISTER_HISTOGRAM(inuse_page_span_distribution, "Continuous pages which are being used by app");
 #elif defined(USING_JEMALLOC) || defined(USE_JEMALLOC)
         REGISTER_GAUGE(active_memory, "Bytes in active pages allocated by the application");
         REGISTER_GAUGE(allocated_memory, "Bytes allocated by the application");
@@ -100,7 +96,9 @@ public:
     MallocMetrics& operator=(const MallocMetrics&) = delete;
     MallocMetrics& operator=(MallocMetrics&&) noexcept = delete;
 
-    ~MallocMetrics() { deregister_me_from_farm(); }
+    ~MallocMetrics() {
+        deregister_me_from_farm();
+    }
 
     void on_gather() {
 #ifdef USING_TCMALLOC
@@ -110,7 +108,9 @@ public:
 #endif
     }
 
-    static void enable() { get(); }
+    static void enable() {
+        get();
+    }
     static MallocMetrics& get() {
         static MallocMetrics malloc_metrics;
         return malloc_metrics;
@@ -366,10 +366,13 @@ static void get_parse_tcmalloc_stats(nlohmann::json* const j, MallocMetrics* con
                 GAUGE_UPDATE(*metrics, os_released_bytes, std::stol(match.str(1)));
             }
         } else if (std::regex_search(line, match, re2) && match.size() > 1) {
-            if (j) (*j)["Stats"]["Malloc"][match.str(2)] = match.str(1);
+            if (j)
+                (*j)["Stats"]["Malloc"][match.str(2)] = match.str(1);
             if (match.str(2) == "Tcmalloc page size") {
                 const auto sz{std::stol(match.str(1))};
-                if (sz != 0) { tcmalloc_page_size = sz; }
+                if (sz != 0) {
+                    tcmalloc_page_size = sz;
+                }
             }
         } else if (j) {
             if (std::regex_search(line, match, re3) && match.size() > 1) {
@@ -390,7 +393,9 @@ static void get_parse_tcmalloc_stats(nlohmann::json* const j, MallocMetrics* con
         }
     }
 
-    if (metrics) { MallocExtension::instance()->Ranges(nullptr, update_tcmalloc_range_stats); }
+    if (metrics) {
+        MallocExtension::instance()->Ranges(nullptr, update_tcmalloc_range_stats);
+    }
     delete[] stats_buf;
 }
 #elif defined(USING_JEMALLOC) || defined(USE_JEMALLOC)
@@ -412,7 +417,9 @@ static void get_parse_jemalloc_stats(nlohmann::json* const j, MallocMetrics* con
     if (::mallctlbymib(stats_allocated_mib.first.data(), stats_allocated_mib.second, &allocated, &sz_allocated, nullptr,
                        0) == 0) {
         GAUGE_UPDATE(*metrics, allocated_memory, allocated);
-        if (j) { (*j)["Stats"]["Malloc"]["Allocated"] = allocated; }
+        if (j) {
+            (*j)["Stats"]["Malloc"]["Allocated"] = allocated;
+        }
     }
 
     size_t active{0};
@@ -420,7 +427,9 @@ static void get_parse_jemalloc_stats(nlohmann::json* const j, MallocMetrics* con
     static const auto& stats_active_mib{jemalloc_statics.get_stats_active_mib()};
     if (::mallctlbymib(stats_active_mib.first.data(), stats_active_mib.second, &active, &sz_active, nullptr, 0) == 0) {
         GAUGE_UPDATE(*metrics, active_memory, active);
-        if (j) { (*j)["Stats"]["Malloc"]["Active"] = active; }
+        if (j) {
+            (*j)["Stats"]["Malloc"]["Active"] = active;
+        }
     }
 
     size_t mapped{0};
@@ -428,7 +437,9 @@ static void get_parse_jemalloc_stats(nlohmann::json* const j, MallocMetrics* con
     static const auto& stats_mapped_mib{jemalloc_statics.get_stats_mapped_mib()};
     if (::mallctlbymib(stats_mapped_mib.first.data(), stats_mapped_mib.second, &mapped, &sz_mapped, nullptr, 0) == 0) {
         GAUGE_UPDATE(*metrics, mapped_memory, mapped);
-        if (j) { (*j)["Stats"]["Malloc"]["Mapped"] = mapped; }
+        if (j) {
+            (*j)["Stats"]["Malloc"]["Mapped"] = mapped;
+        }
     }
 
     size_t resident{0};
@@ -437,7 +448,9 @@ static void get_parse_jemalloc_stats(nlohmann::json* const j, MallocMetrics* con
     if (::mallctlbymib(stats_resident_mib.first.data(), stats_resident_mib.second, &resident, &sz_resident, nullptr,
                        0) == 0) {
         GAUGE_UPDATE(*metrics, resident_memory, resident);
-        if (j) { (*j)["Stats"]["Malloc"]["Resident"] = resident; }
+        if (j) {
+            (*j)["Stats"]["Malloc"]["Resident"] = resident;
+        }
     }
 
     size_t retained{0};
@@ -446,7 +459,9 @@ static void get_parse_jemalloc_stats(nlohmann::json* const j, MallocMetrics* con
     if (::mallctlbymib(stats_retained_mib.first.data(), stats_retained_mib.second, &retained, &sz_retained, nullptr,
                        0) == 0) {
         GAUGE_UPDATE(*metrics, retained_memory, retained);
-        if (j) { (*j)["Stats"]["Malloc"]["Retained"] = retained; }
+        if (j) {
+            (*j)["Stats"]["Malloc"]["Retained"] = retained;
+        }
     }
 
     size_t metadata_memory{0};
@@ -455,7 +470,9 @@ static void get_parse_jemalloc_stats(nlohmann::json* const j, MallocMetrics* con
     if (::mallctlbymib(stats_metadata_mib.first.data(), stats_metadata_mib.second, &metadata_memory,
                        &sz_metadata_memory, nullptr, 0) == 0) {
         GAUGE_UPDATE(*metrics, metadata_memory, metadata_memory);
-        if (j) { (*j)["Stats"]["Malloc"]["Metadata"]["Memory"] = metadata_memory; }
+        if (j) {
+            (*j)["Stats"]["Malloc"]["Metadata"]["Memory"] = metadata_memory;
+        }
     }
 
     size_t metadata_thp{0};
@@ -464,16 +481,22 @@ static void get_parse_jemalloc_stats(nlohmann::json* const j, MallocMetrics* con
     if (::mallctlbymib(stats_metadata_thp_mib.first.data(), stats_metadata_thp_mib.second, &metadata_thp,
                        &sz_metadata_thp, nullptr, 0) == 0) {
         GAUGE_UPDATE(*metrics, metadata_thp, metadata_thp);
-        if (j) { (*j)["Stats"]["Malloc"]["Metadata"]["THP"] = metadata_thp; }
+        if (j) {
+            (*j)["Stats"]["Malloc"]["Metadata"]["THP"] = metadata_thp;
+        }
     }
 
     const size_t dirty_pages{get_jemalloc_dirty_page_count()};
     GAUGE_UPDATE(*metrics, dirty_memory, dirty_pages * jemalloc_statics.page_size());
-    if (j) { (*j)["Stats"]["Malloc"]["Arenas"]["DirtyPages"] = dirty_pages; }
+    if (j) {
+        (*j)["Stats"]["Malloc"]["Arenas"]["DirtyPages"] = dirty_pages;
+    }
 
     const size_t muzzy_pages{get_jemalloc_muzzy_page_count()};
     GAUGE_UPDATE(*metrics, muzzy_memory, muzzy_pages * jemalloc_statics.page_size());
-    if (j) { (*j)["Stats"]["Malloc"]["Arenas"]["MuzzyPages"] = muzzy_pages; }
+    if (j) {
+        (*j)["Stats"]["Malloc"]["Arenas"]["MuzzyPages"] = muzzy_pages;
+    }
 }
 
 static void print_my_jemalloc_data(void* const opaque, const char* const buf) {
@@ -500,7 +523,9 @@ static void print_my_jemalloc_data(void* const opaque, const char* const buf) {
     }
 
     j["Implementation"] = "JEMalloc";
-    if (!detailed.empty()) { j["Stats"] = nlohmann::json::parse(detailed); }
+    if (!detailed.empty()) {
+        j["Stats"] = nlohmann::json::parse(detailed);
+    }
 #endif
 
     char* common_stats;

@@ -30,11 +30,11 @@ using sisl::IOBuffer;
 // ──────────────────────────────────────────────────────────────────────────────
 // create
 // ──────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< void > MetaBlkManager::create(uint64_t vdev_size) {
+folly::coro::Task< void > MetaBlkManager::create(uint64_t chunk_size) {
     VDevParameters params;
     params.vdev_name = "meta_vdev";
     params.blk_size = 512;
-    params.initial_chunk_size = vdev_size; // single chunk holding the whole meta vdev
+    params.initial_chunk_size = chunk_size; // single chunk to start; vdev expands in chunk_size increments on demand
     params.initial_num_chunks = 1;
     params.dev_type = HSDevType::Fast;
     params.multi_pdev_opts = MultiPDevOpts::AllPDevStriped;

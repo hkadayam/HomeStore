@@ -21,7 +21,7 @@
 #include <nlohmann/json.hpp>
 
 #include "homestore/base/homestore_decl.h"
-#include <homestore/blk.h>
+#include <homestore/base/blk.h>
 #include "base/homestore_config.hpp"
 #include "base/homestore_assert.hpp"
 

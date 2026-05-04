@@ -1,0 +1,105 @@
+// Flatbuffer port of flip_spec.proto.  Generated via flatc into flip_spec_generated.h with --gen-object-api so
+// runtime types are mutable C++ structs (FlipSpecT, FlipConditionT, ...) rather than read-only buffer accessors.
+// flip.h stores these object-API types directly; serialization (via FlatBufferBuilder) only happens at the grpc
+// boundary (when/if the remote-control rpc server is wired up).
+
+namespace flip;
+
+enum Operator : ubyte {
+    EQUAL = 0,
+    NOT_EQUAL = 1,
+    LESS_THAN = 2,
+    LESS_THAN_OR_EQUAL = 3,
+    GREATER_THAN = 4,
+    GREATER_THAN_OR_EQUAL = 5,
+    DONT_CARE = 6,
+    REG_EX = 7,
+}
+
+// ── ParamValue: tagged variant ───────────────────────────────────────────────
+table NullValue {}
+table IntValue { v:int; }
+table LongValue { v:long; }
+table DoubleValue { v:double; }
+table StringValue { v:string; }
+table BoolValue { v:bool; }
+table BinaryValue { v:[ubyte]; }
+
+union ParamValueKind {
+    NullValue,
+    IntValue,
+    LongValue,
+    DoubleValue,
+    StringValue,
+    BoolValue,
+    BinaryValue,
+}
+
+table ParamValue {
+    kind:ParamValueKind;
+}
+
+// ── Condition: predicate on a runtime parameter ──────────────────────────────
+table FlipCondition {
+    name:string;
+    oper:Operator = EQUAL;
+    value:ParamValue;
+}
+
+// ── Action: what to do when the flip fires (tagged variant) ──────────────────
+table NoAction {}
+table ActionReturns {
+    retval:ParamValue;
+}
+table ActionDelays {
+    delay_in_usec:ulong;
+}
+table ActionDelayedReturns {
+    delay_in_usec:ulong;
+    retval:ParamValue;
+}
+
+union FlipActionKind {
+    NoAction,
+    ActionReturns,
+    ActionDelays,
+    ActionDelayedReturns,
+}
+
+table FlipAction {
+    action:FlipActionKind;
+}
+
+// ── Frequency: how often the flip fires (tagged variant) ─────────────────────
+table PercentFrequency { v:uint; }
+table EveryNthFrequency { v:uint; }
+
+union FlipFrequencyKind {
+    PercentFrequency,
+    EveryNthFrequency,
+}
+
+table FlipFrequency {
+    count:uint = 0; // 0 = unlimited
+    kind:FlipFrequencyKind;
+}
+
+// ── FlipSpec: top-level ──────────────────────────────────────────────────────
+table FlipSpec {
+    flip_name:string;
+    conditions:[FlipCondition];
+    flip_action:FlipAction;
+    flip_frequency:FlipFrequency;
+}
+
+table FlipResponseMetadataEntry {
+    key:string;
+    value:string;
+}
+
+table FlipResponse {
+    success:bool = false;
+    metadata:[FlipResponseMetadataEntry];
+}
+
+root_type FlipSpec;

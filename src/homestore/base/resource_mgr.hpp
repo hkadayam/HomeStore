@@ -47,6 +47,10 @@ public:
     /// Drop the singleton.
     static void stop();
 
+    /// Total physical RAM on the host, in bytes.  0 if the platform query failed.  Used by HomeStore::start to resolve
+    /// a ProportionalMem InputParams.mem_size into a concrete byte budget.
+    static uint64_t total_system_memory();
+
     uint64_t dev_capacity() const { return dev_capacity_; }
     uint64_t mem_cap() const { return mem_cap_; }
     uint64_t cache_size() const { return cache_size_; }

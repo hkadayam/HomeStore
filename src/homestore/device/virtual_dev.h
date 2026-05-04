@@ -30,7 +30,7 @@
 #include <folly/coro/Task.h>
 #include "sisl/fds/rcu.h"
 
-#include "homestore/blk.h" // BlkId, BlkIds, BlkAllocStatus, blk_alloc_hints, blk_count_t
+#include "homestore/base/blk.h" // BlkId, BlkIds, BlkAllocStatus, blk_alloc_hints, blk_count_t
 
 #include "device/hs_super_blk.h"         // VDevInfo, ChunkInfo, HSSuperBlk
 #include "device/chunk.h"                // Chunk, ChunkPool

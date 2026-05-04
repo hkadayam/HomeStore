@@ -30,8 +30,8 @@
 
 #include <gtest/gtest.h>
 #include <iomgr/iomgr_flip.hpp>
-#include <homestore/blk.h>
-#include <homestore/homestore.hpp>
+#include <homestore/base/blk.h>
+#include <homestore/homestore.h>
 #include <homestore/homestore_decl.hpp>
 #include <homestore/blkdata_service.hpp>
 #include <homestore/replication_service.hpp>

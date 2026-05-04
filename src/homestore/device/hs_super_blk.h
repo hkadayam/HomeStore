@@ -26,7 +26,7 @@
 #include "sisl/fds/utils.h"
 #include "common/defs.h"
 #include "device/device_decl.h"
-#include "homestore/crc.h"
+#include "homestore/base/crc.h"
 
 #ifdef _PRERELEASE
 #include "sisl/flip/flip.h"

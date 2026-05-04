@@ -25,7 +25,7 @@
 #include <sisl/cache/simple_hashmap.h>
 #include <sisl/fds/utils.h>
 
-#include <homestore/blk.h> // BlkId, blk_num_t, blk_count_t, chunk_num_t
+#include <homestore/base/blk.h> // BlkId, blk_num_t, blk_count_t, chunk_num_t
 
 namespace homestore {
 

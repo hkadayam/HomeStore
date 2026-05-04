@@ -94,7 +94,6 @@ folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(uint64_t 
         new AppendByteStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_sz, concurrent_safe}};
     stream->sb_mblk_ = std::move(sb);
     stream->head_offset_ = recovered_head;
-    stream->tail_offset_ = recovered_tail;
     stream->offset_in_first_chunk_ = recovered_head % chunk_sz;
     stream->chain_seed_ = s->chain_seed;
 
@@ -107,20 +106,25 @@ folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(uint64_t 
     }
     stream->install_chunks(std::move(chunks));
 
-    // If the recovered tail is not block-aligned, read the partial tail block from disk and inject its valid bytes
-    // into flush_buf_ so the next append/flush carries them forward (same mechanism flush() uses for the live case).
-    const uint32_t blk_sz = stream->block_size();
-    if (recovered_tail > 0 && (recovered_tail % blk_sz) != 0) {
-        const uint32_t partial = recovered_tail % blk_sz;
-        auto [cid, offset_in_chunk] = stream->resolve(recovered_tail - partial);
-        auto [ec, rbuf] = co_await stream->read_blocks(cid, to_u32(offset_in_chunk / blk_sz), 1);
-        if (!ec) {
-            stream->flush_buf_.start_offset = recovered_tail - partial;
-            stream->flush_buf_.builder.append(sisl::Blob{rbuf.bytes(), partial});
-        }
-    }
+    co_await stream->resume_writes_at(recovered_tail);
 
     co_return stream;
+}
+
+folly::coro::Task< void > AppendByteStream::resume_writes_at(uint64_t tail) {
+    tail_offset_ = tail;
+    const uint32_t blk_sz = block_size();
+    if (tail == 0 || (tail % blk_sz) == 0) {
+        co_return; // block-aligned (or empty) — no partial bytes to carry
+    }
+    const uint32_t partial = tail % blk_sz;
+    auto [cid, off_in_chunk] = resolve(tail - partial);
+    auto [ec, rbuf] = co_await read_blocks(cid, to_u32(off_in_chunk / blk_sz), 1);
+    if (ec) {
+        throw std::system_error(ec, "AppendByteStream::resume_writes_at: failed to read partial-tail block");
+    }
+    flush_buf_.start_offset = tail - partial;
+    flush_buf_.builder.append(sisl::Blob{rbuf.bytes(), partial});
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

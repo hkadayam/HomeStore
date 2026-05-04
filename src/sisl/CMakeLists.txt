@@ -48,6 +48,8 @@ target_link_libraries(sisl_settings PUBLIC
     userspace-rcu::userspace-rcu
 )
 
+add_subdirectory(flip)
+
 if(NOT DEFINED BUILD_TESTING OR BUILD_TESTING)
     add_subdirectory(logging/tests)
     add_subdirectory(cache/tests)

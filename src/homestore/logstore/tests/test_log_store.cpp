@@ -182,7 +182,8 @@ public:
         auto cpmgr = CPManager::create();
         co_await cpmgr->start(true /* first_time_boot */);
 
-        co_await LogStoreManager::create();
+        // 4MB chunk × 1 initial chunk fits inside the 256MB dev files even with multi-test buildup.
+        co_await LogStoreManager::create(/*chunk_size=*/4 * 1024 * 1024, /*initial_num_chunks=*/1);
     }
 
     folly::coro::Task< void > reload() {
@@ -370,6 +371,158 @@ CORO_TEST_F(LogStoreTest, WriteWithHolesAndFillGap) {
 
     co_await s.store().truncate(7);
     EXPECT_EQ(s.store().head_lsn(), 8);
+
+    co_await self.shutdown();
+}
+
+// ── Cross-store truncate (the central LogStore-over-LogStream invariant) ────────────────────────────────────────
+
+CORO_TEST_F(LogStoreTest, GlobalTruncateMinAcrossStores) {
+    co_await self.bootstrap();
+
+    // Two stores sharing one stream; alternating flushes so each store's records land in distinct LogGroups at
+    // distinct stream offsets.  After this setup:
+    //   stream:  [group_a0][group_b0][group_a1][group_b1]
+    //   off:     0          off_b0    off_a1    off_b1
+    auto raw_a = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+    auto raw_b = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+    log_store_mgr().open_log_store(raw_a->store_id(), [](lsn_t, const sisl::ByteView&) {});
+    log_store_mgr().open_log_store(raw_b->store_id(), [](lsn_t, const sisl::ByteView&) {});
+    ShadowStore a{raw_a};
+    ShadowStore b{raw_b};
+
+    auto append_batch = [](ShadowStore& s, uint32_t n) -> folly::coro::Task< void > {
+        for (uint32_t i = 0; i < n; ++i) {
+            auto blob = s.materialize(s.store().tail_lsn() + 1, 128);
+            s.store().quick_append(blob);
+        }
+        co_await s.store().flush();
+    };
+
+    co_await append_batch(a, 5); // group_a0
+    co_await append_batch(b, 5); // group_b0
+    co_await append_batch(a, 5); // group_a1
+    co_await append_batch(b, 5); // group_b1
+
+    // A's first record is in group_a0 at stream offset 0; B's first record is in group_b0 just after.
+    const uint64_t a_initial_anchor = a.store().min_trunc_stream_offset().value();
+    const uint64_t b_initial_anchor = b.store().min_trunc_stream_offset().value();
+    EXPECT_EQ(a_initial_anchor, 0u) << "A's first record is in group_a0 at stream offset 0";
+    EXPECT_GT(b_initial_anchor, a_initial_anchor) << "B's first record (group_b0) is past A's group_a0";
+
+    // Truncate A to LSN 4 — A's surviving anchor is now group_a1's offset (somewhere past group_b0).
+    co_await a.store().truncate(4);
+    const uint64_t a_anchor = a.store().min_trunc_stream_offset().value();
+    EXPECT_GT(a_anchor, 0u) << "after truncating A's first batch, A's anchor moved past offset 0";
+
+    // B is untouched — its anchor is still at group_b0 (between A's two groups, so smaller than A's anchor).
+    const uint64_t b_anchor = b.store().min_trunc_stream_offset().value();
+    EXPECT_LT(b_anchor, a_anchor) << "B's anchor is earlier than A's";
+
+    // global_truncate uses min(a_anchor, b_anchor) = b_anchor.  Stream head must NOT advance past A's anchor —
+    // doing so would discard A's surviving records.
+    co_await log_store_mgr().global_truncate();
+    EXPECT_EQ(log_store_mgr().log_stream()->head_offset(), b_anchor)
+        << "global_truncate should advance stream head to min(A's anchor, B's anchor) = B's anchor";
+
+    // Now truncate B past A's anchor.  global_truncate should now use A's anchor.
+    co_await b.store().truncate(4);
+    const uint64_t b_anchor_2 = b.store().min_trunc_stream_offset().value();
+    EXPECT_GT(b_anchor_2, a_anchor) << "B's new anchor is past A's";
+    co_await log_store_mgr().global_truncate();
+    EXPECT_EQ(log_store_mgr().log_stream()->head_offset(), a_anchor)
+        << "after B truncated past A, stream head advances only to A's anchor";
+
+    co_await self.shutdown();
+}
+
+CORO_TEST_F(LogStoreTest, GlobalTruncateAcrossRestart) {
+    co_await self.bootstrap();
+    auto raw_a = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+    auto raw_b = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+    auto sid_a = raw_a->store_id();
+    auto sid_b = raw_b->store_id();
+    log_store_mgr().open_log_store(sid_a, [](lsn_t, const sisl::ByteView&) {});
+    log_store_mgr().open_log_store(sid_b, [](lsn_t, const sisl::ByteView&) {});
+
+    {
+        ShadowStore a{raw_a};
+        ShadowStore b{raw_b};
+        for (uint32_t i = 0; i < 5; ++i) {
+            a.store().quick_append(a.materialize(i, 128));
+        }
+        co_await a.store().flush();
+        for (uint32_t i = 0; i < 5; ++i) {
+            b.store().quick_append(b.materialize(i, 128));
+        }
+        co_await b.store().flush();
+        for (uint32_t i = 5; i < 10; ++i) {
+            a.store().quick_append(a.materialize(i, 128));
+        }
+        co_await a.store().flush();
+
+        // Truncate A's first 5; B untouched.  global_truncate uses B's anchor (smaller).
+        co_await a.store().truncate(4);
+        co_await log_store_mgr().global_truncate();
+    }
+
+    const uint64_t pre_restart_head = log_store_mgr().log_stream()->head_offset();
+    EXPECT_GT(pre_restart_head, 0u) << "stream head advanced after global_truncate";
+
+    raw_a.reset();
+    raw_b.reset();
+    co_await self.reload();
+
+    EXPECT_EQ(log_store_mgr().log_stream()->head_offset(), pre_restart_head)
+        << "stream head_offset persisted across restart";
+
+    auto recov_a = log_store_mgr().get_log_store(sid_a);
+    auto recov_b = log_store_mgr().get_log_store(sid_b);
+    CO_ASSERT_NE(recov_a, nullptr);
+    CO_ASSERT_NE(recov_b, nullptr);
+    ShadowStore a2{recov_a};
+    ShadowStore b2{recov_b};
+    co_await log_store_mgr().recover();
+
+    // A had 10 records, truncated to LSN 4 → 5 survive (LSNs 5..9).  B had 5 records, none truncated → 5 survive.
+    EXPECT_EQ(a2.replayed_count(), 5u) << "A's surviving records replay";
+    EXPECT_EQ(b2.replayed_count(), 5u) << "B's records replay";
+
+    co_await self.shutdown();
+}
+
+CORO_TEST_F(LogStoreTest, GlobalTruncateNoOpWhenStoreEmpty) {
+    co_await self.bootstrap();
+    auto raw_a = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+    auto raw_b = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+    log_store_mgr().open_log_store(raw_a->store_id(), [](lsn_t, const sisl::ByteView&) {});
+    log_store_mgr().open_log_store(raw_b->store_id(), [](lsn_t, const sisl::ByteView&) {});
+    ShadowStore a{raw_a};
+    ShadowStore b{raw_b};
+
+    // Only A has data; B is created but never written to.  B's min_trunc_stream_offset() is std::nullopt and
+    // must NOT constrain the global min (an empty store would otherwise pin the stream head at 0 forever).
+    for (uint32_t i = 0; i < 10; ++i) {
+        a.store().quick_append(a.materialize(i, 128));
+    }
+    co_await a.store().flush();
+    for (uint32_t i = 5; i < 10; ++i) {
+        a.store().quick_append(a.materialize(i, 128));
+    }
+    co_await a.store().flush();
+
+    EXPECT_FALSE(b.store().min_trunc_stream_offset().has_value())
+        << "empty store contributes no anchor (must be nullopt, not 0)";
+
+    // Truncate A past the first batch; A's anchor is now past offset 0.
+    co_await a.store().truncate(9);
+    const uint64_t a_anchor = a.store().min_trunc_stream_offset().value();
+    EXPECT_GT(a_anchor, 0u);
+
+    // global_truncate should use A's anchor only — B being empty must not pin the stream head at 0.
+    co_await log_store_mgr().global_truncate();
+    EXPECT_EQ(log_store_mgr().log_stream()->head_offset(), a_anchor)
+        << "global_truncate uses A's anchor; B being empty doesn't constrain the min";
 
     co_await self.shutdown();
 }
@@ -600,13 +753,15 @@ CORO_TEST_F(LogStoreTest, RollbackAppendRestartCycle) {
     lsn_t expected_max_alive_lsn = -1;
 
     for (uint32_t cycle = 0; cycle < N_CYCLES; ++cycle) {
-        auto cur_raw = (cycle == 0) ? raw : log_store_mgr().get_log_store(sid);
-        CO_ASSERT_NE(cur_raw, nullptr);
-        ShadowStore s{cur_raw};
-
-        // recover() needs to be called once after each reload to drive on_log_found into the freshly-attached
-        // handler.  On cycle 0 there's nothing to recover; on cycle >= 1 there's the prior cycle's surviving
-        // half.
+        // For cycle > 0, simulate a real reboot — close devices, drop managers, reload from disk, then
+        // recover.  recover() on a live in-memory LogStream is meaningless; only post-reload makes sense.
+        if (cycle > 0) {
+            raw.reset();
+            co_await self.reload();
+            raw = log_store_mgr().get_log_store(sid);
+            CO_ASSERT_NE(raw, nullptr);
+        }
+        ShadowStore s{raw};
         if (cycle > 0) {
             co_await log_store_mgr().recover();
             EXPECT_EQ(s.replayed_count(), to_size(expected_max_alive_lsn + 1))
@@ -632,6 +787,53 @@ CORO_TEST_F(LogStoreTest, RollbackAppendRestartCycle) {
     }
 
     // Final restart and replay verification.
+    raw.reset();
+    co_await self.reload();
+    auto final_raw = log_store_mgr().get_log_store(sid);
+    CO_ASSERT_NE(final_raw, nullptr);
+    ShadowStore final_s{final_raw};
+    co_await log_store_mgr().recover();
+
+    auto rec = final_s.replayed();
+    CO_ASSERT_EQ(rec.size(), to_size(expected_max_alive_lsn + 1));
+    for (size_t i = 0; i < rec.size(); ++i) {
+        EXPECT_EQ(rec[i].first, to_i64(i)) << "final replay order mismatch at index " << i;
+    }
+
+    co_await self.shutdown();
+}
+
+CORO_TEST_F(LogStoreTest, RollbackAppendNoRestartCycle) {
+    co_await self.bootstrap();
+    auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+    auto sid = raw->store_id();
+    log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::ByteView&) {});
+    ShadowStore s{raw};
+
+    // Same intent as RollbackAppendRestartCycle but without reboots between cycles — exercises rollback +
+    // append against a live in-memory LogStream where the chain stays intact in memory.  Final reload validates
+    // that the persisted chain + rollback ranges replay correctly.
+    constexpr uint32_t N_CYCLES = 2;
+    constexpr uint32_t kBatchSize = 8;
+    lsn_t expected_max_alive_lsn = -1;
+
+    for (uint32_t cycle = 0; cycle < N_CYCLES; ++cycle) {
+        const lsn_t batch_start = s.store().tail_lsn() + 1;
+        for (uint32_t i = 0; i < kBatchSize; ++i) {
+            const lsn_t lsn = batch_start + i;
+            auto blob = s.materialize(lsn, 128);
+            auto got = s.store().quick_append(blob);
+            EXPECT_EQ(got, lsn) << "cycle=" << cycle;
+        }
+        co_await s.store().flush();
+
+        const lsn_t rollback_to = batch_start + (kBatchSize / 2) - 1;
+        EXPECT_TRUE(co_await s.store().rollback(rollback_to));
+        EXPECT_EQ(s.store().tail_lsn(), rollback_to);
+        expected_max_alive_lsn = rollback_to;
+    }
+
+    // Single final reload to verify the persisted chain + accumulated rollback ranges replay correctly.
     raw.reset();
     co_await self.reload();
     auto final_raw = log_store_mgr().get_log_store(sid);

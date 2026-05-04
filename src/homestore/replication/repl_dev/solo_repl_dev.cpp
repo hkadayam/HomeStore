@@ -1,7 +1,7 @@
 #include <boost/smart_ptr/intrusive_ref_counter.hpp>
 #include "replication/repl_dev/solo_repl_dev.h"
 #include "replication/repl_dev/common.h"
-#include <homestore/homestore.hpp>
+#include <homestore/homestore.h>
 #include <homestore/blkdata_service.hpp>
 #include <homestore/logstore_service.hpp>
 #include <homestore/superblk_handler.hpp>

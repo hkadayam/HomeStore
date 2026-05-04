@@ -8,7 +8,7 @@
 #include "service/raft_repl_service.h"
 #include "repl_dev/raft_state_machine.h"
 #include "repl_dev/raft_repl_dev.h"
-#include <homestore/homestore.hpp>
+#include <homestore/homestore.h>
 #include "common/homestore_config.hpp"
 #include "common/crash_simulator.hpp"
 

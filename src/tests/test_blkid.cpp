@@ -5,7 +5,7 @@
 #include <sisl/options/options.h>
 #include <gtest/gtest.h>
 
-#include <homestore/blk.h>
+#include <homestore/base/blk.h>
 
 
 SISL_OPTION_GROUP(test_blkid,

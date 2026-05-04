@@ -23,7 +23,7 @@
 #include <folly/coro/Mutex.h>
 #include <folly/coro/Task.h>
 
-#include <homestore/blk.h>              // BlkId
+#include <homestore/base/blk.h>              // BlkId
 #include "common/defs.h" // shared<>, unique<>, cshared<>
 
 #include "meta/meta_client.h"      // MetaClient
@@ -85,8 +85,9 @@ class MetaBlkManager {
 public:
     // ── Factories ─────────────────────────────────────────────────────────────
 
-    /// Format a brand-new meta vdev and install this manager into Managers.
-    static folly::coro::Task< void > create(uint64_t vdev_size);
+    /// Format a brand-new meta vdev and install this manager into Managers.  The vdev is created with one chunk of
+    /// `chunk_size` bytes and grows in `chunk_size` increments via VirtualDev::expand() as more space is needed.
+    static folly::coro::Task< void > create(uint64_t chunk_size);
 
     /// Load an existing meta vdev and install this manager into Managers.
     static folly::coro::Task< void > load();

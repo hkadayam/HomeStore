@@ -30,7 +30,7 @@
 #include <sisl/options/options.h>
 #include <farmhash.h>
 
-#include <homestore/homestore.hpp>
+#include <homestore/homestore.h>
 #include <homestore/logstore_service.hpp>
 #include "device/virtual_dev.hpp"
 #include "device/journal_vdev.hpp"

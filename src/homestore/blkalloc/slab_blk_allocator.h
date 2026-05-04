@@ -26,7 +26,7 @@
 #include <sisl/logging/logging.h>
 #include <sisl/fds/bitset.h>
 
-#include <homestore/blk.h>
+#include <homestore/base/blk.h>
 #include "bitmap_blk_allocator.h"
 #include "sweep_service.h"
 #include "segment_manager.h"

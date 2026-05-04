@@ -438,6 +438,12 @@ CORO_TEST_F(LogStreamTest, MultiGroupPerFlush) {
     // group is built; each independent flush() corresponds to one group.  The internal flush loop builds multiple
     // groups in a single flush() only when records keep arriving while the loop is running — hard to reproduce
     // deterministically from a single thread, so we verify the multi-group path via successive flushes.
+
+    // Disable the auto-flush timer so it can't fire between our manual flushes and create extra groups; without
+    // this the count is racy (timer can grab flush_mtx_ first and emit a group of its own).
+    HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.logstore.max_time_between_flush_us = 1ull << 60; });
+    HS_SETTINGS_FACTORY().save();
+
     std::vector< std::shared_ptr< LogStreamTest::PendingAppend > > keep;
     constexpr uint32_t kBatches = 4;
     constexpr uint32_t kPerBatch = 8;

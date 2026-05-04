@@ -23,7 +23,7 @@
 
 #include <homestore/logstore_service.hpp>
 #include <homestore/meta_service.hpp>
-#include <homestore/homestore.hpp>
+#include <homestore/homestore.h>
 
 #include "log_dev.hpp"
 #include "device/journal_vdev.hpp"

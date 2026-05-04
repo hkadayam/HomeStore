@@ -22,7 +22,7 @@
 #include "base/homestore_config.hpp"
 #include "managers.h"
 // TODO: re-enable once HomeStore singleton and crash_simulator are ported to new iomanager
-// #include <homestore/homestore.hpp>
+// #include <homestore/homestore.h>
 // #include "base/resource_mgr.hpp"
 // #ifdef _PRERELEASE
 // #include "base/crash_simulator.hpp"

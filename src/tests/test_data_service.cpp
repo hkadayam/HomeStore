@@ -29,8 +29,8 @@
 #include <iomgr/iomgr_flip.hpp>
 #include <folly/concurrency/ConcurrentHashMap.h>
 
-#include <homestore/blk.h>
-#include <homestore/homestore.hpp>
+#include <homestore/base/blk.h>
+#include <homestore/homestore.h>
 #include <homestore/homestore_decl.hpp>
 #include "device/device.h"
 #include "device/physical_dev.hpp"

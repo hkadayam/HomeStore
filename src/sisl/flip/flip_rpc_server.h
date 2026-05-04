@@ -15,6 +15,24 @@
  *
  *********************************************************************************/
 #pragma once
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Remote-control grpc endpoint for flip — NOT CURRENTLY BUILT.
+//
+// This file is preserved in source as the reference implementation for when grpc is brought back into the build.
+// The flip stack moved off protobuf onto flatbuffer (see proto/flip_spec.fbs); reviving this surface needs:
+//   1. Add grpc + (re-add) protobuf — or rewrite the service stubs to use flatbuffer-on-the-wire (flatc --grpc).
+//   2. Replace FlipSpec / FlipResponse / FlipNameRequest etc. (protobuf types) with FlipSpecT (flatbuffer object
+//      API) plus a serializer at the wire boundary.
+//   3. Add this header + flip_rpc_server.cpp back to sisl_flip's CMakeLists, then remove the #if 0 below.
+//
+// Intentionally left as #if 0 (rather than deleted) so the next person doesn't have to dig commit history to find
+// the prior shape of the rpc surface.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#if 0
+#include <string>
+
 #include <grpcpp/grpcpp.h>
 
 #include "proto/flip_spec.pb.h"
@@ -30,4 +48,10 @@ public:
     grpc::Status RemoveFault(grpc::ServerContext*, const FlipRemoveRequest* request,
                              FlipRemoveResponse* response) override;
 };
+
+// Launch / shut down a remote-control grpc endpoint that mutates flip::Flip::instance().
+void start_flip_rpc_server(const std::string& addr = "0.0.0.0:50051");
+void stop_flip_rpc_server();
+
 } // namespace flip
+#endif

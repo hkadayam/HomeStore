@@ -22,7 +22,7 @@
 
 #include <homestore/meta_service.hpp>
 #include <homestore/logstore_service.hpp>
-#include <homestore/homestore.hpp>
+#include <homestore/homestore.h>
 #include "device/chunk.h"
 
 #include "common/homestore_assert.hpp"

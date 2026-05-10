@@ -1,24 +1,31 @@
 #include <cstring>
 
-#include <sisl/fds/buffer.h>
+#include "sisl/fds/buffer.h"
 
-#include <homestore/index/btree/detail/btree_node.h>
-#include <homestore/index/btree/btree_base.h>
+#include "homestore/index/btree/detail/btree_node.h"
+#include "homestore/index/btree/btree_base.h"
 
-#include "base/homestore_config.hpp"
-#include "base/homestore_utils.hpp"
-#include "blob/append_blk_stream.h"
-#include "blob/append_byte_stream.h"
-#include "blob/blob_dev.h"
-#include "blob/raw_blk_stream.h"
-#include "index/cow_btree/cow_btree.h"
+#include "homestore/base/homestore_config.h"
+#include "homestore/base/homestore_utils.h"
+#include "homestore/blob/append_blk_stream.h"
+#include "homestore/blob/append_byte_stream.h"
+#include "homestore/blob/blob_dev.h"
+#include "homestore/blob/raw_blk_stream.h"
+#include "homestore/index/cow_btree/cow_btree.h"
 
 namespace homestore {
 
 using sisl::IOBuffer;
 
-#define COWBT_LOG(level, msg, ...) SPECIFIC_BT_LOG(level, (*base_btree_), msg, ##__VA_ARGS__)
-#define COWBT_CP_LOG(level, cp_id, msg, ...) SPECIFIC_BT_LOG(level, (*base_btree_), "[cp={}] " msg, cp_id, ##__VA_ARGS__)
+// Source the [btree=] prefix from super_blk().btree_name (always present after construction) instead of going
+// through base_btree_, which isn't bound until the BtreeBase ctor runs — and recover() executes before that.
+#define COWBT_LOG(level, msg, ...)                                                                                     \
+    { LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, super_blk().btree_name, )), msg, ##__VA_ARGS__); }
+#define COWBT_CP_LOG(level, cp_id, msg, ...)                                                                           \
+    {                                                                                                                  \
+        LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, super_blk().btree_name, )), "[cp={}] " msg, cp_id,           \
+                            ##__VA_ARGS__);                                                                            \
+    }
 
 // bnodeid_t layout: [ordinal(31 bits)][overflow_bit(1 bit)][node_number(32 bits)]
 // Overflow bit is bit 32 (the lowest bit of the upper half).
@@ -520,6 +527,9 @@ folly::coro::Task< bool > COWBtree::incr_cp_flush(CP* cp) {
     map_footer.checksum = crc;
     incr_map_stream_->append(sisl::Blob{uintptr_cast(&map_footer), sizeof(map_footer)});
 
+    // Drain incr_map_stream_'s in-memory append buffer to disk and persist its SB metablk inline.
+    co_await incr_map_stream_->flush();
+
     bnodeid_map_.updates_since_last_flush_.fetch_add(session->modified_nodes_.size() + session->deleted_nodes_.size());
 
     // Report bytes appended to the manager so the global incr_map size threshold is tracked accurately.
@@ -678,19 +688,23 @@ folly::coro::Task< void > COWBtree::recover_full_map(cp_id_t cur_cp_id) {
     }
 }
 
-folly::coro::Task< IOBuffer > COWBtree::read_from_incr_stream(uint64_t offset, size_t len) {
+folly::coro::Task< sisl::ByteView > COWBtree::read_from_incr_stream(uint64_t offset, size_t len) {
     if (offset + len > incr_map_stream_->tail_offset()) {
         HS_REL_ASSERT(false, "Expected atleast {} bytes after offset={}, but got eof, tail_offset={}", len, offset,
                       incr_map_stream_->tail_offset());
     }
-    auto [ec, buf] = co_await incr_map_stream_->read(offset, len);
+    auto [ec, view] = co_await incr_map_stream_->read(offset, len);
     HS_REL_ASSERT(!ec, "read_from_incr_stream: failed to read from incr_map_stream_ at offset={}", offset);
-    co_return {std::move(buf)};
+    co_return std::move(view);
 }
 
 folly::coro::Task< uint64_t > COWBtree::recover_one_incr_cp(uint64_t offset, cp_id_t last_full_cp, cp_id_t cur_cp_id) {
+    COWBT_LOG(DEBUG, "recover_one_incr_cp ENTRY offset={} sizes: Header={} NodeRecord={} CompactNodeId={} Footer={}",
+              offset, sizeof(IncrMapHeader), sizeof(IncrMapNodeRecord), sizeof(CompactNodeId), sizeof(IncrMapFooter));
     auto hdr_buf = co_await read_from_incr_stream(offset, sizeof(IncrMapHeader));
     auto const& hdr = *r_cast< IncrMapHeader const* >(hdr_buf.bytes());
+    COWBT_LOG(DEBUG, "recover_one_incr_cp HDR cp_id={} num_updates={} num_deletes={} new_root={}", hdr.cp_id,
+              hdr.num_updates, hdr.num_deletes, hdr.new_root_nodeid);
     HS_REL_ASSERT_EQ(hdr.header_magic, IncrMapHeader::HEADER_MAGIC, "recover_one_incr_cp: invalid header magic");
 
     // Decide if we need the incr cp records to be processed.
@@ -711,9 +725,11 @@ folly::coro::Task< uint64_t > COWBtree::recover_one_incr_cp(uint64_t offset, cp_
     // Walk IncrMapNodeRecords.
     uint32_t updates_seen = 0;
     while (updates_seen < hdr.num_updates) {
+        COWBT_LOG(DEBUG, "recover_one_incr_cp REC LOOP offset={} updates_seen={}", offset, updates_seen);
         auto rbuf = co_await read_from_incr_stream(offset, sizeof(IncrMapNodeRecord));
         auto const* rec_hdr = r_cast< IncrMapNodeRecord const* >(rbuf.bytes());
         uint32_t const rec_size = rec_hdr->size();
+        COWBT_LOG(DEBUG, "recover_one_incr_cp REC n_nodes={} rec_size={}", rec_hdr->n_nodes, rec_size);
 
         if (!skip) {
             auto full_rbuf = co_await read_from_incr_stream(offset, rec_size);

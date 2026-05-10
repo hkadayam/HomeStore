@@ -26,14 +26,14 @@
 #include <folly/small_vector.h>
 #include "sisl/fds/utils.h" // Clock, get_elapsed_time_us
 
-#include "logstore/log_stream.h"
-#include "base/homestore_config.hpp" // HS_DYNAMIC_CONFIG
+#include "homestore/logstore/log_stream.h"
+#include "homestore/base/homestore_config.h" // HS_DYNAMIC_CONFIG
 #include "common/defs.h"
-#include "device/chunk.h"
-#include "device/virtual_dev.h"
+#include "homestore/device/chunk.h"
+#include "homestore/device/virtual_dev.h"
 #include "iomanager/iomanager.h" // iomanager::spawn_detached for size-triggered auto-flush
-#include "managers.h"
-#include "meta/meta_client.h"
+#include "homestore/managers.h"
+#include "homestore/meta/meta_client.h"
 
 namespace homestore {
 
@@ -294,9 +294,8 @@ folly::coro::Task< sisl::ByteView > LogStream::read(const stream_key& key) {
         co_return sisl::ByteView{};
     }
 
-    // AppendByteStream::read returns a block-aligned IOBuffer; the requested bytes start at (offset % blk).
-    const uint32_t in_buf = key.record_stream_offset % block_size();
-    const auto* rhdr = r_cast< const log_record_header* >(hdr_buf.cbytes() + in_buf);
+    // AppendByteStream::read returns a ByteView already sliced to start exactly at byte_offset — index from 0.
+    const auto* rhdr = r_cast< const log_record_header* >(hdr_buf.bytes());
     if (rhdr->log_id != key.log_id) {
         co_return sisl::ByteView{};
     }
@@ -309,10 +308,8 @@ folly::coro::Task< sisl::ByteView > LogStream::read(const stream_key& key) {
         co_return sisl::ByteView{};
     }
 
-    // Wrap the IOBuffer into a shared ByteArray (no buffer copy — just a wrapper alloc) so the returned view owns
-    // its underlying storage; the caller can retain or drop it as it pleases.
-    auto ba = sisl::make_byte_array(std::move(data_buf));
-    co_return sisl::ByteView{std::move(ba), to_u32(data_offset % block_size()), data_size};
+    // data_buf is already a ByteView sliced to start at data_offset with size == data_size — return as-is.
+    co_return data_buf;
 }
 
 folly::coro::Task< void > LogStream::recover(lookup_store_fn lookup) {
@@ -351,8 +348,8 @@ folly::coro::Task< void > LogStream::recover(lookup_store_fn lookup) {
             tail_offset_ = prev_tail;
             break;
         }
-        const uint32_t hdr_in_buf = cursor % block_size();
-        const auto* hdr = r_cast< const log_group_header* >(hdr_buf.cbytes() + hdr_in_buf);
+        // AppendByteStream::read returns a ByteView pre-sliced to start at byte_offset — index from 0.
+        const auto* hdr = r_cast< const log_group_header* >(hdr_buf.bytes());
         if (hdr->magic != LOG_GROUP_MAGIC || hdr->group_size < sizeof(log_group_header) + sizeof(log_group_footer)) {
             tail_offset_ = prev_tail;
             break;
@@ -371,11 +368,9 @@ folly::coro::Task< void > LogStream::recover(lookup_store_fn lookup) {
             break;
         }
 
-        // Wrap the IOBuffer once into a shared ByteArray; per-record ByteViews below all share the ref-count, so the
-        // underlying aligned buffer outlives any individual view (no extra memcpy).
-        const uint32_t group_in_buf = cursor % block_size();
-        auto group_ba = sisl::make_byte_array(std::move(group_buf));
-        const uint8_t* group_bytes = group_ba->cbytes() + group_in_buf;
+        // group_buf is a ByteView already sliced to the group's start; per-record sub-views below share its
+        // underlying refcount via the ByteView(ByteView, offset, size) ctor (no extra memcpy).
+        const uint8_t* group_bytes = group_buf.bytes();
         const auto* footer = r_cast< const log_group_footer* >(group_bytes + group_size - sizeof(log_group_footer));
 
         // Validate CRC chain.  Skip prev_crc on the iteration-0 partial-truncate case (see flag init above);
@@ -403,10 +398,11 @@ folly::coro::Task< void > LogStream::recover(lookup_store_fn lookup) {
         for (uint32_t i = 0; i < n_records; ++i) {
             const auto* rhdr = r_cast< const log_record_header* >(group_bytes + off_in_group);
             const uint64_t rec_stream_offset = cursor + off_in_group;
-            const uint32_t data_off_in_buf = group_in_buf + off_in_group + sizeof(log_record_header);
+            const uint32_t data_off_in_view = off_in_group + sizeof(log_record_header);
 
             if (auto* client = lookup ? lookup(rhdr->store_id) : nullptr) {
-                sisl::ByteView data_view{group_ba, data_off_in_buf, rhdr->size};
+                // Sub-view sharing group_buf's underlying refcount — no copy, group's buffer outlives the view.
+                sisl::ByteView data_view{group_buf, data_off_in_view, rhdr->size};
                 client->on_log_found(rhdr->store_lsn, stream_key{rhdr->log_id, rec_stream_offset, cursor}, data_view);
             }
             // else: orphan record — store_id was never opened; manager handles cleanup.
@@ -477,8 +473,8 @@ folly::coro::Task< std::optional< uint64_t > > LogStream::probe_for_torn_write(u
         if (ec_h)
             continue;
 
-        const uint32_t hdr_in_buf = probe % block_size();
-        const auto* hdr = r_cast< const log_group_header* >(hdr_buf.cbytes() + hdr_in_buf);
+        // AppendByteStream::read returns a ByteView pre-sliced to start at byte_offset — index from 0.
+        const auto* hdr = r_cast< const log_group_header* >(hdr_buf.bytes());
         if (hdr->magic != LOG_GROUP_MAGIC)
             continue;
 
@@ -496,9 +492,7 @@ folly::coro::Task< std::optional< uint64_t > > LogStream::probe_for_torn_write(u
         if (ec_g)
             continue;
 
-        const uint32_t group_in_buf = probe % block_size();
-        auto group_ba = sisl::make_byte_array(std::move(group_buf));
-        const uint8_t* group_bytes = group_ba->cbytes() + group_in_buf;
+        const uint8_t* group_bytes = group_buf.bytes();
 
         const uint64_t actual_group_size = group_size - sizeof(log_group_footer);
         const auto* footer = r_cast< const log_group_footer* >(group_bytes + actual_group_size);

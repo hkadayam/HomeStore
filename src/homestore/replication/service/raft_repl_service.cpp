@@ -12,15 +12,15 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
-#include <sisl/logging/logging.h>
+#include "sisl/logging/logging.h"
 #include <iomgr/io_environment.hpp>
 #include <chrono>
 
 #include <boost/uuid/string_generator.hpp>
-#include <homestore/blkdata_service.hpp>
-#include <homestore/logstore_service.hpp>
-#include "common/homestore_config.hpp"
-#include "common/homestore_assert.hpp"
+#include "homestore/blkdata_service.hpp"
+#include "homestore/logstore_service.hpp"
+#include "common/homestore_config.h"
+#include "common/homestore_assert.h"
 #include "replication/service/raft_repl_service.h"
 #include "replication/repl_dev/raft_repl_dev.h"
 

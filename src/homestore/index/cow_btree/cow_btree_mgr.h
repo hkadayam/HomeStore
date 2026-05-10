@@ -14,13 +14,13 @@
 #include "sisl/cache/two_q_evictor.h"
 
 #include "common/defs.h"
-#include <homestore/base/blk.h>
-#include <homestore/checkpoint/cp_mgr.h>
-#include <homestore/index/btree/detail/btree_internal.h>
+#include "homestore/base/blk.h"
+#include "homestore/checkpoint/cp_mgr.h"
+#include "homestore/index/btree/detail/btree_internal.h"
 #include "sisl/fds/id_reserver.h"
 
-#include "meta/meta_blk.h"
-#include "meta/meta_client.h"
+#include "homestore/meta/meta_blk.h"
+#include "homestore/meta/meta_client.h"
 
 namespace homestore {
 class BlobDev;

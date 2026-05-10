@@ -18,18 +18,18 @@
 
 #include <fmt/format.h>
 #include <iomgr/iomgr.hpp>
-#include <sisl/fds/thread_factory.h>
+#include "sisl/fds/thread_factory.h"
 
-#include <homestore/meta_service.hpp>
-#include <homestore/logstore_service.hpp>
-#include <homestore/homestore.h>
-#include "device/chunk.h"
+#include "homestore/meta_service.hpp"
+#include "homestore/logstore_service.hpp"
+#include "homestore/homestore.h"
+#include "homestore/device/chunk.h"
 
-#include "common/homestore_assert.hpp"
-#include "common/homestore_status_mgr.hpp"
-#include "device/journal_vdev.hpp"
-#include "device/physical_dev.hpp"
-#include "log_dev.hpp"
+#include "common/homestore_assert.h"
+#include "common/homestore_status_mgr.h"
+#include "homestore/device/journal_vdev.hpp"
+#include "homestore/device/physical_dev.hpp"
+#include "log_dev.h"
 
 namespace homestore {
 

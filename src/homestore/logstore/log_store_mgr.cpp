@@ -14,7 +14,7 @@
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
  ***************************************************************************/
 
-#include "logstore/log_store_mgr.h"
+#include "homestore/logstore/log_store_mgr.h"
 
 #include <algorithm>
 #include <charconv>
@@ -22,15 +22,15 @@
 #include <string_view>
 
 #include <fmt/format.h>
-#include <sisl/logging/logging.h>
+#include "sisl/logging/logging.h"
 
-#include "base/homestore_assert.hpp"
-#include "base/homestore_config.hpp" // HS_DYNAMIC_CONFIG
+#include "homestore/base/homestore_assert.h"
+#include "homestore/base/homestore_config.h" // HS_DYNAMIC_CONFIG
 #include "common/defs.h"
-#include "device/device_manager.h"
-#include "managers.h"
-#include "meta/meta_blk.h"
-#include "meta/meta_client.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/managers.h"
+#include "homestore/meta/meta_blk.h"
+#include "homestore/meta/meta_client.h"
 
 namespace homestore {
 

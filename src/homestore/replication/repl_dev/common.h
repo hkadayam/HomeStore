@@ -16,11 +16,11 @@
 
 #include <boost/intrusive_ptr.hpp>
 #include <random>
-#include <homestore/replication/repl_decls.h>
-#include <homestore/replication_service.hpp>
-#include <homestore/replication/repl_dev.h>
-#include <homestore/logstore/log_store.hpp>
-#include <homestore/superblk_handler.hpp>
+#include "homestore/replication/repl_decls.h"
+#include "homestore/replication_service.hpp"
+#include "homestore/replication/repl_dev.h"
+#include "homestore/logstore/log_store.hpp"
+#include "homestore/superblk_handler.hpp"
 
 namespace homestore {
 

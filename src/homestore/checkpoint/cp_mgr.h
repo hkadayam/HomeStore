@@ -20,9 +20,9 @@
 #include <stack>
 #include <unordered_map>
 
-#include <sisl/metrics/metrics.h>
-#include <sisl/fds/enum.h>
-#include <sisl/fds/utils.h>
+#include "sisl/metrics/metrics.h"
+#include "sisl/fds/enum.h"
+#include "sisl/fds/utils.h"
 #include <folly/SharedMutex.h>
 #include <folly/coro/Task.h>
 #include <folly/futures/Future.h>
@@ -32,8 +32,8 @@
 
 #include "iomanager/coro_timer.h"
 
-#include <homestore/meta/module_meta_blk.h>
-#include <homestore/checkpoint/cp.h>
+#include "homestore/meta/module_meta_blk.h"
+#include "homestore/checkpoint/cp.h"
 
 namespace homestore {
 class CPMgrMetrics : public sisl::MetricsGroup {

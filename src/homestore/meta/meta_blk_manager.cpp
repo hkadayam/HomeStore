@@ -18,10 +18,10 @@
 #include <stdexcept>
 
 #include "common/defs.h"
-#include "managers.h"
-#include "meta/meta_blk_manager.h"
-#include "device/device_manager.h"
-#include "device/virtual_dev.h"
+#include "homestore/managers.h"
+#include "homestore/meta/meta_blk_manager.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/device/virtual_dev.h"
 
 namespace homestore {
 

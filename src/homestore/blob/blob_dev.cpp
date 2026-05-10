@@ -20,12 +20,12 @@
 #include <string>
 #include <unordered_set>
 
-#include "blob/blob_dev.h"
-#include "blob/raw_blk_stream.h"
-#include "blob/append_blk_stream.h"
-#include "blob/append_byte_stream.h"
-#include "device/chunk.h"
-#include "device/virtual_dev.h"
+#include "homestore/blob/blob_dev.h"
+#include "homestore/blob/raw_blk_stream.h"
+#include "homestore/blob/append_blk_stream.h"
+#include "homestore/blob/append_byte_stream.h"
+#include "homestore/device/chunk.h"
+#include "homestore/device/virtual_dev.h"
 
 namespace homestore {
 

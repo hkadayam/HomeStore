@@ -19,12 +19,12 @@
 #include <utility>
 
 #include <fmt/format.h>
-#include <sisl/logging/logging.h>
+#include "sisl/logging/logging.h"
 
-#include "blob/stream_base.h"
-#include "device/chunk.h"
-#include "device/virtual_dev.h"
-#include "meta/meta_client.h"
+#include "homestore/blob/stream_base.h"
+#include "homestore/device/chunk.h"
+#include "homestore/device/virtual_dev.h"
+#include "homestore/meta/meta_client.h"
 
 namespace homestore {
 

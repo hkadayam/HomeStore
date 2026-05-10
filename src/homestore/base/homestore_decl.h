@@ -35,7 +35,7 @@
 #include <nlohmann/json.hpp>
 
 #include "common/defs.h"
-#include "device/device_decl.h"
+#include "homestore/device/device_decl.h"
 
 //
 // This file contains declarations shared across homestore service layers and consumers above.
@@ -62,7 +62,9 @@ constexpr uint32_t BLKS_PER_PORTION{1024};
 constexpr uint32_t TOTAL_SEGMENTS{8};
 constexpr uint64_t MAX_BLK_NUM_BITS_PER_CHUNK{((uint64_cast(1) << BLK_NUM_BITS) - 1)};
 
-inline uint64_t MIN_DATA_CHUNK_SIZE(uint32_t blk_size) { return blk_size * BLKS_PER_PORTION * TOTAL_SEGMENTS; }
+inline uint64_t MIN_DATA_CHUNK_SIZE(uint32_t blk_size) {
+    return blk_size * BLKS_PER_PORTION * TOTAL_SEGMENTS;
+}
 inline uint64_t MAX_DATA_CHUNK_SIZE(uint32_t blk_size) {
     return uint64_cast(sisl::round_down((MAX_BLK_NUM_BITS_PER_CHUNK * blk_size), MIN_DATA_CHUNK_SIZE(blk_size)));
 }
@@ -83,15 +85,7 @@ static constexpr hs_uuid_t INVALID_SYSTEM_UUID{0};
 // ── Legacy enums (used by old code and hs_format_params; new device/ code uses BlkAllocatorType, ChunkSelectorType
 // from virtual_dev.h) ────────────────────────────────────────────────────────────────────────────────────────────────
 ENUM(blk_allocator_type_t, uint8_t, none, fixed, varsize, append);
-ENUM(chunk_selector_type_t, uint8_t,
-     NONE,
-     ROUND_ROBIN,
-     CUSTOM,
-     RANDOM,
-     MOST_AVAILABLE_SPACE,
-     ALWAYS_CALLER_CONTROLLED
-);
-
+ENUM(chunk_selector_type_t, uint8_t, NONE, ROUND_ROBIN, CUSTOM, RANDOM, MOST_AVAILABLE_SPACE, ALWAYS_CALLER_CONTROLLED);
 
 // ── Homestore configuration structs ──────────────────────────────────────────────────────────────────────────────────
 struct hs_format_params {
@@ -123,8 +117,12 @@ public:
 #endif
 
     nlohmann::json to_json() const;
-    std::string to_string() const { return to_json().dump(4); }
-    uint64_t io_mem_size() const { return (hugepage_size != 0) ? hugepage_size : app_mem_size; }
+    std::string to_string() const {
+        return to_json().dump(4);
+    }
+    uint64_t io_mem_size() const {
+        return (hugepage_size != 0) ? hugepage_size : app_mem_size;
+    }
     bool has_fast_dev() const {
         return std::any_of(devices.begin(), devices.end(),
                            [](const DevInfo& d) { return d.dev_type == HSDevType::Fast; });

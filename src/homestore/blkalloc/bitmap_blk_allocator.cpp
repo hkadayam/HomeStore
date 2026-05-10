@@ -15,7 +15,7 @@
 #include <optional>
 
 #include "bitmap_blk_allocator.h"
-#include "base/homestore_assert.hpp"
+#include "homestore/base/homestore_assert.h"
 
 namespace homestore {
 namespace blkalloc {

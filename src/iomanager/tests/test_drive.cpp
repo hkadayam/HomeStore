@@ -16,7 +16,7 @@
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
 #include <iomanager/iomanager.h>
-#include <iomanager/drive_interface.hpp>
+#include <iomanager/drive_interface.h>
 
 using namespace iomanager;
 using namespace std::chrono_literals;

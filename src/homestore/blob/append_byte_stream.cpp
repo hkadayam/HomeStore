@@ -20,12 +20,12 @@
 
 #include <fmt/format.h>
 
-#include "blob/append_byte_stream.h"
-#include "blob/blob_dev.h"
-#include "device/chunk.h"
-#include "device/virtual_dev.h"
-#include "managers.h"
-#include "meta/meta_client.h"
+#include "homestore/blob/append_byte_stream.h"
+#include "homestore/blob/blob_dev.h"
+#include "homestore/device/chunk.h"
+#include "homestore/device/virtual_dev.h"
+#include "homestore/managers.h"
+#include "homestore/meta/meta_client.h"
 
 namespace homestore {
 
@@ -73,13 +73,13 @@ folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(uint64_t 
     // Parse {chunk_size, head, tail, chunk_ids} from the stream sb payload.  The sb is always written by create()
     // and persist_stream_sb(), so any stream that was created should have a valid payload here.
     if (sb_payload.size() < sizeof(AppendByteStreamSb)) {
-        throw std::runtime_error(fmt::format("AppendByteStream::load: sb payload too small for stream {} on {}",
-                                              stream_id, dev_name));
+        throw std::runtime_error(
+            fmt::format("AppendByteStream::load: sb payload too small for stream {} on {}", stream_id, dev_name));
     }
     const auto* s = r_cast< const AppendByteStreamSb* >(sb_payload.bytes());
     if (s->chunk_size == 0) {
-        throw std::runtime_error(fmt::format("AppendByteStream::load: sb has chunk_size=0 for stream {} on {}",
-                                              stream_id, dev_name));
+        throw std::runtime_error(
+            fmt::format("AppendByteStream::load: sb has chunk_size=0 for stream {} on {}", stream_id, dev_name));
     }
     const uint64_t chunk_sz = s->chunk_size;
     const uint64_t recovered_head = s->head_offset;
@@ -102,7 +102,9 @@ folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(uint64_t 
     std::vector< shared< Chunk > > chunks;
     chunks.reserve(chunk_ids.size());
     for (auto cid : chunk_ids) {
-        if (auto c = vdev->get_chunk(cid)) { chunks.push_back(std::move(c)); }
+        if (auto c = vdev->get_chunk(cid)) {
+            chunks.push_back(std::move(c));
+        }
     }
     stream->install_chunks(std::move(chunks));
 
@@ -196,16 +198,24 @@ folly::coro::Task< void > AppendByteStream::truncate(uint64_t upto_offset) {
 // read
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< std::pair< std::error_code, IOBuffer > > AppendByteStream::read(uint64_t byte_offset, size_t len) {
+folly::coro::Task< std::pair< std::error_code, sisl::ByteView > > AppendByteStream::read(uint64_t byte_offset,
+                                                                                         size_t len) {
     if (byte_offset < head_offset_ || byte_offset + len > tail_offset_) {
-        co_return {std::make_error_code(std::errc::invalid_argument), IOBuffer{}};
+        co_return {std::make_error_code(std::errc::invalid_argument), sisl::ByteView{}};
     }
     auto [cid, offset_in_chunk] = resolve(byte_offset);
-    const uint32_t blk_num = to_u32(offset_in_chunk / block_size());
-    const blk_count_t nblks =
-        s_cast< blk_count_t >((offset_in_chunk + len + block_size() - 1) / block_size() - to_u64(blk_num));
+    const uint32_t blk_sz = block_size();
+    const uint32_t blk_num = to_u32(offset_in_chunk / blk_sz);
+    const blk_count_t nblks = s_cast< blk_count_t >((offset_in_chunk + len + blk_sz - 1) / blk_sz - to_u64(blk_num));
 
-    co_return co_await read_blocks(cid, blk_num, nblks);
+    auto [ec, buf] = co_await read_blocks(cid, blk_num, nblks);
+    if (ec) {
+        co_return {ec, sisl::ByteView{}};
+    }
+    // Slice the block-aligned buf so bytes() lands exactly at byte_offset and size() is len.  Zero-copy: the
+    // ByteView holds a shared_ptr to the underlying IOBuffer via make_byte_array.
+    co_return {std::error_code{},
+               sisl::ByteView{sisl::make_byte_array(std::move(buf)), to_u32(byte_offset % blk_sz), to_u32(len)}};
 }
 
 folly::coro::Task< std::pair< std::error_code, IOBuffer > >
@@ -232,9 +242,9 @@ AppendByteStream::ReadCursor AppendByteStream::open_cursor(uint64_t start_offset
     return ReadCursor{const_cast< AppendByteStream& >(*this), start_offset, end_offset};
 }
 
-folly::coro::Task< std::pair< IOBuffer, uint32_t > > AppendByteStream::ReadCursor::next(size_t max_bytes) {
+folly::coro::Task< std::pair< sisl::ByteView, uint32_t > > AppendByteStream::ReadCursor::next(size_t max_bytes) {
     if (pos_ >= end_) {
-        co_return {IOBuffer{}, 0};
+        co_return {sisl::ByteView{}, 0};
     }
 
     auto [cid, offset_in_chunk] = stream_.resolve(pos_);
@@ -249,11 +259,13 @@ folly::coro::Task< std::pair< IOBuffer, uint32_t > > AppendByteStream::ReadCurso
 
     auto [ec, buf] = co_await stream_.read_blocks(cid, blk_num, nblks);
     if (ec) {
-        co_return {IOBuffer{}, 0};
+        co_return {sisl::ByteView{}, 0};
     }
 
+    // Slice so the returned ByteView's bytes() lands at pos_ — same logic as AppendByteStream::read().  Zero-copy.
+    const uint32_t in_buf = to_u32(offset_in_chunk % blk_sz);
     pos_ += valid;
-    co_return {std::move(buf), valid};
+    co_return {sisl::ByteView{sisl::make_byte_array(std::move(buf)), in_buf, valid}, valid};
 }
 
 folly::coro::Task< bool > AppendByteStream::flush() {

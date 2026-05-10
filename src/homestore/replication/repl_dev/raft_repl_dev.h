@@ -5,11 +5,11 @@
 #include <libnuraft/ptr.hxx>
 #include <nuraft_mesg/nuraft_mesg.hpp>
 #include <nuraft_mesg/mesg_state_mgr.hpp>
-#include <sisl/fds/buffer.h>
-#include <sisl/fds/utils.h>
-#include <homestore/replication/repl_dev.h>
-#include <homestore/superblk_handler.hpp>
-#include <homestore/logstore/log_store.hpp>
+#include "sisl/fds/buffer.h"
+#include "sisl/fds/utils.h"
+#include "homestore/replication/repl_dev.h"
+#include "homestore/superblk_handler.hpp"
+#include "homestore/logstore/log_store.hpp"
 #include "replication/repl_dev/common.h"
 #include "replication/repl_dev/raft_state_machine.h"
 #include "replication/log_store/repl_log_store.h"

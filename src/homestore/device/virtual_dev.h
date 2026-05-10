@@ -32,9 +32,9 @@
 
 #include "homestore/base/blk.h" // BlkId, BlkIds, BlkAllocStatus, blk_alloc_hints, blk_count_t
 
-#include "device/hs_super_blk.h"         // VDevInfo, ChunkInfo, HSSuperBlk
-#include "device/chunk.h"                // Chunk, ChunkPool
-#include "device/chunk_selector.h"       // IChunkSelector, ChunkSelectorType, concrete selectors
+#include "homestore/device/hs_super_blk.h"         // VDevInfo, ChunkInfo, HSSuperBlk
+#include "homestore/device/chunk.h"                // Chunk, ChunkPool
+#include "homestore/device/chunk_selector.h"       // IChunkSelector, ChunkSelectorType, concrete selectors
 
 namespace homestore {
 

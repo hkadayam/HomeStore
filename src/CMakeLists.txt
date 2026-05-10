@@ -15,6 +15,7 @@ find_package(userspace-rcu QUIET REQUIRED)
 find_package(Snappy QUIET REQUIRED)
 find_package(flatbuffers QUIET REQUIRED)
 find_package(cxxopts QUIET REQUIRED)
+find_package(zmarok-semver QUIET REQUIRED)
 
 # Memory allocator selection (driven by conanfile MALLOC_IMPL toolchain variable).  jemalloc/tcmalloc replace
 # malloc/free symbols and so are mutually exclusive with ASAN — the conanfile auto-coerces to libc when sanitize=True.
@@ -53,6 +54,7 @@ list(APPEND COMMON_DEPS
     Snappy::snappy
     flatbuffers::flatbuffers
     cxxopts::cxxopts
+    zmarok-semver::zmarok-semver
 )
 
 if (DEFINED REPLICATION)
@@ -81,9 +83,9 @@ list(APPEND COMMON_TEST_DEPS
     GTest::gmock
 )
 
-include_directories (BEFORE ${CMAKE_CURRENT_SOURCE_DIR})  # enables <sisl/...>, <iomanager/...>, <homestore/...>
+include_directories (BEFORE ${CMAKE_CURRENT_SOURCE_DIR})  # enables "sisl/...", "iomanager/...", "homestore/..."
 include_directories (BEFORE include/)
-include_directories (BEFORE ${CMAKE_CURRENT_BINARY_DIR}/homestore)
+include_directories (BEFORE ${CMAKE_CURRENT_BINARY_DIR})  # enables "homestore/base/generated/..." (flatbuffers gen)
 
 add_subdirectory(sisl)
 add_subdirectory(iomanager)

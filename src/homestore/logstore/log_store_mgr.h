@@ -24,11 +24,11 @@
 #include <folly/SharedMutex.h>
 #include <folly/coro/Task.h>
 
-#include <homestore/device/virtual_dev.h>
+#include "homestore/device/virtual_dev.h"
 
 #include "homestore/base/homestore_decl.h"
-#include "logstore/log_store.h"
-#include "logstore/log_stream.h"
+#include "homestore/logstore/log_store.h"
+#include "homestore/logstore/log_stream.h"
 
 namespace homestore {
 

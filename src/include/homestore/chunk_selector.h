@@ -14,7 +14,7 @@
  *********************************************************************************/
 #pragma once
 
-#include <homestore/vchunk.h>
+#include "homestore/vchunk.h"
 
 namespace homestore {
 class Chunk;

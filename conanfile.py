@@ -99,6 +99,9 @@ class HomestoreConan(ConanFile):
         if self.settings.arch in ['x86', 'x86_64']:
             self.requires("isa-l/2.30.0", transitive_headers=True)
 
+        # semver200.h (used by sisl/version.h for VersionMgr)
+        self.requires("zmarok-semver/1.1.0", transitive_headers=True)
+
         # Tests require OpenSSL 3.x
         self.requires("openssl/[^3.1]", override=True)
 

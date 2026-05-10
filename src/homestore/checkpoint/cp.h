@@ -18,12 +18,12 @@
 #include <memory>
 #include <mutex>
 
-#include <sisl/logging/logging.h>
-#include <sisl/fds/atomic_counter.h>
-#include <sisl/fds/enum.h>
+#include "sisl/logging/logging.h"
+#include "sisl/fds/atomic_counter.h"
+#include "sisl/fds/enum.h"
 #include <folly/futures/SharedPromise.h>
 
-#include "base/homestore_assert.hpp" // HS_SUBMOD_LOG, HS_PERIODIC_DETAILED_LOG
+#include "homestore/base/homestore_assert.h" // HS_SUBMOD_LOG, HS_PERIODIC_DETAILED_LOG
 
 /*
  * These are the design requirements of this class. If we don't follow these requirements then there can be serious

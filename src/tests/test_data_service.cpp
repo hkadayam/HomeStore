@@ -22,27 +22,27 @@
 
 #include <gtest/gtest.h>
 #include <iomgr/io_environment.hpp>
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
-#include <sisl/fds/buffer.h>
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
+#include "sisl/fds/buffer.h"
 #include <gtest/gtest.h>
 #include <iomgr/iomgr_flip.hpp>
 #include <folly/concurrency/ConcurrentHashMap.h>
 
-#include <homestore/base/blk.h>
-#include <homestore/homestore.h>
-#include <homestore/homestore_decl.hpp>
+#include "homestore/base/blk.h"
+#include "homestore/homestore.h"
+#include "homestore/homestore_decl.hpp"
 #include "device/device.h"
 #include "device/physical_dev.hpp"
 #include "device/virtual_dev.hpp"
 #include "device/chunk.h"
-#include "common/homestore_config.hpp"
-#include "common/homestore_assert.hpp"
+#include "common/homestore_config.h"
+#include "common/homestore_assert.h"
 #include "blkalloc/blk_allocator.h"
-#include "test_common/bits_generator.hpp"
-#include "test_common/homestore_test_common.hpp"
+#include "test_common/bits_generator.h"
+#include "test_common/homestore_test_common.h"
 
-#include <homestore/blkdata_service.hpp>
+#include "homestore/blkdata_service.hpp"
 
 ////////////////////////////////////////////////////////////////////////////
 //                                                                        //

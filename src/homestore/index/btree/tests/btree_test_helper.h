@@ -33,7 +33,7 @@
 #include "sisl/fds/enum.h"
 #include "iomanager/iomanager.h"
 #include "homestore/index/btree/btree.ipp"
-#include "shadow_map.hpp"
+#include "shadow_map.h"
 
 static constexpr uint32_t g_node_size{4096};
 

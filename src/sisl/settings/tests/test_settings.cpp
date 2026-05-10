@@ -5,7 +5,7 @@
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
 #include "generated/test_app_schema_generated.h"
-#include "sisl/settings/settings.hpp"
+#include "sisl/settings/settings.h"
 
 SETTINGS_INIT(testapp::TestAppSettings, test_app_schema)
 

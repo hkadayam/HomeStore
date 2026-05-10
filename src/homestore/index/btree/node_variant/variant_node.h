@@ -14,8 +14,8 @@
  *********************************************************************************/
 #pragma once
 
-#include <homestore/index/btree/detail/btree_node.h>
-#include <homestore/index/btree/btree_kv.h>
+#include "homestore/index/btree/detail/btree_node.h"
+#include "homestore/index/btree/btree_kv.h"
 
 namespace homestore {
 template < typename K >

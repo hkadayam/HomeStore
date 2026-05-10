@@ -23,7 +23,7 @@
 
 #include <folly/MPMCQueue.h>
 
-#include <homestore/base/blk.h>
+#include "homestore/base/blk.h"
 #include "blk_allocator.h"
 #include "blk_cache.h"
 

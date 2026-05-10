@@ -25,10 +25,10 @@
 #include <folly/coro/Task.h>
 #include "sisl/fds/bitset.h"
 
-#include "device/device_decl.h"  // HSDevType, IOFlag, DevInfo
-#include "device/hs_super_blk.h" // FirstBlockHeader, HSSuperBlk
-#include "device/physical_dev.h" // PhysicalDev
-#include "device/virtual_dev.h"  // VirtualDev, VDevParameters, VDevInfo
+#include "homestore/device/device_decl.h"  // HSDevType, IOFlag, DevInfo
+#include "homestore/device/hs_super_blk.h" // FirstBlockHeader, HSSuperBlk
+#include "homestore/device/physical_dev.h" // PhysicalDev
+#include "homestore/device/virtual_dev.h"  // VirtualDev, VDevParameters, VDevInfo
 
 namespace homestore {
 

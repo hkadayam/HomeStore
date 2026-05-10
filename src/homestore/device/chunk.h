@@ -29,7 +29,7 @@
 #include <boost/icl/split_interval_set.hpp>
 
 #include "common/defs.h"
-#include "device/hs_super_blk.h" // ChunkInfo
+#include "homestore/device/hs_super_blk.h" // ChunkInfo
 
 namespace homestore {
 

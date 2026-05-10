@@ -30,28 +30,28 @@
 
 #include <fmt/format.h>
 #include <folly/coro/Sleep.h>
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
-#include <sisl/fds/buffer.h>
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
+#include "sisl/fds/buffer.h"
 
 #include "iomanager/iomanager.h"
-#include "base/test_defs.h"
-#include "base/homestore_config.hpp"
+#include "homestore/base/test_defs.h"
+#include "homestore/base/homestore_config.h"
 
 #include "common/defs.h"
-#include "device/device_manager.h"
-#include "device/chunk.h"
-#include "device/physical_dev.h"
-#include "meta/meta_blk_manager.h"
-#include "meta/meta_client.h"
-#include "managers.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/device/chunk.h"
+#include "homestore/device/physical_dev.h"
+#include "homestore/meta/meta_blk_manager.h"
+#include "homestore/meta/meta_client.h"
+#include "homestore/managers.h"
 
-#include <homestore/checkpoint/cp_mgr.h>
-#include <homestore/checkpoint/cp.h>
+#include "homestore/checkpoint/cp_mgr.h"
+#include "homestore/checkpoint/cp.h"
 
-#include "device/virtual_dev.h"
+#include "homestore/device/virtual_dev.h"
 
-#include "logstore/log_stream.h"
+#include "homestore/logstore/log_stream.h"
 
 using namespace homestore;
 using namespace iomanager;
@@ -131,6 +131,9 @@ private:
 class LogStreamTest : public ::testing::Test {
 public:
     void SetUp() override {
+        // Per-test fresh reactors so CPManager's t_cp_info_ thread_local cache doesn't dangle into the freed
+        // CPManager from the previous test.  See comment in test_append_byte_stream.cpp's SetUp for details.
+        iomanager::init_iomgr(2);
         for (size_t i = 0; i < num_devs_; ++i) {
             auto path = fmt::format("/tmp/hs_test_log_stream_{}", i);
             dev_paths_.push_back(path);
@@ -143,9 +146,11 @@ public:
 
     void TearDown() override {
         Managers::reset();
+        iomanager::stop_iomgr();
         for (auto& p : dev_paths_) {
             std::filesystem::remove(p);
         }
+        dev_paths_.clear();
     }
 
     std::vector< DevInfo > make_dev_infos() const {
@@ -949,8 +954,7 @@ int main(int argc, char* argv[]) {
     sisl::logging::SetLogger("test_log_stream");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
 
-    iomanager::init_iomgr(2);
+    // iomgr is started/stopped per-test in the fixture's SetUp/TearDown — see comment there.
     auto ret = RUN_ALL_TESTS();
-    iomanager::stop_iomgr();
     return ret;
 }

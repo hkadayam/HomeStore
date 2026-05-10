@@ -25,11 +25,11 @@
 #include "sisl/fds/buffer.h"
 #include "sisl/logging/logging.h"
 
-#include "blkalloc/sweep_service.h"
-#include "device/device_manager.h"
-#include "device/physical_dev.h"
-#include "device/virtual_dev.h"
-#include "managers.h"
+#include "homestore/blkalloc/sweep_service.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/device/physical_dev.h"
+#include "homestore/device/virtual_dev.h"
+#include "homestore/managers.h"
 
 namespace homestore {
 

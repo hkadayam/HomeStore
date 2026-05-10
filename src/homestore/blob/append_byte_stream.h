@@ -25,11 +25,11 @@
 
 #include <folly/coro/Task.h>
 
-#include <homestore/base/blk.h>                 // BlkId, blk_count_t, chunk_num_t
+#include "homestore/base/blk.h"                 // BlkId, blk_count_t, chunk_num_t
 #include "homestore/base/homestore_decl.h" // shared<>, unique<>
-#include <sisl/fds/buffer.h>               // sisl::Blob, sisl::BufBuilder
+#include "sisl/fds/buffer.h"               // sisl::Blob, sisl::BufBuilder
 
-#include "blob/stream_base.h" // StreamBase, FlushSessionBase, sisl::Rcu
+#include "homestore/blob/stream_base.h" // StreamBase, FlushSessionBase, sisl::Rcu
 
 namespace homestore {
 
@@ -93,7 +93,9 @@ public:
     // ── ReadCursor ───────────────────────────────────────────────────────────
     class ReadCursor {
     public:
-        folly::coro::Task< std::pair< sisl::IOBuffer, uint32_t > > next(size_t max_bytes);
+        // Returns up to max_bytes from the cursor's current position, plus a `valid` byte count (= view.size()).
+        // The returned ByteView's bytes() points exactly at the cursor position — block alignment is hidden inside.
+        folly::coro::Task< std::pair< sisl::ByteView, uint32_t > > next(size_t max_bytes);
 
         bool has_more() const { return pos_ < end_; }
         uint64_t position() const { return pos_; }
@@ -150,8 +152,10 @@ public:
         return do_emplace(size, std::forward< FillFn >(fill));
     }
 
-    /// Read len bytes starting at byte_offset.
-    folly::coro::Task< std::pair< std::error_code, sisl::IOBuffer > > read(uint64_t byte_offset, size_t len);
+    /// Read len bytes starting at byte_offset.  Returns a ByteView whose bytes() points exactly at byte_offset
+    /// (the underlying read is block-aligned, but that's hidden — the slice handles the in-block offset for the
+    /// caller).  size() == len.
+    folly::coro::Task< std::pair< std::error_code, sisl::ByteView > > read(uint64_t byte_offset, size_t len);
 
     ReadCursor open_cursor(uint64_t start_offset = 0) const;
     ReadCursor open_cursor(uint64_t start_offset, uint64_t end_offset) const;

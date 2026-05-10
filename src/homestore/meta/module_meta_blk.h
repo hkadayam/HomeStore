@@ -23,14 +23,14 @@
 #include <type_traits>
 
 #include <folly/coro/Task.h>
-#include <sisl/fds/buffer.h>
+#include "sisl/fds/buffer.h"
 
 #include "common/defs.h"
 
-#include "meta/meta_blk.h"
-#include "meta/meta_blk_manager.h"
-#include "managers.h"
-#include "meta/meta_client.h"
+#include "homestore/meta/meta_blk.h"
+#include "homestore/meta/meta_blk_manager.h"
+#include "homestore/managers.h"
+#include "homestore/meta/meta_client.h"
 
 namespace homestore {
 

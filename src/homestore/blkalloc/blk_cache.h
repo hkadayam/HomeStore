@@ -19,10 +19,10 @@
 #include <cstdint>
 #include <utility>
 
-#include <sisl/fds/bitword.h>
+#include "sisl/fds/bitword.h"
 
-#include <homestore/base/blk.h>
-#include "base/homestore_assert.hpp"
+#include "homestore/base/blk.h"
+#include "homestore/base/homestore_assert.h"
 
 namespace homestore {
 namespace blkalloc {

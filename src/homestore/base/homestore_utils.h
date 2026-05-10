@@ -15,8 +15,8 @@
  *********************************************************************************/
 #pragma once
 
-#include "homestore_config.hpp"
-#include <sisl/fds/buffer.h>
+#include "homestore_config.h"
+#include "sisl/fds/buffer.h"
 
 namespace homestore {
 template < typename T >

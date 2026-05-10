@@ -13,12 +13,12 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
-#include "device/chunk.h"
-#include "common/homestore_assert.hpp"
-#include "common/homestore_config.hpp"
-#include "common/homestore_utils.hpp"
-#include "log_dev.hpp"
-#include "device/journal_vdev.hpp"
+#include "homestore/device/chunk.h"
+#include "common/homestore_assert.h"
+#include "common/homestore_config.h"
+#include "common/homestore_utils.h"
+#include "log_dev.h"
+#include "homestore/device/journal_vdev.hpp"
 
 namespace homestore {
 

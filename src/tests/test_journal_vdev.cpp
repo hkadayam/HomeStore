@@ -26,17 +26,17 @@
 
 #include <gtest/gtest.h>
 #include <iomgr/io_environment.hpp>
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
 #include <farmhash.h>
 
-#include <homestore/homestore.h>
-#include <homestore/logstore_service.hpp>
+#include "homestore/homestore.h"
+#include "homestore/logstore_service.hpp"
 #include "device/virtual_dev.hpp"
 #include "device/journal_vdev.hpp"
-#include "common/homestore_utils.hpp"
-#include "common/homestore_assert.hpp"
-#include "test_common/homestore_test_common.hpp"
+#include "common/homestore_utils.h"
+#include "common/homestore_assert.h"
+#include "test_common/homestore_test_common.h"
 
 using namespace homestore;
 

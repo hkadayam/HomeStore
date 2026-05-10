@@ -19,9 +19,9 @@
 #include <stdexcept>
 
 #include "common/defs.h"
-#include "meta/meta_client.h"
-#include "meta/meta_blk_manager.h" // META_SUPER_HEADER_SIZE
-#include "device/virtual_dev.h"
+#include "homestore/meta/meta_client.h"
+#include "homestore/meta/meta_blk_manager.h" // META_SUPER_HEADER_SIZE
+#include "homestore/device/virtual_dev.h"
 
 namespace homestore {
 

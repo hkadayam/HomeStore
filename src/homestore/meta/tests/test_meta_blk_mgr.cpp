@@ -25,23 +25,23 @@
 
 #include <gtest/gtest.h>
 
-#include <sisl/fds/buffer.h>
+#include "sisl/fds/buffer.h"
 #include "sisl/logging/logging.h"
 #include "sisl/options/options.h"
 #include "iomanager/iomanager.h"
-#include "base/test_defs.h"
+#include "homestore/base/test_defs.h"
 
 #include "common/defs.h"
 #include "homestore/base/blk.h"
 #include "homestore/base/crc.h"
-#include "device/device_manager.h"
-#include "device/physical_dev.h"
-#include "device/virtual_dev.h"
-#include "device/chunk.h"
-#include "meta/meta_blk.h"
-#include "meta/meta_blk_manager.h"
-#include "meta/meta_client.h"
-#include "managers.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/device/physical_dev.h"
+#include "homestore/device/virtual_dev.h"
+#include "homestore/device/chunk.h"
+#include "homestore/meta/meta_blk.h"
+#include "homestore/meta/meta_blk_manager.h"
+#include "homestore/meta/meta_client.h"
+#include "homestore/managers.h"
 
 using namespace homestore;
 using namespace iomanager;

@@ -28,10 +28,10 @@
 
 #include "sisl/fds/bitset.h"
 
-#include "device/device_decl.h"          // HSDevType, IOFlag, DevInfo
-#include "device/hs_super_blk.h"         // PDevInfoHeader, FirstBlock, HSSuperBlk
-#include "iomanager/drive_interface.hpp" // iomanager::DriveInterface, iomanager::IoDevice
-#include "device/chunk.h"                // ChunkInfo, ChunkInterval, ChunkIntervalSet, Chunk
+#include "homestore/device/device_decl.h"          // HSDevType, IOFlag, DevInfo
+#include "homestore/device/hs_super_blk.h"         // PDevInfoHeader, FirstBlock, HSSuperBlk
+#include "iomanager/drive_interface.h" // iomanager::DriveInterface, iomanager::IoDevice
+#include "homestore/device/chunk.h"                // ChunkInfo, ChunkInterval, ChunkIntervalSet, Chunk
 
 namespace homestore {
 

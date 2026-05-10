@@ -4,9 +4,9 @@
 #include <functional>
 #include <iomgr/iomgr.hpp>
 #include <folly/concurrency/ConcurrentHashMap.h>
-#include <sisl/fds/enum.h>
+#include "sisl/fds/enum.h"
 #include <nuraft_mesg/mesg_state_mgr.hpp>
-#include <homestore/replication/repl_decls.h>
+#include "homestore/replication/repl_decls.h"
 
 #include "replication/repl_dev/common.h"
 

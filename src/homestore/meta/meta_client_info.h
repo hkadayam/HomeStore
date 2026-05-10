@@ -20,8 +20,8 @@
 #include <string>
 #include <string_view>
 
-#include <homestore/base/blk.h> // BlkId
-#include <homestore/base/crc.h> // crc32_ieee
+#include "homestore/base/blk.h" // BlkId
+#include "homestore/base/crc.h" // crc32_ieee
 
 namespace homestore {
 

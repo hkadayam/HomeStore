@@ -28,16 +28,16 @@
 
 #include <gtest/gtest.h>
 #include <boost/dynamic_bitset.hpp>
-#include <sisl/fds/bitword.h>
+#include "sisl/fds/bitword.h"
 #include <folly/ConcurrentSkipList.h>
 #include <folly/concurrency/ConcurrentHashMap.h>
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
 #include <iomgr/iomgr_flip.hpp>
 
 #include "blkalloc/blk_cache.h"
-#include "common/homestore_assert.hpp"
-#include "common/homestore_config.hpp"
+#include "common/homestore_assert.h"
+#include "common/homestore_config.h"
 #include "blkalloc/slab_blk_allocator.h"
 
  

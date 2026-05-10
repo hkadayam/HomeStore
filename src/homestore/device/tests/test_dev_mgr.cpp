@@ -24,11 +24,11 @@
 #include "sisl/logging/logging.h"
 #include "sisl/options/options.h"
 #include "iomanager/iomanager.h"
-#include "base/test_defs.h"
+#include "homestore/base/test_defs.h"
 
-#include "base/homestore_config.hpp"
-#include "device/device_manager.h"
-#include "device/virtual_dev.h"
+#include "homestore/base/homestore_config.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/device/virtual_dev.h"
 
 using namespace homestore;
 using namespace iomanager;

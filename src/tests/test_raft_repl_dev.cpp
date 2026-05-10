@@ -12,7 +12,7 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
-#include "test_common/raft_repl_test_base.hpp"
+#include "test_common/raft_repl_test_base.h"
 
 class RaftReplDevTest : public RaftReplDevTestBase {};
 TEST_F(RaftReplDevTest, Write_Duplicated_Data) {

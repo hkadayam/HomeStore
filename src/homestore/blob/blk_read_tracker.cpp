@@ -12,8 +12,8 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
-#include "blob/blk_read_tracker.h"
-#include "base/homestore_assert.hpp"
+#include "homestore/blob/blk_read_tracker.h"
+#include "homestore/base/homestore_assert.h"
 
 namespace homestore {
 static BlkId extract_key(const BlkTrackRecord& rec) {

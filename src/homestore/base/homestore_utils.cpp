@@ -14,8 +14,8 @@
  *
  *********************************************************************************/
 #include <boost/uuid/random_generator.hpp>
-#include "homestore_utils.hpp"
-#include "homestore_assert.hpp"
+#include "homestore_utils.h"
+#include "homestore_assert.h"
 
 namespace homestore {
 uint8_t* hs_utils::iobuf_alloc(const size_t size, const sisl::Buftag tag, const size_t alignment) {

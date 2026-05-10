@@ -24,11 +24,11 @@
 #include <folly/coro/Mutex.h>
 #include <folly/coro/Task.h>
 
-#include <homestore/base/blk.h>              // BlkId
+#include "homestore/base/blk.h"              // BlkId
 #include "common/defs.h" // shared<>, unique<>, cshared<>
 
-#include "meta/meta_blk.h"         // MetaBlk
-#include "meta/meta_client_info.h" // MetaClientInfo
+#include "homestore/meta/meta_blk.h"         // MetaBlk
+#include "homestore/meta/meta_client_info.h" // MetaClientInfo
 
 namespace homestore {
 

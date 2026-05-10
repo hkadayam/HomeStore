@@ -17,15 +17,15 @@
 #include <stdexcept>
 #include <string>
 
-#include "checkpoint/cp.h"     // CP, cp_id_t
-#include "checkpoint/cp_mgr.h" // CPGuard
+#include "homestore/checkpoint/cp.h"     // CP, cp_id_t
+#include "homestore/checkpoint/cp_mgr.h" // CPGuard
 
-#include "blob/append_blk_stream.h"
-#include "blob/blob_dev.h"
-#include "blkalloc/blk_allocator.h"
-#include "device/chunk.h"
-#include "device/virtual_dev.h"
-#include "managers.h" // meta_mgr()
+#include "homestore/blob/append_blk_stream.h"
+#include "homestore/blob/blob_dev.h"
+#include "homestore/blkalloc/blk_allocator.h"
+#include "homestore/device/chunk.h"
+#include "homestore/device/virtual_dev.h"
+#include "homestore/managers.h" // meta_mgr()
 
 namespace homestore {
 

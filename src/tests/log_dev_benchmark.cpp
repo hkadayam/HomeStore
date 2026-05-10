@@ -23,10 +23,10 @@
 #include <vector>
 
 #include <benchmark/benchmark.h>
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
 
-#include "logstore/log_dev.hpp"
+#include "logstore/log_dev.h"
 
  
 RCU_REGISTER_INIT

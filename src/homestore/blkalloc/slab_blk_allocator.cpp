@@ -16,8 +16,8 @@
 #include <optional>
 
 #include <fmt/format.h>
-#include <sisl/logging/logging.h>
-#include <sisl/fds/rcu.h>
+#include "sisl/logging/logging.h"
+#include "sisl/fds/rcu.h"
 
 #include "slab_blk_allocator.h"
 

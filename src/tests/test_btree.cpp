@@ -16,13 +16,13 @@
 #include <gtest/gtest.h>
 #include <boost/uuid/random_generator.hpp>
 
-#include <sisl/fds/enum.h>
-#include "common/homestore_config.hpp"
-#include "common/resource_mgr.hpp"
-#include "test_common/homestore_test_common.hpp"
-#include "test_common/range_scheduler.hpp"
-#include "btree_helpers/btree_test_helper.hpp"
-#include "btree_helpers/btree_test_kvs.hpp"
+#include "sisl/fds/enum.h"
+#include "common/homestore_config.h"
+#include "common/resource_mgr.h"
+#include "test_common/homestore_test_common.h"
+#include "test_common/range_scheduler.h"
+#include "btree_helpers/btree_test_helper.h"
+#include "btree_helpers/btree_test_kvs.h"
 #include "btree_helpers/btree_decls.h"
 
 using namespace homestore;

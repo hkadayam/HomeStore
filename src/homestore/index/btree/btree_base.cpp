@@ -1,10 +1,10 @@
 #include <string>
 
-#include <sisl/logging/logging.h>
+#include "sisl/logging/logging.h"
 
 #include "homestore/index/btree/btree_base.h"
 #include "homestore/index/btree/detail/btree_node.h"
-#include "homestore/base/homestore_assert.hpp"
+#include "homestore/base/homestore_assert.h"
 
 namespace homestore {
 

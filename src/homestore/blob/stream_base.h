@@ -25,14 +25,14 @@
 
 #include <folly/coro/Mutex.h>
 #include <folly/coro/Task.h>
-#include <sisl/fds/concurrent_insert_set.h>
-#include <sisl/fds/rcu.h>
+#include "sisl/fds/concurrent_insert_set.h"
+#include "sisl/fds/rcu.h"
 
 #include "homestore/base/homestore_decl.h" // shared<>, unique<>
-#include "checkpoint/cp.h"              // cp_id_t
-#include "checkpoint/cp_mgr.h"          // CPManager::max_concurent_cps
+#include "homestore/checkpoint/cp.h"              // cp_id_t
+#include "homestore/checkpoint/cp_mgr.h"          // CPManager::max_concurent_cps
 
-#include "meta/meta_blk.h" // MetaBlk
+#include "homestore/meta/meta_blk.h" // MetaBlk
 
 namespace homestore {
 

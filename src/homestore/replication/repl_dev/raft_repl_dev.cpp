@@ -5,21 +5,21 @@
 #include <boost/lexical_cast.hpp>
 #include <boost/uuid/nil_generator.hpp>
 
-#include <sisl/fds/buffer.h>
-#include <sisl/grpc/generic_service.hpp>
-#include <sisl/grpc/rpc_client.hpp>
-#include <sisl/fds/vector_pool.h>
-#include <homestore/blkdata_service.hpp>
-#include <homestore/logstore_service.hpp>
-#include <homestore/superblk_handler.hpp>
+#include "sisl/fds/buffer.h"
+#include "sisl/grpc/generic_service.hpp"
+#include "sisl/grpc/rpc_client.hpp"
+#include "sisl/fds/vector_pool.h"
+#include "homestore/blkdata_service.hpp"
+#include "homestore/logstore_service.hpp"
+#include "homestore/superblk_handler.hpp"
 
-#include "common/homestore_assert.hpp"
-#include "common/homestore_config.hpp"
-#include "common/homestore_utils.hpp"
+#include "common/homestore_assert.h"
+#include "common/homestore_config.h"
+#include "common/homestore_utils.h"
 #include "replication/service/raft_repl_service.h"
 #include "replication/repl_dev/raft_repl_dev.h"
-#include "device/chunk.h"
-#include "device/device.h"
+#include "homestore/device/chunk.h"
+#include "homestore/device/device.h"
 #include "push_data_rpc_generated.h"
 #include "fetch_data_rpc_generated.h"
 

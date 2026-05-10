@@ -25,7 +25,7 @@
 #include "device.h"
 #include "physical_dev.hpp"
 #include "virtual_dev.hpp"
-#include <homestore/logstore/log_store_internal.hpp>
+#include "homestore/logstore/log_store_internal.hpp"
 
 namespace homestore {
 typedef std::function< void(const off_t ret_off) > alloc_next_blk_cb_t;

@@ -17,13 +17,13 @@
 #include <cstdint>
 #include <string>
 
-#include <sisl/fds/buffer.h>
+#include "sisl/fds/buffer.h"
 #include <nlohmann/json.hpp>
 
 #include "homestore/base/homestore_decl.h"
-#include <homestore/base/blk.h>
-#include "base/homestore_config.hpp"
-#include "base/homestore_assert.hpp"
+#include "homestore/base/blk.h"
+#include "homestore/base/homestore_config.h"
+#include "homestore/base/homestore_assert.h"
 
 namespace homestore {
 #define BLKALLOC_LOG(level, msg, ...) HS_SUBMOD_LOG(level, blkalloc, , "blkalloc", get_name(), msg, ##__VA_ARGS__)

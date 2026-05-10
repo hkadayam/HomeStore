@@ -26,7 +26,7 @@
 #include <folly/coro/Task.h>
 
 #include "homestore/base/homestore_decl.h" // shared<>, unique<>
-#include <homestore/checkpoint/cp_mgr.h> // CPCallbacks
+#include "homestore/checkpoint/cp_mgr.h" // CPCallbacks
 
 namespace homestore {
 

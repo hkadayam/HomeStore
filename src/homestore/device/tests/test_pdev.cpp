@@ -30,9 +30,9 @@
 #include "sisl/options/options.h"
 #include "iomanager/iomanager.h"
 
-#include "base/test_defs.h"
-#include "device/physical_dev.h"
-#include "device/chunk.h"
+#include "homestore/base/test_defs.h"
+#include "homestore/device/physical_dev.h"
+#include "homestore/device/chunk.h"
 
 using namespace homestore;
 using namespace iomanager;

@@ -25,7 +25,7 @@
 #include "sisl/fds/sparse_vector.h"
 #include "sisl/fds/utils.h"
 #include "common/defs.h"
-#include "device/device_decl.h"
+#include "homestore/device/device_decl.h"
 #include "homestore/base/crc.h"
 
 #ifdef _PRERELEASE

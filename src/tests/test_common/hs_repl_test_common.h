@@ -17,7 +17,7 @@
  */
 
 #pragma once
-#include "raft_repl_test_base.hpp"
+#include "raft_repl_test_base.h"
 
 #include <mutex>
 #include <condition_variable>
@@ -31,11 +31,11 @@
 #include <boost/interprocess/sync/interprocess_condition.hpp>
 #include <boost/uuid/string_generator.hpp>
 
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
-#include <sisl/settings/settings.hpp>
-#include <sisl/grpc/rpc_client.hpp>
-#include "test_common/homestore_test_common.hpp"
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
+#include "sisl/settings/settings.h"
+#include "sisl/grpc/rpc_client.hpp"
+#include "test_common/homestore_test_common.h"
 
 #include <replication/service/raft_repl_service.h>
 

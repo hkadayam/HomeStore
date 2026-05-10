@@ -20,10 +20,10 @@
 #include <memory>
 
 #include "homestore/index/btree/btree.h"
-#include "homestore/index/btree/node_variant/simple_node.hpp"
-#include "homestore/index/btree/node_variant/varlen_node.hpp"
-// TODO: re-enable FixedPrefixNode when variant_node.hpp is ported.
-// #include "homestore/index/btree/node_variant/prefix_node.hpp"
+#include "homestore/index/btree/node_variant/simple_node.h"
+#include "homestore/index/btree/node_variant/varlen_node.h"
+// TODO: re-enable FixedPrefixNode when variant_node.h is ported.
+// #include "homestore/index/btree/node_variant/prefix_node.h"
 
 namespace homestore {
 

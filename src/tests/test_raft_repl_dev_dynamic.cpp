@@ -12,9 +12,9 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
-#include "test_common/raft_repl_test_base.hpp"
+#include "test_common/raft_repl_test_base.h"
 #include <boost/uuid/random_generator.hpp>
-#include "common/homestore_config.hpp"
+#include "common/homestore_config.h"
 
 // Dynamic tests spawn spare replica's also which can be used to add and remove from a repl dev.
 class ReplDevDynamicTest : public RaftReplDevTestBase {

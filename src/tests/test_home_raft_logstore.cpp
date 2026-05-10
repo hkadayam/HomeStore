@@ -3,9 +3,9 @@
 #include <filesystem>
 #include <gtest/gtest.h>
 #include <iomgr/io_environment.hpp>
-#include <homestore/homestore.h>
+#include "homestore/homestore.h"
 
-#include "test_common/homestore_test_common.hpp"
+#include "test_common/homestore_test_common.h"
 #include "replication/log_store/home_raft_log_store.h"
 
 using namespace homestore;

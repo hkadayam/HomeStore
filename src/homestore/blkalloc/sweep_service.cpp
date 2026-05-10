@@ -15,10 +15,10 @@
 #include "sweep_service.h"
 
 #include <folly/executors/thread_factory/NamedThreadFactory.h>
-#include <sisl/logging/logging.h>
+#include "sisl/logging/logging.h"
 
-#include "base/homestore_assert.hpp"
-#include "base/homestore_config.hpp"
+#include "homestore/base/homestore_assert.h"
+#include "homestore/base/homestore_config.h"
 
 namespace homestore {
 namespace blkalloc {

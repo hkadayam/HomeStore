@@ -20,19 +20,19 @@
 #include <limits>
 #include <memory>
 
-#include <sisl/logging/logging.h>
+#include "sisl/logging/logging.h"
 #include <iomgr/iomgr_flip.hpp>
-#include <homestore/homestore.h>
-#include <homestore/logstore_service.hpp>
-#include "device/chunk.h"
-#include "device/device.h"
-#include "device/physical_dev.hpp"
-#include "device/journal_vdev.hpp"
+#include "homestore/homestore.h"
+#include "homestore/logstore_service.hpp"
+#include "homestore/device/chunk.h"
+#include "homestore/device/device.h"
+#include "homestore/device/physical_dev.hpp"
+#include "homestore/device/journal_vdev.hpp"
 #include "common/error.h"
-#include "common/homestore_assert.hpp"
-#include "common/homestore_utils.hpp"
-#include "common/resource_mgr.hpp"
-#include "common/crash_simulator.hpp"
+#include "common/homestore_assert.h"
+#include "common/homestore_utils.h"
+#include "common/resource_mgr.h"
+#include "common/crash_simulator.h"
 
 namespace homestore {
 JournalVirtualDev::JournalVirtualDev(DeviceManager& dmgr, const vdev_info& vinfo, vdev_event_cb_t event_cb) :

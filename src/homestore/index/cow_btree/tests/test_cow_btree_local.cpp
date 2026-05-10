@@ -24,30 +24,30 @@
 #include <vector>
 
 #include <gtest/gtest.h>
-#include <sisl/options/options.h>
-#include <sisl/logging/logging.h>
-#include <sisl/flip/flip.h>
-#include <sisl/flip/flip_client.h>
+#include "sisl/options/options.h"
+#include "sisl/logging/logging.h"
+#include "sisl/flip/flip.h"
+#include "sisl/flip/flip_client.h"
 
 #include "iomanager/iomanager.h"
-#include "base/test_defs.h"
-#include "base/resource_mgr.hpp"
+#include "homestore/base/test_defs.h"
+#include "homestore/base/resource_mgr.h"
 
 #include "common/defs.h"
-#include "device/device_manager.h"
-#include "meta/meta_blk_manager.h"
-#include "managers.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/meta/meta_blk_manager.h"
+#include "homestore/managers.h"
 
-#include <homestore/checkpoint/cp_mgr.h>
-#include "blob/blob_dev.h"
-#include "blob/blob_dev_mgr.h"
+#include "homestore/checkpoint/cp_mgr.h"
+#include "homestore/blob/blob_dev.h"
+#include "homestore/blob/blob_dev_mgr.h"
 
 #include "homestore/index/btree/btree.ipp"
-#include "homestore/index/btree/node_variant/simple_node.hpp"
-#include "index/cow_btree/cow_btree_mgr.h"
-#include "index/cow_btree/cow_btree.h"
-#include "index/cow_btree/cow_btree_mgr.ipp"
-#include "homestore/index/btree/tests/btree_test_kvs.hpp"
+#include "homestore/index/btree/node_variant/simple_node.h"
+#include "homestore/index/cow_btree/cow_btree_mgr.h"
+#include "homestore/index/cow_btree/cow_btree.h"
+#include "homestore/index/cow_btree/cow_btree_mgr.ipp"
+#include "homestore/index/btree/tests/btree_test_kvs.h"
 
 using namespace homestore;
 using namespace iomanager;
@@ -69,7 +69,7 @@ static constexpr uint64_t CHUNK_SIZE = 32ull * 1024 * 1024;     // 32 MB blob ch
 static constexpr uint32_t BLK_SIZE = 4096;
 static constexpr size_t NUM_DEVS = 2;
 static constexpr uint32_t NODE_SIZE = 4096;
-static constexpr char BLOB_DEV_NAME[] = "test_cow_btree_local_blob_dev";
+static constexpr char BLOB_DEV_NAME[] = "cow_local_bd";
 static constexpr char BTREE_NAME[] = "local_btree";
 
 using K = TestFixedKey;
@@ -105,7 +105,7 @@ static folly::coro::Task< shared< BlobDev > > bootstrap_stack(bool first_time_bo
     auto cpmgr = CPManager::create();
     co_await cpmgr->start(first_time_boot);
 
-    ResourceMgr::start(dm->total_capacity());
+    ResourceMgr::start(make_dev_infos());
 
     if (first_time_boot) {
         co_await BlobDevManager::create();
@@ -164,22 +164,31 @@ public:
             ofs.close();
         }
 
+        // Per-test fresh reactors so CPManager's t_cp_info_ thread_local cache doesn't dangle into the freed
+        // CPManager from the previous test.
+        iomanager::init_iomgr(SISL_OPTIONS["num_threads"].as< uint32_t >());
         bringup(/*first_time_boot=*/true);
     }
 
     void TearDown() override {
         teardown();
+        iomanager::stop_iomgr();
         for (auto& p : g_dev_paths) {
             std::filesystem::remove(p);
         }
         g_dev_paths.clear();
     }
 
-    /// Restart the stack: shutdown, then bootstrap with first_time_boot=false and reload our btree from the
-    /// recovered super_blk list.  The cache is empty after this — every subsequent read_node hits disk via the
-    /// recovered bnode_map (and thus exercises full-map / incr-map replay paths).
+    /// Restart the stack: shutdown, recycle iomgr, then bootstrap with first_time_boot=false and reload our btree
+    /// from the recovered super_blk list.  Bouncing iomgr is what makes this a true restart: reactor threads die
+    /// and their thread-local state (e.g. CPGuard's cached per-thread cp stack pointer into the old CPManager) is
+    /// wiped — without this, a stale thread_local would dereference freed manager-owned memory on the next access.
+    /// The cache is empty after this; every subsequent read_node hits disk via the recovered bnode_map (and thus
+    /// exercises full-map / incr-map replay paths).
     void restart() {
         teardown();
+        iomanager::stop_iomgr();
+        iomanager::init_iomgr(SISL_OPTIONS["num_threads"].as< uint32_t >());
         bringup(/*first_time_boot=*/false);
     }
 
@@ -596,8 +605,6 @@ int main(int argc, char* argv[]) {
     auto const seed = SISL_OPTIONS["seed"].as< uint64_t >();
     g_re.seed(seed ? seed : std::chrono::system_clock::now().time_since_epoch().count());
 
-    iomanager::init_iomgr(SISL_OPTIONS["num_threads"].as< uint32_t >());
-    auto ret = RUN_ALL_TESTS();
-    iomanager::stop_iomgr();
-    return ret;
+    // iomgr is started/stopped per-test in the fixture's SetUp/TearDown.
+    return RUN_ALL_TESTS();
 }

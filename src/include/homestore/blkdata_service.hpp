@@ -19,11 +19,11 @@
 
 #include <folly/small_vector.h>
 #include <folly/futures/Future.h>
-#include <sisl/fds/buffer.h>
-#include <sisl/fds/atomic_counter.h>
+#include "sisl/fds/buffer.h"
+#include "sisl/fds/atomic_counter.h"
 
-#include <homestore/homestore_decl.hpp>
-#include <homestore/blk.h>
+#include "homestore/homestore_decl.hpp"
+#include "homestore/blk.h"
 
 namespace homestore {
 // callback type for caller to provide

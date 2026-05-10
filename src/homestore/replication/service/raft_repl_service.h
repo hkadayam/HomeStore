@@ -22,11 +22,11 @@
 #include <folly/Expected.h>
 #include <folly/futures/Future.h>
 #include <nuraft_mesg/nuraft_mesg.hpp>
-#include <sisl/fds/buffer.h>
-#include <sisl/logging/logging.h>
+#include "sisl/fds/buffer.h"
+#include "sisl/logging/logging.h"
 
-#include <homestore/homestore.h>
-#include <homestore/superblk_handler.hpp>
+#include "homestore/homestore.h"
+#include "homestore/superblk_handler.hpp"
 #include "replication/service/generic_repl_svc.h"
 
 namespace homestore {

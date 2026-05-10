@@ -27,15 +27,19 @@ namespace homestore {
 
 // fmt v11's make_format_args requires lvalue references; use format_to + fmt::runtime which takes a forwarding
 // reference parameter pack so both rvalues and lvalues bind.
-#define _BT_LOG_METHOD_IMPL(req, btcfg, node)                                                                          \
+//
+// Takes a `name` string-like (not a config object) for the [btree=] prefix so callers that don't yet have a bound
+// BtreeBase (e.g. COWBtree::recover() before its base_btree_ is set) can use it directly.  Callers with a config
+// just pass `cfg.name()`.
+#define _BT_LOG_METHOD_IMPL(req, name, node)                                                                           \
     ([&](fmt::memory_buffer& buf, const char* msgcb, auto&&... args) -> bool {                                         \
         fmt::format_to(fmt::appender{buf}, fmt::runtime("[{}:{}] "), file_name(__FILE__), __LINE__);                   \
         BOOST_PP_IF(                                                                                                   \
             BOOST_VMD_IS_EMPTY(req), BOOST_PP_EMPTY,                                                                   \
             BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("[req={}] "), req->to_string())))        \
         ();                                                                                                            \
-        BOOST_PP_IF(BOOST_VMD_IS_EMPTY(btcfg), BOOST_PP_EMPTY,                                                         \
-                    BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("[btree={}] "), btcfg.name())))  \
+        BOOST_PP_IF(BOOST_VMD_IS_EMPTY(name), BOOST_PP_EMPTY,                                                          \
+                    BOOST_PP_IDENTITY(fmt::format_to(fmt::appender{buf}, fmt::runtime("[btree={}] "), name)))          \
         ();                                                                                                            \
         BOOST_PP_IF(BOOST_VMD_IS_EMPTY(node), BOOST_PP_EMPTY,                                                          \
                     BOOST_PP_IDENTITY(                                                                                 \
@@ -46,13 +50,13 @@ namespace homestore {
     })
 
 #define BT_LOG(level, msg, ...)                                                                                        \
-    { LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, this->bt_cfg_, )), msg, ##__VA_ARGS__); }
+    { LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, this->bt_cfg_.name(), )), msg, ##__VA_ARGS__); }
 
 #define BT_NODE_LOG(level, node, msg, ...)                                                                             \
-    { LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, this->bt_cfg_, node)), msg, ##__VA_ARGS__); }
+    { LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, this->bt_cfg_.name(), node)), msg, ##__VA_ARGS__); }
 
 #define SPECIFIC_BT_LOG(level, bt, msg, ...)                                                                           \
-    { LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, bt.bt_config(), )), msg, ##__VA_ARGS__); }
+    { LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, bt.bt_config().name(), )), msg, ##__VA_ARGS__); }
 #if 0
 #define THIS_BT_LOG(level, req, msg, ...)                                                                              \
     {                                                                                                                  \
@@ -130,10 +134,10 @@ namespace homestore {
 #endif
 
 #define BT_ASSERT(assert_type, cond, ...)                                                                              \
-    { assert_type##_ASSERT_FMT(cond, _BT_LOG_METHOD_IMPL(, this->bt_cfg_, ), ##__VA_ARGS__); }
+    { assert_type##_ASSERT_FMT(cond, _BT_LOG_METHOD_IMPL(, this->bt_cfg_.name(), ), ##__VA_ARGS__); }
 
 #define BT_ASSERT_CMP(assert_type, val1, cmp, val2, ...)                                                               \
-    { assert_type##_ASSERT_CMP(val1, cmp, val2, _BT_LOG_METHOD_IMPL(, this->bt_cfg_, ), ##__VA_ARGS__); }
+    { assert_type##_ASSERT_CMP(val1, cmp, val2, _BT_LOG_METHOD_IMPL(, this->bt_cfg_.name(), ), ##__VA_ARGS__); }
 
 #define BT_DBG_ASSERT(cond, ...) BT_ASSERT(DEBUG, cond, ##__VA_ARGS__)
 #define BT_DBG_ASSERT_EQ(val1, val2, ...) BT_ASSERT_CMP(DEBUG, val1, ==, val2, ##__VA_ARGS__)
@@ -160,10 +164,10 @@ namespace homestore {
 #define BT_REL_ASSERT_GE(val1, val2, ...) BT_ASSERT_CMP(RELEASE, val1, >=, val2, ##__VA_ARGS__)
 
 #define BT_NODE_ASSERT(assert_type, cond, node, ...)                                                                   \
-    { assert_type##_ASSERT_FMT(cond, _BT_LOG_METHOD_IMPL(, bt_cfg_, node), ##__VA_ARGS__); }
+    { assert_type##_ASSERT_FMT(cond, _BT_LOG_METHOD_IMPL(, bt_cfg_.name(), node), ##__VA_ARGS__); }
 
 #define BT_NODE_ASSERT_CMP(assert_type, val1, cmp, val2, node, ...)                                                    \
-    { assert_type##_ASSERT_CMP(val1, cmp, val2, _BT_LOG_METHOD_IMPL(, bt_cfg_, node), ##__VA_ARGS__); }
+    { assert_type##_ASSERT_CMP(val1, cmp, val2, _BT_LOG_METHOD_IMPL(, bt_cfg_.name(), node), ##__VA_ARGS__); }
 
 #define BT_NODE_DBG_ASSERT(cond, ...) BT_NODE_ASSERT(DEBUG, cond, ##__VA_ARGS__)
 #define BT_NODE_DBG_ASSERT_EQ(val1, val2, ...) BT_NODE_ASSERT_CMP(DEBUG, val1, ==, val2, ##__VA_ARGS__)

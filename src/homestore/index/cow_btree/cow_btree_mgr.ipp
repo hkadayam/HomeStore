@@ -11,11 +11,11 @@
 #include <algorithm>
 #include <cstring>
 
-#include "index/cow_btree/cow_btree.h"
-#include "index/cow_btree/cow_btree_mgr.h"
+#include "homestore/index/cow_btree/cow_btree.h"
+#include "homestore/index/cow_btree/cow_btree_mgr.h"
 #include "homestore/index/btree/btree.h"
 #include "homestore/index/btree/btree.ipp"
-#include "meta/meta_blk.h"
+#include "homestore/meta/meta_blk.h"
 
 namespace homestore {
 

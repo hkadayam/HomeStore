@@ -15,9 +15,9 @@
  *********************************************************************************/
 #include <cstring>
 
-#include <homestore/logstore/log_store.hpp>
-#include "common/homestore_assert.hpp"
-#include "log_dev.hpp"
+#include "homestore/logstore/log_store.hpp"
+#include "common/homestore_assert.h"
+#include "log_dev.h"
 
 namespace homestore {
 

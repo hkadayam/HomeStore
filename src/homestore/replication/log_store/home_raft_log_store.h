@@ -14,8 +14,8 @@
  *********************************************************************************/
 #pragma once
 
-#include <homestore/replication/repl_decls.h>
-#include <homestore/logstore_service.hpp>
+#include "homestore/replication/repl_decls.h"
+#include "homestore/logstore_service.hpp"
 
 #if defined __clang__ or defined __GNUC__
 #pragma GCC diagnostic push

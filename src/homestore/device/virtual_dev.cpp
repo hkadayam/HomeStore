@@ -22,10 +22,10 @@
 #include <system_error>
 
 #include "sisl/logging/logging.h"
-#include "blkalloc/slab_blk_allocator.h"
-#include "device/hs_super_blk.h" // HSSuperBlk layout constants
-#include "device/physical_dev.h" // PhysicalDev
-#include "device/virtual_dev.h"
+#include "homestore/blkalloc/slab_blk_allocator.h"
+#include "homestore/device/hs_super_blk.h" // HSSuperBlk layout constants
+#include "homestore/device/physical_dev.h" // PhysicalDev
+#include "homestore/device/virtual_dev.h"
 
 namespace homestore {
 using namespace iomanager;

@@ -5,14 +5,14 @@
 #include <memory>
 #include <vector>
 
-#include <sisl/cache/cache.h>
-#include <homestore/base/blk.h>
-#include <homestore/index/btree/btree_base.h>
-#include <homestore/checkpoint/cp_mgr.h>
+#include "sisl/cache/cache.h"
+#include "homestore/base/blk.h"
+#include "homestore/index/btree/btree_base.h"
+#include "homestore/checkpoint/cp_mgr.h"
 
 #include "sisl/fds/large_id_reserver.h"
 #include "sisl/fds/concurrent_insert_vector.h"
-#include "index/cow_btree/cow_btree_mgr.h"
+#include "homestore/index/cow_btree/cow_btree_mgr.h"
 
 namespace homestore {
 class AppendBlkStream;
@@ -334,7 +334,7 @@ private:
     CPSession* cp_session(cp_id_t cp_id);
     folly::coro::Task< void > recover_full_map(cp_id_t cur_cp_id);
     folly::coro::Task< uint64_t > recover_one_incr_cp(uint64_t offset, cp_id_t last_full_cp, cp_id_t cur_cp_id);
-    folly::coro::Task< sisl::IOBuffer > read_from_incr_stream(uint64_t offset, size_t len);
+    folly::coro::Task< sisl::ByteView > read_from_incr_stream(uint64_t offset, size_t len);
 
     // ── Incremental map journal format (written to incr_map_stream_) ─────────
     //

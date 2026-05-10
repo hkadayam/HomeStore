@@ -26,9 +26,9 @@
 #include <folly/coro/Mutex.h>
 #include <folly/coro/Task.h>
 
-#include <homestore/base/blk.h>               // BlkId, BlkAllocStatus, blk_count_t, blk_alloc_hints
+#include "homestore/base/blk.h"               // BlkId, BlkAllocStatus, blk_count_t, blk_alloc_hints
 #include "homestore/base/homestore_decl.h" // shared<>, unique<>
-#include "blob/stream_base.h"              // StreamBase, CPSessionBase, cp_id_t, CPManager::max_concurent_cps
+#include "homestore/blob/stream_base.h"              // StreamBase, CPSessionBase, cp_id_t, CPManager::max_concurent_cps
 
 namespace homestore {
 

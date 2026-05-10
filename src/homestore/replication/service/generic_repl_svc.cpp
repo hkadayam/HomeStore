@@ -12,12 +12,12 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
-#include <sisl/logging/logging.h>
-#include <homestore/meta_service.hpp>
-#include <homestore/blkdata_service.hpp>
-#include <homestore/logstore_service.hpp>
+#include "sisl/logging/logging.h"
+#include "homestore/meta_service.hpp"
+#include "homestore/blkdata_service.hpp"
+#include "homestore/logstore_service.hpp"
 #include <boost/uuid/uuid.hpp>
-#include "common/homestore_assert.hpp"
+#include "common/homestore_assert.h"
 #include "replication/service/generic_repl_svc.h"
 #include "replication/service/raft_repl_service.h"
 #include "replication/repl_dev/solo_repl_dev.h"

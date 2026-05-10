@@ -24,14 +24,14 @@
 #include "sisl/logging/logging.h"
 #include "sisl/options/options.h"
 #include "iomanager/iomanager.h"
-#include "base/test_defs.h"
+#include "homestore/base/test_defs.h"
 
 #include "homestore/base/blk.h"
-#include "base/homestore_config.hpp"
-#include "device/device_manager.h"
-#include "device/physical_dev.h"
-#include "device/virtual_dev.h"
-#include "device/chunk.h"
+#include "homestore/base/homestore_config.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/device/physical_dev.h"
+#include "homestore/device/virtual_dev.h"
+#include "homestore/device/chunk.h"
 
 using namespace homestore;
 using namespace iomanager;

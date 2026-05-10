@@ -36,20 +36,20 @@
 #include <type_traits>
 #include <vector>
 
-#include <sisl/fds/buffer.h>
+#include "sisl/fds/buffer.h"
 #include <folly/Synchronized.h>
 #include <iomgr/io_environment.hpp>
 #include <iomgr/http_server.hpp>
 #include <iomgr/iomgr_flip.hpp>
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
 #include <gtest/gtest.h>
 
-#include <homestore/homestore.h>
-#include <homestore/logstore_service.hpp>
+#include "homestore/homestore.h"
+#include "homestore/logstore_service.hpp"
 
-#include "logstore/log_dev.hpp"
-#include "test_common/homestore_test_common.hpp"
+#include "logstore/log_dev.h"
+#include "test_common/homestore_test_common.h"
 
 using namespace homestore;
 RCU_REGISTER_INIT

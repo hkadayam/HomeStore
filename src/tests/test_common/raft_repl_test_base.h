@@ -21,27 +21,27 @@
 
 #include <gtest/gtest.h>
 #include <iomgr/io_environment.hpp>
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
-#include <sisl/fds/buffer.h>
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
+#include "sisl/fds/buffer.h"
 #include <folly/init/Init.h>
 #include <folly/executors/GlobalExecutor.h>
 #include <boost/uuid/nil_generator.hpp>
 
 #include <gtest/gtest.h>
 #include <iomgr/iomgr_flip.hpp>
-#include <homestore/base/blk.h>
-#include <homestore/homestore.h>
-#include <homestore/homestore_decl.hpp>
-#include <homestore/blkdata_service.hpp>
-#include <homestore/replication_service.hpp>
-#include <homestore/replication/repl_dev.h>
-#include "common/homestore_config.hpp"
-#include "common/homestore_assert.hpp"
-#include "common/homestore_utils.hpp"
+#include "homestore/base/blk.h"
+#include "homestore/homestore.h"
+#include "homestore/homestore_decl.hpp"
+#include "homestore/blkdata_service.hpp"
+#include "homestore/replication_service.hpp"
+#include "homestore/replication/repl_dev.h"
+#include "common/homestore_config.h"
+#include "common/homestore_assert.h"
+#include "common/homestore_utils.h"
 
 #define private public
-#include "test_common/hs_repl_test_common.hpp"
+#include "test_common/hs_repl_test_common.h"
 #include "replication/service/raft_repl_service.h"
 #include "replication/repl_dev/raft_repl_dev.h"
 

@@ -24,7 +24,7 @@
 
 #include <folly/coro/BlockingWait.h>
 
-#include "device/physical_dev.h"
+#include "homestore/device/physical_dev.h"
 
 namespace homestore {
 

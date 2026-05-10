@@ -15,14 +15,14 @@
  *********************************************************************************/
 #include <gtest/gtest.h>
 
-#include <sisl/options/options.h>
-#include <sisl/logging/logging.h>
-#include <sisl/fds/enum.h>
-#include <homestore/index/btree/node_variant/simple_node.hpp>
-#include <homestore/index/btree/node_variant/varlen_node.hpp>
-// prefix_node.hpp is not ported to the new shared_ptr<uint8_t> buffer API yet — skip PrefixIntervalBtreeTest.
-// #include <homestore/index/btree/node_variant/prefix_node.hpp>
-#include "btree_test_kvs.hpp"
+#include "sisl/options/options.h"
+#include "sisl/logging/logging.h"
+#include "sisl/fds/enum.h"
+#include "homestore/index/btree/node_variant/simple_node.h"
+#include "homestore/index/btree/node_variant/varlen_node.h"
+// prefix_node.h is not ported to the new shared_ptr<uint8_t> buffer API yet — skip PrefixIntervalBtreeTest.
+// #include "homestore/index/btree/node_variant/prefix_node.h"
+#include "btree_test_kvs.h"
 
 static constexpr uint32_t g_node_size{4096};
 static constexpr uint32_t g_max_keys{6000};
@@ -58,7 +58,7 @@ struct VarObjSizeNodeTest {
     using ValueType = TestVarLenValue;
 };
 
-// PrefixIntervalBtreeTest disabled: prefix_node.hpp is not yet ported to the new buffer API.
+// PrefixIntervalBtreeTest disabled: prefix_node.h is not yet ported to the new buffer API.
 // struct PrefixIntervalBtreeTest {
 //     using NodeType = FixedPrefixNode< TestIntervalKey, TestIntervalValue >;
 //     using KeyType = TestIntervalKey;

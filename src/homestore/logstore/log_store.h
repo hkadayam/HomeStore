@@ -26,12 +26,12 @@
 #include <vector>
 
 #include <folly/coro/Task.h>
-#include <sisl/fds/buffer.h>
-#include <sisl/fds/stream_tracker.h>
+#include "sisl/fds/buffer.h"
+#include "sisl/fds/stream_tracker.h"
 
 #include "homestore/base/homestore_decl.h"
-#include "logstore/log_stream.h"
-#include "meta/meta_blk.h"
+#include "homestore/logstore/log_stream.h"
+#include "homestore/meta/meta_blk.h"
 
 namespace homestore {
 

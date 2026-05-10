@@ -26,23 +26,23 @@
 #include <gtest/gtest.h>
 #include <folly/coro/Collect.h>
 
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
 
 #include "iomanager/iomanager.h"
-#include "base/test_defs.h"
+#include "homestore/base/test_defs.h"
 
 #include "common/defs.h"
-#include "device/device_manager.h"
-#include "meta/meta_blk_manager.h"
-#include "managers.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/meta/meta_blk_manager.h"
+#include "homestore/managers.h"
 
-#include <homestore/checkpoint/cp_mgr.h>
-#include <homestore/checkpoint/cp.h>
+#include "homestore/checkpoint/cp_mgr.h"
+#include "homestore/checkpoint/cp.h"
 
-#include "blob/append_blk_stream.h"
-#include "blob/blob_dev.h"
-#include "blob/blob_dev_mgr.h"
+#include "homestore/blob/append_blk_stream.h"
+#include "homestore/blob/blob_dev.h"
+#include "homestore/blob/blob_dev_mgr.h"
 
 using namespace homestore;
 using namespace iomanager;

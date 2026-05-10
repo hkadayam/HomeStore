@@ -15,20 +15,20 @@
  *********************************************************************************/
 #include <folly/io/async/EventBaseManager.h>
 #include <folly/io/async/Request.h>
-#include <sisl/fds/rcu.h>
+#include "sisl/fds/rcu.h"
 
 #include "homestore/checkpoint/cp_mgr.h"
-#include "base/homestore_assert.hpp"
-#include "base/homestore_config.hpp"
-#include "managers.h"
+#include "homestore/base/homestore_assert.h"
+#include "homestore/base/homestore_config.h"
+#include "homestore/managers.h"
 // TODO: re-enable once HomeStore singleton and crash_simulator are ported to new iomanager
-// #include <homestore/homestore.h>
-// #include "base/resource_mgr.hpp"
+// #include "homestore/homestore.h"
+// #include "homestore/base/resource_mgr.h"
 // #ifdef _PRERELEASE
-// #include "base/crash_simulator.hpp"
+// #include "homestore/base/crash_simulator.h"
 // #endif
 
-#include <iomanager/iomanager.h>
+#include "iomanager/iomanager.h"
 
 namespace homestore {
 

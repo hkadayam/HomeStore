@@ -14,7 +14,7 @@
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
  ***************************************************************************/
 
-#include "logstore/log_store.h"
+#include "homestore/logstore/log_store.h"
 
 #include <algorithm>
 #include <cstring>
@@ -23,10 +23,10 @@
 #include <fmt/format.h>
 #include <folly/coro/Sleep.h>
 
-#include "base/homestore_assert.hpp"
-#include "base/homestore_config.hpp" // HS_DYNAMIC_CONFIG
+#include "homestore/base/homestore_assert.h"
+#include "homestore/base/homestore_config.h" // HS_DYNAMIC_CONFIG
 #include "common/defs.h"
-#include "meta/meta_client.h"
+#include "homestore/meta/meta_client.h"
 
 namespace homestore {
 

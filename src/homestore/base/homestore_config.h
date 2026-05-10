@@ -29,14 +29,14 @@
 #include <boost/uuid/uuid_io.hpp>
 
 #include <nlohmann/json.hpp>
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
-#include <sisl/settings/settings.hpp>
-#include <sisl/fds/enum.h>
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
+#include "sisl/settings/settings.h"
+#include "sisl/fds/enum.h"
 
 #include "homestore/base/homestore_decl.h"
 #include "error.h"
-#include "base/generated/homestore_config_generated.h"
+#include "homestore/base/generated/homestore_config_generated.h"
 
 SETTINGS_INIT(homestorecfg::HomeStoreSettings, homestore_config);
 

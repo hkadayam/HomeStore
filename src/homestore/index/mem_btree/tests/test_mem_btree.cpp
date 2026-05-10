@@ -16,18 +16,18 @@
 #include <map>
 #include <memory>
 #include <gtest/gtest.h>
-#include <sisl/options/options.h>
-#include <sisl/logging/logging.h>
-#include <sisl/fds/enum.h>
+#include "sisl/options/options.h"
+#include "sisl/logging/logging.h"
+#include "sisl/fds/enum.h"
 #include <boost/algorithm/string.hpp>
 
-#include <iomanager/iomanager.h>
-#include "homestore/index/btree/node_variant/simple_node.hpp"
-#include "homestore/index/btree/node_variant/varlen_node.hpp"
-// TODO: re-enable prefix_node when variant_node.hpp is ported.
-// #include "homestore/index/btree/node_variant/prefix_node.hpp"
+#include "iomanager/iomanager.h"
+#include "homestore/index/btree/node_variant/simple_node.h"
+#include "homestore/index/btree/node_variant/varlen_node.h"
+// TODO: re-enable prefix_node when variant_node.h is ported.
+// #include "homestore/index/btree/node_variant/prefix_node.h"
 #include "homestore/index/mem_btree/mem_btree.h"
-#include "homestore/index/btree/tests/btree_test_helper.hpp"
+#include "homestore/index/btree/tests/btree_test_helper.h"
 
 using namespace homestore;
 using namespace iomanager;

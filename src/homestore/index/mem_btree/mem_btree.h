@@ -14,7 +14,7 @@
 namespace homestore {
 
 // Forward declaration — full definition in <homestore/index/btree/btree.h>.  Callers of MemBtree::create<K,V>() must
-// have the Btree<K,V> template body visible (via btree.ipp or btree_test_helper.hpp) at the call site.
+// have the Btree<K,V> template body visible (via btree.ipp or btree_test_helper.h) at the call site.
 template < typename K, typename V >
 class Btree;
 
@@ -108,7 +108,7 @@ private:
 };
 
 // Template factory — defined inline to keep it visible wherever Btree<K,V> is.  Relies on the caller having already
-// included btree.ipp (or btree_test_helper.hpp, which does).  Avoid #including btree.ipp here to keep mem_btree.h as
+// included btree.ipp (or btree_test_helper.h, which does).  Avoid #including btree.ipp here to keep mem_btree.h as
 // light as the other UnderlyingBtree headers.
 template < typename K, typename V >
 shared< Btree< K, V > > MemBtree::create(BtreeConfig const& cfg) {

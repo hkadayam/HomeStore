@@ -30,18 +30,18 @@
 
 #include <gtest/gtest.h>
 #include <boost/dynamic_bitset.hpp>
-#include <sisl/fds/bitword.h>
+#include "sisl/fds/bitword.h"
 #include <folly/ConcurrentSkipList.h>
 #include <folly/concurrency/ConcurrentHashMap.h>
 #include <folly/init/Init.h>
 #include <folly/synchronization/Hazptr.h>
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
 
-#include "blkalloc/blk_cache.h"
-#include "base/homestore_assert.hpp"
-#include "base/homestore_config.hpp"
-#include "blkalloc/slab_blk_allocator.h"
+#include "homestore/blkalloc/blk_cache.h"
+#include "homestore/base/homestore_assert.h"
+#include "homestore/base/homestore_config.h"
+#include "homestore/blkalloc/slab_blk_allocator.h"
 
 using namespace homestore;
 using namespace homestore::blkalloc;

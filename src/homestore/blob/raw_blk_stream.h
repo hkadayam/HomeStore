@@ -23,12 +23,12 @@
 
 #include <folly/coro/Task.h>
 
-#include <homestore/base/blk.h>              // BlkId, BlkAllocStatus, blk_count_t, blk_alloc_hints
+#include "homestore/base/blk.h"              // BlkId, BlkAllocStatus, blk_count_t, blk_alloc_hints
 #include "homestore/base/homestore_decl.h" // shared<>, unique<>
-#include <sisl/fds/concurrent_insert_vector.h>
+#include "sisl/fds/concurrent_insert_vector.h"
 
-#include "blob/blk_read_tracker.h"
-#include "blob/stream_base.h"
+#include "homestore/blob/blk_read_tracker.h"
+#include "homestore/blob/stream_base.h"
 
 namespace homestore {
 

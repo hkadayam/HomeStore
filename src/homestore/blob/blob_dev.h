@@ -30,9 +30,9 @@
 #include <folly/coro/Task.h>
 
 #include "homestore/base/homestore_decl.h" // shared<>, unique<>
-#include <homestore/checkpoint/cp.h>    // CP
+#include "homestore/checkpoint/cp.h"    // CP
 
-#include "meta/meta_blk.h"             // MetaBlk
+#include "homestore/meta/meta_blk.h"             // MetaBlk
 
 namespace homestore {
 

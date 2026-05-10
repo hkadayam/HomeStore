@@ -14,9 +14,9 @@
  *********************************************************************************/
 #include <algorithm>
 
-#include <sisl/logging/logging.h>
+#include "sisl/logging/logging.h"
 #include "sisl/fds/bitword.h"
-#include "base/homestore_assert.hpp"
+#include "homestore/base/homestore_assert.h"
 #include "segment_manager.h"
 
 namespace homestore {

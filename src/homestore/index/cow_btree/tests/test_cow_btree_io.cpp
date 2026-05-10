@@ -25,30 +25,30 @@
 #include <memory>
 
 #include <gtest/gtest.h>
-#include <sisl/options/options.h>
-#include <sisl/logging/logging.h>
-#include <sisl/fds/enum.h>
+#include "sisl/options/options.h"
+#include "sisl/logging/logging.h"
+#include "sisl/fds/enum.h"
 #include <boost/algorithm/string.hpp>
 
 #include "iomanager/iomanager.h"
-#include "base/test_defs.h"
-#include "base/resource_mgr.hpp"
+#include "homestore/base/test_defs.h"
+#include "homestore/base/resource_mgr.h"
 
 #include "common/defs.h"
-#include "device/device_manager.h"
-#include "meta/meta_blk_manager.h"
-#include "managers.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/meta/meta_blk_manager.h"
+#include "homestore/managers.h"
 
-#include <homestore/checkpoint/cp_mgr.h>
-#include "blob/blob_dev.h"
-#include "blob/blob_dev_mgr.h"
+#include "homestore/checkpoint/cp_mgr.h"
+#include "homestore/blob/blob_dev.h"
+#include "homestore/blob/blob_dev_mgr.h"
 
-#include "homestore/index/btree/node_variant/simple_node.hpp"
-#include "homestore/index/btree/node_variant/varlen_node.hpp"
-#include "index/cow_btree/cow_btree_mgr.h"
-#include "index/cow_btree/cow_btree.h"
-#include "index/cow_btree/cow_btree_mgr.ipp"
-#include "homestore/index/btree/tests/btree_test_helper.hpp"
+#include "homestore/index/btree/node_variant/simple_node.h"
+#include "homestore/index/btree/node_variant/varlen_node.h"
+#include "homestore/index/cow_btree/cow_btree_mgr.h"
+#include "homestore/index/cow_btree/cow_btree.h"
+#include "homestore/index/cow_btree/cow_btree_mgr.ipp"
+#include "homestore/index/btree/tests/btree_test_helper.h"
 
 using namespace homestore;
 using namespace iomanager;
@@ -137,7 +137,7 @@ static folly::coro::Task< shared< BlobDev > > bootstrap_stack() {
     auto cpmgr = CPManager::create();
     co_await cpmgr->start(true /* first_time_boot */);
 
-    ResourceMgr::start(dm->total_capacity());
+    ResourceMgr::start(make_dev_infos());
     co_await BlobDevManager::create();
     co_await COWBtreeManager::create();
 
@@ -149,7 +149,7 @@ static folly::coro::Task< shared< BlobDev > > bootstrap_stack() {
     params.chunk_sel_type = ChunkSelectorType::RoundRobin;
 
     using namespace std::string_literals;
-    co_return co_await blob_dev_mgr().create_blob_dev("test_cow_btree_io_blob_dev"s, std::move(params));
+    co_return co_await blob_dev_mgr().create_blob_dev("cow_io_bd"s, std::move(params));
 }
 
 static folly::coro::Task< void > shutdown_stack() {
@@ -170,6 +170,10 @@ struct BtreeTest : public BtreeTestHelper< TestType >, public ::testing::Test {
     BtreeTest() : BtreeTestHelper< TestType >(make_options()), ::testing::Test() {}
 
     void SetUp() override {
+        // Per-test fresh reactors so CPManager's t_cp_info_ thread_local cache doesn't dangle into the freed
+        // CPManager from the previous test.  See comment in test_append_byte_stream.cpp's SetUp for details.
+        iomanager::init_iomgr(SISL_OPTIONS["num_threads"].as< uint32_t >());
+
         // Create dev files for this test.
         for (size_t i = 0; i < NUM_DEVS; ++i) {
             auto path = fmt::format("/tmp/hs_test_cow_btree_io_{}_{}", ::getpid(), i);
@@ -197,6 +201,7 @@ struct BtreeTest : public BtreeTestHelper< TestType >, public ::testing::Test {
         this->bt_.reset();
         blob_dev_.reset();
         iomgr().spawn_and_block(iomanager::ReactorTarget::any(), shutdown_stack());
+        iomanager::stop_iomgr();
 
         for (auto& p : g_dev_paths) {
             std::filesystem::remove(p);
@@ -414,8 +419,6 @@ int main(int argc, char* argv[]) {
         g_re.seed(seed);
     }
 
-    iomanager::init_iomgr(SISL_OPTIONS["num_threads"].as< uint32_t >());
-    auto ret = RUN_ALL_TESTS();
-    iomanager::stop_iomgr();
-    return ret;
+    // iomgr is started/stopped per-test in the fixture's SetUp/TearDown — see comment there.
+    return RUN_ALL_TESTS();
 }

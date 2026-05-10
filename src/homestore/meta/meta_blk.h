@@ -23,12 +23,12 @@
 
 #include <folly/coro/Task.h>
 
-#include <homestore/base/blk.h>              // BlkId, BlkAllocStatus, blk_alloc_hints
-#include <homestore/base/crc.h>              // crc32_ieee
+#include "homestore/base/blk.h"              // BlkId, BlkAllocStatus, blk_alloc_hints
+#include "homestore/base/crc.h"              // crc32_ieee
 #include "common/defs.h"                // shared<>, unique<>, to_u32
-#include "base/homestore_assert.hpp"    // HS_SUBMOD_LOG
+#include "homestore/base/homestore_assert.h"    // HS_SUBMOD_LOG
 
-#include <sisl/fds/buffer.h>            // ByteArray, make_byte_array
+#include "sisl/fds/buffer.h"            // ByteArray, make_byte_array
 
 namespace homestore {
 
@@ -65,6 +65,11 @@ struct MetaBlkHeader {
     static constexpr size_t SIZE = META_BLK_HEADER_SIZE;
 
     static MetaBlkHeader make(std::string_view name_sv) {
+        // Silent truncation here is a debugging nightmare — multiple metablks end up sharing the same on-disk
+        // name, parse_mblk_name fails on every one of them, and recovery surfaces zero metablks with no obvious
+        // cause.  Trip in debug builds so callers find this immediately.
+        HS_DBG_ASSERT_LT(name_sv.size(), sizeof(MetaBlkHeader::name), "MetaBlk name '{}' is too long ({} bytes); max {}",
+                         name_sv, name_sv.size(), sizeof(MetaBlkHeader::name) - 1);
         MetaBlkHeader h;
         h.magic = META_BLK_HEADER_MAGIC;
         h.data_size = 0;

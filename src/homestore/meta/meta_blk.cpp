@@ -18,9 +18,9 @@
 #include <stdexcept>
 
 #include "common/defs.h"
-#include "meta/meta_blk.h"
-#include "meta/meta_client.h"
-#include "device/virtual_dev.h"
+#include "homestore/meta/meta_blk.h"
+#include "homestore/meta/meta_client.h"
+#include "homestore/device/virtual_dev.h"
 
 namespace homestore {
 

@@ -25,23 +25,23 @@
 
 #include <gtest/gtest.h>
 
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
 
 #include "iomanager/iomanager.h"
-#include "base/test_defs.h"
+#include "homestore/base/test_defs.h"
 
 #include "common/defs.h"
-#include "device/device_manager.h"
-#include "meta/meta_blk_manager.h"
-#include "managers.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/meta/meta_blk_manager.h"
+#include "homestore/managers.h"
 
-#include <homestore/checkpoint/cp_mgr.h>
-#include <homestore/checkpoint/cp.h>
+#include "homestore/checkpoint/cp_mgr.h"
+#include "homestore/checkpoint/cp.h"
 
-#include "blob/append_byte_stream.h"
-#include "blob/blob_dev.h"
-#include "blob/blob_dev_mgr.h"
+#include "homestore/blob/append_byte_stream.h"
+#include "homestore/blob/blob_dev.h"
+#include "homestore/blob/blob_dev_mgr.h"
 
 using namespace homestore;
 using namespace iomanager;
@@ -59,6 +59,11 @@ static constexpr uint32_t BLK_SIZE = 4096;
 class AppendByteStreamTest : public ::testing::Test {
 public:
     void SetUp() override {
+        // Per-test fresh reactors: CPManager's per-thread cache (cp_mgr.cpp's t_cp_info_) is a thread_local
+        // pointer into the manager's owned_stacks_; the prior test's CPManager is gone but its stack info bytes
+        // were freed, so the cache would dangle.  Cycling iomgr kills the reactor threads (and their TLS) so
+        // the next test's first cp_guard() sees a fresh, empty cache.
+        iomanager::init_iomgr(2);
         for (size_t i = 0; i < num_devs_; ++i) {
             auto path = fmt::format("/tmp/hs_test_append_byte_stream_{}", i);
             dev_paths_.push_back(path);
@@ -71,9 +76,11 @@ public:
 
     void TearDown() override {
         Managers::reset();
+        iomanager::stop_iomgr();
         for (auto& p : dev_paths_) {
             std::filesystem::remove(p);
         }
+        dev_paths_.clear();
     }
 
     std::vector< DevInfo > make_dev_infos() const {
@@ -164,15 +171,13 @@ public:
     }
 
     // Read [offset, offset+size) and verify it matches the seed pattern.  AppendByteStream::read() returns a
-    // block-aligned IOBuffer covering the requested range, so the actual data starts at (offset % block_size())
-    // within the returned buffer.
+    // ByteView pre-sliced to start at byte_offset — index from 0.
     static folly::coro::Task< bool > verify_at(AppendByteStream& s, uint64_t offset, size_t size, uint64_t seed) {
-        auto [ec, iobuf] = co_await s.read(offset, size);
+        auto [ec, view] = co_await s.read(offset, size);
         if (ec) {
             co_return false;
         }
-        auto const in_buf_offset = offset % s.block_size();
-        co_return verify_pattern(iobuf.cbytes() + in_buf_offset, size, seed);
+        co_return verify_pattern(view.bytes(), size, seed);
     }
 
     static constexpr size_t num_devs_ = 2;
@@ -369,10 +374,10 @@ CORO_TEST_F(AppendByteStreamTest, ReadCursorSequential) {
     uint32_t i = 0;
     uint64_t pos = 0;
     while (cursor.has_more()) {
-        auto in_buf_offset = pos % stream->block_size();
-        auto [iobuf, sz] = co_await cursor.next(kRecSize);
+        // ReadCursor::next now returns a ByteView pre-sliced to start at pos — index from 0.
+        auto [view, sz] = co_await cursor.next(kRecSize);
         EXPECT_EQ(sz, kRecSize);
-        EXPECT_TRUE(self.verify_pattern(iobuf.cbytes() + in_buf_offset, sz, 0xF500 + i));
+        EXPECT_TRUE(self.verify_pattern(view.bytes(), sz, 0xF500 + i));
         ++i;
         pos += sz;
     }
@@ -808,8 +813,6 @@ int main(int argc, char* argv[]) {
     sisl::logging::SetLogger("test_append_byte_stream");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
 
-    iomanager::init_iomgr(2);
-    auto ret = RUN_ALL_TESTS();
-    iomanager::stop_iomgr();
-    return ret;
+    // iomgr is started/stopped per-test in the fixture's SetUp/TearDown — see comment there.
+    return RUN_ALL_TESTS();
 }

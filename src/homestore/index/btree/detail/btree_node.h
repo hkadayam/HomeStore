@@ -27,7 +27,7 @@
 #include "homestore/base/crc.h"
 #include "sisl/fds/enum.h"
 #include "sisl/fds/obj_life_counter.h"
-#include "base/homestore_assert.hpp" // HS_REL_ASSERT
+#include "homestore/base/homestore_assert.h" // HS_REL_ASSERT
 #include "homestore/index/btree/btree_async.h"
 #include "homestore/index/btree/detail/btree_internal.h"
 #include "homestore/index/btree/btree_kv.h"

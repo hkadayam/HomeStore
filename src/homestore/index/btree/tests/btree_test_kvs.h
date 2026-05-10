@@ -22,10 +22,10 @@
 #include <array>
 
 #include "homestore/index/btree/btree_kv.h"
-#include "homestore/index/btree/node_variant/simple_node.hpp"
-#include "homestore/index/btree/node_variant/varlen_node.hpp"
-// TODO: re-enable prefix_node when variant_node.hpp is ported.
-// #include "homestore/index/btree/node_variant/prefix_node.hpp"
+#include "homestore/index/btree/node_variant/simple_node.h"
+#include "homestore/index/btree/node_variant/varlen_node.h"
+// TODO: re-enable prefix_node when variant_node.h is ported.
+// #include "homestore/index/btree/node_variant/prefix_node.h"
 
 static constexpr uint32_t g_max_keysize{100}; // for  node size = 512 : free space : 442 => 100+100+6(record size) = 46%
 static constexpr uint32_t g_max_valsize{100};

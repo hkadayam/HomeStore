@@ -25,23 +25,23 @@
 
 #include <gtest/gtest.h>
 
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
 
 #include "iomanager/iomanager.h"
-#include "base/test_defs.h"
+#include "homestore/base/test_defs.h"
 
 #include "common/defs.h"
-#include "device/device_manager.h"
-#include "meta/meta_blk_manager.h"
-#include "managers.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/meta/meta_blk_manager.h"
+#include "homestore/managers.h"
 
-#include <homestore/checkpoint/cp_mgr.h>
-#include <homestore/checkpoint/cp.h>
+#include "homestore/checkpoint/cp_mgr.h"
+#include "homestore/checkpoint/cp.h"
 
-#include "blob/blob_dev.h"
-#include "blob/blob_dev_mgr.h"
-#include "blob/raw_blk_stream.h"
+#include "homestore/blob/blob_dev.h"
+#include "homestore/blob/blob_dev_mgr.h"
+#include "homestore/blob/raw_blk_stream.h"
 
 using namespace homestore;
 using namespace iomanager;
@@ -64,6 +64,9 @@ static constexpr uint32_t BLK_SIZE = 4096;
 class RawBlkStreamTest : public ::testing::Test {
 public:
     void SetUp() override {
+        // Per-test fresh reactors so CPManager's t_cp_info_ thread_local cache doesn't dangle into the freed
+        // CPManager from the previous test.  See comment in test_append_byte_stream.cpp's SetUp for details.
+        iomanager::init_iomgr(2);
         for (size_t i = 0; i < num_devs_; ++i) {
             auto path = fmt::format("/tmp/hs_test_raw_blk_stream_{}", i);
             dev_paths_.push_back(path);
@@ -76,9 +79,11 @@ public:
 
     void TearDown() override {
         Managers::reset();
+        iomanager::stop_iomgr();
         for (auto& p : dev_paths_) {
             std::filesystem::remove(p);
         }
+        dev_paths_.clear();
     }
 
     std::vector< DevInfo > make_dev_infos() const {
@@ -1041,8 +1046,6 @@ int main(int argc, char* argv[]) {
     sisl::logging::SetLogger("test_raw_blk_stream");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
 
-    iomanager::init_iomgr(2);
-    auto ret = RUN_ALL_TESTS();
-    iomanager::stop_iomgr();
-    return ret;
+    // iomgr is started/stopped per-test in the fixture's SetUp/TearDown — see comment there.
+    return RUN_ALL_TESTS();
 }

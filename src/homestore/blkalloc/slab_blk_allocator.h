@@ -22,16 +22,16 @@
 #include <string>
 #include <vector>
 
-#include <sisl/metrics/metrics.h>
-#include <sisl/logging/logging.h>
-#include <sisl/fds/bitset.h>
+#include "sisl/metrics/metrics.h"
+#include "sisl/logging/logging.h"
+#include "sisl/fds/bitset.h"
 
-#include <homestore/base/blk.h>
+#include "homestore/base/blk.h"
 #include "bitmap_blk_allocator.h"
 #include "sweep_service.h"
 #include "segment_manager.h"
-#include "base/homestore_assert.hpp"
-#include "base/homestore_config.hpp"
+#include "homestore/base/homestore_assert.h"
+#include "homestore/base/homestore_config.h"
 
 namespace homestore {
 namespace blkalloc {

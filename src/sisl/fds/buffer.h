@@ -445,7 +445,7 @@ public:
 // ── IOBuffer ──────────────────────────────────────────────────────────────────
 // Public alias for IoBlobSafe — the canonical aligned heap buffer used across the IO path
 // (drive_interface, virtual_dev, blob streams, meta service). Lives here rather than in
-// iomanager/drive_interface.hpp so callers that only need the type don't drag in folly::coro.
+// iomanager/drive_interface.h so callers that only need the type don't drag in folly::coro.
 
 using IOBuffer = IoBlobSafe;
 

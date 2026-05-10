@@ -16,8 +16,8 @@
 
 #include <fmt/format.h>
 
-#include "device/chunk.h"
-#include "device/physical_dev.h"
+#include "homestore/device/chunk.h"
+#include "homestore/device/physical_dev.h"
 
 namespace homestore {
 

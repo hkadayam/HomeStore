@@ -16,9 +16,9 @@
 
 #pragma once
 
-#include <sisl/logging/logging.h>
-#include <homestore/index/btree/node_variant/variant_node.hpp>
-#include <homestore/index/btree/btree_kv.h>
+#include "sisl/logging/logging.h"
+#include "homestore/index/btree/node_variant/variant_node.h"
+#include "homestore/index/btree/btree_kv.h"
 
 namespace homestore {
 // Internal format of variable node:

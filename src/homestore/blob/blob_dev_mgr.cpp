@@ -23,19 +23,19 @@
 
 #include "sisl/logging/logging.h"
 
-#include <homestore/checkpoint/cp.h>     // CP
-#include <homestore/checkpoint/cp_mgr.h> // CPManager
+#include "homestore/checkpoint/cp.h"     // CP
+#include "homestore/checkpoint/cp_mgr.h" // CPManager
 
-#include "blob/blob_dev.h"
-#include "blob/blob_dev_mgr.h"
-#include "blob/raw_blk_stream.h"
-#include "blob/append_blk_stream.h"
-#include "blob/append_byte_stream.h"
-#include "device/chunk.h"
-#include "device/device_manager.h"
-#include "device/virtual_dev.h"
-#include "meta/meta_client.h"
-#include "managers.h"
+#include "homestore/blob/blob_dev.h"
+#include "homestore/blob/blob_dev_mgr.h"
+#include "homestore/blob/raw_blk_stream.h"
+#include "homestore/blob/append_blk_stream.h"
+#include "homestore/blob/append_byte_stream.h"
+#include "homestore/device/chunk.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/device/virtual_dev.h"
+#include "homestore/meta/meta_client.h"
+#include "homestore/managers.h"
 
 namespace homestore {
 

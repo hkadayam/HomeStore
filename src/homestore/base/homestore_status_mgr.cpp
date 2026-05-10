@@ -13,7 +13,7 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
-#include "homestore_status_mgr.hpp"
+#include "homestore_status_mgr.h"
 
 #include <mutex>
 

@@ -27,8 +27,8 @@
 
 #include <boost/icl/interval_map.hpp>
 #include <folly/small_vector.h>
-#include <sisl/fds/enum.h>
-#include <sisl/fds/buffer.h>
+#include "sisl/fds/enum.h"
+#include "sisl/fds/buffer.h"
 #include "homestore/base/homestore_decl.h"
 
 namespace homestore {

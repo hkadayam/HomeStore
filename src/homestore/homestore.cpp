@@ -16,27 +16,27 @@
 #include <stdexcept>
 #include <utility>
 
-#include <sisl/fds/malloc_helper.h>
-#include <sisl/logging/logging.h>
-#include <sisl/version.h>
+#include "sisl/fds/malloc_helper.h"
+#include "sisl/logging/logging.h"
+#include "sisl/version.h"
+#include "sisl/fds/obj_life_counter.h"
 
 #include "homestore/homestore.h"
-#include "managers.h"
+#include "homestore/managers.h"
 
-#include "common/homestore_assert.hpp"
-#include "common/homestore_config.hpp"
-#include "device/device_manager.h"
-#include "checkpoint/cp_mgr.h"
-#include "meta/meta_blk_manager.h"
-#include "blob/blob_dev_mgr.h"
-#include "index/cow_btree/cow_btree_mgr.h"
-#include "logstore/log_store_mgr.h"
-#include "base/resource_mgr.hpp"
-#include "base/homestore_status_mgr.hpp"
+#include "homestore/base/homestore_assert.h"
+#include "homestore/base/homestore_config.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/checkpoint/cp_mgr.h"
+#include "homestore/meta/meta_blk_manager.h"
+#include "homestore/blob/blob_dev_mgr.h"
+#include "homestore/index/cow_btree/cow_btree_mgr.h"
+#include "homestore/logstore/log_store_mgr.h"
+#include "homestore/base/resource_mgr.h"
 
 #ifdef _PRERELEASE
-#include "common/crash_simulator.hpp"
-#include <flip/flip.hpp>
+#include "homestore/common/crash_simulator.h"
+#include "sisl/flip/flip.hpp"
 #endif
 
 namespace homestore {
@@ -102,7 +102,9 @@ folly::coro::Task< bool > HomeStore::start(InputParams input) {
 #endif
 
     // DeviceManager: synchronously construct, then either format (first-boot, deferred to format_and_start) or load.
-    auto dm = DeviceManager::create(std::move(input_.devices), input_.data_open_flags, input_.fast_open_flags);
+    // Copy input_.devices into DeviceManager — the vector stays in input_ so ResourceMgr::start can use it later.
+    auto dm =
+        DeviceManager::create(std::vector< DevInfo >{input_.devices}, input_.data_open_flags, input_.fast_open_flags);
     Managers::init_device_mgr(dm);
 
     if (dm->is_first_time_boot()) {
@@ -122,7 +124,7 @@ folly::coro::Task< bool > HomeStore::start(InputParams input) {
     co_await LogStoreManager::load();
 
     cp->start_timer();
-    ResourceMgr::start(device_mgr().total_capacity(), resolve_mem_cap(input_.mem_size));
+    ResourceMgr::start(input_.devices, resolve_mem_cap(input_.mem_size));
 
     init_done_.store(true, std::memory_order_release);
     LOGINFO("HomeStore: recovery boot complete");
@@ -151,7 +153,7 @@ folly::coro::Task< void > HomeStore::format_and_start(FormatOpts opts) {
     co_await cp_mgr().trigger_cp_flush(true /* force */, CPTriggerReason::Timer);
 
     cp->start_timer();
-    ResourceMgr::start(device_mgr().total_capacity(), resolve_mem_cap(input_.mem_size));
+    ResourceMgr::start(input_.devices, resolve_mem_cap(input_.mem_size));
 
     // Commit the formatting, so from now on it will not be treated as first-time boot
     co_await device_mgr().commit_formatting();

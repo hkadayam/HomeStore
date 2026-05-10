@@ -25,8 +25,8 @@
 
 #include <gtest/gtest.h>
 #include <iomgr/io_environment.hpp>
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
 
 #include "device/chunk.h"
 

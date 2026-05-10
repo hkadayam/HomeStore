@@ -1,16 +1,16 @@
 #include <folly/coro/Collect.h>
 
-#include <sisl/flip/flip.h>
+#include "sisl/flip/flip.h"
 
-#include "index/cow_btree/cow_btree_mgr.h"
-#include "index/cow_btree/cow_btree.h"
-#include "base/homestore_config.hpp" // HS_DYNAMIC_CONFIG
-#include "base/resource_mgr.hpp"
-#include "blob/blob_dev.h"
-#include "blob/blob_dev_mgr.h"
-#include "device/device_manager.h"
-#include "meta/meta_blk_manager.h"
-#include "managers.h"
+#include "homestore/index/cow_btree/cow_btree_mgr.h"
+#include "homestore/index/cow_btree/cow_btree.h"
+#include "homestore/base/homestore_config.h" // HS_DYNAMIC_CONFIG
+#include "homestore/base/resource_mgr.h"
+#include "homestore/blob/blob_dev.h"
+#include "homestore/blob/blob_dev_mgr.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/meta/meta_blk_manager.h"
+#include "homestore/managers.h"
 
 namespace homestore {
 

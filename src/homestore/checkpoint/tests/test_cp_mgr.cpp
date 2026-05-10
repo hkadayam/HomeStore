@@ -23,19 +23,19 @@
 
 #include <gtest/gtest.h>
 
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
 
 #include "iomanager/iomanager.h"
-#include "base/test_defs.h"
+#include "homestore/base/test_defs.h"
 
 #include "common/defs.h"
-#include "device/device_manager.h"
-#include "meta/meta_blk_manager.h"
-#include "managers.h"
+#include "homestore/device/device_manager.h"
+#include "homestore/meta/meta_blk_manager.h"
+#include "homestore/managers.h"
 
-#include <homestore/checkpoint/cp_mgr.h>
-#include <homestore/checkpoint/cp.h>
+#include "homestore/checkpoint/cp_mgr.h"
+#include "homestore/checkpoint/cp.h"
 
 using namespace homestore;
 using namespace iomanager;

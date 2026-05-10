@@ -4,8 +4,8 @@
 #include <mutex>
 #include <gtest/gtest.h>
 
-#include "btree_test_kvs.hpp"
-#include "range_scheduler.hpp"
+#include "btree_test_kvs.h"
+#include "range_scheduler.h"
 
 ENUM(ShadowMapDelta, uint8_t, Added, Removed, Updated);
 

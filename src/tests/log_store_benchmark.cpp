@@ -27,12 +27,12 @@
 
 #include <benchmark/benchmark.h>
 #include <iomgr/io_environment.hpp>
-#include <sisl/logging/logging.h>
-#include <sisl/options/options.h>
-#include <homestore/homestore.h>
-#include <homestore/homestore_decl.hpp>
-#include <homestore/logstore_service.hpp>
-#include "test_common/homestore_test_common.hpp"
+#include "sisl/logging/logging.h"
+#include "sisl/options/options.h"
+#include "homestore/homestore.h"
+#include "homestore/homestore_decl.hpp"
+#include "homestore/logstore_service.hpp"
+#include "test_common/homestore_test_common.h"
 
 using namespace homestore;
  

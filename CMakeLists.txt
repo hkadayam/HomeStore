@@ -113,6 +113,19 @@ else()
 endif()
 
 add_flags("-g")
+
+# === NuRaft fork (extern/NuRaft submodule) ===
+# Only added when REPLICATION=ON. Built only when a target actually links
+# `static_lib` (EXCLUDE_FROM_ALL). SSL disabled for now — TLS is a follow-up.
+if (DEFINED REPLICATION AND ${REPLICATION} STREQUAL "ON")
+    set(_BUILD_TESTING_SAVED ${BUILD_TESTING})
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(DISABLE_SSL 1 CACHE STRING "" FORCE)
+    add_subdirectory(extern/NuRaft EXCLUDE_FROM_ALL)
+    set(BUILD_TESTING ${_BUILD_TESTING_SAVED} CACHE BOOL "" FORCE)
+endif()
+
 add_subdirectory(src)
 
 # build info

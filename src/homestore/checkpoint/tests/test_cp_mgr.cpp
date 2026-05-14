@@ -87,6 +87,9 @@ private:
 class CPMgrTest : public ::testing::Test {
 public:
     void SetUp() override {
+        // Per-test fresh reactors: CPManager's t_cp_info_ thread_local pointer would otherwise dangle into the
+        // freed prior-test CPManager's owned_stacks_, and the next cp_guard() reads it as UAF.
+        iomanager::init_iomgr(2);
         for (size_t i = 0; i < num_devs_; ++i) {
             auto path = fmt::format("/tmp/hs_test_cp_{}", i);
             dev_paths_.push_back(path);
@@ -98,10 +101,14 @@ public:
     }
 
     void TearDown() override {
+        // Stop iomgr (joins reactor threads) BEFORE dropping Managers so the reactor's TLS deleters fire while
+        // the owning containers (e.g. CPManager::owned_stacks_) are still alive.
+        iomanager::stop_iomgr();
         Managers::reset();
         for (auto& p : dev_paths_) {
             std::filesystem::remove(p);
         }
+        dev_paths_.clear();
     }
 
     std::vector< DevInfo > make_dev_infos() const {
@@ -265,43 +272,55 @@ CORO_TEST_F(CPMgrTest, CPIdAdvancesAfterFlush) {
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 // Test 6: CP superblock persists across restart — CP id continues from where it left off.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-CORO_TEST_F(CPMgrTest, CPIdSurvivesRestart) {
-    cp_id_t id_before_restart;
+// In-test restart driven from the main thread: phase 1 runs on the original iomgr, then we cycle iomgr
+// (kills reactor TLS so CPManager's t_cp_info_ doesn't dangle into the freed prior CPManager), then phase
+// 2 runs on a fresh reactor pool.  Done via plain TEST_F + spawn_and_block since stop_iomgr() cannot be
+// called from inside a coroutine running on one of the reactors it would join.
+TEST_F(CPMgrTest, CPIdSurvivesRestart) {
+    cp_id_t id_before_restart{};
 
-    {
-        auto dm = co_await self.format_and_start_cp();
+    iomgr().spawn_and_block(ReactorTarget::any(),
+                            [this, &id_before_restart]() -> folly::coro::Task< void > {
+                                auto dm = co_await format_and_start_cp();
+                                for (int i = 0; i < 3; ++i) {
+                                    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+                                    EXPECT_TRUE(success);
+                                }
+                                {
+                                    auto guard = cp_mgr().cp_guard();
+                                    id_before_restart = guard->id();
+                                }
+                                co_await cp_mgr().shutdown();
+                                co_await dm->close_devices();
+                                Managers::reset();
+                            }());
 
-        // Flush a few CPs to advance the id.
-        for (int i = 0; i < 3; ++i) {
-            auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
-            EXPECT_TRUE(success);
-        }
+    iomanager::stop_iomgr();
+    iomanager::init_iomgr(2);
 
-        {
-            auto guard = cp_mgr().cp_guard();
-            id_before_restart = guard->id();
-        }
+    iomgr().spawn_and_block(ReactorTarget::any(),
+                            [this, id_before_restart]() -> folly::coro::Task< void > {
+                                auto dm = DeviceManager::create(make_dev_infos(), IOFlag::BUFFERED_IO,
+                                                                IOFlag::BUFFERED_IO);
+                                co_await dm->load_devices();
+                                co_await MetaBlkManager::load();
+                                auto cpmgr = CPManager::create();
+                                co_await cpmgr->start(false /* first_time_boot */);
+                                test_cb_ = std::make_shared< TestCPCallbacks >();
+                                cpmgr->register_consumer("test_consumer", test_cb_);
 
-        co_await cp_mgr().shutdown();
-        co_await dm->close_devices();
-    }
+                                cp_id_t id_after_restart{};
+                                {
+                                    auto guard = cp_mgr().cp_guard();
+                                    id_after_restart = guard->id();
+                                }
+                                // After restart, the CP id should be last_flushed + 1, which equals
+                                // id_before_restart (since shutdown does a final flush).
+                                EXPECT_GE(id_after_restart, id_before_restart);
 
-    {
-        auto dm = co_await self.reload_and_start_cp();
-
-        cp_id_t id_after_restart;
-        {
-            auto guard = cp_mgr().cp_guard();
-            id_after_restart = guard->id();
-        }
-
-        // After restart, the CP id should be last_flushed + 1, which equals id_before_restart
-        // (since shutdown does a final flush).
-        EXPECT_GE(id_after_restart, id_before_restart);
-
-        co_await cp_mgr().shutdown();
-        co_await dm->close_devices();
-    }
+                                co_await cp_mgr().shutdown();
+                                co_await dm->close_devices();
+                            }());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -369,8 +388,6 @@ int main(int argc, char* argv[]) {
     sisl::logging::SetLogger("test_cp_mgr");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
 
-    iomanager::init_iomgr(2);
-    auto ret = RUN_ALL_TESTS();
-    iomanager::stop_iomgr();
-    return ret;
+    // iomgr is started/stopped per-test in the fixture's SetUp/TearDown.
+    return RUN_ALL_TESTS();
 }

@@ -28,8 +28,12 @@ static constexpr int8_t SWEEP_PRIO_HIGH = 1;
 static constexpr int8_t SWEEP_NUM_PRIORITIES = 2;
 
 SweepService::AllocatorHandle::~AllocatorHandle() {
-    alive_.store(false, std::memory_order_release);
-    while (in_flight_.load(std::memory_order_acquire) > 0) {
+    // seq_cst on both sides (here and in run_refill) is required for the Dekker-style protocol against worker
+    // entry: either the worker's fetch_add on in_flight_ is visible before we load it (we spin), or our store
+    // to alive_=false is visible before the worker loads it (worker backs out).  Release/acquire alone is not
+    // enough — it admits a total-order interleaving where worker sees alive_=true and we see in_flight_=0.
+    alive_.store(false, std::memory_order_seq_cst);
+    while (in_flight_.load(std::memory_order_seq_cst) > 0) {
         std::this_thread::yield();
     }
 }
@@ -125,11 +129,17 @@ bool SweepService::try_enqueue(std::shared_ptr< AllocatorHandle > h, InmemPortio
 }
 
 void SweepService::run_refill(std::shared_ptr< AllocatorHandle > h, InmemPortion* portion) {
-    if (!h->alive_.load(std::memory_order_acquire)) {
+    // Reserve our slot first, then check alive_.  Inverting the order (check then reserve) races with
+    // ~AllocatorHandle: it could read alive_=true here, the dtor flips alive_=false and observes in_flight_=0,
+    // the allocator is freed, and we then call refill_fn on dead memory.  By incrementing first and using
+    // seq_cst on the read of alive_, the dtor either sees in_flight_>0 (and spins) or we see alive_=false
+    // (and back out before touching the allocator).
+    h->in_flight_.fetch_add(1, std::memory_order_seq_cst);
+    if (!h->alive_.load(std::memory_order_seq_cst)) {
+        h->in_flight_.fetch_sub(1, std::memory_order_acq_rel);
         portion->enqueued_.store(false, std::memory_order_release);
         return;
     }
-    h->in_flight_.fetch_add(1, std::memory_order_acq_rel);
     try {
         h->refill_fn(*portion);
     } catch (...) {

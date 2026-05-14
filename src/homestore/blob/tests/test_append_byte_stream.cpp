@@ -75,8 +75,12 @@ public:
     }
 
     void TearDown() override {
-        Managers::reset();
+        // Stop iomgr (joins reactor threads) BEFORE dropping Managers — streams own ConcurrentInsertSets whose
+        // folly::ThreadLocalPtr deleters push into the owner's zombies_ vector when the reactor exits.  If
+        // Managers::reset() runs first the owner is freed, and the thread-exit deleter ends up writing into
+        // dangling memory (ASan reports this as a small leak from the resurrected vector).
         iomanager::stop_iomgr();
+        Managers::reset();
         for (auto& p : dev_paths_) {
             std::filesystem::remove(p);
         }
@@ -111,23 +115,29 @@ public:
         blob_dev_ = co_await blob_dev_mgr().create_blob_dev("test_blob_dev"s, std::move(params));
     }
 
-    folly::coro::Task< void > reload() {
-        blob_dev_.reset();
-        co_await cp_mgr().shutdown();
-        blob_dev_mgr().shutdown();
-        co_await dm_->close_devices();
-        Managers::reset();
-
-        dm_ = DeviceManager::create(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
-        co_await dm_->load_devices();
-        co_await MetaBlkManager::load();
-
-        auto cpmgr = CPManager::create();
-        co_await cpmgr->start(false /* first_time_boot */);
-
-        co_await BlobDevManager::load();
-
-        blob_dev_ = blob_dev_mgr().get_blob_dev("test_blob_dev");
+    // Drive a full reload from the main test thread.  Cycling iomgr (kills reactor TLS, including CPManager's
+    // cached ThreadStackInfo pointer that would otherwise dangle into the freed CPManager) requires the main
+    // thread because stop_iomgr joins reactor threads — a reactor calling it would self-join.  Two coroutine
+    // phases bracket the cycle: one to tear down on the old reactor pool, one to bring up on the new pool.
+    void reload_sync() {
+        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+            blob_dev_.reset();
+            co_await cp_mgr().shutdown();
+            blob_dev_mgr().shutdown();
+            co_await dm_->close_devices();
+            Managers::reset();
+        }());
+        iomanager::stop_iomgr();
+        iomanager::init_iomgr(2);
+        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+            dm_ = DeviceManager::create(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+            co_await dm_->load_devices();
+            co_await MetaBlkManager::load();
+            auto cpmgr = CPManager::create();
+            co_await cpmgr->start(false /* first_time_boot */);
+            co_await BlobDevManager::load();
+            blob_dev_ = blob_dev_mgr().get_blob_dev("test_blob_dev");
+        }());
     }
 
     folly::coro::Task< void > shutdown() {
@@ -527,283 +537,296 @@ CORO_TEST_F(AppendByteStreamTest, ConcurrentSafeOff) {
 
 // ── Restart recovery ─────────────────────────────────────────────────────────────────────────────────────────────────
 
-CORO_TEST_F(AppendByteStreamTest, RestartRecoverySingleChunk) {
-    co_await self.bootstrap();
-
-    auto stream = co_await self.blob_dev_->create_append_byte_stream(CHUNK_SIZE);
-    auto sid = stream->stream_id();
-
+TEST_F(AppendByteStreamTest, RestartRecoverySingleChunk) {
     constexpr size_t N = 16 * 1024;
-    self.append_pattern(*stream, N, 0x2A01);
-    co_await stream->flush();
-    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
-    CO_ASSERT_TRUE(success);
+    uint64_t sid{};
 
-    stream.reset();
-    co_await self.reload();
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> folly::coro::Task< void > {
+        co_await bootstrap();
+        auto stream = co_await blob_dev_->create_append_byte_stream(CHUNK_SIZE);
+        sid = stream->stream_id();
+        append_pattern(*stream, N, 0x2A01);
+        co_await stream->flush();
+        auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+        CO_ASSERT_TRUE(success);
+    }());
 
-    auto streams = self.blob_dev_->append_byte_streams();
-    CO_ASSERT_EQ(streams.size(), 1u);
-    auto recovered = streams[0];
-    EXPECT_EQ(recovered->stream_id(), sid);
-    EXPECT_EQ(recovered->tail_offset(), N);
-    EXPECT_TRUE(co_await self.verify_at(*recovered, 0, N, 0x2A01));
+    reload_sync();
 
-    co_await self.shutdown();
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, N]() -> folly::coro::Task< void > {
+        auto streams = blob_dev_->append_byte_streams();
+        CO_ASSERT_EQ(streams.size(), 1u);
+        auto recovered = streams[0];
+        EXPECT_EQ(recovered->stream_id(), sid);
+        EXPECT_EQ(recovered->tail_offset(), N);
+        EXPECT_TRUE(co_await verify_at(*recovered, 0, N, 0x2A01));
+        co_await shutdown();
+    }());
 }
 
-CORO_TEST_F(AppendByteStreamTest, RestartRecoveryMultiChunk) {
-    co_await self.bootstrap();
-
-    auto stream = co_await self.blob_dev_->create_append_byte_stream(CHUNK_SIZE);
-    auto sid = stream->stream_id();
-
-    // Block-aligned writes spanning multiple chunks.
+TEST_F(AppendByteStreamTest, RestartRecoveryMultiChunk) {
     struct Seg {
         uint64_t off;
         size_t size;
         uint64_t seed;
     };
-    std::vector< Seg > segs;
     constexpr size_t kSeg = 256 * 1024;
     constexpr uint32_t kCount = (CHUNK_SIZE * 2 + kSeg - 1) / kSeg;
+    std::vector< Seg > segs;
+    uint64_t sid{};
     uint64_t off = 0;
-    for (uint32_t i = 0; i < kCount; ++i) {
-        self.append_pattern(*stream, kSeg, 0x2B00 + i);
-        segs.push_back({off, kSeg, 0x2B00 + i});
-        off += kSeg;
-    }
-    co_await stream->flush();
-    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
-    CO_ASSERT_TRUE(success);
-    EXPECT_GE(stream->num_chunks(), 2u);
 
-    stream.reset();
-    co_await self.reload();
+    iomgr().spawn_and_block(ReactorTarget::any(),
+                            [this, &sid, &off, &segs]() -> folly::coro::Task< void > {
+                                co_await bootstrap();
+                                auto stream = co_await blob_dev_->create_append_byte_stream(CHUNK_SIZE);
+                                sid = stream->stream_id();
+                                for (uint32_t i = 0; i < kCount; ++i) {
+                                    append_pattern(*stream, kSeg, 0x2B00 + i);
+                                    segs.push_back({off, kSeg, 0x2B00 + i});
+                                    off += kSeg;
+                                }
+                                co_await stream->flush();
+                                auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+                                CO_ASSERT_TRUE(success);
+                                EXPECT_GE(stream->num_chunks(), 2u);
+                            }());
 
-    auto streams = self.blob_dev_->append_byte_streams();
-    CO_ASSERT_EQ(streams.size(), 1u);
-    auto recovered = streams[0];
-    EXPECT_EQ(recovered->stream_id(), sid);
-    EXPECT_EQ(recovered->tail_offset(), off);
+    reload_sync();
 
-    for (auto const& s : segs) {
-        EXPECT_TRUE(co_await self.verify_at(*recovered, s.off, s.size, s.seed))
-            << "mismatch after restart at off=" << s.off;
-    }
-
-    co_await self.shutdown();
+    iomgr().spawn_and_block(ReactorTarget::any(),
+                            [this, sid, off, &segs]() -> folly::coro::Task< void > {
+                                auto streams = blob_dev_->append_byte_streams();
+                                CO_ASSERT_EQ(streams.size(), 1u);
+                                auto recovered = streams[0];
+                                EXPECT_EQ(recovered->stream_id(), sid);
+                                EXPECT_EQ(recovered->tail_offset(), off);
+                                for (auto const& s : segs) {
+                                    EXPECT_TRUE(co_await verify_at(*recovered, s.off, s.size, s.seed))
+                                        << "mismatch after restart at off=" << s.off;
+                                }
+                                co_await shutdown();
+                            }());
 }
 
-CORO_TEST_F(AppendByteStreamTest, RestartWithPartialTailBlock) {
-    co_await self.bootstrap();
-
-    auto stream = co_await self.blob_dev_->create_append_byte_stream(CHUNK_SIZE);
-    auto sid = stream->stream_id();
-
-    // Append a non-block-aligned amount so the tail crosses a partial block.
+TEST_F(AppendByteStreamTest, RestartWithPartialTailBlock) {
+    // Non-block-aligned write sizes so tail crosses partial blocks.
     constexpr size_t N = 2 * BLK_SIZE + 137;
-    self.append_pattern(*stream, N, 0x2C01);
-    co_await stream->flush();
-    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
-    CO_ASSERT_TRUE(success);
-
-    stream.reset();
-    co_await self.reload();
-
-    auto streams = self.blob_dev_->append_byte_streams();
-    CO_ASSERT_EQ(streams.size(), 1u);
-    auto recovered = streams[0];
-    EXPECT_EQ(recovered->stream_id(), sid);
-    EXPECT_EQ(recovered->tail_offset(), N);
-    EXPECT_TRUE(co_await self.verify_at(*recovered, 0, N, 0x2C01));
-
-    // Subsequent append starts exactly at N — tail_block_ should be primed from disk so the bytes are contiguous.
     constexpr size_t M = BLK_SIZE + 7;
-    auto off = self.append_pattern(*recovered, M, 0x2C02);
-    EXPECT_EQ(off, N);
-    co_await recovered->flush();
-    EXPECT_TRUE(co_await self.verify_at(*recovered, N, M, 0x2C02));
+    uint64_t sid{};
 
-    co_await self.shutdown();
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> folly::coro::Task< void > {
+        co_await bootstrap();
+        auto stream = co_await blob_dev_->create_append_byte_stream(CHUNK_SIZE);
+        sid = stream->stream_id();
+        append_pattern(*stream, N, 0x2C01);
+        co_await stream->flush();
+        auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+        CO_ASSERT_TRUE(success);
+    }());
+
+    reload_sync();
+
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, N, M]() -> folly::coro::Task< void > {
+        auto streams = blob_dev_->append_byte_streams();
+        CO_ASSERT_EQ(streams.size(), 1u);
+        auto recovered = streams[0];
+        EXPECT_EQ(recovered->stream_id(), sid);
+        EXPECT_EQ(recovered->tail_offset(), N);
+        EXPECT_TRUE(co_await verify_at(*recovered, 0, N, 0x2C01));
+        // Subsequent append starts exactly at N — tail_block_ primed from disk so bytes stay contiguous.
+        auto off = append_pattern(*recovered, M, 0x2C02);
+        EXPECT_EQ(off, N);
+        co_await recovered->flush();
+        EXPECT_TRUE(co_await verify_at(*recovered, N, M, 0x2C02));
+        co_await shutdown();
+    }());
 }
 
-CORO_TEST_F(AppendByteStreamTest, RestartAfterTruncate) {
-    co_await self.bootstrap();
+TEST_F(AppendByteStreamTest, RestartAfterTruncate) {
+    uint64_t sid{};
 
-    auto stream = co_await self.blob_dev_->create_append_byte_stream(CHUNK_SIZE);
-    auto sid = stream->stream_id();
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> folly::coro::Task< void > {
+        co_await bootstrap();
+        auto stream = co_await blob_dev_->create_append_byte_stream(CHUNK_SIZE);
+        sid = stream->stream_id();
+        append_pattern(*stream, 4096, 0x2D01);
+        co_await stream->flush();
+        co_await stream->truncate(stream->tail_offset());
+        auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+        CO_ASSERT_TRUE(success);
+    }());
 
-    self.append_pattern(*stream, 4096, 0x2D01);
-    co_await stream->flush();
-    co_await stream->truncate(stream->tail_offset());
-    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
-    CO_ASSERT_TRUE(success);
+    reload_sync();
 
-    stream.reset();
-    co_await self.reload();
-
-    auto streams = self.blob_dev_->append_byte_streams();
-    CO_ASSERT_EQ(streams.size(), 1u);
-    auto recovered = streams[0];
-    EXPECT_EQ(recovered->stream_id(), sid);
-    EXPECT_EQ(recovered->tail_offset(), 0u);
-
-    co_await self.shutdown();
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid]() -> folly::coro::Task< void > {
+        auto streams = blob_dev_->append_byte_streams();
+        CO_ASSERT_EQ(streams.size(), 1u);
+        auto recovered = streams[0];
+        EXPECT_EQ(recovered->stream_id(), sid);
+        EXPECT_EQ(recovered->tail_offset(), 0u);
+        co_await shutdown();
+    }());
 }
 
-CORO_TEST_F(AppendByteStreamTest, DoubleRestart) {
-    co_await self.bootstrap();
+TEST_F(AppendByteStreamTest, DoubleRestart) {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+        co_await bootstrap();
+        auto stream = co_await blob_dev_->create_append_byte_stream(CHUNK_SIZE);
+        append_pattern(*stream, 4096, 0x2E01);
+        co_await stream->flush();
+        co_await cp_mgr().trigger_cp_flush(true);
+    }());
 
-    auto stream = co_await self.blob_dev_->create_append_byte_stream(CHUNK_SIZE);
+    reload_sync();
 
-    self.append_pattern(*stream, 4096, 0x2E01);
-    co_await stream->flush();
-    co_await cp_mgr().trigger_cp_flush(true);
+    iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+        auto recovered = blob_dev_->append_byte_streams().at(0);
+        EXPECT_EQ(recovered->tail_offset(), 4096u);
+        append_pattern(*recovered, 4096, 0x2E02);
+        co_await recovered->flush();
+        co_await cp_mgr().trigger_cp_flush(true);
+    }());
 
-    stream.reset();
-    co_await self.reload();
+    reload_sync();
 
-    auto recovered = self.blob_dev_->append_byte_streams().at(0);
-    EXPECT_EQ(recovered->tail_offset(), 4096u);
-    self.append_pattern(*recovered, 4096, 0x2E02);
-    co_await recovered->flush();
-    co_await cp_mgr().trigger_cp_flush(true);
-
-    recovered.reset();
-    co_await self.reload();
-
-    auto recovered2 = self.blob_dev_->append_byte_streams().at(0);
-    EXPECT_EQ(recovered2->tail_offset(), 8192u);
-    EXPECT_TRUE(co_await self.verify_at(*recovered2, 0, 4096, 0x2E01));
-    EXPECT_TRUE(co_await self.verify_at(*recovered2, 4096, 4096, 0x2E02));
-
-    co_await self.shutdown();
+    iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+        auto recovered2 = blob_dev_->append_byte_streams().at(0);
+        EXPECT_EQ(recovered2->tail_offset(), 8192u);
+        EXPECT_TRUE(co_await verify_at(*recovered2, 0, 4096, 0x2E01));
+        EXPECT_TRUE(co_await verify_at(*recovered2, 4096, 4096, 0x2E02));
+        co_await shutdown();
+    }());
 }
 
 // Extended lifecycle: empty restart → partial + cross-chunk writes → mid-chunk truncate → restart → further truncate
 // + append → restart → full truncate (keeps 1 chunk anchor) → restart → append again.
-CORO_TEST_F(AppendByteStreamTest, LifecycleExtended) {
-    co_await self.bootstrap();
-
-    // ── Step 1: create empty stream, flush (no-op), restart, verify empty. ──────────────────────────────────────
-    auto stream = co_await self.blob_dev_->create_append_byte_stream(CHUNK_SIZE);
-    // VirtualDev bumps chunk_size up to its MIN_CHUNK_SIZE, so use the actual chunk_size the stream was created with.
-    const uint64_t CS = stream->chunk_size();
-    const auto sid = stream->stream_id();
-    co_await stream->flush();
-    stream.reset();
-    CO_ASSERT_TRUE(co_await cp_mgr().trigger_cp_flush(true /* force */));
-    co_await self.reload();
-    {
-        auto ss = self.blob_dev_->append_byte_streams();
-        CO_ASSERT_EQ(ss.size(), 1u);
-        stream = ss[0];
-    }
-    EXPECT_EQ(stream->stream_id(), sid);
-    EXPECT_EQ(stream->head_offset(), 0u);
-    EXPECT_EQ(stream->tail_offset(), 0u);
-
-    // ── Step 2: append 0.5C (seed A), flush. ────────────────────────────────────────────────────────────────────
+TEST_F(AppendByteStreamTest, LifecycleExtended) {
     constexpr uint64_t seed_a = 0x3A00;
-    self.append_pattern(*stream, CS / 2, seed_a);
-    co_await stream->flush();
-    EXPECT_EQ(stream->tail_offset(), CS / 2);
-
-    // ── Step 3: append 1C (seed B), flush.  Tail now at 1.5C, stream spans 2 chunks. ────────────────────────────
     constexpr uint64_t seed_b = 0x3B00;
-    self.append_pattern(*stream, CS, seed_b);
-    co_await stream->flush();
-    EXPECT_EQ(stream->tail_offset(), CS + CS / 2);
-    EXPECT_GE(stream->num_chunks(), 2u);
-
-    // ── Step 4: restart, verify both patterns intact. ────────────────────────────────────────────────────────────
-    stream.reset();
-    CO_ASSERT_TRUE(co_await cp_mgr().trigger_cp_flush(true /* force */));
-    co_await self.reload();
-    {
-        auto ss = self.blob_dev_->append_byte_streams();
-        CO_ASSERT_EQ(ss.size(), 1u);
-        stream = ss[0];
-    }
-    EXPECT_EQ(stream->head_offset(), 0u);
-    EXPECT_EQ(stream->tail_offset(), CS + CS / 2);
-    EXPECT_TRUE(co_await self.verify_at(*stream, 0, CS / 2, seed_a));
-    EXPECT_TRUE(co_await self.verify_at(*stream, CS / 2, CS, seed_b));
-
-    // ── Step 5: append 0.25C (seed C), flush, then truncate head to 0.25C. ──────────────────────────────────────
     constexpr uint64_t seed_c = 0x3C00;
-    self.append_pattern(*stream, CS / 4, seed_c);
-    co_await stream->flush();
-    EXPECT_EQ(stream->tail_offset(), CS + CS * 3 / 4); // 1.75C
-    co_await stream->truncate(CS / 4);
-    EXPECT_EQ(stream->head_offset(), CS / 4);
-    EXPECT_EQ(stream->tail_offset(), CS + CS * 3 / 4);
-
-    // ── Step 6: restart, verify the untouched-by-truncate regions (seed B whole, seed C whole). ─────────────────
-    stream.reset();
-    CO_ASSERT_TRUE(co_await cp_mgr().trigger_cp_flush(true /* force */));
-    co_await self.reload();
-    {
-        auto ss = self.blob_dev_->append_byte_streams();
-        CO_ASSERT_EQ(ss.size(), 1u);
-        stream = ss[0];
-    }
-    EXPECT_EQ(stream->head_offset(), CS / 4);
-    EXPECT_EQ(stream->tail_offset(), CS + CS * 3 / 4);
-    EXPECT_TRUE(co_await self.verify_at(*stream, CS / 2, CS, seed_b));
-    EXPECT_TRUE(co_await self.verify_at(*stream, CS + CS / 2, CS / 4, seed_c));
-
-    // ── Step 7: truncate to 1.6C — head crosses the first chunk boundary; one chunk should be released. ────────
-    const uint64_t upto_1_6 = CS + CS * 6 / 10; // 1.6C
-    co_await stream->truncate(upto_1_6);
-    EXPECT_EQ(stream->head_offset(), upto_1_6);
-
-    // ── Step 8: append 0.1C (seed D), flush.  Tail goes from 1.75C to 1.85C. ────────────────────────────────────
     constexpr uint64_t seed_d = 0x3D00;
-    self.append_pattern(*stream, CS / 10, seed_d);
-    co_await stream->flush();
-    EXPECT_EQ(stream->tail_offset(), CS + CS * 3 / 4 + CS / 10); // 1.85C
-
-    // ── Step 9: restart, verify seed D (the only whole-pattern block after these truncates). ───────────────────
-    stream.reset();
-    CO_ASSERT_TRUE(co_await cp_mgr().trigger_cp_flush(true /* force */));
-    co_await self.reload();
-    {
-        auto ss = self.blob_dev_->append_byte_streams();
-        CO_ASSERT_EQ(ss.size(), 1u);
-        stream = ss[0];
-    }
-    EXPECT_EQ(stream->head_offset(), upto_1_6);
-    EXPECT_EQ(stream->tail_offset(), CS + CS * 3 / 4 + CS / 10);
-    EXPECT_TRUE(co_await self.verify_at(*stream, CS + CS * 3 / 4, CS / 10, seed_d));
-
-    // ── Step 10: truncate up to tail — stream empty, 1 chunk should remain as anchor. ──────────────────────────
-    co_await stream->truncate(stream->tail_offset());
-    EXPECT_EQ(stream->head_offset(), 0u);
-    EXPECT_EQ(stream->tail_offset(), 0u);
-    EXPECT_EQ(stream->num_chunks(), 1u);
-
-    stream.reset();
-    CO_ASSERT_TRUE(co_await cp_mgr().trigger_cp_flush(true /* force */));
-    co_await self.reload();
-    {
-        auto ss = self.blob_dev_->append_byte_streams();
-        CO_ASSERT_EQ(ss.size(), 1u);
-        stream = ss[0];
-    }
-    EXPECT_EQ(stream->head_offset(), 0u);
-    EXPECT_EQ(stream->tail_offset(), 0u);
-    EXPECT_EQ(stream->num_chunks(), 1u);
-
-    // ── Step 11: append fresh data, flush. ──────────────────────────────────────────────────────────────────────
     constexpr uint64_t seed_e = 0x3E00;
-    self.append_pattern(*stream, CS / 2, seed_e);
-    co_await stream->flush();
-    EXPECT_EQ(stream->tail_offset(), CS / 2);
-    EXPECT_TRUE(co_await self.verify_at(*stream, 0, CS / 2, seed_e));
+    uint64_t sid{};
+    uint64_t CS = 0; // VirtualDev bumps chunk_size to MIN_CHUNK_SIZE; captured from the first created stream.
+    uint64_t upto_1_6 = 0;
 
-    co_await self.shutdown();
+    // ── Phase 1: bootstrap → create empty stream → flush + cp_flush → (reload boundary). ────────────────────────
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid, &CS]() -> folly::coro::Task< void > {
+        co_await bootstrap();
+        auto stream = co_await blob_dev_->create_append_byte_stream(CHUNK_SIZE);
+        CS = stream->chunk_size();
+        sid = stream->stream_id();
+        co_await stream->flush();
+        CO_ASSERT_TRUE(co_await cp_mgr().trigger_cp_flush(true /* force */));
+    }());
+
+    reload_sync();
+
+    // ── Phase 2: verify empty after restart → append seed_a + seed_b → cp_flush → (reload boundary). ───────────
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, CS]() -> folly::coro::Task< void > {
+        auto ss = blob_dev_->append_byte_streams();
+        CO_ASSERT_EQ(ss.size(), 1u);
+        auto stream = ss[0];
+        EXPECT_EQ(stream->stream_id(), sid);
+        EXPECT_EQ(stream->head_offset(), 0u);
+        EXPECT_EQ(stream->tail_offset(), 0u);
+
+        append_pattern(*stream, CS / 2, seed_a);
+        co_await stream->flush();
+        EXPECT_EQ(stream->tail_offset(), CS / 2);
+
+        append_pattern(*stream, CS, seed_b);
+        co_await stream->flush();
+        EXPECT_EQ(stream->tail_offset(), CS + CS / 2);
+        EXPECT_GE(stream->num_chunks(), 2u);
+
+        CO_ASSERT_TRUE(co_await cp_mgr().trigger_cp_flush(true /* force */));
+    }());
+
+    reload_sync();
+
+    // ── Phase 3: verify a/b after restart → append seed_c + head-truncate to CS/4 → cp_flush → (reload). ───────
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, CS]() -> folly::coro::Task< void > {
+        auto ss = blob_dev_->append_byte_streams();
+        CO_ASSERT_EQ(ss.size(), 1u);
+        auto stream = ss[0];
+        EXPECT_EQ(stream->head_offset(), 0u);
+        EXPECT_EQ(stream->tail_offset(), CS + CS / 2);
+        EXPECT_TRUE(co_await verify_at(*stream, 0, CS / 2, seed_a));
+        EXPECT_TRUE(co_await verify_at(*stream, CS / 2, CS, seed_b));
+
+        append_pattern(*stream, CS / 4, seed_c);
+        co_await stream->flush();
+        EXPECT_EQ(stream->tail_offset(), CS + CS * 3 / 4); // 1.75C
+        co_await stream->truncate(CS / 4);
+        EXPECT_EQ(stream->head_offset(), CS / 4);
+        EXPECT_EQ(stream->tail_offset(), CS + CS * 3 / 4);
+
+        CO_ASSERT_TRUE(co_await cp_mgr().trigger_cp_flush(true /* force */));
+    }());
+
+    reload_sync();
+
+    // ── Phase 4: verify b/c after restart → head-truncate to 1.6C (releases chunk) → append seed_d → (reload). ─
+    iomgr().spawn_and_block(ReactorTarget::any(),
+                            [this, CS, &upto_1_6]() -> folly::coro::Task< void > {
+                                auto ss = blob_dev_->append_byte_streams();
+                                CO_ASSERT_EQ(ss.size(), 1u);
+                                auto stream = ss[0];
+                                EXPECT_EQ(stream->head_offset(), CS / 4);
+                                EXPECT_EQ(stream->tail_offset(), CS + CS * 3 / 4);
+                                EXPECT_TRUE(co_await verify_at(*stream, CS / 2, CS, seed_b));
+                                EXPECT_TRUE(co_await verify_at(*stream, CS + CS / 2, CS / 4, seed_c));
+
+                                upto_1_6 = CS + CS * 6 / 10; // 1.6C
+                                co_await stream->truncate(upto_1_6);
+                                EXPECT_EQ(stream->head_offset(), upto_1_6);
+
+                                append_pattern(*stream, CS / 10, seed_d);
+                                co_await stream->flush();
+                                EXPECT_EQ(stream->tail_offset(), CS + CS * 3 / 4 + CS / 10); // 1.85C
+
+                                CO_ASSERT_TRUE(co_await cp_mgr().trigger_cp_flush(true /* force */));
+                            }());
+
+    reload_sync();
+
+    // ── Phase 5: verify d after restart → full-truncate (1 chunk anchor) → (reload). ────────────────────────────
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, CS, upto_1_6]() -> folly::coro::Task< void > {
+        auto ss = blob_dev_->append_byte_streams();
+        CO_ASSERT_EQ(ss.size(), 1u);
+        auto stream = ss[0];
+        EXPECT_EQ(stream->head_offset(), upto_1_6);
+        EXPECT_EQ(stream->tail_offset(), CS + CS * 3 / 4 + CS / 10);
+        EXPECT_TRUE(co_await verify_at(*stream, CS + CS * 3 / 4, CS / 10, seed_d));
+
+        co_await stream->truncate(stream->tail_offset());
+        EXPECT_EQ(stream->head_offset(), 0u);
+        EXPECT_EQ(stream->tail_offset(), 0u);
+        EXPECT_EQ(stream->num_chunks(), 1u);
+
+        CO_ASSERT_TRUE(co_await cp_mgr().trigger_cp_flush(true /* force */));
+    }());
+
+    reload_sync();
+
+    // ── Phase 6: verify empty + 1 anchor chunk → append seed_e → verify → shutdown. ─────────────────────────────
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, CS]() -> folly::coro::Task< void > {
+        auto ss = blob_dev_->append_byte_streams();
+        CO_ASSERT_EQ(ss.size(), 1u);
+        auto stream = ss[0];
+        EXPECT_EQ(stream->head_offset(), 0u);
+        EXPECT_EQ(stream->tail_offset(), 0u);
+        EXPECT_EQ(stream->num_chunks(), 1u);
+
+        append_pattern(*stream, CS / 2, seed_e);
+        co_await stream->flush();
+        EXPECT_EQ(stream->tail_offset(), CS / 2);
+        EXPECT_TRUE(co_await verify_at(*stream, 0, CS / 2, seed_e));
+
+        co_await shutdown();
+    }());
 }
 
 int main(int argc, char* argv[]) {

@@ -234,6 +234,15 @@ folly::coro::Task< std::error_code > PhysicalDev::read_super_block(IOBuffer& buf
 }
 
 folly::coro::Task< void > PhysicalDev::close_device() {
+    // Release this pdev's owning refs to its chunks.  Chunks hold shared<PhysicalDev> back at us, so without this
+    // the mutual ownership keeps both sides alive forever (PhysicalDev → chunk_provisioner_.chunks → Chunk → pdev_
+    // → PhysicalDev).  After this clear, only VirtualDev's shared<Chunk> entries remain; those are released when
+    // DeviceManager drops state_.all_vdevs during its destructor, at which point Chunks die, their pdev_ refs
+    // drop, and PhysicalDev itself is freeable.
+    {
+        auto lock = co_await chunk_mutex_.co_scoped_lock();
+        chunk_provisioner_.chunks.clear();
+    }
     co_await close_and_uncache_dev(devname_);
 }
 

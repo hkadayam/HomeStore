@@ -145,8 +145,12 @@ public:
     }
 
     void TearDown() override {
-        Managers::reset();
+        // Stop iomgr (joins reactor threads) BEFORE dropping Managers — streams own ConcurrentInsertSets whose
+        // folly::ThreadLocalPtr deleters push into the owner's zombies_ vector when the reactor exits.  If
+        // Managers::reset() runs first the owner is freed, and the thread-exit deleter ends up writing into
+        // dangling memory (ASan reports this as a small leak from the resurrected vector).
         iomanager::stop_iomgr();
+        Managers::reset();
         for (auto& p : dev_paths_) {
             std::filesystem::remove(p);
         }

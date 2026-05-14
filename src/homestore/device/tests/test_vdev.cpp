@@ -32,6 +32,7 @@
 #include "homestore/device/physical_dev.h"
 #include "homestore/device/virtual_dev.h"
 #include "homestore/device/chunk.h"
+#include "homestore/managers.h"
 
 using namespace homestore;
 using namespace iomanager;
@@ -57,6 +58,11 @@ public:
     }
 
     void TearDown() override {
+        // DeviceManager::create() registers itself in Managers::s_device_mgr_ — drop that here so the
+        // DeviceManager is destroyed within the test lifetime.  Without this, the static handle keeps the
+        // DeviceManager alive until program exit, where ~BitmapBlkAllocator → ~Bitset → aligned_free races
+        // against sisl's aligned_alloc_metrics() Meyers-singleton destructor.
+        Managers::reset();
         for (auto& p : dev_paths_) {
             std::filesystem::remove(p);
         }

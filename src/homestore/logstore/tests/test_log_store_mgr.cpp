@@ -57,6 +57,9 @@ static constexpr uint64_t META_VDEV_SIZE = 64 * 1024 * 1024;
 class LogStoreMgrTest : public ::testing::Test {
 public:
     void SetUp() override {
+        // Per-test fresh reactors: CPManager's t_cp_info_ thread_local pointer would otherwise dangle into the
+        // freed prior-test CPManager's owned_stacks_, and the next cp_guard() reads it as UAF.
+        iomanager::init_iomgr(2);
         for (size_t i = 0; i < num_devs_; ++i) {
             auto path = fmt::format("/tmp/hs_test_log_store_mgr_{}", i);
             dev_paths_.push_back(path);
@@ -68,10 +71,15 @@ public:
     }
 
     void TearDown() override {
+        // Stop iomgr (joins reactor threads) BEFORE Managers::reset() so the reactor's TLS deleters fire
+        // while the owning containers (ConcurrentInsertSet's zombies_, CPManager's owned_stacks_) are still
+        // alive.
+        iomanager::stop_iomgr();
         Managers::reset();
         for (auto& p : dev_paths_) {
             std::filesystem::remove(p);
         }
+        dev_paths_.clear();
     }
 
     std::vector< DevInfo > make_dev_infos() const {
@@ -92,20 +100,28 @@ public:
         co_await LogStoreManager::create(/*chunk_size=*/4 * 1024 * 1024, /*initial_num_chunks=*/1);
     }
 
-    folly::coro::Task< void > reload() {
-        co_await log_store_mgr().shutdown();
-        co_await cp_mgr().shutdown();
-        co_await dm_->close_devices();
-        Managers::reset();
-
-        dm_ = DeviceManager::create(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
-        co_await dm_->load_devices();
-        co_await MetaBlkManager::load();
-
-        auto cpmgr = CPManager::create();
-        co_await cpmgr->start(false /* first_time_boot */);
-
-        co_await LogStoreManager::load();
+    // Drive a full reload from the main test thread.  Cycling iomgr (kills reactor TLS, including
+    // CPManager's cached ThreadStackInfo pointer that would otherwise dangle into the freed CPManager)
+    // requires the main thread because stop_iomgr joins reactor threads — a reactor calling it would
+    // self-join.  Two coroutine phases bracket the cycle: teardown on the old reactor pool, bringup on
+    // the new pool.
+    void reload_sync() {
+        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+            co_await log_store_mgr().shutdown();
+            co_await cp_mgr().shutdown();
+            co_await dm_->close_devices();
+            Managers::reset();
+        }());
+        iomanager::stop_iomgr();
+        iomanager::init_iomgr(2);
+        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+            dm_ = DeviceManager::create(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+            co_await dm_->load_devices();
+            co_await MetaBlkManager::load();
+            auto cpmgr = CPManager::create();
+            co_await cpmgr->start(false /* first_time_boot */);
+            co_await LogStoreManager::load();
+        }());
     }
 
     folly::coro::Task< void > shutdown() {
@@ -137,158 +153,184 @@ public:
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────────────────────────────────────────
 
-CORO_TEST_F(LogStoreMgrTest, RecoverWithoutAnyStores) {
-    co_await self.bootstrap();
-    EXPECT_EQ(log_store_mgr().log_stores().size(), 0u);
-    co_await self.reload();
-    EXPECT_EQ(log_store_mgr().log_stores().size(), 0u);
-    co_await log_store_mgr().recover(); // no-op
-    co_await self.shutdown();
+TEST_F(LogStoreMgrTest, RecoverWithoutAnyStores) {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+        co_await bootstrap();
+        EXPECT_EQ(log_store_mgr().log_stores().size(), 0u);
+    }());
+
+    reload_sync();
+
+    iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+        EXPECT_EQ(log_store_mgr().log_stores().size(), 0u);
+        co_await log_store_mgr().recover(); // no-op
+        co_await shutdown();
+    }());
 }
 
-CORO_TEST_F(LogStoreMgrTest, CreateOpenRecover) {
-    co_await self.bootstrap();
+TEST_F(LogStoreMgrTest, CreateOpenRecover) {
     constexpr uint32_t kStores = 3;
     constexpr uint32_t kRecordsPer = 8;
-
     std::vector< logstore_id_t > sids;
-    {
+
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sids]() -> folly::coro::Task< void > {
+        co_await bootstrap();
         std::vector< std::shared_ptr< std::vector< uint8_t > > > keep;
         for (uint32_t i = 0; i < kStores; ++i) {
             auto store = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
             sids.push_back(store->store_id());
             log_store_mgr().open_log_store(store->store_id(), [](lsn_t, const sisl::ByteView&) {});
-            co_await self.append_n(*store, kRecordsPer, 128, keep);
+            co_await append_n(*store, kRecordsPer, 128, keep);
         }
-    }
-    co_await self.reload();
-    EXPECT_EQ(log_store_mgr().log_stores().size(), kStores);
+    }());
 
-    // Open all stores with replay-counting handlers, then recover.
-    std::map< logstore_id_t, std::atomic< uint32_t > > replay_counts;
-    for (auto sid : sids) {
-        auto& cnt = replay_counts[sid];
-        log_store_mgr().open_log_store(sid, [&cnt](lsn_t, const sisl::ByteView&) {
-            cnt.fetch_add(1, std::memory_order_relaxed);
-        });
-    }
-    co_await log_store_mgr().recover();
+    reload_sync();
 
-    for (auto sid : sids) {
-        EXPECT_EQ(replay_counts[sid].load(), kRecordsPer) << "sid=" << sid;
-    }
-    co_await self.shutdown();
+    iomgr().spawn_and_block(ReactorTarget::any(),
+                            [this, &sids, kStores, kRecordsPer]() -> folly::coro::Task< void > {
+                                EXPECT_EQ(log_store_mgr().log_stores().size(), kStores);
+
+                                std::map< logstore_id_t, std::atomic< uint32_t > > replay_counts;
+                                for (auto sid : sids) {
+                                    auto& cnt = replay_counts[sid];
+                                    log_store_mgr().open_log_store(sid, [&cnt](lsn_t, const sisl::ByteView&) {
+                                        cnt.fetch_add(1, std::memory_order_relaxed);
+                                    });
+                                }
+                                co_await log_store_mgr().recover();
+
+                                for (auto sid : sids) {
+                                    EXPECT_EQ(replay_counts[sid].load(), kRecordsPer) << "sid=" << sid;
+                                }
+                                co_await shutdown();
+                            }());
 }
 
-CORO_TEST_F(LogStoreMgrTest, DropUnopenedStores) {
-    co_await self.bootstrap();
+TEST_F(LogStoreMgrTest, DropUnopenedStores) {
     constexpr uint32_t kStores = 3;
-
     std::vector< logstore_id_t > sids;
-    {
+
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sids]() -> folly::coro::Task< void > {
+        co_await bootstrap();
         std::vector< std::shared_ptr< std::vector< uint8_t > > > keep;
         for (uint32_t i = 0; i < kStores; ++i) {
             auto store = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
             sids.push_back(store->store_id());
             log_store_mgr().open_log_store(store->store_id(), [](lsn_t, const sisl::ByteView&) {});
-            co_await self.append_n(*store, 4, 128, keep);
+            co_await append_n(*store, 4, 128, keep);
         }
-    }
-    co_await self.reload();
-    CO_ASSERT_EQ(log_store_mgr().log_stores().size(), kStores);
+    }());
 
-    // Open only sids[0] and sids[2]; sids[1] is unopened — drop_unopened_stores should remove it.
-    std::map< logstore_id_t, std::atomic< uint32_t > > replay_counts;
-    log_store_mgr().open_log_store(sids[0], [&replay_counts, sid = sids[0]](lsn_t, const sisl::ByteView&) {
-        replay_counts[sid].fetch_add(1);
-    });
-    log_store_mgr().open_log_store(sids[2], [&replay_counts, sid = sids[2]](lsn_t, const sisl::ByteView&) {
-        replay_counts[sid].fetch_add(1);
-    });
+    reload_sync();
 
-    co_await log_store_mgr().recover();
+    iomgr().spawn_and_block(ReactorTarget::any(),
+                            [this, &sids, kStores]() -> folly::coro::Task< void > {
+                                CO_ASSERT_EQ(log_store_mgr().log_stores().size(), kStores);
 
-    // sids[1] should be dropped post-recover.
-    EXPECT_EQ(log_store_mgr().log_stores().size(), 2u) << "unopened sid should be dropped";
-    EXPECT_NE(log_store_mgr().get_log_store(sids[0]), nullptr);
-    EXPECT_EQ(log_store_mgr().get_log_store(sids[1]), nullptr) << "unopened sid removed";
-    EXPECT_NE(log_store_mgr().get_log_store(sids[2]), nullptr);
+        std::map< logstore_id_t, std::atomic< uint32_t > > replay_counts;
+        log_store_mgr().open_log_store(sids[0], [&replay_counts, sid = sids[0]](lsn_t, const sisl::ByteView&) {
+            replay_counts[sid].fetch_add(1);
+        });
+        log_store_mgr().open_log_store(sids[2], [&replay_counts, sid = sids[2]](lsn_t, const sisl::ByteView&) {
+            replay_counts[sid].fetch_add(1);
+        });
 
-    EXPECT_EQ(replay_counts[sids[0]].load(), 4u);
-    EXPECT_EQ(replay_counts[sids[2]].load(), 4u);
+        co_await log_store_mgr().recover();
 
-    // Restart again and verify the dropped store stays gone (its sb mblk was removed).
-    co_await self.reload();
-    EXPECT_EQ(log_store_mgr().log_stores().size(), 2u) << "dropped store stays gone across restart";
-    EXPECT_EQ(log_store_mgr().get_log_store(sids[1]), nullptr);
+        EXPECT_EQ(log_store_mgr().log_stores().size(), 2u) << "unopened sid should be dropped";
+        EXPECT_NE(log_store_mgr().get_log_store(sids[0]), nullptr);
+        EXPECT_EQ(log_store_mgr().get_log_store(sids[1]), nullptr) << "unopened sid removed";
+        EXPECT_NE(log_store_mgr().get_log_store(sids[2]), nullptr);
 
-    co_await self.shutdown();
+        EXPECT_EQ(replay_counts[sids[0]].load(), 4u);
+        EXPECT_EQ(replay_counts[sids[2]].load(), 4u);
+    }());
+
+    reload_sync();
+
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sids]() -> folly::coro::Task< void > {
+        EXPECT_EQ(log_store_mgr().log_stores().size(), 2u) << "dropped store stays gone across restart";
+        EXPECT_EQ(log_store_mgr().get_log_store(sids[1]), nullptr);
+        co_await shutdown();
+    }());
 }
 
-CORO_TEST_F(LogStoreMgrTest, OrphanRecordsSilentlyDropped) {
-    co_await self.bootstrap();
+// Create 2 stores, write to both, restart, but only OPEN one of them.  The other is "orphaned" — its
+// records survive in the LogStream chain but on_log_found for them dispatches to an unopened LogStore,
+// which has no handler so the records are silently dropped during recover.  After recover, the unopened
+// store is dropped (same as DropUnopenedStores).
+TEST_F(LogStoreMgrTest, OrphanRecordsSilentlyDropped) {
+    logstore_id_t kept_sid{};
+    logstore_id_t orphan_sid{};
 
-    // Create 2 stores, write to both, restart, but only OPEN one of them.  The other is "orphaned" — its
-    // records survive in the LogStream chain but on_log_found for them dispatches to an unopened LogStore,
-    // which has no handler so the records are silently dropped during recover.  After recover, the unopened
-    // store is dropped (same as DropUnopenedStores).
-    logstore_id_t kept_sid;
-    logstore_id_t orphan_sid;
-    {
-        std::vector< std::shared_ptr< std::vector< uint8_t > > > keep;
-        auto kept = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
-        auto orphan = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
-        kept_sid = kept->store_id();
-        orphan_sid = orphan->store_id();
-        log_store_mgr().open_log_store(kept_sid, [](lsn_t, const sisl::ByteView&) {});
-        log_store_mgr().open_log_store(orphan_sid, [](lsn_t, const sisl::ByteView&) {});
-        co_await self.append_n(*kept, 5, 128, keep);
-        co_await self.append_n(*orphan, 5, 128, keep);
-    }
-    co_await self.reload();
+    iomgr().spawn_and_block(ReactorTarget::any(),
+                            [this, &kept_sid, &orphan_sid]() -> folly::coro::Task< void > {
+                                co_await bootstrap();
+                                std::vector< std::shared_ptr< std::vector< uint8_t > > > keep;
+                                auto kept = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+                                auto orphan = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+                                kept_sid = kept->store_id();
+                                orphan_sid = orphan->store_id();
+                                log_store_mgr().open_log_store(kept_sid, [](lsn_t, const sisl::ByteView&) {});
+                                log_store_mgr().open_log_store(orphan_sid, [](lsn_t, const sisl::ByteView&) {});
+                                co_await append_n(*kept, 5, 128, keep);
+                                co_await append_n(*orphan, 5, 128, keep);
+                            }());
 
-    // Open only `kept`.  Don't open `orphan`.
-    std::atomic< uint32_t > kept_replay{0};
-    log_store_mgr().open_log_store(kept_sid, [&kept_replay](lsn_t, const sisl::ByteView&) { kept_replay.fetch_add(1); });
+    reload_sync();
 
-    co_await log_store_mgr().recover();
-
-    EXPECT_EQ(kept_replay.load(), 5u) << "kept store sees its 5 records";
-    EXPECT_EQ(log_store_mgr().log_stores().size(), 1u) << "orphan store dropped after recover";
-    EXPECT_EQ(log_store_mgr().get_log_store(orphan_sid), nullptr);
-
-    co_await self.shutdown();
+    iomgr().spawn_and_block(ReactorTarget::any(),
+                            [this, kept_sid, orphan_sid]() -> folly::coro::Task< void > {
+                                std::atomic< uint32_t > kept_replay{0};
+                                log_store_mgr().open_log_store(
+                                    kept_sid, [&kept_replay](lsn_t, const sisl::ByteView&) {
+                                        kept_replay.fetch_add(1);
+                                    });
+                                co_await log_store_mgr().recover();
+                                EXPECT_EQ(kept_replay.load(), 5u) << "kept store sees its 5 records";
+                                EXPECT_EQ(log_store_mgr().log_stores().size(), 1u)
+                                    << "orphan store dropped after recover";
+                                EXPECT_EQ(log_store_mgr().get_log_store(orphan_sid), nullptr);
+                                co_await shutdown();
+                            }());
 }
 
-CORO_TEST_F(LogStoreMgrTest, CreateAfterRecoverContinuesIds) {
-    co_await self.bootstrap();
+TEST_F(LogStoreMgrTest, CreateAfterRecoverContinuesIds) {
     constexpr uint32_t kInitialStores = 4;
     std::vector< logstore_id_t > original_sids;
-    {
-        std::vector< std::shared_ptr< std::vector< uint8_t > > > keep;
-        for (uint32_t i = 0; i < kInitialStores; ++i) {
-            auto store = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
-            original_sids.push_back(store->store_id());
-            log_store_mgr().open_log_store(store->store_id(), [](lsn_t, const sisl::ByteView&) {});
-            co_await self.append_n(*store, 2, 64, keep);
-        }
-    }
-    co_await self.reload();
 
-    // Re-open all so they aren't dropped.
-    for (auto sid : original_sids) {
-        log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::ByteView&) {});
-    }
-    co_await log_store_mgr().recover();
-    CO_ASSERT_EQ(log_store_mgr().log_stores().size(), kInitialStores);
+    iomgr().spawn_and_block(ReactorTarget::any(),
+                            [this, &original_sids]() -> folly::coro::Task< void > {
+                                co_await bootstrap();
+                                std::vector< std::shared_ptr< std::vector< uint8_t > > > keep;
+                                for (uint32_t i = 0; i < kInitialStores; ++i) {
+                                    auto store = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+                                    original_sids.push_back(store->store_id());
+                                    log_store_mgr().open_log_store(store->store_id(),
+                                                                    [](lsn_t, const sisl::ByteView&) {});
+                                    co_await append_n(*store, 2, 64, keep);
+                                }
+                            }());
 
-    // The next created store should get sid >= max(original_sids) + 1.  Allocator must NOT collide with
-    // recovered ids.
-    auto fresh = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
-    const logstore_id_t expected_min = *std::max_element(original_sids.begin(), original_sids.end()) + 1;
-    EXPECT_GE(fresh->store_id(), expected_min) << "new sid must not collide with recovered sids";
+    reload_sync();
 
-    co_await self.shutdown();
+    iomgr().spawn_and_block(ReactorTarget::any(),
+                            [this, &original_sids, kInitialStores]() -> folly::coro::Task< void > {
+                                for (auto sid : original_sids) {
+                                    log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::ByteView&) {});
+                                }
+                                co_await log_store_mgr().recover();
+                                CO_ASSERT_EQ(log_store_mgr().log_stores().size(), kInitialStores);
+
+                                auto fresh =
+                                    co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+                                const logstore_id_t expected_min =
+                                    *std::max_element(original_sids.begin(), original_sids.end()) + 1;
+                                EXPECT_GE(fresh->store_id(), expected_min)
+                                    << "new sid must not collide with recovered sids";
+
+                                co_await shutdown();
+                            }());
 }
 
 // ── Test main ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -300,8 +342,6 @@ int main(int argc, char* argv[]) {
     sisl::logging::SetLogger("test_log_store_mgr");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
 
-    iomanager::init_iomgr(2);
-    auto ret = RUN_ALL_TESTS();
-    iomanager::stop_iomgr();
-    return ret;
+    // iomgr is started/stopped per-test in the fixture's SetUp/TearDown.
+    return RUN_ALL_TESTS();
 }

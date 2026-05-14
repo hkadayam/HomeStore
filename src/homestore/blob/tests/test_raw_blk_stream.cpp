@@ -78,8 +78,12 @@ public:
     }
 
     void TearDown() override {
-        Managers::reset();
+        // Stop iomgr (joins reactor threads) BEFORE dropping Managers — streams own ConcurrentInsertSets whose
+        // folly::ThreadLocalPtr deleters push into the owner's zombies_ vector when the reactor exits.  If
+        // Managers::reset() runs first the owner is freed, and the thread-exit deleter ends up writing into
+        // dangling memory (ASan reports this as a small leak from the resurrected vector).
         iomanager::stop_iomgr();
+        Managers::reset();
         for (auto& p : dev_paths_) {
             std::filesystem::remove(p);
         }
@@ -116,24 +120,29 @@ public:
         blob_dev_ = co_await blob_dev_mgr().create_blob_dev("test_blob_dev"s, std::move(params));
     }
 
-    // Reload: close everything, re-open devices, load MetaBlkManager, start CPManager, load BlobDevManager.
-    folly::coro::Task< void > reload() {
-        blob_dev_.reset();
-        co_await cp_mgr().shutdown();
-        blob_dev_mgr().shutdown();
-        co_await dm_->close_devices();
-        Managers::reset();
-
-        dm_ = DeviceManager::create(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
-        co_await dm_->load_devices();
-        co_await MetaBlkManager::load();
-
-        auto cpmgr = CPManager::create();
-        co_await cpmgr->start(false /* first_time_boot */);
-
-        co_await BlobDevManager::load();
-
-        blob_dev_ = blob_dev_mgr().get_blob_dev("test_blob_dev");
+    // Drive a full reload from the main test thread.  Cycling iomgr (kills reactor TLS, including CPManager's
+    // cached ThreadStackInfo pointer that would otherwise dangle into the freed CPManager) requires the main
+    // thread because stop_iomgr joins reactor threads — a reactor calling it would self-join.  Two coroutine
+    // phases bracket the cycle: one to tear down on the old reactor pool, one to bring up on the new pool.
+    void reload_sync() {
+        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+            blob_dev_.reset();
+            co_await cp_mgr().shutdown();
+            blob_dev_mgr().shutdown();
+            co_await dm_->close_devices();
+            Managers::reset();
+        }());
+        iomanager::stop_iomgr();
+        iomanager::init_iomgr(2);
+        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+            dm_ = DeviceManager::create(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+            co_await dm_->load_devices();
+            co_await MetaBlkManager::load();
+            auto cpmgr = CPManager::create();
+            co_await cpmgr->start(false /* first_time_boot */);
+            co_await BlobDevManager::load();
+            blob_dev_ = blob_dev_mgr().get_blob_dev("test_blob_dev");
+        }());
     }
 
     folly::coro::Task< void > shutdown() {
@@ -622,298 +631,270 @@ CORO_TEST_F(RawBlkStreamTest, DestroyStream) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Test 14: Restart recovery — write + flush, reload, verify data and allocator state survive.
 // ─────────────────────────────────────────────────────────────────────────────
-CORO_TEST_F(RawBlkStreamTest, RestartRecoverySingleBlock) {
-    co_await self.bootstrap();
-
-    auto stream = co_await self.blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
-    auto sid = stream->stream_id();
-
+TEST_F(RawBlkStreamTest, RestartRecoverySingleBlock) {
+    uint64_t sid{};
     BlkId bid;
-    blk_alloc_hints hints;
-    auto status = stream->alloc_blk(1, hints, bid);
-    CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
 
-    {
-        auto guard = cp_mgr().cp_guard();
-        stream->commit_blk(guard.get(), bid);
-    }
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid, &bid]() -> folly::coro::Task< void > {
+        co_await bootstrap();
+        auto stream = co_await blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
+        sid = stream->stream_id();
+        blk_alloc_hints hints;
+        auto status = stream->alloc_blk(1, hints, bid);
+        CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
+        {
+            auto guard = cp_mgr().cp_guard();
+            stream->commit_blk(guard.get(), bid);
+        }
+        IOBuffer wbuf(BLK_SIZE, 512);
+        fill_buf(wbuf.bytes(), BLK_SIZE, 0xABCD0001);
+        co_await stream->write(bid, wbuf);
+        auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+        CO_ASSERT_TRUE(success);
+    }());
 
-    IOBuffer wbuf(BLK_SIZE, 512);
-    self.fill_buf(wbuf.bytes(), BLK_SIZE, 0xABCD0001);
-    co_await stream->write(bid, wbuf);
+    reload_sync();
 
-    // Flush to persist allocator bitmaps.
-    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
-    CO_ASSERT_TRUE(success);
-
-    // ── Reload ──
-    stream.reset();
-    co_await self.reload();
-
-    CO_ASSERT_NE(self.blob_dev_, nullptr);
-
-    // Find the recovered stream.
-    auto streams = self.blob_dev_->raw_blk_streams();
-    CO_ASSERT_EQ(streams.size(), 1u);
-    auto recovered = streams[0];
-    EXPECT_EQ(recovered->stream_id(), sid);
-    EXPECT_EQ(recovered->num_chunks(), 1u);
-
-    // Read back the data written before restart.
-    IOBuffer rbuf(BLK_SIZE, 512);
-    auto ec = co_await recovered->read(rbuf, bid);
-    CO_ASSERT_FALSE(ec);
-    EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), BLK_SIZE, 0xABCD0001));
-
-    co_await self.shutdown();
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, bid]() -> folly::coro::Task< void > {
+        CO_ASSERT_NE(blob_dev_, nullptr);
+        auto streams = blob_dev_->raw_blk_streams();
+        CO_ASSERT_EQ(streams.size(), 1u);
+        auto recovered = streams[0];
+        EXPECT_EQ(recovered->stream_id(), sid);
+        EXPECT_EQ(recovered->num_chunks(), 1u);
+        IOBuffer rbuf(BLK_SIZE, 512);
+        auto ec = co_await recovered->read(rbuf, bid);
+        CO_ASSERT_FALSE(ec);
+        EXPECT_TRUE(verify_buf(rbuf.cbytes(), BLK_SIZE, 0xABCD0001));
+        co_await shutdown();
+    }());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test 15: Restart recovery — multi-block write across expanded chunks.
 // ─────────────────────────────────────────────────────────────────────────────
-CORO_TEST_F(RawBlkStreamTest, RestartRecoveryMultiChunk) {
-    co_await self.bootstrap();
-
-    auto stream = co_await self.blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
-
-    // Expand so the stream has 2 chunks.
-    co_await stream->expand();
-    EXPECT_EQ(stream->num_chunks(), 2u);
-
-    // Write blocks across chunks.
+TEST_F(RawBlkStreamTest, RestartRecoveryMultiChunk) {
     struct IoEntry {
         BlkId bid;
         uint64_t seed;
     };
     std::vector< IoEntry > entries;
 
-    for (uint32_t i = 0; i < 20; ++i) {
-        BlkId bid;
-        blk_alloc_hints hints{.is_contiguous = true};
-        auto status = stream->alloc_blk(4, hints, bid);
-        if (status == BlkAllocStatus::SPACE_FULL) {
-            co_await stream->expand();
-            status = stream->alloc_blk(4, hints, bid);
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &entries]() -> folly::coro::Task< void > {
+        co_await bootstrap();
+        auto stream = co_await blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
+        co_await stream->expand();
+        EXPECT_EQ(stream->num_chunks(), 2u);
+
+        for (uint32_t i = 0; i < 20; ++i) {
+            BlkId bid;
+            blk_alloc_hints hints{.is_contiguous = true};
+            auto status = stream->alloc_blk(4, hints, bid);
+            if (status == BlkAllocStatus::SPACE_FULL) {
+                co_await stream->expand();
+                status = stream->alloc_blk(4, hints, bid);
+            }
+            CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
+            {
+                auto guard = cp_mgr().cp_guard();
+                stream->commit_blk(guard.get(), bid);
+            }
+            uint64_t seed = 0x2000 + i;
+            uint32_t io_size = bid.blk_count() * BLK_SIZE;
+            IOBuffer wbuf(io_size, 512);
+            fill_buf(wbuf.bytes(), io_size, seed);
+            co_await stream->write(bid, wbuf);
+            entries.push_back({bid, seed});
         }
-        CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
+        auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+        CO_ASSERT_TRUE(success);
+    }());
 
-        {
-            auto guard = cp_mgr().cp_guard();
-            stream->commit_blk(guard.get(), bid);
+    reload_sync();
+
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &entries]() -> folly::coro::Task< void > {
+        CO_ASSERT_NE(blob_dev_, nullptr);
+        auto streams = blob_dev_->raw_blk_streams();
+        CO_ASSERT_EQ(streams.size(), 1u);
+        auto recovered = streams[0];
+        for (auto& [bid, seed] : entries) {
+            uint32_t io_size = bid.blk_count() * BLK_SIZE;
+            IOBuffer rbuf(io_size, 512);
+            auto ec = co_await recovered->read(rbuf, bid);
+            CO_ASSERT_FALSE(ec);
+            EXPECT_TRUE(verify_buf(rbuf.cbytes(), io_size, seed))
+                << "Mismatch after restart at blk_num=" << bid.blk_num();
         }
-
-        uint64_t seed = 0x2000 + i;
-        uint32_t io_size = bid.blk_count() * BLK_SIZE;
-        IOBuffer wbuf(io_size, 512);
-        self.fill_buf(wbuf.bytes(), io_size, seed);
-        co_await stream->write(bid, wbuf);
-        entries.push_back({bid, seed});
-    }
-
-    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
-    CO_ASSERT_TRUE(success);
-
-    // ── Reload ──
-    stream.reset();
-    co_await self.reload();
-
-    CO_ASSERT_NE(self.blob_dev_, nullptr);
-    auto streams = self.blob_dev_->raw_blk_streams();
-    CO_ASSERT_EQ(streams.size(), 1u);
-    auto recovered = streams[0];
-
-    // Verify all written blocks are readable after recovery.
-    for (auto& [bid, seed] : entries) {
-        uint32_t io_size = bid.blk_count() * BLK_SIZE;
-        IOBuffer rbuf(io_size, 512);
-        auto ec = co_await recovered->read(rbuf, bid);
-        CO_ASSERT_FALSE(ec);
-        EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), io_size, seed))
-            << "Mismatch after restart at blk_num=" << bid.blk_num();
-    }
-
-    co_await self.shutdown();
+        co_await shutdown();
+    }());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test 16: Restart recovery — multiple streams per BlobDev survive restart.
 // ─────────────────────────────────────────────────────────────────────────────
-CORO_TEST_F(RawBlkStreamTest, RestartRecoveryMultipleStreams) {
-    co_await self.bootstrap();
-
-    auto s1 = co_await self.blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
-    auto s2 = co_await self.blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
-
-    // Write one block to each stream with different patterns.
+TEST_F(RawBlkStreamTest, RestartRecoveryMultipleStreams) {
     BlkId bid1, bid2;
-    blk_alloc_hints hints;
+    uint64_t sid1{}, sid2{};
 
-    auto st = s1->alloc_blk(1, hints, bid1);
-    CO_ASSERT_EQ(st, BlkAllocStatus::SUCCESS);
-    {
-        auto guard = cp_mgr().cp_guard();
-        s1->commit_blk(guard.get(), bid1);
-    }
-    IOBuffer w1(BLK_SIZE, 512);
-    self.fill_buf(w1.bytes(), BLK_SIZE, 0xAAAA);
-    co_await s1->write(bid1, w1);
+    iomgr().spawn_and_block(ReactorTarget::any(),
+                            [this, &bid1, &bid2, &sid1, &sid2]() -> folly::coro::Task< void > {
+                                co_await bootstrap();
+                                auto s1 = co_await blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
+                                auto s2 = co_await blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
+                                blk_alloc_hints hints;
 
-    st = s2->alloc_blk(1, hints, bid2);
-    CO_ASSERT_EQ(st, BlkAllocStatus::SUCCESS);
-    {
-        auto guard = cp_mgr().cp_guard();
-        s2->commit_blk(guard.get(), bid2);
-    }
-    IOBuffer w2(BLK_SIZE, 512);
-    self.fill_buf(w2.bytes(), BLK_SIZE, 0xBBBB);
-    co_await s2->write(bid2, w2);
+                                auto st = s1->alloc_blk(1, hints, bid1);
+                                CO_ASSERT_EQ(st, BlkAllocStatus::SUCCESS);
+                                {
+                                    auto guard = cp_mgr().cp_guard();
+                                    s1->commit_blk(guard.get(), bid1);
+                                }
+                                IOBuffer w1(BLK_SIZE, 512);
+                                fill_buf(w1.bytes(), BLK_SIZE, 0xAAAA);
+                                co_await s1->write(bid1, w1);
 
-    auto sid1 = s1->stream_id();
-    auto sid2 = s2->stream_id();
+                                st = s2->alloc_blk(1, hints, bid2);
+                                CO_ASSERT_EQ(st, BlkAllocStatus::SUCCESS);
+                                {
+                                    auto guard = cp_mgr().cp_guard();
+                                    s2->commit_blk(guard.get(), bid2);
+                                }
+                                IOBuffer w2(BLK_SIZE, 512);
+                                fill_buf(w2.bytes(), BLK_SIZE, 0xBBBB);
+                                co_await s2->write(bid2, w2);
 
-    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
-    CO_ASSERT_TRUE(success);
+                                sid1 = s1->stream_id();
+                                sid2 = s2->stream_id();
 
-    // ── Reload ──
-    s1.reset();
-    s2.reset();
-    co_await self.reload();
+                                auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+                                CO_ASSERT_TRUE(success);
+                            }());
 
-    auto streams = self.blob_dev_->raw_blk_streams();
-    CO_ASSERT_EQ(streams.size(), 2u);
+    reload_sync();
 
-    // Find each stream by id and verify its data.
-    for (auto& s : streams) {
-        if (s->stream_id() == sid1) {
-            IOBuffer rbuf(BLK_SIZE, 512);
-            auto ec = co_await s->read(rbuf, bid1);
-            CO_ASSERT_FALSE(ec);
-            EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), BLK_SIZE, 0xAAAA));
-        } else {
-            EXPECT_EQ(s->stream_id(), sid2);
-            IOBuffer rbuf(BLK_SIZE, 512);
-            auto ec = co_await s->read(rbuf, bid2);
-            CO_ASSERT_FALSE(ec);
-            EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), BLK_SIZE, 0xBBBB));
-        }
-    }
-
-    co_await self.shutdown();
+    iomgr().spawn_and_block(ReactorTarget::any(),
+                            [this, bid1, bid2, sid1, sid2]() -> folly::coro::Task< void > {
+                                auto streams = blob_dev_->raw_blk_streams();
+                                CO_ASSERT_EQ(streams.size(), 2u);
+                                for (auto& s : streams) {
+                                    if (s->stream_id() == sid1) {
+                                        IOBuffer rbuf(BLK_SIZE, 512);
+                                        auto ec = co_await s->read(rbuf, bid1);
+                                        CO_ASSERT_FALSE(ec);
+                                        EXPECT_TRUE(verify_buf(rbuf.cbytes(), BLK_SIZE, 0xAAAA));
+                                    } else {
+                                        EXPECT_EQ(s->stream_id(), sid2);
+                                        IOBuffer rbuf(BLK_SIZE, 512);
+                                        auto ec = co_await s->read(rbuf, bid2);
+                                        CO_ASSERT_FALSE(ec);
+                                        EXPECT_TRUE(verify_buf(rbuf.cbytes(), BLK_SIZE, 0xBBBB));
+                                    }
+                                }
+                                co_await shutdown();
+                            }());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test 17: Write, flush, free, flush, restart — freed blocks should remain free after recovery.
 // ─────────────────────────────────────────────────────────────────────────────
-CORO_TEST_F(RawBlkStreamTest, RestartAfterFree) {
-    co_await self.bootstrap();
+TEST_F(RawBlkStreamTest, RestartAfterFree) {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+        co_await bootstrap();
+        auto stream = co_await blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
+        BlkId bid;
+        blk_alloc_hints hints;
+        auto status = stream->alloc_blk(1, hints, bid);
+        CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
+        {
+            auto guard = cp_mgr().cp_guard();
+            stream->commit_blk(guard.get(), bid);
+        }
+        IOBuffer wbuf(BLK_SIZE, 512);
+        fill_buf(wbuf.bytes(), BLK_SIZE, 0xF00DF00D);
+        co_await stream->write(bid, wbuf);
+        auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+        CO_ASSERT_TRUE(success);
+        {
+            auto guard = cp_mgr().cp_guard();
+            co_await stream->invalidate(guard.get(), bid);
+        }
+        success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+        CO_ASSERT_TRUE(success);
+    }());
 
-    auto stream = co_await self.blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
+    reload_sync();
 
-    BlkId bid;
-    blk_alloc_hints hints;
-    auto status = stream->alloc_blk(1, hints, bid);
-    CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
-
-    {
-        auto guard = cp_mgr().cp_guard();
-        stream->commit_blk(guard.get(), bid);
-    }
-
-    IOBuffer wbuf(BLK_SIZE, 512);
-    self.fill_buf(wbuf.bytes(), BLK_SIZE, 0xF00DF00D);
-    co_await stream->write(bid, wbuf);
-
-    // Flush to persist allocation.
-    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
-    CO_ASSERT_TRUE(success);
-
-    // Free the block and flush again.
-    {
-        auto guard = cp_mgr().cp_guard();
-        co_await stream->invalidate(guard.get(), bid);
-    }
-    success = co_await cp_mgr().trigger_cp_flush(true /* force */);
-    CO_ASSERT_TRUE(success);
-
-    // ── Reload ──
-    stream.reset();
-    co_await self.reload();
-
-    auto streams = self.blob_dev_->raw_blk_streams();
-    CO_ASSERT_EQ(streams.size(), 1u);
-    auto recovered = streams[0];
-
-    // The block we freed should be allocatable again after restart.
-    BlkId bid2;
-    status = recovered->alloc_blk(1, hints, bid2);
-    EXPECT_EQ(status, BlkAllocStatus::SUCCESS);
-
-    co_await self.shutdown();
+    iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+        auto streams = blob_dev_->raw_blk_streams();
+        CO_ASSERT_EQ(streams.size(), 1u);
+        auto recovered = streams[0];
+        BlkId bid2;
+        blk_alloc_hints hints;
+        auto status = recovered->alloc_blk(1, hints, bid2);
+        EXPECT_EQ(status, BlkAllocStatus::SUCCESS);
+        co_await shutdown();
+    }());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test 18: Double restart — write+flush, restart, write more+flush, restart again, verify all data.
 // ─────────────────────────────────────────────────────────────────────────────
-CORO_TEST_F(RawBlkStreamTest, DoubleRestart) {
-    co_await self.bootstrap();
+TEST_F(RawBlkStreamTest, DoubleRestart) {
+    BlkId bid1, bid2;
 
-    auto stream = co_await self.blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &bid1]() -> folly::coro::Task< void > {
+        co_await bootstrap();
+        auto stream = co_await blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
+        blk_alloc_hints hints;
+        auto status = stream->alloc_blk(1, hints, bid1);
+        CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
+        {
+            auto guard = cp_mgr().cp_guard();
+            stream->commit_blk(guard.get(), bid1);
+        }
+        IOBuffer w1(BLK_SIZE, 512);
+        fill_buf(w1.bytes(), BLK_SIZE, 0x1111);
+        co_await stream->write(bid1, w1);
+        auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+        CO_ASSERT_TRUE(success);
+    }());
 
-    // First write.
-    BlkId bid1;
-    blk_alloc_hints hints;
-    auto status = stream->alloc_blk(1, hints, bid1);
-    CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
-    {
-        auto guard = cp_mgr().cp_guard();
-        stream->commit_blk(guard.get(), bid1);
-    }
-    IOBuffer w1(BLK_SIZE, 512);
-    self.fill_buf(w1.bytes(), BLK_SIZE, 0x1111);
-    co_await stream->write(bid1, w1);
-    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
-    CO_ASSERT_TRUE(success);
+    reload_sync();
 
-    // ── First restart ──
-    stream.reset();
-    co_await self.reload();
-    auto streams = self.blob_dev_->raw_blk_streams();
-    CO_ASSERT_EQ(streams.size(), 1u);
-    stream = streams[0];
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &bid2]() -> folly::coro::Task< void > {
+        auto streams = blob_dev_->raw_blk_streams();
+        CO_ASSERT_EQ(streams.size(), 1u);
+        auto stream = streams[0];
+        blk_alloc_hints hints;
+        auto status = stream->alloc_blk(1, hints, bid2);
+        CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
+        {
+            auto guard = cp_mgr().cp_guard();
+            stream->commit_blk(guard.get(), bid2);
+        }
+        IOBuffer w2(BLK_SIZE, 512);
+        fill_buf(w2.bytes(), BLK_SIZE, 0x2222);
+        co_await stream->write(bid2, w2);
+        auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+        CO_ASSERT_TRUE(success);
+    }());
 
-    // Second write on the recovered stream.
-    BlkId bid2;
-    status = stream->alloc_blk(1, hints, bid2);
-    CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
-    {
-        auto guard = cp_mgr().cp_guard();
-        stream->commit_blk(guard.get(), bid2);
-    }
-    IOBuffer w2(BLK_SIZE, 512);
-    self.fill_buf(w2.bytes(), BLK_SIZE, 0x2222);
-    co_await stream->write(bid2, w2);
-    success = co_await cp_mgr().trigger_cp_flush(true /* force */);
-    CO_ASSERT_TRUE(success);
+    reload_sync();
 
-    // ── Second restart ──
-    stream.reset();
-    co_await self.reload();
-    streams = self.blob_dev_->raw_blk_streams();
-    CO_ASSERT_EQ(streams.size(), 1u);
-    auto recovered = streams[0];
-
-    // Verify both blocks.
-    IOBuffer r1(BLK_SIZE, 512);
-    auto ec = co_await recovered->read(r1, bid1);
-    CO_ASSERT_FALSE(ec);
-    EXPECT_TRUE(self.verify_buf(r1.cbytes(), BLK_SIZE, 0x1111));
-
-    IOBuffer r2(BLK_SIZE, 512);
-    ec = co_await recovered->read(r2, bid2);
-    CO_ASSERT_FALSE(ec);
-    EXPECT_TRUE(self.verify_buf(r2.cbytes(), BLK_SIZE, 0x2222));
-
-    co_await self.shutdown();
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, bid1, bid2]() -> folly::coro::Task< void > {
+        auto streams = blob_dev_->raw_blk_streams();
+        CO_ASSERT_EQ(streams.size(), 1u);
+        auto recovered = streams[0];
+        IOBuffer r1(BLK_SIZE, 512);
+        auto ec = co_await recovered->read(r1, bid1);
+        CO_ASSERT_FALSE(ec);
+        EXPECT_TRUE(verify_buf(r1.cbytes(), BLK_SIZE, 0x1111));
+        IOBuffer r2(BLK_SIZE, 512);
+        ec = co_await recovered->read(r2, bid2);
+        CO_ASSERT_FALSE(ec);
+        EXPECT_TRUE(verify_buf(r2.cbytes(), BLK_SIZE, 0x2222));
+        co_await shutdown();
+    }());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -990,53 +971,47 @@ CORO_TEST_F(RawBlkStreamTest, BlockSizeMultiplier) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Test 20: Block-size multiplier survives restart recovery.
 // ─────────────────────────────────────────────────────────────────────────────
-CORO_TEST_F(RawBlkStreamTest, BlockSizeMultiplierRestart) {
-    co_await self.bootstrap();
-
+TEST_F(RawBlkStreamTest, BlockSizeMultiplierRestart) {
     static constexpr uint32_t STREAM_BLK_SIZE = BLK_SIZE * 4; // 16384 when vdev is 4096
-
-    auto stream = co_await self.blob_dev_->create_raw_blk_stream(CHUNK_SIZE, STREAM_BLK_SIZE);
-    EXPECT_EQ(stream->block_size(), STREAM_BLK_SIZE);
-    EXPECT_EQ(stream->blk_multiplier(), 4u);
-
     BlkId bid;
-    blk_alloc_hints hints;
-    auto status = stream->alloc_blk(1, hints, bid);
-    CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
+    uint64_t sid{};
 
-    {
-        auto guard = cp_mgr().cp_guard();
-        stream->commit_blk(guard.get(), bid);
-    }
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &bid, &sid]() -> folly::coro::Task< void > {
+        co_await bootstrap();
+        auto stream = co_await blob_dev_->create_raw_blk_stream(CHUNK_SIZE, STREAM_BLK_SIZE);
+        EXPECT_EQ(stream->block_size(), STREAM_BLK_SIZE);
+        EXPECT_EQ(stream->blk_multiplier(), 4u);
 
-    IOBuffer wbuf(STREAM_BLK_SIZE, 512);
-    self.fill_buf(wbuf.bytes(), STREAM_BLK_SIZE, 0xABCD04);
-    co_await stream->write(bid, wbuf);
+        blk_alloc_hints hints;
+        auto status = stream->alloc_blk(1, hints, bid);
+        CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
+        {
+            auto guard = cp_mgr().cp_guard();
+            stream->commit_blk(guard.get(), bid);
+        }
+        IOBuffer wbuf(STREAM_BLK_SIZE, 512);
+        fill_buf(wbuf.bytes(), STREAM_BLK_SIZE, 0xABCD04);
+        co_await stream->write(bid, wbuf);
+        auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+        CO_ASSERT_TRUE(success);
+        sid = stream->stream_id();
+    }());
 
-    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
-    CO_ASSERT_TRUE(success);
+    reload_sync();
 
-    // ── Reload ──
-    auto sid = stream->stream_id();
-    stream.reset();
-    co_await self.reload();
-
-    auto streams = self.blob_dev_->raw_blk_streams();
-    CO_ASSERT_EQ(streams.size(), 1u);
-    auto recovered = streams[0];
-    EXPECT_EQ(recovered->stream_id(), sid);
-
-    // After recovery the block_size and multiplier should be preserved.
-    EXPECT_EQ(recovered->block_size(), STREAM_BLK_SIZE);
-    EXPECT_EQ(recovered->blk_multiplier(), 4u);
-
-    // Read back the data.
-    IOBuffer rbuf(STREAM_BLK_SIZE, 512);
-    auto ec = co_await recovered->read(rbuf, bid);
-    CO_ASSERT_FALSE(ec);
-    EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), STREAM_BLK_SIZE, 0xABCD04));
-
-    co_await self.shutdown();
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, bid, sid]() -> folly::coro::Task< void > {
+        auto streams = blob_dev_->raw_blk_streams();
+        CO_ASSERT_EQ(streams.size(), 1u);
+        auto recovered = streams[0];
+        EXPECT_EQ(recovered->stream_id(), sid);
+        EXPECT_EQ(recovered->block_size(), STREAM_BLK_SIZE);
+        EXPECT_EQ(recovered->blk_multiplier(), 4u);
+        IOBuffer rbuf(STREAM_BLK_SIZE, 512);
+        auto ec = co_await recovered->read(rbuf, bid);
+        CO_ASSERT_FALSE(ec);
+        EXPECT_TRUE(verify_buf(rbuf.cbytes(), STREAM_BLK_SIZE, 0xABCD04));
+        co_await shutdown();
+    }());
 }
 
 int main(int argc, char* argv[]) {

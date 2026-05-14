@@ -112,12 +112,12 @@ public:
         }
     }
 
-    T& at(int64_t idx) const {
+    /// Read-only accessor: copies the slot value under shared_lock and returns it by value.
+    T at(int64_t idx) const {
         std::shared_lock holder(lock_);
         if (idx < slot_ref_idx_) {
             throw std::out_of_range("Slot idx is not in range");
         }
-
         size_t nbit = idx - slot_ref_idx_;
         if (!active_slot_bits_.get_bitval(nbit)) {
             throw std::out_of_range("Slot idx is not in range");
@@ -125,10 +125,24 @@ public:
         return *get_slot_data(nbit);
     }
 
-    /// Non-throwing variant of at().  Returns a pointer to the slot if it exists and is active; otherwise an
-    /// error indicating whether the idx was out-of-range or in-range-but-not-active.  Caller can branch on the
-    /// error if it cares; otherwise just check has_value().
-    folly::Expected< T*, StreamTrackerError > try_at(int64_t idx) const noexcept {
+    /// Modify accessor: invokes fn(T&) on the slot under unique_lock and returns whatever fn returns.  Use
+    /// this when the caller needs in-place read-modify-write atomicity on the slot.
+    template < typename Fn >
+    auto at(int64_t idx, Fn&& fn) {
+        std::unique_lock holder(lock_);
+        if (idx < slot_ref_idx_) {
+            throw std::out_of_range("Slot idx is not in range");
+        }
+        size_t nbit = idx - slot_ref_idx_;
+        if (!active_slot_bits_.get_bitval(nbit)) {
+            throw std::out_of_range("Slot idx is not in range");
+        }
+        return std::forward< Fn >(fn)(*get_slot_data(nbit));
+    }
+
+    /// Non-throwing variant of at().  Copies the slot value under shared_lock and returns it by value; or
+    /// an error indicating whether idx was out-of-range or in-range-but-not-active.
+    folly::Expected< T, StreamTrackerError > try_at(int64_t idx) const noexcept {
         std::shared_lock holder(lock_);
         if (idx < slot_ref_idx_) {
             return folly::makeUnexpected(StreamTrackerError::OutOfRange);
@@ -137,7 +151,23 @@ public:
         if (nbit >= alloced_slots_ || !active_slot_bits_.get_bitval(nbit)) {
             return folly::makeUnexpected(StreamTrackerError::NotActive);
         }
-        return get_slot_data(nbit);
+        return *get_slot_data(nbit);
+    }
+
+    /// Modify variant of try_at().  Invokes fn(T&) under unique_lock; returns Expected<R, Error> where R is
+    /// the result of fn.  If the slot is missing, fn is not invoked and the corresponding error is returned.
+    template < typename Fn >
+    auto try_at(int64_t idx, Fn&& fn)
+        -> folly::Expected< std::invoke_result_t< Fn, T& >, StreamTrackerError > {
+        std::unique_lock holder(lock_);
+        if (idx < slot_ref_idx_) {
+            return folly::makeUnexpected(StreamTrackerError::OutOfRange);
+        }
+        size_t nbit = idx - slot_ref_idx_;
+        if (nbit >= alloced_slots_ || !active_slot_bits_.get_bitval(nbit)) {
+            return folly::makeUnexpected(StreamTrackerError::NotActive);
+        }
+        return std::forward< Fn >(fn)(*get_slot_data(nbit));
     }
 
     auto status(int64_t idx) const {

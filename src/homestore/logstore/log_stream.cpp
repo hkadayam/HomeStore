@@ -191,7 +191,7 @@ folly::coro::Task< void > LogStream::flush() {
     for (auto& g : emplaced) {
         uint64_t rec_off = g.group_offset + sizeof(log_group_header);
         for (logid_t i = g.from_idx; i <= g.upto_idx; ++i) {
-            auto& rec = log_records_->at(i);
+            auto rec = log_records_->at(i);
             rec.client->on_write_completion(rec.lsn, stream_key{i, rec_off, g.group_offset});
             rec_off += sizeof(log_record_header) + rec.data.size();
             flushed_bytes += to_i64(rec.data.size());
@@ -263,7 +263,7 @@ uint64_t LogStream::build_and_emplace_group(logid_t from_idx, logid_t upto_idx) 
 
         // log_record_header[i] + data[i] for each record
         for (logid_t i = from_idx; i <= upto_idx; ++i) {
-            const auto& rec = log_records_->at(i);
+            const auto rec = log_records_->at(i);
             auto* rhdr = r_cast< log_record_header* >(p);
             rhdr->log_id = i;
             rhdr->store_id = rec.client->store_id();

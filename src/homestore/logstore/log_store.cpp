@@ -175,8 +175,8 @@ folly::coro::Task< sisl::ByteView > LogStore::read(lsn_t lsn) {
             co_return sisl::ByteView{};
         }
     }
-    auto* rec = exp.value();
-    co_return co_await stream_->read(stream_key{rec->log_id, rec->record_stream_offset, 0});
+    auto rec = exp.value();
+    co_return co_await stream_->read(stream_key{rec.log_id, rec.record_stream_offset, 0});
 }
 
 folly::coro::Task< void > LogStore::flush() {
@@ -309,7 +309,7 @@ std::optional< uint64_t > LogStore::min_trunc_stream_offset() const {
     if (!exp) {
         return std::nullopt;
     }
-    return exp.value()->trunc_stream_offset;
+    return exp.value().trunc_stream_offset;
 }
 
 bool LogStore::in_rollback_range(logid_t log_id) const {

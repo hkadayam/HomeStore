@@ -71,15 +71,28 @@ folly::coro::Task< shared< AppendBlkStream > > AppendBlkStream::load(uint64_t st
 
 folly::coro::Task< BlkId > AppendBlkStream::alloc_or_expand(blk_count_t nblks, const blk_alloc_hints& hints) {
     BlkId bid;
-    auto status = vdev().alloc_contiguous_blks(nblks, hints, bid);
-    if (status == BlkAllocStatus::SUCCESS) {
-        co_return bid;
+    blk_alloc_hints h = hints;
+
+    // Pin allocation to THIS stream's chunks via chunk_id_hint.  Without the hint, the vdev's chunk_selector
+    // would pick from any chunk in the vdev — including chunks owned by sibling streams (e.g. cow_btree's
+    // node_stream stealing blocks from incr_map_stream's chunk because they share one vdev).
+    {
+        auto chunks_ro = chunks();
+        for (auto const& chunk : *chunks_ro) {
+            h.chunk_id_hint = chunk->chunk_id();
+            if (vdev().alloc_contiguous_blks(nblks, h, bid) == BlkAllocStatus::SUCCESS) {
+                co_return bid;
+            }
+        }
     }
 
-    // No space — add one chunk and retry once.
+    // No room in any of our chunks — expand and try the newly added one.
     co_await expand_to(num_chunks());
-    status = vdev().alloc_contiguous_blks(nblks, hints, bid);
-    if (status != BlkAllocStatus::SUCCESS) {
+    {
+        auto chunks_ro = chunks();
+        h.chunk_id_hint = (*chunks_ro).back()->chunk_id();
+    }
+    if (vdev().alloc_contiguous_blks(nblks, h, bid) != BlkAllocStatus::SUCCESS) {
         throw std::runtime_error{"AppendBlkStream: allocation failed even after expanding"};
     }
     co_return bid;

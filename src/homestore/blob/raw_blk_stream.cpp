@@ -70,11 +70,34 @@ RawBlkStream::RawBlkStream(uint64_t stream_id, MetaClient& meta_client, std::str
 // ─────────────────────────────────────────────────────────────────────────────
 
 BlkAllocStatus RawBlkStream::alloc_blk(blk_count_t nblks, const blk_alloc_hints& hints, BlkId& out_blkid) {
-    return vdev().alloc_contiguous_blks(nblks, hints, out_blkid);
+    // Pin allocation to THIS stream's chunks via chunk_id_hint.  Without the hint, the vdev's chunk_selector
+    // would pick from any chunk in the vdev — including chunks owned by sibling streams that share the vdev.
+    blk_alloc_hints h = hints;
+    auto chunks_ro = chunks();
+    BlkAllocStatus last = BlkAllocStatus::SPACE_FULL;
+    for (auto const& chunk : *chunks_ro) {
+        h.chunk_id_hint = chunk->chunk_id();
+        last = vdev().alloc_contiguous_blks(nblks, h, out_blkid);
+        if (last == BlkAllocStatus::SUCCESS) {
+            return last;
+        }
+    }
+    return last;
 }
 
 BlkAllocStatus RawBlkStream::alloc_blks(blk_count_t nblks, const blk_alloc_hints& hints, BlkIds& out_blkids) {
-    return vdev().alloc_blks(nblks, hints, out_blkids);
+    // Same chunk-scoping as alloc_blk: try each of our chunks in turn so blocks come only from this stream.
+    blk_alloc_hints h = hints;
+    auto chunks_ro = chunks();
+    BlkAllocStatus last = BlkAllocStatus::SPACE_FULL;
+    for (auto const& chunk : *chunks_ro) {
+        h.chunk_id_hint = chunk->chunk_id();
+        last = vdev().alloc_blks(nblks, h, out_blkids);
+        if (last == BlkAllocStatus::SUCCESS) {
+            return last;
+        }
+    }
+    return last;
 }
 
 BlkAllocStatus RawBlkStream::commit_blk(CP* cp, const BlkId& bid) {

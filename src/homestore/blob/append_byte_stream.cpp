@@ -268,6 +268,10 @@ folly::coro::Task< std::pair< sisl::ByteView, uint32_t > > AppendByteStream::Rea
     co_return {sisl::ByteView{sisl::make_byte_array(std::move(buf)), in_buf, valid}, valid};
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Flush
+// ─────────────────────────────────────────────────────────────────────────────
+
 folly::coro::Task< bool > AppendByteStream::flush() {
     FlushBuffer old_buf;
     std::vector< sisl::IOBuffer > bufs;

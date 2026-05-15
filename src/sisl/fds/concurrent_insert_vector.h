@@ -95,6 +95,14 @@ public:
     ConcurrentInsertVector& operator=(ConcurrentInsertVector&&) noexcept = delete;
 
     ~ConcurrentInsertVector() {
+        // Destroy tl_vec_ first so its per-thread-slot deleter pushes into zombies_ while zombies_ is still
+        // alive.  Without this, members destruct in reverse declaration order (zombies_ then tl_vec_) and the
+        // deleter writes into freed memory — push_back resurrects the vector with a fresh allocation that
+        // nobody ever frees (ASan reports the resurrected storage as a leak).  Re-init tl_vec_ as an empty
+        // TLP so the natural member destruction is a no-op.
+        tl_vec_.~ThreadLocalPtr();
+        new (&tl_vec_) folly::ThreadLocalPtr< std::vector< T >, Tag >{};
+
         std::unique_lock lg{zombie_mutex_};
         for (auto* v : zombies_) {
             delete v;

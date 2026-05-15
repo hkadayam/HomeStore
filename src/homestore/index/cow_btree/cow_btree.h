@@ -251,13 +251,13 @@ public:
             std::unique_lock lg{mtx_};
             entries_.clear();
             live_count_ = 0;
-            updates_since_last_flush_.store(0);
+            updates_since_last_full_flush_.store(0);
         }
 
         std::vector< CompactBlkId > entries_;
         size_t live_count_{0};
         mutable folly::SharedMutex mtx_;
-        std::atomic< uint64_t > updates_since_last_flush_{0};
+        std::atomic< uint64_t > updates_since_last_full_flush_{0};
     };
 
     // ── Per-CP session ────────────────────────────────────────────────────────

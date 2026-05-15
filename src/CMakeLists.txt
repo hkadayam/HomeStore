@@ -37,12 +37,6 @@ else ()
     message(STATUS "Memory allocator: libc (MALLOC_IMPL not set)")
 endif ()
 
-if (DEFINED REPLICATION)
-  if (${REPLICATION} STREQUAL "ON")
-    find_package(NuraftMesg QUIET REQUIRED)
-  endif()
-endif()
-
 list(APPEND COMMON_DEPS
     farmhash::farmhash
     folly::folly

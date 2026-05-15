@@ -19,13 +19,18 @@ using sisl::IOBuffer;
 
 // Source the [btree=] prefix from super_blk().btree_name (always present after construction) instead of going
 // through base_btree_, which isn't bound until the BtreeBase ctor runs — and recover() executes before that.
-#define COWBT_LOG(level, msg, ...)                                                                                     \
-    { LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, super_blk().btree_name, )), msg, ##__VA_ARGS__); }
-#define COWBT_CP_LOG(level, cp_id, msg, ...)                                                                           \
+#define COWBT_SPECIFIC_LOG(level, bt, msg, ...)                                                                        \
+    { LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, (bt).super_blk().btree_name, )), msg, ##__VA_ARGS__); }
+
+#define COWBT_LOG(level, msg, ...) COWBT_SPECIFIC_LOG(level, *this, msg, ##__VA_ARGS__)
+
+#define COWBT_SPECIFIC_CP_LOG(level, bt, cp_id, msg, ...)                                                              \
     {                                                                                                                  \
-        LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, super_blk().btree_name, )), "[cp={}] " msg, cp_id,           \
+        LOG##level##MOD_FMT(btree, (_BT_LOG_METHOD_IMPL(, (bt).super_blk().btree_name, )), "[cp={}] " msg, cp_id,      \
                             ##__VA_ARGS__);                                                                            \
     }
+
+#define COWBT_CP_LOG(level, cp_id, msg, ...) COWBT_SPECIFIC_CP_LOG(level, *this, cp_id, msg, ##__VA_ARGS__)
 
 // bnodeid_t layout: [ordinal(31 bits)][overflow_bit(1 bit)][node_number(32 bits)]
 // Overflow bit is bit 32 (the lowest bit of the upper half).
@@ -168,6 +173,7 @@ BtreeResult< Node > COWBtree::read_node(bnodeid_t id, LockType lock_type) {
     // Get the mapping of nodeid -> blkid
     BlkId const blkid = get_blkid_for_nodeid(id);
     HS_REL_ASSERT(blkid.is_valid(), "read_node: no BlkId found for node_id={}", id);
+    COWBT_LOG(DEBUG, "read_node: id={} compact_id={} blkid={}", id, to_compact_nodeid(id), blkid.to_string());
 
     // Read blkid from the stream
     IOBuffer io_buf{base_btree_->node_size(), node_stream_->block_size(), sisl::Buftag::btree_node};
@@ -177,6 +183,14 @@ BtreeResult< Node > COWBtree::read_node(bnodeid_t id, LockType lock_type) {
                   ec.message());
         CO_RETURN folly::makeUnexpected(BtreeStatus::node_read_failed);
     }
+
+    // Dump first 16 bytes of the persistent header so we can compare against the buf_nid logged at flush.
+    auto const* bytes = io_buf.cbytes();
+    COWBT_LOG(DEBUG, "read_node: id={} blkid={} hdr_bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}"
+                     " {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] nid_at_8={}",
+              id, blkid.to_string(), bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+              bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+              *r_cast< bnodeid_t const* >(bytes + 8));
 
     auto core = base_btree_->construct_existing_node(io_buf.release_to_shared_ptr(), id);
     auto h = node_cache_->insert(id, std::move(core), sisl::CacheHint::COLD);
@@ -366,6 +380,10 @@ folly::coro::Task< void > flush_dirty_nodes(COWBtree& bt, CP* cp, OnNodeFlushed&
     // We update bnode_map before confirming the write landed on disk — safe because FlushNodeEntry cache handles keep
     // nodes pinned so reads hit the cache.
     for (auto& node : session->modified_nodes_) {
+        // Snapshot the persistent-header node_id (at offset 8) directly out of the buffer we are about to
+        // write, so we can compare against what comes out on read.  If this differs from node.node_id()
+        // (which reads from the cache's NodeCore), the cache and the on-disk buffer are out of sync.
+        bnodeid_t const buf_nid = *r_cast< bnodeid_t const* >(node.flush_buf->bytes() + 8);
         sisl::ByteArray buf = std::move(node.flush_buf);
         auto bid = bt.node_stream_->quick_append(cp, /*segment_id=*/0, buf);
         if (!bid) {
@@ -375,6 +393,8 @@ folly::coro::Task< void > flush_dirty_nodes(COWBtree& bt, CP* cp, OnNodeFlushed&
 
         auto const compact_id = to_compact_nodeid(node.node_id());
         auto const compact_blkid = COWBtree::CompactBlkId{*bid};
+        COWBT_SPECIFIC_CP_LOG(DEBUG, bt, cp->id(), "FLUSH cached_nid={} buf_nid={} compact_id={} blkid={}",
+                              node.node_id(), buf_nid, compact_id, compact_blkid.to_string());
         bt.bnodeid_map_.update(compact_id, compact_blkid);
 
         on_flushed(compact_id, compact_blkid);
@@ -530,7 +550,8 @@ folly::coro::Task< bool > COWBtree::incr_cp_flush(CP* cp) {
     // Drain incr_map_stream_'s in-memory append buffer to disk and persist its SB metablk inline.
     co_await incr_map_stream_->flush();
 
-    bnodeid_map_.updates_since_last_flush_.fetch_add(session->modified_nodes_.size() + session->deleted_nodes_.size());
+    bnodeid_map_.updates_since_last_full_flush_.fetch_add(session->modified_nodes_.size() +
+                                                          session->deleted_nodes_.size());
 
     // Report bytes appended to the manager so the global incr_map size threshold is tracked accurately.
     auto const incr_map_appended = incr_map_stream_->tail_offset() - incr_map_pre_offset;
@@ -544,7 +565,8 @@ folly::coro::Task< bool > COWBtree::incr_cp_flush(CP* cp) {
 
 folly::coro::Task< void > COWBtree::full_cp_flush(CP* cp) {
     CPSession* session = cp_session(cp->id());
-    auto const updates_since_last_flush = bnodeid_map_.updates_since_last_flush_.load();
+    auto const updates_since_last_flush = bnodeid_map_.updates_since_last_full_flush_.load() +
+        session->modified_nodes_.size() + session->deleted_nodes_.size();
     COWBT_CP_LOG(INFO, cp->id(),
                  "Full flush started: modified={} deleted={} dirty_overflow={} deleted_overflow={}, "
                  "map_changes_since_last_flush={}",
@@ -589,7 +611,7 @@ folly::coro::Task< void > COWBtree::full_cp_flush(CP* cp) {
     co_await incr_map_stream_->truncate(incr_map_stream_->tail_offset());
     mgr_.incr_map_truncated(incr_map_truncated_bytes);
 
-    bnodeid_map_.updates_since_last_flush_.store(0);
+    bnodeid_map_.updates_since_last_full_flush_.store(0);
     COWBT_CP_LOG(INFO, cp->id(), "Full map flush complete: incr_map_truncated={}", incr_map_truncated_bytes);
 }
 
@@ -735,6 +757,8 @@ folly::coro::Task< uint64_t > COWBtree::recover_one_incr_cp(uint64_t offset, cp_
             auto full_rbuf = co_await read_from_incr_stream(offset, rec_size);
             auto const* rec = r_cast< IncrMapNodeRecord const* >(full_rbuf.bytes());
             for (uint16_t n = 0; n < rec->n_nodes; ++n) {
+                COWBT_LOG(DEBUG, "recover_one_incr_cp UPDATE compact_id={} -> base_blkid={} +offset={}", rec->nodes[n],
+                          rec->base_blkid.to_string(), n);
                 bnodeid_map_.update(rec->nodes[n], CompactBlkId{rec->base_blkid.to_blkid(), n});
                 nodeid_generator_.reserve(rec->nodes[n]);
             }

@@ -53,10 +53,9 @@ list(APPEND COMMON_DEPS
 
 if (DEFINED REPLICATION)
   if (${REPLICATION} STREQUAL "ON")
-    list(APPEND COMMON_DEPS 
-        nuraft_mesg::proto
-        nuraft::nuraft
-    )
+    # NuRaft linkage deferred — submodule is built (EXCLUDE_FROM_ALL) but no
+    # target links it yet. Adapter code in §5-7 of NURAFT_CORO_PLAN.md will
+    # append NuRaft::static_lib here when those modules are wired in.
   endif()
 endif()
 

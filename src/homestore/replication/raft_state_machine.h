@@ -5,10 +5,9 @@
 #include <iomgr/iomgr.hpp>
 #include <folly/concurrency/ConcurrentHashMap.h>
 #include "sisl/fds/enum.h"
-#include <nuraft_mesg/mesg_state_mgr.hpp>
 #include "homestore/replication/repl_decls.h"
 
-#include "replication/repl_dev/common.h"
+#include "replication/common.h"
 
 #if defined __clang__ or defined __GNUC__
 #pragma GCC diagnostic push
@@ -85,18 +84,18 @@ static constexpr uint64_t snp_obj_id_type_app = 1ULL << 63;
 using AsyncNotify = folly::SemiFuture< folly::Unit >;
 using AsyncNotifier = folly::Promise< folly::Unit >;
 
-class RaftReplDev;
+class ReplicaSet;
 class RaftStateMachine : public nuraft::state_machine {
 private:
     folly::ConcurrentHashMap< int64_t /*lsn*/, repl_req_ptr_t > m_lsn_req_map;
-    RaftReplDev& m_rd;
+    ReplicaSet& m_rd;
     nuraft::ptr< nuraft::buffer > m_success_ptr; // Preallocate the success return to raft
     // iomgr::timer_handle_t m_wait_blkid_write_timer_hdl{iomgr::null_timer_handle};
     bool m_resync_mode{false};
     int64_t next_batch_size_hint{0};
 
 public:
-    RaftStateMachine(RaftReplDev& rd);
+    RaftStateMachine(ReplicaSet& rd);
     ~RaftStateMachine() override = default;
     RaftStateMachine(RaftStateMachine const&) = delete;
     RaftStateMachine& operator=(RaftStateMachine const&) = delete;
@@ -121,13 +120,12 @@ public:
     void free_user_snp_ctx(void*& user_snp_ctx) override;
 
     ////////// APIs outside of nuraft::state_machine requirements ////////////////////
-    ReplServiceError propose_to_raft(repl_req_ptr_t rreq);
+    ReplError propose_to_raft(repl_req_ptr_t rreq);
     repl_req_ptr_t localize_journal_entry_prepare(nuraft::log_entry& lentry, int64_t lsn = -1);
     repl_req_ptr_t localize_journal_entry_finish(nuraft::log_entry& lentry);
     void link_lsn_to_req(repl_req_ptr_t rreq, int64_t lsn);
     void unlink_lsn_to_req(int64_t lsn, repl_req_ptr_t rreq);
     repl_req_ptr_t lsn_to_req(int64_t lsn);
-    nuraft_mesg::repl_service_ctx* group_msg_service();
 
     void iterate_repl_reqs(std::function< void(int64_t, repl_req_ptr_t rreq) > const& cb);
 

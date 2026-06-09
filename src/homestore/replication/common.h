@@ -17,8 +17,8 @@
 #include <boost/intrusive_ptr.hpp>
 #include <random>
 #include "homestore/replication/repl_decls.h"
-#include "homestore/replication_service.hpp"
-#include "homestore/replication/repl_dev.h"
+#include "homestore/replication/repl_manager.h"
+#include "homestore/replication/replica_set.h"
 #include "homestore/logstore/log_store.hpp"
 #include "homestore/superblk_handler.hpp"
 
@@ -35,9 +35,9 @@ struct repl_journal_entry {
     uint16_t minor_version{JOURNAL_ENTRY_MINOR};
 
     journal_type_t code;
-    trace_id_t traceID; // traceID provided by application, mostly for consolidate logs.
-    int32_t server_id;  // Server id from where journal entry is originated
-    uint64_t dsn;       // Data seq number
+    TraceId traceID;   // traceID provided by application, mostly for consolidate logs.
+    int32_t server_id; // Server id from where journal entry is originated
+    uint64_t dsn;      // Data seq number
     uint32_t user_header_size;
     uint32_t key_size;
     uint32_t value_size;
@@ -81,7 +81,7 @@ struct repl_dev_superblk {
 #pragma pack()
 
 template < class V = folly::Unit >
-auto make_async_error(ReplServiceError err) {
+auto make_async_error(ReplError err) {
     return folly::makeSemiFuture< ReplResult< V > >(folly::makeUnexpected(err));
 }
 

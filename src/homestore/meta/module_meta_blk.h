@@ -20,9 +20,11 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 
 #include <folly/coro/Task.h>
+#include <nlohmann/json.hpp>
 #include "sisl/fds/buffer.h"
 
 #include "common/defs.h"
@@ -200,6 +202,134 @@ private:
 
         // Pre-allocate the MetaBlk (not written to disk until write() is called).
         m.meta_blk_ = co_await client.create_meta_blk(name, buf_sz);
+        m.name_ = std::move(name);
+        m.client_ = std::move(client);
+        m.is_persisted_ = false;
+        co_return m;
+    }
+};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// JsonMetaBlk
+//
+// A single-block metadata wrapper backed by an nlohmann::json document. The on-disk payload is the msgpack-serialised
+// form of the JSON value. Analogous to ModuleMetaBlk<T> but for schema-less data.
+//
+// # Concurrency model
+//   JsonMetaBlk is NOT thread-safe. The caller must provide external synchronisation if concurrent access is needed.
+//
+// # Usage
+//   auto cfg = co_await JsonMetaBlk::open("my_module");
+//   (*cfg)["version"] = 2;
+//   (*cfg)["flags"]   = 0x1;
+//   co_await cfg.write();
+// ──────────────────────────────────────────────────────────────────────────────
+class JsonMetaBlk {
+public:
+    // ── Factory ──────────────────────────────────────────────────────────────
+
+    /// Create or recover a JsonMetaBlk.
+    ///
+    /// - If `name` is empty, an auto-generated unique name is used.
+    /// - On first call (no existing data): json document is empty; the block is allocated but NOT written until write()
+    ///   is called.
+    /// - On recovery: the on-disk msgpack payload is deserialised into the json document.
+    static folly::coro::Task< JsonMetaBlk > open(std::string name) {
+        if (name.empty()) {
+            name = "meta_blk_" + std::to_string(g_module_counter.fetch_add(1, std::memory_order_relaxed));
+        }
+
+        MetaClient client = co_await meta_mgr().register_client(name);
+        const size_t n_blks = co_await client.num_meta_blks();
+
+        if (n_blks > 0) {
+            co_return co_await load_existing(std::move(client), std::move(name));
+        } else {
+            co_return co_await create_new(std::move(client), std::move(name));
+        }
+    }
+
+    // ── JSON access ───────────────────────────────────────────────────────────
+    nlohmann::json& get() { return json_; }
+    const nlohmann::json& get() const { return json_; }
+    nlohmann::json* operator->() { return &json_; }
+    const nlohmann::json* operator->() const { return &json_; }
+    nlohmann::json& operator*() { return json_; }
+    const nlohmann::json& operator*() const { return json_; }
+
+    // ── Persistence ───────────────────────────────────────────────────────────
+
+    /// Serialise the current json document to msgpack and persist it.
+    folly::coro::Task< void > write() {
+        const auto packed = nlohmann::json::to_msgpack(json_);
+        const auto sz = packed.size();
+        sisl::ByteArray buf = sisl::make_byte_array(to_u32(sz));
+        std::memcpy(buf->bytes(), packed.data(), sz);
+        co_await client_.write_meta_blk(meta_blk_, buf);
+        is_persisted_ = true;
+    }
+
+    /// Remove this module's metadata from disk. After destroy() the object must not be used for further writes.
+    folly::coro::Task< void > destroy() {
+        if (is_persisted_) {
+            co_await client_.remove_meta_blk(meta_blk_);
+            is_persisted_ = false;
+        }
+        json_ = nlohmann::json{};
+    }
+
+    // ── Metadata ──────────────────────────────────────────────────────────────
+    std::string_view name() const { return name_; }
+    size_t size() const { return json_.size(); }
+
+    // ── Move-only ─────────────────────────────────────────────────────────────
+    JsonMetaBlk() = default;
+    JsonMetaBlk(JsonMetaBlk&&) = default;
+    JsonMetaBlk& operator=(JsonMetaBlk&&) = default;
+    JsonMetaBlk(const JsonMetaBlk&) = delete;
+    JsonMetaBlk& operator=(const JsonMetaBlk&) = delete;
+
+private:
+    MetaClient client_;
+    MetaBlk meta_blk_;
+    nlohmann::json json_;
+    std::string name_;
+    bool is_persisted_{false};
+
+    static folly::coro::Task< JsonMetaBlk > load_existing(MetaClient client, std::string name) {
+        JsonMetaBlk m;
+        bool found = false;
+
+        co_await client.for_each_recovered_block(
+            [&m, &found](const MetaBlk& blk, const sisl::ByteView& data) -> folly::coro::Task< void > {
+                if (!found) {
+                    try {
+                        std::string_view const sv{c_charptr_cast(data.bytes()), data.size()};
+                        m.json_ = nlohmann::json::from_msgpack(sv);
+                    } catch (const nlohmann::json::exception& e) {
+                        throw std::runtime_error{std::string{"JsonMetaBlk::load_existing: msgpack parse failed: "} +
+                                                 e.what()};
+                    }
+                    m.meta_blk_ = blk;
+                    m.is_persisted_ = true;
+                    found = true;
+                }
+                co_return;
+            });
+
+        if (!found) {
+            throw std::runtime_error{"JsonMetaBlk::load_existing: expected a recovered block but found none"};
+        }
+
+        m.name_ = std::move(name);
+        m.client_ = std::move(client);
+        co_return m;
+    }
+
+    static folly::coro::Task< JsonMetaBlk > create_new(MetaClient client, std::string name) {
+        JsonMetaBlk m;
+        m.json_ = nlohmann::json{};
+        m.meta_blk_ = co_await client.create_meta_blk(name, std::nullopt);
         m.name_ = std::move(name);
         m.client_ = std::move(client);
         m.is_persisted_ = false;

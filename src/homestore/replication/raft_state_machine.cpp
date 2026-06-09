@@ -5,16 +5,16 @@
 #include "sisl/fds/vector_pool.h"
 #include <libnuraft/nuraft.hxx>
 
-#include "service/raft_repl_service.h"
-#include "repl_dev/raft_state_machine.h"
-#include "repl_dev/raft_repl_dev.h"
+#include "replication/repl_manager.h"
+#include "replication/raft_state_machine.h"
+#include "replication/replica_set.h"
 #include "homestore/homestore.h"
 #include "common/homestore_config.h"
 #include "common/crash_simulator.h"
 
 namespace homestore {
 
-RaftStateMachine::RaftStateMachine(RaftReplDev& rd) : m_rd{rd} {
+RaftStateMachine::RaftStateMachine(ReplicaSet& rd) : m_rd{rd} {
     m_success_ptr = nuraft::buffer::alloc(sizeof(int));
     m_success_ptr->put(0);
 }
@@ -30,7 +30,7 @@ static std::pair< sisl::Blob, sisl::Blob > header_only_extract(nuraft::buffer& b
     return {header, key};
 }
 
-ReplServiceError RaftStateMachine::propose_to_raft(repl_req_ptr_t rreq) {
+ReplError RaftStateMachine::propose_to_raft(repl_req_ptr_t rreq) {
     rreq->create_journal_entry(true /* raft_buf */, m_rd.server_id());
     RD_LOGT(rreq->traceID(), "Raft Channel: propose journal_entry=[{}] ", rreq->journal_entry()->to_string());
 
@@ -45,7 +45,7 @@ ReplServiceError RaftStateMachine::propose_to_raft(repl_req_ptr_t rreq) {
                 append_status->get_result_code());
         return RaftReplService::to_repl_error(append_status->get_result_code());
     }
-    return ReplServiceError::OK;
+    return ReplError::OK;
 }
 
 repl_req_ptr_t RaftStateMachine::localize_journal_entry_prepare(nuraft::log_entry& lentry, int64_t lsn) {
@@ -86,7 +86,9 @@ repl_req_ptr_t RaftStateMachine::localize_journal_entry_prepare(nuraft::log_entr
         rreq =
             m_rd.applier_create_req(rkey, jentry->code, entry_to_hdr(jentry), entry_to_key(jentry),
                                     (entry_blkid.blk_count() * m_rd.get_blk_size()), false /* is_data_channel */, lsn);
-        if (rreq == nullptr) { goto out; }
+        if (rreq == nullptr) {
+            goto out;
+        }
 
         rreq->set_remote_blkid(RemoteBlkId{jentry->server_id, entry_blkid});
 
@@ -111,7 +113,8 @@ repl_req_ptr_t RaftStateMachine::localize_journal_entry_prepare(nuraft::log_entr
     } else {
         rreq = m_rd.applier_create_req(rkey, jentry->code, entry_to_hdr(jentry), entry_to_key(jentry),
                                        jentry->value_size, false /* is_data_channel */, lsn);
-        if (rreq == nullptr) goto out;
+        if (rreq == nullptr)
+            goto out;
     }
 
     // We might have localized the journal entry with new blkid. We need to also update the header/key pointers pointing
@@ -259,7 +262,9 @@ void RaftStateMachine::rollback_ext(const nuraft::state_machine::ext_op_params& 
     m_rd.handle_rollback(rreq);
 }
 
-int64_t RaftStateMachine::get_next_batch_size_hint_in_bytes() { return next_batch_size_hint; }
+int64_t RaftStateMachine::get_next_batch_size_hint_in_bytes() {
+    return next_batch_size_hint;
+}
 
 int64_t RaftStateMachine::inc_next_batch_size_hint() {
     constexpr int64_t next_batch_size_hint_limit = 16;
@@ -289,13 +294,17 @@ uint64_t RaftStateMachine::last_commit_index() {
     return uint64_cast(m_rd.get_last_commit_lsn());
 }
 
-void RaftStateMachine::become_ready() { m_rd.become_ready(); }
+void RaftStateMachine::become_ready() {
+    m_rd.become_ready();
+}
 
 void RaftStateMachine::unlink_lsn_to_req(int64_t lsn, repl_req_ptr_t rreq) {
     // it is possible a LSN mapped to different rreq in history
     // due to log overwritten. Verify the rreq before removing
     auto deleted = m_lsn_req_map.erase_if_equal(lsn, rreq);
-    if (deleted) { RD_LOGT(rreq->traceID(), "Raft channel: erase lsn {},  rreq {}", lsn, rreq->to_string()); }
+    if (deleted) {
+        RD_LOGT(rreq->traceID(), "Raft channel: erase lsn {},  rreq {}", lsn, rreq->to_string());
+    }
 }
 
 void RaftStateMachine::link_lsn_to_req(repl_req_ptr_t rreq, int64_t lsn) {
@@ -315,14 +324,14 @@ repl_req_ptr_t RaftStateMachine::lsn_to_req(int64_t lsn) {
     // Pull the req from the lsn
     auto const it = m_lsn_req_map.find(lsn);
     // RD_DBG_ASSERT(it != m_lsn_req_map.cend(), "lsn req map missing lsn={}", lsn);
-    if (it == m_lsn_req_map.cend()) { return nullptr; }
+    if (it == m_lsn_req_map.cend()) {
+        return nullptr;
+    }
 
     repl_req_ptr_t rreq = it->second;
     RD_DBG_ASSERT_EQ(lsn, rreq->lsn(), "lsn req map mismatch");
     return rreq;
 }
-
-nuraft_mesg::repl_service_ctx* RaftStateMachine::group_msg_service() { return m_rd.group_msg_service(); }
 
 void RaftStateMachine::create_snapshot(nuraft::snapshot& s, nuraft::async_result< bool >::handler_type& when_done) {
     m_rd.on_create_snapshot(s, when_done);
@@ -361,7 +370,8 @@ int RaftStateMachine::read_logical_snp_obj(nuraft::snapshot& s, void*& user_ctx,
     // Listener will read the snapshot data and we pass through the same.
     int ret = m_rd.m_listener->read_snapshot_obj(snp_ctx, snp_data);
     user_ctx = snp_data->user_ctx; // Have to pass the user_ctx to NuRaft even if ret<0 to get it freed later
-    if (ret < 0) return ret;
+    if (ret < 0)
+        return ret;
 
     is_last_obj = snp_data->is_last_obj;
 
@@ -424,12 +434,17 @@ bool RaftStateMachine::apply_snapshot(nuraft::snapshot& s) {
 
 nuraft::ptr< nuraft::snapshot > RaftStateMachine::last_snapshot() {
     auto s = std::dynamic_pointer_cast< nuraft_snapshot_context >(m_rd.m_listener->last_snapshot());
-    if (s == nullptr) return nullptr;
+    if (s == nullptr)
+        return nullptr;
     return s->nuraft_snapshot();
 }
 
-void RaftStateMachine::free_user_snp_ctx(void*& user_snp_ctx) { m_rd.m_listener->free_user_snp_ctx(user_snp_ctx); }
+void RaftStateMachine::free_user_snp_ctx(void*& user_snp_ctx) {
+    m_rd.m_listener->free_user_snp_ctx(user_snp_ctx);
+}
 
-std::string RaftStateMachine::identify_str() const { return m_rd.identify_str(); }
+std::string RaftStateMachine::identify_str() const {
+    return m_rd.identify_str();
+}
 
 } // namespace homestore

@@ -2,17 +2,16 @@
 #include "sisl/grpc/generic_service.hpp"
 #include "sisl/grpc/rpc_call.hpp"
 #include "homestore/blkdata_service.hpp"
-#include "homestore/replication/repl_dev.h"
+#include "homestore/replication/replica_set.h"
 #include <common/homestore_config.h>
-#include "replication/repl_dev/common.h"
+#include "replication/common.h"
 #include <libnuraft/nuraft.hxx>
 #include <iomgr/iomgr_flip.hpp>
 
 namespace homestore {
 
-ReplServiceError repl_req_ctx::init(repl_key rkey, journal_type_t op_code, bool is_proposer,
-                                    sisl::Blob const& user_header, sisl::Blob const& key, uint32_t data_size,
-                                    cshared< ReplDevListener >& listener) {
+ReplError repl_req_ctx::init(repl_key rkey, journal_type_t op_code, bool is_proposer, sisl::Blob const& user_header,
+                             sisl::Blob const& key, uint32_t data_size, cshared< ReplicaSetListener >& listener) {
     m_rkey = std::move(rkey);
 #ifndef NDEBUG
     if (data_size > 0) {
@@ -31,23 +30,23 @@ ReplServiceError repl_req_ctx::init(repl_key rkey, journal_type_t op_code, bool 
     // threads(data channel and raft channel) are trying to do the same thing. So take state mutex and allocate the blk
     std::unique_lock< std::mutex > lg(m_state_mtx);
     if (has_linked_data() && !has_state(repl_req_state_t::BLK_ALLOCATED)) {
-        ReplServiceError alloc_status;
+        ReplError alloc_status;
 #ifdef _PRERELEASE
         if (iomgr_flip::instance()->test_flip("simulate_no_space_left") && !is_proposer) {
             LOGERROR("Simulate no space left on follower for testing purposes");
             // TODO: support `simulate_no_space_left` for the leader, do not throw exception in on-error in the test
             // framework, it will cause the leader to fail and exit.
-            alloc_status = ReplServiceError::NO_SPACE_LEFT;
+            alloc_status = ReplError::NO_SPACE_LEFT;
         } else {
             alloc_status = alloc_local_blks(listener, data_size);
-            if (alloc_status != ReplServiceError::OK) {
+            if (alloc_status != ReplError::OK) {
                 LOGERRORMOD(replication, "[traceID={}] Allocate blk for rreq failed error={}", m_rkey.traceID,
                             alloc_status);
             }
         }
 #else
         alloc_status = alloc_local_blks(listener, data_size);
-        if (alloc_status != ReplServiceError::OK) {
+        if (alloc_status != ReplError::OK) {
             LOGERRORMOD(replication, "[traceID={}] Allocate blk for rreq failed error={}", m_rkey.traceID,
                         alloc_status);
         }
@@ -55,11 +54,13 @@ ReplServiceError repl_req_ctx::init(repl_key rkey, journal_type_t op_code, bool 
         return alloc_status;
     }
 
-    return ReplServiceError::OK;
+    return ReplError::OK;
 }
 
 repl_req_ctx::~repl_req_ctx() {
-    if (m_journal_entry) { m_journal_entry->~repl_journal_entry(); }
+    if (m_journal_entry) {
+        m_journal_entry->~repl_journal_entry();
+    }
 }
 
 void repl_req_ctx::create_journal_entry(bool is_raft_buf, int32_t server_id) {
@@ -129,11 +130,13 @@ void repl_req_ctx::change_raft_journal_buf(raft_buf_ptr_t new_buf, bool adjust_h
     m_is_jentry_localize_pending = false;
 }
 
-ReplServiceError repl_req_ctx::alloc_local_blks(cshared< ReplDevListener >& listener, uint32_t data_size) {
+ReplError repl_req_ctx::alloc_local_blks(cshared< ReplicaSetListener >& listener, uint32_t data_size) {
     DEBUG_ASSERT(has_linked_data(), "Trying to allocate a block for non-inlined block");
 
     auto const hints_result = listener->get_blk_alloc_hints(m_header, data_size, repl_req_ptr_t(this));
-    if (hints_result.hasError()) { return hints_result.error(); }
+    if (hints_result.hasError()) {
+        return hints_result.error();
+    }
 
     if (hints_result.value().committed_blk_id.has_value()) {
         // if the committed_blk_id is already present, use it and skip allocation and commitment
@@ -146,7 +149,7 @@ ReplServiceError repl_req_ctx::alloc_local_blks(cshared< ReplDevListener >& list
         add_state(repl_req_state_t::DATA_COMMITTED);
         m_data_received_promise.setValue();
         m_data_written_promise.setValue();
-        return ReplServiceError::OK;
+        return ReplError::OK;
     }
 
     std::vector< BlkId > blkids;
@@ -156,18 +159,22 @@ ReplServiceError repl_req_ctx::alloc_local_blks(cshared< ReplDevListener >& list
         LOGWARNMOD(replication, "[traceID={}] block allocation failure, repl_key=[{}], status=[{}]", rkey().traceID,
                    rkey(), status);
         DEBUG_ASSERT_EQ(status, BlkAllocStatus::SUCCESS, "Unable to allocate blks");
-        return ReplServiceError::NO_SPACE_LEFT;
+        return ReplError::NO_SPACE_LEFT;
     }
 
     for (auto& blkid : blkids) {
         m_local_blkids.emplace_back(blkid);
     }
     add_state(repl_req_state_t::BLK_ALLOCATED);
-    return ReplServiceError::OK;
+    return ReplError::OK;
 }
 
-raft_buf_ptr_t& repl_req_ctx::raft_journal_buf() { return std::get< raft_buf_ptr_t >(m_journal_buf); }
-uint8_t* repl_req_ctx::raw_journal_buf() { return std::get< std::unique_ptr< uint8_t[] > >(m_journal_buf).get(); }
+raft_buf_ptr_t& repl_req_ctx::raft_journal_buf() {
+    return std::get< raft_buf_ptr_t >(m_journal_buf);
+}
+uint8_t* repl_req_ctx::raw_journal_buf() {
+    return std::get< std::unique_ptr< uint8_t[] > >(m_journal_buf).get();
+}
 
 void repl_req_ctx::set_lsn(int64_t lsn) {
     DEBUG_ASSERT((m_lsn == -1) || (m_lsn == lsn),
@@ -179,7 +186,9 @@ void repl_req_ctx::set_lsn(int64_t lsn) {
 
 bool repl_req_ctx::save_pushed_data(intrusive< sisl::GenericRpcData > const& pushed_data, uint8_t const* data,
                                     uint32_t data_size) {
-    if (!add_state_if_not_already(repl_req_state_t::DATA_RECEIVED)) { return false; }
+    if (!add_state_if_not_already(repl_req_state_t::DATA_RECEIVED)) {
+        return false;
+    }
 
     if (((uintptr_t)data % data_service().get_align_size()) != 0) {
         // Unaligned buffer, create a new buffer and copy the entire buf
@@ -196,7 +205,9 @@ bool repl_req_ctx::save_pushed_data(intrusive< sisl::GenericRpcData > const& pus
 
 bool repl_req_ctx::save_fetched_data(sisl::GenericClientResponse const& fetched_data, uint8_t const* data,
                                      uint32_t data_size) {
-    if (!add_state_if_not_already(repl_req_state_t::DATA_RECEIVED)) { return false; }
+    if (!add_state_if_not_already(repl_req_state_t::DATA_RECEIVED)) {
+        return false;
+    }
 
     if (((uintptr_t)data % data_service().get_align_size()) != 0) {
         // Unaligned buffer, create a new buffer and copy the entire buf
@@ -211,7 +222,9 @@ bool repl_req_ctx::save_fetched_data(sisl::GenericClientResponse const& fetched_
     return true;
 }
 
-void repl_req_ctx::add_state(repl_req_state_t s) { m_state.fetch_or(uint32_cast(s)); }
+void repl_req_ctx::add_state(repl_req_state_t s) {
+    m_state.fetch_or(uint32_cast(s));
+}
 
 bool repl_req_ctx::add_state_if_not_already(repl_req_state_t s) {
     bool changed{false};
@@ -247,14 +260,26 @@ void repl_req_ctx::release_data() {
 }
 
 static std::string req_state_name(uint32_t state) {
-    if (state == (uint32_t)repl_req_state_t::INIT) { return "INIT"; }
+    if (state == (uint32_t)repl_req_state_t::INIT) {
+        return "INIT";
+    }
 
     std::string ret;
-    if (state & (uint32_t)repl_req_state_t::BLK_ALLOCATED) { ret += "BLK_ALLOCATED | "; }
-    if (state & (uint32_t)repl_req_state_t::DATA_RECEIVED) { ret += "DATA_RECEIVED | "; }
-    if (state & (uint32_t)repl_req_state_t::DATA_WRITTEN) { ret += "DATA_WRITTEN | "; }
-    if (state & (uint32_t)repl_req_state_t::LOG_RECEIVED) { ret += "LOG_RECEIVED | "; }
-    if (state & (uint32_t)repl_req_state_t::LOG_FLUSHED) { ret += "LOG_FLUSHED"; }
+    if (state & (uint32_t)repl_req_state_t::BLK_ALLOCATED) {
+        ret += "BLK_ALLOCATED | ";
+    }
+    if (state & (uint32_t)repl_req_state_t::DATA_RECEIVED) {
+        ret += "DATA_RECEIVED | ";
+    }
+    if (state & (uint32_t)repl_req_state_t::DATA_WRITTEN) {
+        ret += "DATA_WRITTEN | ";
+    }
+    if (state & (uint32_t)repl_req_state_t::LOG_RECEIVED) {
+        ret += "LOG_RECEIVED | ";
+    }
+    if (state & (uint32_t)repl_req_state_t::LOG_FLUSHED) {
+        ret += "LOG_FLUSHED";
+    }
     return ret;
 }
 
@@ -266,7 +291,8 @@ std::string repl_req_ctx::to_string() const {
 }
 
 std::string repl_req_ctx::to_compact_string() const {
-    if (m_op_code == journal_type_t::HS_CTRL_DESTROY || m_op_code == journal_type_t::HS_CTRL_START_REPLACE || m_op_code == journal_type_t::HS_CTRL_COMPLETE_REPLACE) {
+    if (m_op_code == journal_type_t::HS_CTRL_DESTROY || m_op_code == journal_type_t::HS_CTRL_START_REPLACE ||
+        m_op_code == journal_type_t::HS_CTRL_COMPLETE_REPLACE) {
         return fmt::format("term={} lsn={} op={}", m_rkey.term, m_lsn, enum_name(m_op_code));
     }
 

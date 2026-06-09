@@ -3,21 +3,19 @@
 #include <string>
 
 #include <libnuraft/ptr.hxx>
-#include <nuraft_mesg/nuraft_mesg.hpp>
-#include <nuraft_mesg/mesg_state_mgr.hpp>
 #include "sisl/fds/buffer.h"
 #include "sisl/fds/utils.h"
-#include "homestore/replication/repl_dev.h"
+#include "homestore/replication/replica_set.h"
 #include "homestore/superblk_handler.hpp"
 #include "homestore/logstore/log_store.hpp"
-#include "replication/repl_dev/common.h"
-#include "replication/repl_dev/raft_state_machine.h"
-#include "replication/log_store/repl_log_store.h"
+#include "replication/common.h"
+#include "replication/raft_state_machine.h"
+#include "replication/replica_set.h"
 
 namespace homestore {
 struct replace_member_ctx_superblk {
-    replica_id_t replica_out;
-    replica_id_t replica_in;
+    ReplicaId replica_out;
+    ReplicaId replica_in;
 };
 
 #pragma pack(1)
@@ -42,13 +40,13 @@ using raft_cluster_config_ptr_t = nuraft::ptr< nuraft::cluster_config >;
 ENUM(repl_dev_stage_t, uint8_t, INIT, ACTIVE, DESTROYING, DESTROYED, PERMANENT_DESTROYED);
 
 struct replace_member_ctx {
-    replica_member_info replica_out;
-    replica_member_info replica_in;
+    ReplicaMemberInfo replica_out;
+    ReplicaMemberInfo replica_in;
 };
 
-class RaftReplDevMetrics : public sisl::MetricsGroup {
+class ReplicaSetMetrics : public sisl::MetricsGroup {
 public:
-    explicit RaftReplDevMetrics(const char* inst_name) : sisl::MetricsGroup("RaftReplDev", inst_name) {
+    explicit ReplicaSetMetrics(const char* inst_name) : sisl::MetricsGroup("ReplicaSet", inst_name) {
         REGISTER_COUNTER(read_err_cnt, "total read error count", "read_err_cnt", {"op", "read"});
         REGISTER_COUNTER(write_err_cnt, "total write error count", "write_err_cnt", {"op", "write"});
         REGISTER_COUNTER(fetch_err_cnt, "total fetch data error count", "fetch_err_cnt", {"op", "fetch"});
@@ -63,10 +61,8 @@ public:
         REGISTER_COUNTER(total_write_cnt, "total read count", "total_read_cnt", {"op", "write"});
         REGISTER_COUNTER(outstanding_data_read_cnt, "Total data outstanding read cnt",
                          sisl::PublishAs::Gauge); // placeholder
-        REGISTER_COUNTER(outstanding_data_write_cnt, "Total data outstanding write cnt",
-                         sisl::PublishAs::Gauge);
-        REGISTER_COUNTER(outstanding_data_fetch_cnt, "Total data outstanding fetch cnt",
-                         sisl::PublishAs::Gauge);
+        REGISTER_COUNTER(outstanding_data_write_cnt, "Total data outstanding write cnt", sisl::PublishAs::Gauge);
+        REGISTER_COUNTER(outstanding_data_fetch_cnt, "Total data outstanding fetch cnt", sisl::PublishAs::Gauge);
 
         // leader: data write latency;
         // follower: from rreq push data received to data write completion;
@@ -111,16 +107,16 @@ public:
         register_me_to_farm();
     }
 
-    RaftReplDevMetrics(const RaftReplDevMetrics&) = delete;
-    RaftReplDevMetrics(RaftReplDevMetrics&&) noexcept = delete;
-    RaftReplDevMetrics& operator=(const RaftReplDevMetrics&) = delete;
-    RaftReplDevMetrics& operator=(RaftReplDevMetrics&&) noexcept = delete;
-    ~RaftReplDevMetrics() { deregister_me_from_farm(); }
+    ReplicaSetMetrics(const ReplicaSetMetrics&) = delete;
+    ReplicaSetMetrics(ReplicaSetMetrics&&) noexcept = delete;
+    ReplicaSetMetrics& operator=(const ReplicaSetMetrics&) = delete;
+    ReplicaSetMetrics& operator=(ReplicaSetMetrics&&) noexcept = delete;
+    ~ReplicaSetMetrics() { deregister_me_from_farm(); }
 };
 
 class RaftReplService;
 class CP;
-struct ReplDevCPContext {
+struct ReplicaSetCPContext {
     repl_lsn_t cp_lsn;
     repl_lsn_t compacted_to_lsn;
     uint64_t last_applied_dsn;
@@ -158,9 +154,7 @@ private:
     nuraft::ptr< nuraft::snapshot > snapshot_;
 };
 
-class RaftReplDev : public ReplDev,
-                    public nuraft_mesg::mesg_state_mgr,
-                    public std::enable_shared_from_this< RaftReplDev > {
+class ReplicaSet : public nuraft::state_mgr, public std::enable_shared_from_this< ReplicaSet > {
 private:
     class init_req_counter {
     public:
@@ -175,79 +169,65 @@ private:
     };
 
 private:
-    shared< RaftStateMachine > m_state_machine;
-    RaftReplService& m_repl_svc;
-    folly::ConcurrentHashMap< repl_key, repl_req_ptr_t, repl_key::Hasher > m_repl_key_req_map;
-    nuraft_mesg::Manager& m_msg_mgr;
-    group_id_t m_group_id;      // Replication Group id
-    std::string m_rdev_name;    // Short name for the group for easy debugging
-    std::string m_identify_str; // combination of rdev_name:group_id
-    replica_id_t m_my_repl_id;  // This replica's uuid
-    int32_t m_raft_server_id;   // Server ID used by raft (unique within raft group)
-    shared< ReplLogStore > m_data_journal;
-    shared< HomeLogStore > m_free_blks_journal;
-    sisl::urcu_scoped_ptr< repl_dev_stage_t > m_stage;
+    shared< RaftStateMachine > state_machine_;
+    GroupId group_id_;        // Replication Group id
+    ReplicaId my_repl_id_;    // This replica's uuid
+    int32_t m_raft_server_id; // Server ID used by raft (unique within raft group)
+    shared< ReplLogStore > data_journal_;
+    sisl::urcu_scoped_ptr< repl_dev_stage_t > stage_;
 
-    std::mutex m_config_mtx;
-    superblk< raft_repl_dev_superblk > m_rd_sb;        // Superblk where we store the state machine etc
-    json_superblk m_raft_config_sb;                    // Raft Context and Config data information stored
+    std::mutex config_mtx_;
+    json_superblk m_raft_config_sb; // Raft Context and Config data information stored
+
+    std::mutex sb_mtx_;                         // Lock to protect the repl dev superblock
+    superblk< raft_repl_dev_superblk > m_rd_sb; // Superblk where we store the state machine etc
+
     mutable folly::SharedMutexWritePriority m_sb_lock; // Lock to protect staged sb and persisting sb
-    raft_repl_dev_superblk m_sb_in_mem;                // Cached version which is used to read and for staging
+    raft_repl_dev_superblk sb_in_mem_;                 // Cached version which is used to read and for staging
 
-    std::atomic< repl_lsn_t > m_commit_upto_lsn{0}; // LSN which was lastly committed, to track flushes
-    std::atomic< repl_lsn_t > m_compact_lsn{0};     // LSN upto which it was compacted, it is used to track where to
+    std::atomic< repl_lsn_t > commit_upto_lsn_{0}; // LSN which was lastly committed, to track flushes
+    std::atomic< repl_lsn_t > compact_lsn_{0};     // LSN upto which it was compacted, it is used to track where to
+
     // The `traffic_ready_lsn` variable holds the Log Sequence Number (LSN) up to which
     // the state machine should committed to before accepting traffic. This threshold ensures that
     // all potential committed log be committed before handling incoming requests.
-    std::atomic< repl_lsn_t > m_traffic_ready_lsn{0};
+    std::atomic< repl_lsn_t > traffic_ready_lsn_{0};
 
-    std::mutex m_sb_mtx; // Lock to protect the repl dev superblock
+    repl_lsn_t last_flushed_commit_lsn_{0}; // LSN upto which it was flushed to persistent store
 
-    repl_lsn_t m_last_flushed_commit_lsn{0}; // LSN upto which it was flushed to persistent store
-    iomgr::timer_handle_t m_sb_flush_timer_hdl;
-
-    std::atomic< uint64_t > m_next_dsn{0}; // Data Sequence Number that will keep incrementing for each data entry
-
-    iomgr::timer_handle_t m_wait_data_timer_hdl{
-        iomgr::null_timer_handle}; // non-recurring timer doesn't need to be cancelled on shutdown;
-    Clock::time_point m_destroyed_time;
-    folly::Promise< ReplServiceError > m_destroy_promise;
-    RaftReplDevMetrics m_metrics;
+    Clock::time_point destroyed_time_;
+    folly::Promise< ReplError > m_destroy_promise;
+    ReplicaSetMetrics metrics_;
 
     static std::atomic< uint64_t > s_next_group_ordinal;
-    bool m_log_store_replay_done{false};
-
-    // pending create requests, including both raft and data channel
-    std::atomic_uint64_t m_pending_init_req_num;
-    std::atomic< bool > m_in_quience;
+    bool log_store_replay_done_{false};
 
 public:
     friend class RaftStateMachine;
 
-    RaftReplDev(RaftReplService& svc, superblk< raft_repl_dev_superblk >&& rd_sb, bool load_existing);
-    virtual ~RaftReplDev() = default;
+    ReplicaSet(RaftReplService& svc, superblk< raft_repl_dev_superblk >&& rd_sb, bool load_existing);
+    virtual ~ReplicaSet() = default;
 
     bool bind_data_service();
     bool join_group();
-    AsyncReplResult<> start_replace_member(const replica_member_info& member_out, const replica_member_info& member_in,
+    AsyncReplResult<> start_replace_member(const ReplicaMemberInfo& member_out, const ReplicaMemberInfo& member_in,
                                            uint32_t commit_quorum = 0, uint64_t trace_id = 0);
-    AsyncReplResult<> complete_replace_member(const replica_member_info& member_out,
-                                              const replica_member_info& member_in, uint32_t commit_quorum = 0,
-                                              uint64_t trace_id = 0);
-    AsyncReplResult<> flip_learner_flag(const replica_member_info& member, bool target, uint32_t commit_quorum,
+    AsyncReplResult<> complete_replace_member(const ReplicaMemberInfo& member_out, const ReplicaMemberInfo& member_in,
+                                              uint32_t commit_quorum = 0, uint64_t trace_id = 0);
+    AsyncReplResult<> flip_learner_flag(const ReplicaMemberInfo& member, bool target, uint32_t commit_quorum,
                                         bool wait_and_verify = true, uint64_t trace_id = 0);
-    ReplServiceError do_add_member(const replica_member_info& member, uint64_t trace_id = 0);
-    ReplServiceError do_remove_member(const replica_member_info& member, uint64_t trace_id = 0);
-    ReplServiceError do_flip_learner(const replica_member_info& member, bool target, bool wait_and_verify,
-                                     uint64_t trace_id = 0);
-    ReplServiceError set_priority(const replica_id_t& member, int32_t priority, uint64_t trace_id = 0);
+    ReplError do_add_member(const ReplicaMemberInfo& member, uint64_t trace_id = 0);
+    ReplError do_remove_member(const ReplicaMemberInfo& member, uint64_t trace_id = 0);
+    ReplError do_flip_learner(const ReplicaMemberInfo& member, bool target, bool wait_and_verify,
+                              uint64_t trace_id = 0);
+    ReplError set_priority(const ReplicaId& member, int32_t priority, uint64_t trace_id = 0);
     nuraft::cmd_result_code retry_when_config_changing(const std::function< nuraft::cmd_result_code() >& func,
-                                                     uint64_t trace_id = 0);
+                                                       uint64_t trace_id = 0);
     bool wait_and_check(const std::function< bool() >& check_func, uint32_t timeout_ms, uint32_t interval_ms = 100);
 
-    folly::SemiFuture< ReplServiceError > destroy_group();
+    folly::SemiFuture< ReplError > destroy_group();
 
-    //////////////// All ReplDev overrides/implementation ///////////////////////
+    //////////////// All ReplicaSet overrides/implementation ///////////////////////
     virtual std::error_code alloc_blks(uint32_t size, const blk_alloc_hints& hints,
                                        std::vector< MultiBlkId >& out_blkids) override {
         RD_REL_ASSERT(false, "NOT SUPPORTED");
@@ -255,28 +235,28 @@ public:
     }
     virtual folly::Future< std::error_code > async_write(const std::vector< MultiBlkId >& blkids,
                                                          sisl::SgList const& value, bool part_of_batch = false,
-                                                         trace_id_t tid = 0) override {
+                                                         TraceId tid = 0) override {
         RD_REL_ASSERT(false, "NOT SUPPORTED");
         return folly::makeFuture< std::error_code >(std::make_error_code(std::errc::operation_not_supported));
     }
 
     virtual void async_write_journal(const std::vector< MultiBlkId >& blkids, sisl::Blob const& header,
                                      sisl::Blob const& key, uint32_t data_size, repl_req_ptr_t ctx,
-                                     trace_id_t tid = 0) override {
+                                     TraceId tid = 0) override {
         RD_REL_ASSERT(false, "NOT SUPPORTED");
     }
 
     void async_alloc_write(sisl::Blob const& header, sisl::Blob const& key, sisl::SgList const& value,
-                           repl_req_ptr_t ctx, bool part_of_batch = false, trace_id_t tid = 0) override;
+                           repl_req_ptr_t ctx, bool part_of_batch = false, TraceId tid = 0) override;
     folly::Future< std::error_code > async_read(MultiBlkId const& blkid, sisl::SgList& sgs, uint32_t size,
-                                                bool part_of_batch = false, trace_id_t tid = 0) override;
-    folly::Future< std::error_code > async_free_blks(int64_t lsn, MultiBlkId const& blkid, trace_id_t tid = 0) override;
+                                                bool part_of_batch = false, TraceId tid = 0) override;
+    folly::Future< std::error_code > async_free_blks(int64_t lsn, MultiBlkId const& blkid, TraceId tid = 0) override;
     AsyncReplResult<> become_leader() override;
     bool is_leader() const override;
-    replica_id_t get_leader_id() const override;
+    ReplicaId get_leader_id() const override;
     std::vector< peer_info > get_replication_status() const override;
-    std::set< replica_id_t > get_active_peers() const;
-    group_id_t group_id() const override { return m_group_id; }
+    std::set< ReplicaId > get_active_peers() const;
+    GroupId group_id() const override { return m_group_id; }
     void set_custom_rdev_name(std::string const& name) override {
         RD_LOGI(NO_TRACE_ID, "Resetting repl dev name from {} to {}", m_rdev_name, name);
         m_rdev_name = name;
@@ -304,10 +284,9 @@ public:
     }
 
     //////////////// Accessor/shortcut methods ///////////////////////
-    nuraft_mesg::repl_service_ctx* group_msg_service();
 
     nuraft::raft_server* raft_server();
-    RaftReplDevMetrics& metrics() { return m_metrics; }
+    ReplicaSetMetrics& metrics() { return m_metrics; }
 
     //////////////// Methods needed for other Raft classes to access /////////////////
     void use_config(json_superblk raft_config_sb);
@@ -321,8 +300,8 @@ public:
                                       int64_t lsn = -1 /*init lsn*/);
     folly::Future< folly::Unit > notify_after_data_written(std::vector< repl_req_ptr_t >* rreqs);
     void check_and_fetch_remote_data(std::vector< repl_req_ptr_t > rreqs);
-    void cp_flush(CP* cp, cshared< ReplDevCPContext > ctx);
-    cshared< ReplDevCPContext > get_cp_ctx(CP* cp);
+    void cp_flush(CP* cp, cshared< ReplicaSetCPContext > ctx);
+    cshared< ReplicaSetCPContext > get_cp_ctx(CP* cp);
     void cp_cleanup(CP* cp);
     void become_ready();
 
@@ -362,7 +341,9 @@ public:
     }
 #endif
 
-    void wait_for_logstore_ready() { m_data_journal->wait_for_log_store_ready(); }
+    void wait_for_logstore_ready() {
+        m_data_journal->wait_for_log_store_ready();
+    }
 
     void gc_repl_reqs();
 
@@ -372,7 +353,8 @@ public:
     void flush_durable_commit_lsn();
 
     /**
-     * Check the replace_member status, if the new member is fully synced up and ready to take over, remove the old member.
+     * Check the replace_member status, if the new member is fully synced up and ready to take over, remove the old
+     * member.
      */
     void check_replace_member_status();
 
@@ -387,7 +369,9 @@ public:
      * destroy message. but the group is already destroyed, so no leader will send this message again to this stale
      * member. we need to force leave the group to avoid the stale member to be a part of the group.
      */
-    void force_leave() { leave(); }
+    void force_leave() {
+        leave();
+    }
 
     /**
      * \brief This method is called to check if the given LSN is within the last snapshot LSN received from the leader.
@@ -397,7 +381,9 @@ public:
      * \param lsn The LSN to be checked.
      * \return true if the LSN is within the last snapshot LSN, false otherwise.
      */
-    bool need_skip_processing(const repl_lsn_t lsn) { return lsn <= m_rd_sb->last_snapshot_lsn; }
+    bool need_skip_processing(const repl_lsn_t lsn) {
+        return lsn <= m_rd_sb->last_snapshot_lsn;
+    }
 
     void quiesce_reqs();
     void resume_accepting_reqs();
@@ -413,9 +399,11 @@ protected:
     nuraft::ptr< nuraft::srv_state > read_state() override;
     nuraft::ptr< nuraft::log_store > load_log_store() override;
     int32_t server_id() override;
-    void system_exit(const int exit_code) override { LOGINFO("System exiting with code [{}]", exit_code); }
+    void system_exit(const int exit_code) override {
+        LOGINFO("System exiting with code [{}]", exit_code);
+    }
 
-    //////////////// All nuraft_mesg::mesg_state_mgr overrides ///////////////////////
+    //////////////// state_mgr overrides ///////////////////////
     uint32_t get_logstore_id() const override;
     std::shared_ptr< nuraft::state_machine > get_state_machine() override;
     void permanent_destroy() override;
@@ -424,7 +412,9 @@ protected:
     nuraft::cb_func::ReturnCode raft_event(nuraft::cb_func::Type, nuraft::cb_func::Param*) override;
 
 private:
-    shared< nuraft::log_store > data_journal() { return m_data_journal; }
+    shared< nuraft::log_store > data_journal() {
+        return m_data_journal;
+    }
     void push_data_to_all_followers(repl_req_ptr_t rreq, sisl::SgList const& data);
     void on_push_data_received(intrusive< sisl::GenericRpcData >& rpc_data);
     void on_fetch_data_received(intrusive< sisl::GenericRpcData >& rpc_data);
@@ -436,7 +426,7 @@ private:
      * \brief This method handles errors that occur during append entries or data receiving.
      * It should not be called after the append entries phase.
      */
-    void handle_error(repl_req_ptr_t const& rreq, ReplServiceError err);
+    void handle_error(repl_req_ptr_t const& rreq, ReplError err);
 
     bool wait_for_data_receive(std::vector< repl_req_ptr_t > const& rreqs, uint64_t timeout_ms,
                                std::vector< repl_req_ptr_t >* timeout_rreqs = nullptr);
@@ -450,13 +440,17 @@ private:
     bool save_snp_resync_data(nuraft::buffer& data, nuraft::snapshot& s);
 
     void report_blk_metrics_if_needed(repl_req_ptr_t rreq);
-    ReplServiceError init_req_ctx(repl_req_ptr_t rreq, repl_key rkey, journal_type_t op_code, bool is_proposer,
-                                  sisl::Blob const& user_header, sisl::Blob const& key, uint32_t data_size,
-                                  cshared< ReplDevListener >& listener);
+    ReplError init_req_ctx(repl_req_ptr_t rreq, repl_key rkey, journal_type_t op_code, bool is_proposer,
+                           sisl::Blob const& user_header, sisl::Blob const& key, uint32_t data_size,
+                           cshared< ReplicaSetListener >& listener);
 
-    bool is_in_quience() { return m_in_quience.load(std::memory_order_acquire); }
+    bool is_in_quience() {
+        return m_in_quience.load(std::memory_order_acquire);
+    }
 
-    uint64_t get_pending_init_req_num() { return m_pending_init_req_num.load(std::memory_order_acquire); }
+    uint64_t get_pending_init_req_num() {
+        return m_pending_init_req_num.load(std::memory_order_acquire);
+    }
 };
 
 } // namespace homestore

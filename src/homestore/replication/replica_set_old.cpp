@@ -16,22 +16,22 @@
 #include "common/homestore_assert.h"
 #include "common/homestore_config.h"
 #include "common/homestore_utils.h"
-#include "replication/service/raft_repl_service.h"
-#include "replication/repl_dev/raft_repl_dev.h"
+#include "replication/repl_manager.h"
+#include "replication/replica_set.h"
 #include "homestore/device/chunk.h"
 #include "homestore/device/device.h"
 #include "push_data_rpc_generated.h"
 #include "fetch_data_rpc_generated.h"
 
 namespace homestore {
-std::atomic< uint64_t > RaftReplDev::s_next_group_ordinal{1};
+std::atomic< uint64_t > ReplicaSet::s_next_group_ordinal{1};
 
-RaftReplDev::RaftReplDev(RaftReplService& svc, superblk< raft_repl_dev_superblk >&& rd_sb, bool load_existing) :
+ReplicaSet::ReplicaSet(RaftReplService& svc, superblk< raft_repl_dev_superblk >&& rd_sb, bool load_existing) :
         m_repl_svc{svc},
         m_msg_mgr{svc.msg_manager()},
         m_group_id{rd_sb->group_id},
         m_my_repl_id{svc.get_my_repl_uuid()},
-        m_raft_server_id{nuraft_mesg::to_server_id(m_my_repl_id)},
+        m_raft_server_id{homestore::to_server_id(m_my_repl_id)},
         m_rd_sb{std::move(rd_sb)},
         m_metrics{fmt::format("{}_{}", group_id_str(), m_raft_server_id).c_str()} {
     m_state_machine = std::make_shared< RaftStateMachine >(*this);
@@ -85,7 +85,7 @@ RaftReplDev::RaftReplDev(RaftReplService& svc, superblk< raft_repl_dev_superblk 
     m_identify_str = m_rdev_name + ":" + group_id_str();
 
     RD_LOGI(NO_TRACE_ID,
-            "Started {} RaftReplDev group_id={}, replica_id={}, raft_server_id={} commited_lsn={}, "
+            "Started {} ReplicaSet group_id={}, replica_id={}, raft_server_id={} commited_lsn={}, "
             "compact_lsn={}, checkpoint_lsn:{}, next_dsn={} "
             "log_dev={} log_store={}",
             (load_existing ? "Existing" : "New"), group_id_str(), my_replica_id_str(), m_raft_server_id,
@@ -93,7 +93,7 @@ RaftReplDev::RaftReplDev(RaftReplService& svc, superblk< raft_repl_dev_superblk 
             m_rd_sb->logdev_id, m_rd_sb->logstore_id);
 }
 
-bool RaftReplDev::bind_data_service() {
+bool ReplicaSet::bind_data_service() {
     RD_LOGI(NO_TRACE_ID, "Starting data channel, group_id={}, replica_id={}", group_id_str(), my_replica_id_str());
     bool success = false;
 #ifdef _PRERELEASE
@@ -110,14 +110,14 @@ bool RaftReplDev::bind_data_service() {
         });
 #else
     success =
-        m_msg_mgr.bind_data_service_request(PUSH_DATA, m_group_id, bind_this(RaftReplDev::on_push_data_received, 1));
+        m_msg_mgr.bind_data_service_request(PUSH_DATA, m_group_id, bind_this(ReplicaSet::on_push_data_received, 1));
 #endif
     if (!success) {
         RD_LOGE(NO_TRACE_ID, "Failed to bind data service request for PUSH_DATA");
         return false;
     }
     success =
-        m_msg_mgr.bind_data_service_request(FETCH_DATA, m_group_id, bind_this(RaftReplDev::on_fetch_data_received, 1));
+        m_msg_mgr.bind_data_service_request(FETCH_DATA, m_group_id, bind_this(ReplicaSet::on_fetch_data_received, 1));
     if (!success) {
         RD_LOGE(NO_TRACE_ID, "Failed to bind data service request for FETCH_DATA");
         return false;
@@ -125,11 +125,9 @@ bool RaftReplDev::bind_data_service() {
     return true;
 }
 
-bool RaftReplDev::join_group() {
+bool ReplicaSet::join_group() {
     bind_data_service();
-    auto raft_result =
-        m_msg_mgr.join_group(m_group_id, "homestore_replication",
-                             std::dynamic_pointer_cast< nuraft_mesg::mesg_state_mgr >(shared_from_this()));
+    auto raft_result = m_msg_mgr.join_group(m_group_id, "homestore_replication", shared_from_this());
     if (!raft_result) {
         HS_DBG_ASSERT(false, "Unable to join the group_id={} with error={}", group_id_str(), raft_result.error());
         return false;
@@ -138,12 +136,12 @@ bool RaftReplDev::join_group() {
 }
 
 // All the steps in the implementation should be idempotent and retryable.
-AsyncReplResult<> RaftReplDev::start_replace_member(const replica_member_info& member_out,
-                                                    const replica_member_info& member_in, uint32_t commit_quorum,
-                                                    uint64_t trace_id) {
+AsyncReplResult<> ReplicaSet::start_replace_member(const ReplicaMemberInfo& member_out,
+                                                   const ReplicaMemberInfo& member_in, uint32_t commit_quorum,
+                                                   uint64_t trace_id) {
     if (is_stopping()) {
         RD_LOGI(trace_id, "repl dev is being shutdown!");
-        return make_async_error<>(ReplServiceError::STOPPING);
+        return make_async_error<>(ReplError::STOPPING);
     }
     incr_pending_request_num();
 
@@ -156,9 +154,9 @@ AsyncReplResult<> RaftReplDev::start_replace_member(const replica_member_info& m
     }
 
     // Step1, validate request
-    auto out_srv_cfg = raft_server()->get_config()->get_server(nuraft_mesg::to_server_id(member_out.id));
+    auto out_srv_cfg = raft_server()->get_config()->get_server(homestore::to_server_id(member_out.id));
     if (!out_srv_cfg) {
-        auto in_srv_cfg = raft_server()->get_config()->get_server(nuraft_mesg::to_server_id(member_in.id));
+        auto in_srv_cfg = raft_server()->get_config()->get_server(homestore::to_server_id(member_in.id));
         if (in_srv_cfg) {
             RD_LOGI(
                 trace_id,
@@ -171,12 +169,12 @@ AsyncReplResult<> RaftReplDev::start_replace_member(const replica_member_info& m
         RD_LOGE(trace_id, "Step1. Replace member invalid parameter, out member is not found");
         reset_quorum_size(0, trace_id);
         decr_pending_request_num();
-        return make_async_error<>(ReplServiceError::SERVER_NOT_FOUND);
+        return make_async_error<>(ReplError::SERVER_NOT_FOUND);
     }
     if (m_my_repl_id != get_leader_id()) {
         reset_quorum_size(0, trace_id);
         decr_pending_request_num();
-        return make_async_error<>(ReplServiceError::NOT_LEADER);
+        return make_async_error<>(ReplError::NOT_LEADER);
     }
     // Check if leader itself is requested to move out.
     if (m_my_repl_id == member_out.id) {
@@ -187,7 +185,7 @@ AsyncReplResult<> RaftReplDev::start_replace_member(const replica_member_info& m
         RD_LOGI(trace_id, "Step1. Replace member, leader is the member_out so yield leadership");
         reset_quorum_size(0, trace_id);
         decr_pending_request_num();
-        return make_async_error<>(ReplServiceError::NOT_LEADER);
+        return make_async_error<>(ReplError::NOT_LEADER);
     }
     // quorum safety check. TODO currently only consider lsn, need to check last response time.
     auto active_peers = get_active_peers();
@@ -205,23 +203,25 @@ AsyncReplResult<> RaftReplDev::start_replace_member(const replica_member_info& m
     // greater than 1. To be more specific, if we have S1(leader), S2, S3(out), S4(in), we don't allow
     // replace_member(S3, S4) if S2 is down or laggy. Needs to recover S2 first or retry with commit_quorum=1.
     if (quorum <= 1 && commit_quorum == 0) {
-        RD_LOGE(trace_id, "Step1. Replace member, quorum safety check failed, active_peers={}, active_peers_exclude_out/in_member={}, commit_quorum={}",
+        RD_LOGE(trace_id,
+                "Step1. Replace member, quorum safety check failed, active_peers={}, "
+                "active_peers_exclude_out/in_member={}, commit_quorum={}",
                 active_peers.size(), quorum, commit_quorum);
         reset_quorum_size(0, trace_id);
         decr_pending_request_num();
-        return make_async_error<>(ReplServiceError::QUORUM_NOT_MET);
+        return make_async_error<>(ReplError::QUORUM_NOT_MET);
     }
 
     // Step 2: Handle out member.
 #ifdef _PRERELEASE
     if (iomgr_flip::instance()->test_flip("replace_member_set_learner_failure")) {
         RD_LOGE(trace_id, "Simulating set member to learner failure");
-        return make_async_error(ReplServiceError::FAILED);
+        return make_async_error(ReplError::FAILED);
     }
 #endif
     RD_LOGI(trace_id, "Step2. Replace member, flip out member to learner");
     auto learner_ret = do_flip_learner(member_out, true, true, trace_id);
-    if (learner_ret != ReplServiceError::OK) {
+    if (learner_ret != ReplError::OK) {
         RD_LOGE(trace_id, "Step2. Replace member, failed to flip out member to learner {}", learner_ret);
         reset_quorum_size(0, trace_id);
         decr_pending_request_num();
@@ -245,7 +245,7 @@ AsyncReplResult<> RaftReplDev::start_replace_member(const replica_member_info& m
                journal_type_t::HS_CTRL_START_REPLACE, true, header, sisl::Blob{}, 0, m_listener);
 
     auto err = m_state_machine->propose_to_raft(std::move(rreq));
-    if (err != ReplServiceError::OK) {
+    if (err != ReplError::OK) {
         RD_LOGE(trace_id, "Step3. Replace member, propose to raft for HS_CTRL_START_REPLACE req failed {}", err);
         reset_quorum_size(0, trace_id);
         decr_pending_request_num();
@@ -256,29 +256,30 @@ AsyncReplResult<> RaftReplDev::start_replace_member(const replica_member_info& m
 #ifdef _PRERELEASE
     if (iomgr_flip::instance()->test_flip("replace_member_add_member_failure")) {
         RD_LOGE(trace_id, "Simulating add member failure");
-        return make_async_error(ReplServiceError::FAILED);
+        return make_async_error(ReplError::FAILED);
     }
 #endif
     RD_LOGI(trace_id, "Step4. Replace member, propose to raft to add new member, group_id={}", group_id_str());
     auto ret = do_add_member(member_in, trace_id);
-    if (ret != ReplServiceError::OK) {
+    if (ret != ReplError::OK) {
         RD_LOGE(trace_id, "Step4. Replace member, add member failed {}", ret);
         reset_quorum_size(0, trace_id);
         decr_pending_request_num();
         return make_async_error<>(std::move(ret));
     }
-    RD_LOGI(trace_id, "Step4. Replace member, proposed to raft to add member, member={}", boost::uuids::to_string(member_in.id));
+    RD_LOGI(trace_id, "Step4. Replace member, proposed to raft to add member, member={}",
+            boost::uuids::to_string(member_in.id));
     reset_quorum_size(0, trace_id);
     decr_pending_request_num();
     return make_async_success<>();
 }
 
-AsyncReplResult<> RaftReplDev::complete_replace_member(const replica_member_info& member_out,
-                                                       const replica_member_info& member_in, uint32_t commit_quorum,
-                                                       uint64_t trace_id) {
+AsyncReplResult<> ReplicaSet::complete_replace_member(const ReplicaMemberInfo& member_out,
+                                                      const ReplicaMemberInfo& member_in, uint32_t commit_quorum,
+                                                      uint64_t trace_id) {
     if (is_stopping()) {
         RD_LOGI(trace_id, "repl dev is being shutdown!");
-        return make_async_error<>(ReplServiceError::STOPPING);
+        return make_async_error<>(ReplError::STOPPING);
     }
     incr_pending_request_num();
 
@@ -295,11 +296,11 @@ AsyncReplResult<> RaftReplDev::complete_replace_member(const replica_member_info
 #ifdef _PRERELEASE
     if (iomgr_flip::instance()->test_flip("replace_member_remove_member_failure")) {
         RD_LOGE(trace_id, "Simulating remove member failure");
-        return make_async_error(ReplServiceError::FAILED);
+        return make_async_error(ReplError::FAILED);
     }
 #endif
     auto ret = do_remove_member(member_out, trace_id);
-    if (ret != ReplServiceError::OK) {
+    if (ret != ReplError::OK) {
         RD_LOGE(trace_id, "Step5. Replace member, failed to remove member, member={}, err={}",
                 boost::uuids::to_string(member_out.id), ret);
         reset_quorum_size(0, trace_id);
@@ -309,10 +310,10 @@ AsyncReplResult<> RaftReplDev::complete_replace_member(const replica_member_info
     RD_LOGI(trace_id, "Step5. Replace member, proposed to raft to remove member, member={}",
             boost::uuids::to_string(member_out.id));
     auto timeout = HS_DYNAMIC_CONFIG(consensus.wait_for_config_change_ms);
-    // TODO Move wait logic to nuraft_mesg
+
     if (!wait_and_check(
             [&]() {
-                auto srv_conf = raft_server()->get_srv_config(nuraft_mesg::to_server_id(member_out.id));
+                auto srv_conf = raft_server()->get_srv_config(homestore::to_server_id(member_out.id));
                 if (srv_conf) {
                     RD_LOGD(trace_id, "out member still exists in raft group, member={}",
                             boost::uuids::to_string(member_out.id));
@@ -326,7 +327,7 @@ AsyncReplResult<> RaftReplDev::complete_replace_member(const replica_member_info
                 timeout);
         // If the member_out is down, leader will force remove it after
         // leave_timeout=leave_limit_(default=5)*heart_beat_interval_, it's better for client to retry it.
-        return make_async_error<>(ReplServiceError::CANCELLED);
+        return make_async_error<>(ReplError::CANCELLED);
     }
     RD_LOGD(trace_id, "Step5.  Replace member, old member is removed, member={}",
             boost::uuids::to_string(member_out.id));
@@ -347,7 +348,7 @@ AsyncReplResult<> RaftReplDev::complete_replace_member(const replica_member_info
                journal_type_t::HS_CTRL_COMPLETE_REPLACE, true, header, sisl::Blob{}, 0, m_listener);
 
     auto err = m_state_machine->propose_to_raft(std::move(rreq));
-    if (err != ReplServiceError::OK) {
+    if (err != ReplError::OK) {
         RD_LOGE(trace_id, "Step6. Replace member, propose to raft for HS_CTRL_COMPLETE_REPLACE req failed , err={}",
                 err);
         reset_quorum_size(0, trace_id);
@@ -362,10 +363,10 @@ AsyncReplResult<> RaftReplDev::complete_replace_member(const replica_member_info
     return make_async_success<>();
 }
 
-ReplServiceError RaftReplDev::do_add_member(const replica_member_info& member, uint64_t trace_id) {
+ReplError ReplicaSet::do_add_member(const ReplicaMemberInfo& member, uint64_t trace_id) {
     if (m_my_repl_id != get_leader_id()) {
         RD_LOGI(trace_id, "Member to add failed, not leader");
-        return ReplServiceError::BAD_REQUEST;
+        return ReplError::BAD_REQUEST;
     }
     auto ret = retry_when_config_changing(
         [&] {
@@ -384,20 +385,20 @@ ReplServiceError RaftReplDev::do_add_member(const replica_member_info& member, u
         // Its ok to retry this request as the request
         // of replace member is idempotent.
         RD_LOGE(trace_id, "Add member failed, member={}, err={}", boost::uuids::to_string(member.id), ret);
-        return ReplServiceError::RETRY_REQUEST;
+        return ReplError::RETRY_REQUEST;
     }
     RD_LOGI(trace_id, "Proposed to raft to add member, member={}", boost::uuids::to_string(member.id));
-    return ReplServiceError::OK;
+    return ReplError::OK;
 }
 
-ReplServiceError RaftReplDev::do_remove_member(const replica_member_info& member, uint64_t trace_id) {
+ReplError ReplicaSet::do_remove_member(const ReplicaMemberInfo& member, uint64_t trace_id) {
     // The member should not be the leader.
     if (m_my_repl_id == member.id && m_my_repl_id == get_leader_id()) {
         // If leader is the member requested to move out, then give up leadership and return error.
         // Client will retry replace_member request to the new leader.
         raft_server()->yield_leadership(false /* immediate */, -1 /* successor */);
         RD_LOGI(trace_id, "Member to remove is the leader so yield leadership");
-        return ReplServiceError::NOT_LEADER;
+        return ReplError::NOT_LEADER;
     }
     auto ret = retry_when_config_changing(
         [&] {
@@ -417,18 +418,18 @@ ReplServiceError RaftReplDev::do_remove_member(const replica_member_info& member
         // of replace member is idempotent.
         RD_LOGE(trace_id, "Replace member failed to remove member, member={}, err={}",
                 boost::uuids::to_string(member.id), ret);
-        return ReplServiceError::RETRY_REQUEST;
+        return ReplError::RETRY_REQUEST;
     }
     RD_LOGI(trace_id, "Proposed to raft to remove member, member={}", boost::uuids::to_string(member.id));
-    return ReplServiceError::OK;
+    return ReplError::OK;
 }
 
-AsyncReplResult<> RaftReplDev::flip_learner_flag(const replica_member_info& member, bool target, uint32_t commit_quorum,
-                                                 bool wait_and_verify, uint64_t trace_id) {
+AsyncReplResult<> ReplicaSet::flip_learner_flag(const ReplicaMemberInfo& member, bool target, uint32_t commit_quorum,
+                                                bool wait_and_verify, uint64_t trace_id) {
     RD_LOGI(trace_id, "Flip learner flag to {}, member={}", target, boost::uuids::to_string(member.id));
     if (is_stopping()) {
         RD_LOGI(trace_id, "repl dev is being shutdown!");
-        return make_async_error<>(ReplServiceError::STOPPING);
+        return make_async_error<>(ReplError::STOPPING);
     }
     incr_pending_request_num();
 
@@ -437,7 +438,7 @@ AsyncReplResult<> RaftReplDev::flip_learner_flag(const replica_member_info& memb
         reset_quorum_size(commit_quorum, trace_id);
     }
     auto ret = do_flip_learner(member, target, wait_and_verify, trace_id);
-    if (ret != ReplServiceError::OK) {
+    if (ret != ReplError::OK) {
         RD_LOGE(trace_id, "Flip learner flag failed {}, member={}", ret, boost::uuids::to_string(member.id));
         reset_quorum_size(0, trace_id);
         decr_pending_request_num();
@@ -447,38 +448,38 @@ AsyncReplResult<> RaftReplDev::flip_learner_flag(const replica_member_info& memb
     return make_async_success<>();
 }
 
-ReplServiceError RaftReplDev::do_flip_learner(const replica_member_info& member, bool target, bool wait_and_verify,
-                                              uint64_t trace_id) {
+ReplError ReplicaSet::do_flip_learner(const ReplicaMemberInfo& member, bool target, bool wait_and_verify,
+                                      uint64_t trace_id) {
     // 1. Prerequisite check
     if (m_my_repl_id != get_leader_id()) {
         RD_LOGI(trace_id, "flip learner flag failed, not leader");
-        return ReplServiceError::NOT_LEADER;
+        return ReplError::NOT_LEADER;
     }
     if (!target && member.priority == 0) {
         // If the intent is to take the learner back to normal member, then priority should not be 0(never has chance to
         // become leader). Client need to trace the peers' priority, and give a meaningful value, currently default
         // priorities of the quorum: leader=100, follower=66.
         RD_LOGI(trace_id, "clear learner flag failed, priority is 0, member={}", boost::uuids::to_string(member.id));
-        return ReplServiceError::BAD_REQUEST;
+        return ReplError::BAD_REQUEST;
     }
 
     // 2. Flip learner
     RD_LOGI(trace_id, "flip learner flag to {}, member={}", target, boost::uuids::to_string(member.id));
-    auto srv_cfg = raft_server()->get_config()->get_server(nuraft_mesg::to_server_id(member.id));
+    auto srv_cfg = raft_server()->get_config()->get_server(homestore::to_server_id(member.id));
     if (!srv_cfg) {
         RD_LOGE(trace_id, "invalid parameter, member is not found, member={}", boost::uuids::to_string(member.id));
-        return ReplServiceError::SERVER_NOT_FOUND;
+        return ReplError::SERVER_NOT_FOUND;
     }
     if (srv_cfg->is_learner() != target) {
         auto ret = retry_when_config_changing(
             [&] {
-                auto learner_ret = raft_server()->flip_learner_flag(nuraft_mesg::to_server_id(member.id), target);
+                auto learner_ret = raft_server()->flip_learner_flag(homestore::to_server_id(member.id), target);
                 return learner_ret->get_result_code();
             },
             trace_id);
         if (ret != nuraft::cmd_result_code::OK) {
             RD_LOGE(trace_id, "Propose to raft to flip learner failed, err: {}", ret);
-            return ReplServiceError::RETRY_REQUEST;
+            return ReplError::RETRY_REQUEST;
         }
     } else {
         RD_LOGD(trace_id, "learner flag has already been set to {}, skip, member={}", target,
@@ -493,7 +494,9 @@ ReplServiceError RaftReplDev::do_flip_learner(const replica_member_info& member,
     RD_LOGI(trace_id, "Set the priority of the member to {}, member={}", priority, boost::uuids::to_string(member.id));
     if (srv_cfg->get_priority() != priority) {
         auto priority_ret = set_priority(member.id, priority);
-        if (priority_ret != ReplServiceError::OK) { return ReplServiceError::NOT_LEADER; }
+        if (priority_ret != ReplError::OK) {
+            return ReplError::NOT_LEADER;
+        }
     } else {
         RD_LOGD(trace_id, "Priority has already been set to {}, skip, member={}", priority,
                 boost::uuids::to_string(member.id));
@@ -504,21 +507,21 @@ ReplServiceError RaftReplDev::do_flip_learner(const replica_member_info& member,
         auto timeout = HS_DYNAMIC_CONFIG(consensus.wait_for_config_change_ms);
         if (!wait_and_check(
                 [&]() {
-                    auto srv_conf = raft_server()->get_srv_config(nuraft_mesg::to_server_id(member.id));
+                    auto srv_conf = raft_server()->get_srv_config(homestore::to_server_id(member.id));
                     return srv_conf->is_learner() && srv_conf->get_priority() == 0;
                 },
                 timeout)) {
             RD_LOGD(trace_id, "Wait for learner and priority config change timed out, cancel the request, timeout: {}",
                     timeout);
-            return ReplServiceError::CANCELLED;
+            return ReplError::CANCELLED;
         }
     }
 
-    return ReplServiceError::OK;
+    return ReplError::OK;
 }
 
-nuraft::cmd_result_code RaftReplDev::retry_when_config_changing(const std::function< nuraft::cmd_result_code() >& func,
-                                                              uint64_t trace_id) {
+nuraft::cmd_result_code ReplicaSet::retry_when_config_changing(const std::function< nuraft::cmd_result_code() >& func,
+                                                               uint64_t trace_id) {
     auto ret = nuraft::cmd_result_code::OK;
     int32_t retries = HS_DYNAMIC_CONFIG(consensus.config_changing_error_retries);
     for (auto i = 0; i < retries; i++) {
@@ -533,18 +536,22 @@ nuraft::cmd_result_code RaftReplDev::retry_when_config_changing(const std::funct
     return ret;
 }
 
-bool RaftReplDev::wait_and_check(const std::function< bool() >& check_func, uint32_t timeout_ms, uint32_t interval_ms) {
+bool ReplicaSet::wait_and_check(const std::function< bool() >& check_func, uint32_t timeout_ms, uint32_t interval_ms) {
     auto times = timeout_ms / interval_ms;
-    if (times == 0) { times = 1; }
+    if (times == 0) {
+        times = 1;
+    }
     for (auto i = 0; i < static_cast< int32_t >(times); i++) {
-        if (check_func()) { return true; }
+        if (check_func()) {
+            return true;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return false;
 }
 
-ReplServiceError RaftReplDev::set_priority(const replica_id_t& member, int32_t priority, uint64_t trace_id) {
-    auto priority_ret = raft_server()->set_priority(nuraft_mesg::to_server_id(member), priority);
+ReplError ReplicaSet::set_priority(const ReplicaId& member, int32_t priority, uint64_t trace_id) {
+    auto priority_ret = raft_server()->set_priority(homestore::to_server_id(member), priority);
     // Set_priority should be handled by leader, but if the intent is to set the leader's priority to 0, it returns
     // BROADCAST. In this case return NOT_LEADER to let client retry new leader.
     // If there is an uncommited_config, nuraft set_priority will honor this uncommited config and generate new
@@ -552,12 +559,12 @@ ReplServiceError RaftReplDev::set_priority(const replica_id_t& member, int32_t p
     if (priority_ret != nuraft::raft_server::PrioritySetResult::SET) {
         RD_LOGE(trace_id, "Propose to raft to set priority failed, result: {}",
                 priority_ret == nuraft::raft_server::PrioritySetResult::BROADCAST ? "BROADCAST" : "IGNORED");
-        return ReplServiceError::NOT_LEADER;
+        return ReplError::NOT_LEADER;
     }
-    return ReplServiceError::OK;
+    return ReplError::OK;
 }
 
-void RaftReplDev::reset_quorum_size(uint32_t commit_quorum, uint64_t trace_id) {
+void ReplicaSet::reset_quorum_size(uint32_t commit_quorum, uint64_t trace_id) {
     RD_LOGI(trace_id, "Reset raft quorum size={}", commit_quorum);
     nuraft::raft_params params = raft_server()->get_current_params();
     params.with_custom_commit_quorum_size(commit_quorum);
@@ -565,7 +572,7 @@ void RaftReplDev::reset_quorum_size(uint32_t commit_quorum, uint64_t trace_id) {
     raft_server()->update_params(params);
 }
 
-folly::SemiFuture< ReplServiceError > RaftReplDev::destroy_group() {
+folly::SemiFuture< ReplError > ReplicaSet::destroy_group() {
     // Set the intent to destroy the group
     m_stage.update([](auto* stage) { *stage = repl_dev_stage_t::DESTROYING; });
 
@@ -589,26 +596,28 @@ folly::SemiFuture< ReplServiceError > RaftReplDev::destroy_group() {
                                      .traceID = std::numeric_limits< uint64_t >::max()},
                             journal_type_t::HS_CTRL_DESTROY, true, sisl::Blob{}, sisl::Blob{}, 0, m_listener);
 
-    if (err != ReplServiceError::OK) {
+    if (err != ReplError::OK) {
         // Failed to initialize the repl_req_ctx for replace member.
         LOGERROR("Failed to initialize repl_req_ctx for destorying group, error={}", err);
-        return folly::makeSemiFuture< ReplServiceError >(std::move(err));
+        return folly::makeSemiFuture< ReplError >(std::move(err));
     }
 
     err = m_state_machine->propose_to_raft(std::move(rreq));
-    if (err != ReplServiceError::OK) {
+    if (err != ReplError::OK) {
         m_stage.update([](auto* stage) { *stage = repl_dev_stage_t::ACTIVE; });
-        return folly::makeSemiFuture< ReplServiceError >(std::move(err));
-        LOGERROR("RaftReplDev::destroy_group failed {}", err);
+        return folly::makeSemiFuture< ReplError >(std::move(err));
+        LOGERROR("ReplicaSet::destroy_group failed {}", err);
     }
 
     LOGINFO("Raft repl dev destroy_group={}", group_id_str());
     return m_destroy_promise.getSemiFuture();
 }
 
-void RaftReplDev::use_config(json_superblk raft_config_sb) { m_raft_config_sb = std::move(raft_config_sb); }
+void ReplicaSet::use_config(json_superblk raft_config_sb) {
+    m_raft_config_sb = std::move(raft_config_sb);
+}
 
-void RaftReplDev::on_create_snapshot(nuraft::snapshot& s, nuraft::async_result< bool >::handler_type& when_done) {
+void ReplicaSet::on_create_snapshot(nuraft::snapshot& s, nuraft::async_result< bool >::handler_type& when_done) {
     RD_LOGD(NO_TRACE_ID, "create_snapshot last_idx={}/term={}", s.get_last_log_idx(), s.get_last_log_term());
     auto snp_ctx = std::make_shared< nuraft_snapshot_context >(s);
     auto result = m_listener->create_snapshot(snp_ctx).get();
@@ -616,20 +625,23 @@ void RaftReplDev::on_create_snapshot(nuraft::snapshot& s, nuraft::async_result< 
     HS_REL_ASSERT(result.hasError() == false, "Not expecting creating snapshot to return false. ");
 
     auto ret_val{true};
-    if (when_done) { when_done(ret_val, null_except); }
+    if (when_done) {
+        when_done(ret_val, null_except);
+    }
 }
 
-void RaftReplDev::async_alloc_write(sisl::Blob const& header, sisl::Blob const& key, sisl::SgList const& data,
-                                    repl_req_ptr_t rreq, bool part_of_batch, trace_id_t tid) {
-    if (!rreq) { auto rreq = repl_req_ptr_t(new repl_req_ctx{}); }
+void ReplicaSet::async_alloc_write(sisl::Blob const& header, sisl::Blob const& key, sisl::SgList const& data,
+                                   repl_req_ptr_t rreq, bool part_of_batch, TraceId tid) {
+    if (!rreq) {
+        auto rreq = repl_req_ptr_t(new repl_req_ctx{});
+    }
 
     {
         auto const guard = m_stage.access();
         if (auto const stage = *guard.get(); stage != repl_dev_stage_t::ACTIVE) {
             RD_LOGW(tid, "Raft channel: Not ready to accept writes, stage={}", enum_name(stage));
-            handle_error(rreq,
-                         (stage == repl_dev_stage_t::INIT) ? ReplServiceError::SERVER_IS_JOINING
-                                                           : ReplServiceError::SERVER_IS_LEAVING);
+            handle_error(
+                rreq, (stage == repl_dev_stage_t::INIT) ? ReplError::SERVER_IS_JOINING : ReplError::SERVER_IS_LEAVING);
             return;
         }
     }
@@ -642,7 +654,7 @@ void RaftReplDev::async_alloc_write(sisl::Blob const& header, sisl::Blob const& 
                                data.size ? journal_type_t::HS_DATA_LINKED : journal_type_t::HS_DATA_INLINED,
                                true /* is_proposer */, header, key, data.size, m_listener);
 
-    if (status != ReplServiceError::OK) {
+    if (status != ReplError::OK) {
         RD_LOGI(tid, "Initializing rreq failed error={}, failing this req", status);
         handle_error(rreq, status);
         return;
@@ -659,7 +671,7 @@ void RaftReplDev::async_alloc_write(sisl::Blob const& header, sisl::Blob const& 
     if (rreq->has_linked_data()) {
         if (rreq->is_proposer() && rreq->has_state(repl_req_state_t::DATA_COMMITTED)) {
             RD_LOGE(tid, "data blks has already been allocated and committed, failing this req");
-            handle_error(rreq, ReplServiceError::DATA_DUPLICATED);
+            handle_error(rreq, ReplError::DATA_DUPLICATED);
             return;
         }
 
@@ -685,7 +697,7 @@ void RaftReplDev::async_alloc_write(sisl::Blob const& header, sisl::Blob const& 
 
                 if (err) {
                     HS_DBG_ASSERT(false, "Error in writing data, err_code={}", err.value());
-                    handle_error(rreq, ReplServiceError::DRIVE_WRITE_ERROR);
+                    handle_error(rreq, ReplError::DRIVE_WRITE_ERROR);
                 } else {
                     // update metrics for originated rreq;
                     const auto write_num_pieces = rreq->local_blkid().num_pieces();
@@ -696,18 +708,22 @@ void RaftReplDev::async_alloc_write(sisl::Blob const& header, sisl::Blob const& 
                                       get_elapsed_time_us(rreq->created_time()));
 
                     auto raft_status = m_state_machine->propose_to_raft(rreq);
-                    if (raft_status != ReplServiceError::OK) { handle_error(rreq, raft_status); }
+                    if (raft_status != ReplError::OK) {
+                        handle_error(rreq, raft_status);
+                    }
                 }
             });
     } else {
         RD_LOGT(tid, "Skipping data channel send since value size is 0");
         rreq->add_state(repl_req_state_t::DATA_WRITTEN);
         auto raft_status = m_state_machine->propose_to_raft(rreq);
-        if (raft_status != ReplServiceError::OK) { handle_error(rreq, raft_status); }
+        if (raft_status != ReplError::OK) {
+            handle_error(rreq, raft_status);
+        }
     }
 }
 
-void RaftReplDev::push_data_to_all_followers(repl_req_ptr_t rreq, sisl::SgList const& data) {
+void ReplicaSet::push_data_to_all_followers(repl_req_ptr_t rreq, sisl::SgList const& data) {
     auto& builder = rreq->create_fb_builder();
 
     // Prepare the rpc request packet with all repl_reqs details
@@ -724,7 +740,7 @@ void RaftReplDev::push_data_to_all_followers(repl_req_ptr_t rreq, sisl::SgList c
                                            PushDataRequestTypeTable()));*/
 
     auto peers = get_active_peers();
-    auto calls = std::vector< nuraft_mesg::NullAsyncResult >();
+    auto calls = std::vector< folly::SemiFuture< folly::Unit > >();
     for (auto peer : peers) {
         RD_LOGD(rreq->traceID(), "Data Channel: Pushing data to follower {}, rreq=[{}]", peer, rreq->to_string());
         calls.push_back(group_msg_service()
@@ -749,7 +765,7 @@ void RaftReplDev::push_data_to_all_followers(repl_req_ptr_t rreq, sisl::SgList c
     });
 }
 
-void RaftReplDev::on_push_data_received(intrusive< sisl::GenericRpcData >& rpc_data) {
+void ReplicaSet::on_push_data_received(intrusive< sisl::GenericRpcData >& rpc_data) {
     auto const push_data_rcv_time = Clock::now();
     auto const& incoming_buf = rpc_data->request_blob();
     if (!incoming_buf.cbytes()) {
@@ -820,7 +836,7 @@ void RaftReplDev::on_push_data_received(intrusive< sisl::GenericRpcData >& rpc_d
             if (err) {
                 COUNTER_INCREMENT(m_metrics, write_err_cnt, 1);
                 RD_DBG_ASSERT(false, "Error in writing data, error_code={}", err.value());
-                handle_error(rreq, ReplServiceError::DRIVE_WRITE_ERROR);
+                handle_error(rreq, ReplError::DRIVE_WRITE_ERROR);
             } else {
                 rreq->release_data();
                 rreq->add_state(repl_req_state_t::DATA_WRITTEN);
@@ -850,17 +866,19 @@ void RaftReplDev::on_push_data_received(intrusive< sisl::GenericRpcData >& rpc_d
         });
 }
 
-repl_req_ptr_t RaftReplDev::applier_create_req(repl_key const& rkey, journal_type_t code, sisl::Blob const& user_header,
-                                               sisl::Blob const& key, uint32_t data_size, bool is_data_channel,
-                                               int64_t lsn) {
-    if (is_data_channel) RD_DBG_ASSERT(-1 == lsn, "lsn from data channel should always be -1 , got lsn {}", lsn);
+repl_req_ptr_t ReplicaSet::applier_create_req(repl_key const& rkey, journal_type_t code, sisl::Blob const& user_header,
+                                              sisl::Blob const& key, uint32_t data_size, bool is_data_channel,
+                                              int64_t lsn) {
+    if (is_data_channel)
+        RD_DBG_ASSERT(-1 == lsn, "lsn from data channel should always be -1 , got lsn {}", lsn);
 
     auto const [it, happened] = m_repl_key_req_map.try_emplace(rkey, repl_req_ptr_t(new repl_req_ctx()));
     RD_DBG_ASSERT((it != m_repl_key_req_map.end()), "Unexpected error in map_repl_key_to_req");
     auto rreq = it->second;
 
     if (!happened) {
-        // We already have the entry in the map, reset its start time to prevent it from being incorrectly gc during use.
+        // We already have the entry in the map, reset its start time to prevent it from being incorrectly gc during
+        // use.
         rreq->set_created_time();
         // Check if we are already allocated the blk by previous caller, in that case we need to return the req.
         if (rreq->has_state(repl_req_state_t::BLK_ALLOCATED)) {
@@ -876,10 +894,10 @@ repl_req_ptr_t RaftReplDev::applier_create_req(repl_key const& rkey, journal_typ
     // rreq->init will allocate the block if it has linked data.
     auto status = init_req_ctx(rreq, rkey, code, false /* is_proposer */, user_header, key, data_size, m_listener);
 
-    if (status != ReplServiceError::OK) {
+    if (status != ReplError::OK) {
         RD_LOGD(rkey.traceID, "For Repl_key=[{}] alloc hints returned error={}, failing this req", rkey.to_string(),
                 status);
-        if (status == ReplServiceError::NO_SPACE_LEFT && !is_data_channel && !rreq->is_proposer()) {
+        if (status == ReplError::NO_SPACE_LEFT && !is_data_channel && !rreq->is_proposer()) {
             const auto& chunk_id = rreq->local_blkid().chunk_num();
             RD_LOGD(rkey.traceID,
                     "For Repl_key=[{}] alloc hints returned error={} when trying to allocate blk on chunk={}",
@@ -901,14 +919,16 @@ repl_req_ptr_t RaftReplDev::applier_create_req(repl_key const& rkey, journal_typ
     return rreq;
 }
 
-folly::Future< folly::Unit > RaftReplDev::notify_after_data_written(std::vector< repl_req_ptr_t >* rreqs) {
+folly::Future< folly::Unit > ReplicaSet::notify_after_data_written(std::vector< repl_req_ptr_t >* rreqs) {
     std::vector< folly::Future< folly::Unit > > futs;
     futs.reserve(rreqs->size());
     std::vector< repl_req_ptr_t > unreceived_data_reqs;
 
     // Walk through the list of requests and wait for the data to be received and written
     for (auto const& rreq : *rreqs) {
-        if (!rreq->has_linked_data()) { continue; }
+        if (!rreq->has_linked_data()) {
+            continue;
+        }
         auto const status = uint32_cast(rreq->state());
         if (status & uint32_cast(repl_req_state_t::DATA_WRITTEN)) {
             RD_LOGD(rreq->traceID(), "Data written and blkid mapped: rkey=[{}]", rreq->to_compact_string());
@@ -945,12 +965,16 @@ folly::Future< folly::Unit > RaftReplDev::notify_after_data_written(std::vector<
     }
 
     // All the entries are done already, no need to wait
-    if (futs.size() == 0) { return folly::makeFuture< folly::Unit >(folly::Unit{}); }
+    if (futs.size() == 0) {
+        return folly::makeFuture< folly::Unit >(folly::Unit{});
+    }
 
     return folly::collectAllUnsafe(futs).thenValue([this, rreqs](auto&& e) {
 #ifndef NDEBUG
         for (auto const& rreq : *rreqs) {
-            if ((rreq == nullptr) || (!rreq->has_linked_data())) { continue; }
+            if ((rreq == nullptr) || (!rreq->has_linked_data())) {
+                continue;
+            }
             HS_DBG_ASSERT(rreq->has_state(repl_req_state_t::DATA_WRITTEN),
                           "Data written promise raised without updating DATA_WRITTEN state for rkey={}",
                           rreq->rkey().to_string());
@@ -962,8 +986,8 @@ folly::Future< folly::Unit > RaftReplDev::notify_after_data_written(std::vector<
     });
 }
 
-bool RaftReplDev::wait_for_data_receive(std::vector< repl_req_ptr_t > const& rreqs, uint64_t timeout_ms,
-                                        std::vector< repl_req_ptr_t >* timeout_rreqs) {
+bool ReplicaSet::wait_for_data_receive(std::vector< repl_req_ptr_t > const& rreqs, uint64_t timeout_ms,
+                                       std::vector< repl_req_ptr_t >* timeout_rreqs) {
     std::vector< folly::Future< folly::Unit > > futs;
     std::vector< repl_req_ptr_t > only_wait_reqs;
     only_wait_reqs.reserve(rreqs.size());
@@ -978,7 +1002,9 @@ bool RaftReplDev::wait_for_data_receive(std::vector< repl_req_ptr_t > const& rre
     }
 
     // All the data has been received already, no need to wait
-    if (futs.size() == 0) { return true; }
+    if (futs.size() == 0) {
+        return true;
+    }
 
     // If we are currently in resync mode, we can fetch the data immediately. Otherwise, stage it and wait for
     // sometime before do an explicit fetch. This is so that, it is possible raft channel has come ahead of data
@@ -1000,14 +1026,16 @@ bool RaftReplDev::wait_for_data_receive(std::vector< repl_req_ptr_t > const& rre
     if (!all_futs_ready && timeout_rreqs != nullptr) {
         timeout_rreqs->clear();
         for (size_t i{0}; i < futs.size(); ++i) {
-            if (!futs[i].isReady()) { timeout_rreqs->emplace_back(only_wait_reqs[i]); }
+            if (!futs[i].isReady()) {
+                timeout_rreqs->emplace_back(only_wait_reqs[i]);
+            }
         }
         all_futs_ready = timeout_rreqs->empty();
     }
     return all_futs_ready;
 }
 
-void RaftReplDev::check_and_fetch_remote_data(std::vector< repl_req_ptr_t > rreqs) {
+void ReplicaSet::check_and_fetch_remote_data(std::vector< repl_req_ptr_t > rreqs) {
     auto total_size_to_fetch = 0ul;
     std::vector< repl_req_ptr_t > next_batch_rreqs;
     auto const max_batch_size = HS_DYNAMIC_CONFIG(consensus.data_fetch_max_size_kb) * 1024ull;
@@ -1042,8 +1070,10 @@ void RaftReplDev::check_and_fetch_remote_data(std::vector< repl_req_ptr_t > rreq
     fetch_data_from_remote(std::move(next_batch_rreqs));
 }
 
-void RaftReplDev::fetch_data_from_remote(std::vector< repl_req_ptr_t > rreqs) {
-    if (rreqs.size() == 0) { return; }
+void ReplicaSet::fetch_data_from_remote(std::vector< repl_req_ptr_t > rreqs) {
+    if (rreqs.size() == 0) {
+        return;
+    }
 
     std::vector< ::flatbuffers::Offset< RequestEntry > > entries;
     entries.reserve(rreqs.size());
@@ -1084,8 +1114,7 @@ void RaftReplDev::fetch_data_from_remote(std::vector< repl_req_ptr_t > rreqs) {
     group_msg_service()
         ->data_service_request_bidirectional(
             originator, FETCH_DATA,
-            sisl::IoBlobList{
-                sisl::IoBlob{builder->GetBufferPointer(), builder->GetSize(), false /* is_aligned */}})
+            sisl::IoBlobList{sisl::IoBlob{builder->GetBufferPointer(), builder->GetSize(), false /* is_aligned */}})
         .via(&folly::InlineExecutor::instance())
         .thenValue([this, builder, rreqs = std::move(rreqs), fetch_start_time](auto response) {
             COUNTER_DECREMENT(m_metrics, outstanding_data_fetch_cnt, 1);
@@ -1125,7 +1154,7 @@ void RaftReplDev::fetch_data_from_remote(std::vector< repl_req_ptr_t > rreqs) {
         });
 }
 
-void RaftReplDev::on_fetch_data_received(intrusive< sisl::GenericRpcData >& rpc_data) {
+void ReplicaSet::on_fetch_data_received(intrusive< sisl::GenericRpcData >& rpc_data) {
     auto const& incoming_buf = rpc_data->request_blob();
     if (!incoming_buf.cbytes()) {
         RD_LOGW(NO_TRACE_ID, "Data Channel: PushData received with empty buffer, ignoring this call");
@@ -1186,7 +1215,7 @@ void RaftReplDev::on_fetch_data_received(intrusive< sisl::GenericRpcData >& rpc_
             RD_LOGT(NO_TRACE_ID, "Data Channel: FetchData data read completed for {} buffers", sgs_vec.size());
 
             // now prepare the io_blob_list to response back to requester;
-            nuraft_mesg::io_blob_list_t pkts = sisl::IoBlobList{};
+            sisl::IoBlobList pkts = sisl::IoBlobList{};
             for (auto const& sgs : sgs_vec) {
                 auto const ret = sisl::IoBlob::sg_list_to_ioblob_list(sgs);
                 pkts.insert(pkts.end(), ret.begin(), ret.end());
@@ -1204,8 +1233,7 @@ void RaftReplDev::on_fetch_data_received(intrusive< sisl::GenericRpcData >& rpc_
         });
 }
 
-void RaftReplDev::handle_fetch_data_response(sisl::GenericClientResponse response,
-                                             std::vector< repl_req_ptr_t > rreqs) {
+void ReplicaSet::handle_fetch_data_response(sisl::GenericClientResponse response, std::vector< repl_req_ptr_t > rreqs) {
     auto resp_blob = response.response_blob();
     auto raw_data = resp_blob.cbytes();
     auto total_size = resp_blob.size();
@@ -1269,7 +1297,7 @@ void RaftReplDev::handle_fetch_data_response(sisl::GenericClientResponse respons
     RD_DBG_ASSERT_EQ(total_size, 0, "Total size mismatch, some data is not consumed");
 }
 
-void RaftReplDev::commit_blk(repl_req_ptr_t rreq) {
+void ReplicaSet::commit_blk(repl_req_ptr_t rreq) {
     if (rreq->local_blkid().is_valid()) {
         if (data_service().commit_blk(rreq->local_blkid()) != BlkAllocStatus::SUCCESS) {
             if (hs()->device_mgr()->is_boot_in_degraded_mode() && m_log_store_replay_done)
@@ -1280,7 +1308,7 @@ void RaftReplDev::commit_blk(repl_req_ptr_t rreq) {
     }
 }
 
-void RaftReplDev::handle_rollback(repl_req_ptr_t rreq) {
+void ReplicaSet::handle_rollback(repl_req_ptr_t rreq) {
     // 1. call the listener to rollback
     RD_LOGD(rreq->traceID(), "Rolling back rreq: {}", rreq->to_compact_string());
     m_listener->on_rollback(rreq->lsn(), rreq->header(), rreq->key(), rreq);
@@ -1298,8 +1326,10 @@ void RaftReplDev::handle_rollback(repl_req_ptr_t rreq) {
     }
 }
 
-void RaftReplDev::handle_commit(repl_req_ptr_t rreq, bool recovery) {
-    if (!rreq->has_state(repl_req_state_t::DATA_COMMITTED)) { commit_blk(rreq); }
+void ReplicaSet::handle_commit(repl_req_ptr_t rreq, bool recovery) {
+    if (!rreq->has_state(repl_req_state_t::DATA_COMMITTED)) {
+        commit_blk(rreq);
+    }
 
     // Remove the request from repl_key map.
     m_repl_key_req_map.erase(rreq->rkey());
@@ -1325,34 +1355,37 @@ void RaftReplDev::handle_commit(repl_req_ptr_t rreq, bool recovery) {
     if (!recovery) {
         auto prev_lsn = m_commit_upto_lsn.exchange(rreq->lsn());
         RD_DBG_ASSERT_GT(rreq->lsn(), prev_lsn,
-                         "Out of order commit of lsns, it is not expected in RaftReplDev. cur_lsns={}, prev_lsns={}",
+                         "Out of order commit of lsns, it is not expected in ReplicaSet. cur_lsns={}, prev_lsns={}",
                          rreq->lsn(), prev_lsn);
     }
 
-    if (!rreq->is_proposer()) rreq->clear();
+    if (!rreq->is_proposer())
+        rreq->clear();
 }
 
-void RaftReplDev::handle_config_commit(const repl_lsn_t lsn, raft_cluster_config_ptr_t& new_conf) {
+void ReplicaSet::handle_config_commit(const repl_lsn_t lsn, raft_cluster_config_ptr_t& new_conf) {
     // when reaching here, the new config has already been applied to the cluster.
     // since we didn't create repl req for config change, we just need to update m_commit_upto_lsn here.
     RD_LOGD(NO_TRACE_ID, "config commit on lsn {}", lsn);
     // keep this variable in case it is needed later
-    (void) new_conf;
+    (void)new_conf;
     auto prev_lsn = m_commit_upto_lsn.load(std::memory_order_relaxed);
     if (prev_lsn >= lsn || !m_commit_upto_lsn.compare_exchange_strong(prev_lsn, lsn)) {
         RD_LOGE(NO_TRACE_ID, "Raft Channel: unexpected log {} commited before config {} committed", prev_lsn, lsn);
     }
 }
 
-void RaftReplDev::handle_config_rollback(const repl_lsn_t lsn, raft_cluster_config_ptr_t& conf) {
+void ReplicaSet::handle_config_rollback(const repl_lsn_t lsn, raft_cluster_config_ptr_t& conf) {
     RD_LOGD(NO_TRACE_ID, "roll back config on lsn {}", lsn);
     // keep this variable in case it is needed later
     (void)conf;
     m_listener->on_config_rollback(lsn);
 }
 
-void RaftReplDev::handle_error(repl_req_ptr_t const& rreq, ReplServiceError err) {
-    if (err == ReplServiceError::OK) { return; }
+void ReplicaSet::handle_error(repl_req_ptr_t const& rreq, ReplError err) {
+    if (err == ReplError::OK) {
+        return;
+    }
     RD_LOGE(rreq->traceID(), "Raft Channel: Error in processing rreq=[{}] error={}", rreq->to_string(), err);
 
     if (!rreq->add_state_if_not_already(repl_req_state_t::ERRORED)) {
@@ -1369,7 +1402,7 @@ void RaftReplDev::handle_error(repl_req_ptr_t const& rreq, ReplServiceError err)
         HS_REL_ASSERT(false, "Unexpected: LSN={} is already ready to commit, exist_rreq=[{}]", rreq->lsn(),
                       exist_rreq->to_string());
     }
-    if (err == ReplServiceError::DATA_DUPLICATED) {
+    if (err == ReplError::DATA_DUPLICATED) {
         RD_LOGE(rreq->traceID(), "Raft Channel: Error in processing rreq=[{}] error={}", rreq->to_string(), err);
         m_listener->on_error(err, rreq->header(), rreq->key(), rreq);
         rreq->clear();
@@ -1404,7 +1437,7 @@ void RaftReplDev::handle_error(repl_req_ptr_t const& rreq, ReplServiceError err)
     rreq->clear();
 }
 
-void RaftReplDev::start_replace_member(repl_req_ptr_t rreq) {
+void ReplicaSet::start_replace_member(repl_req_ptr_t rreq) {
     auto members = r_cast< const replace_member_ctx* >(rreq->header().cbytes());
 
     RD_LOGI(rreq->traceID(), "Raft repl start_replace_member commit member_out={} member_in={}",
@@ -1418,7 +1451,7 @@ void RaftReplDev::start_replace_member(repl_req_ptr_t rreq) {
     m_rd_sb.write();
 }
 
-void RaftReplDev::complete_replace_member(repl_req_ptr_t rreq) {
+void ReplicaSet::complete_replace_member(repl_req_ptr_t rreq) {
     auto members = r_cast< const replace_member_ctx* >(rreq->header().cbytes());
 
     RD_LOGI(rreq->traceID(), "Raft repl complete_replace_member commit member_out={} member_in={}",
@@ -1434,18 +1467,22 @@ void RaftReplDev::complete_replace_member(repl_req_ptr_t rreq) {
 }
 
 static bool blob_equals(sisl::Blob const& a, sisl::Blob const& b) {
-    if (a.size() != b.size()) { return false; }
+    if (a.size() != b.size()) {
+        return false;
+    }
     return (std::memcmp(a.cbytes(), b.cbytes(), a.size()) == 0);
 }
 
-repl_req_ptr_t RaftReplDev::repl_key_to_req(repl_key const& rkey) const {
+repl_req_ptr_t ReplicaSet::repl_key_to_req(repl_key const& rkey) const {
     auto const it = m_repl_key_req_map.find(rkey);
-    if (it == m_repl_key_req_map.cend()) { return nullptr; }
+    if (it == m_repl_key_req_map.cend()) {
+        return nullptr;
+    }
     return it->second;
 }
 
-folly::Future< std::error_code > RaftReplDev::async_read(MultiBlkId const& bid, sisl::SgList& sgs, uint32_t size,
-                                                         bool part_of_batch, trace_id_t tid) {
+folly::Future< std::error_code > ReplicaSet::async_read(MultiBlkId const& bid, sisl::SgList& sgs, uint32_t size,
+                                                        bool part_of_batch, TraceId tid) {
     if (is_stopping()) {
         LOGINFO("repl dev is being shutdown!");
         return folly::makeFuture< std::error_code >(std::make_error_code(std::errc::operation_canceled));
@@ -1453,13 +1490,13 @@ folly::Future< std::error_code > RaftReplDev::async_read(MultiBlkId const& bid, 
     return data_service().async_read(bid, sgs, size, part_of_batch);
 }
 
-folly::Future< std::error_code > RaftReplDev::async_free_blks(int64_t, MultiBlkId const& bid, trace_id_t tid) {
+folly::Future< std::error_code > ReplicaSet::async_free_blks(int64_t, MultiBlkId const& bid, TraceId tid) {
     // TODO: For timeline consistency required, we should retain the blkid that is changed and write that to another
     // journal.
     data_service().async_free_blk(bid);
 }
 
-AsyncReplResult<> RaftReplDev::become_leader() {
+AsyncReplResult<> ReplicaSet::become_leader() {
     return m_msg_mgr.become_leader(m_group_id).via(&folly::InlineExecutor::instance()).thenValue([this](auto&& e) {
         if (e.hasError()) {
             RD_LOGE(NO_TRACE_ID, "Error in becoming leader: {}", e.error());
@@ -1470,19 +1507,21 @@ AsyncReplResult<> RaftReplDev::become_leader() {
     });
 }
 
-bool RaftReplDev::is_leader() const { return m_repl_svc_ctx->is_raft_leader(); }
-
-replica_id_t RaftReplDev::get_leader_id() const {
-    static replica_id_t empty_uuid = boost::uuids::nil_uuid();
-    auto leader = m_repl_svc_ctx->raft_leader_id();
-    return leader.empty() ? empty_uuid : boost::lexical_cast< replica_id_t >(leader);
+bool ReplicaSet::is_leader() const {
+    return m_repl_svc_ctx->is_raft_leader();
 }
 
-std::vector< peer_info > RaftReplDev::get_replication_status() const {
+ReplicaId ReplicaSet::get_leader_id() const {
+    static ReplicaId empty_uuid = boost::uuids::nil_uuid();
+    auto leader = m_repl_svc_ctx->raft_leader_id();
+    return leader.empty() ? empty_uuid : boost::lexical_cast< ReplicaId >(leader);
+}
+
+std::vector< peer_info > ReplicaSet::get_replication_status() const {
     std::vector< peer_info > pi;
     auto rep_status = m_repl_svc_ctx->get_raft_status();
     for (auto const& pinfo : rep_status) {
-        pi.emplace_back(peer_info{.id_ = boost::lexical_cast< replica_id_t >(pinfo.id_),
+        pi.emplace_back(peer_info{.id_ = boost::lexical_cast< ReplicaId >(pinfo.id_),
                                   .replication_idx_ = pinfo.last_log_idx_,
                                   .last_succ_resp_us_ = pinfo.last_succ_resp_us_,
                                   .priority_ = pinfo.priority_,
@@ -1491,19 +1530,22 @@ std::vector< peer_info > RaftReplDev::get_replication_status() const {
     return pi;
 }
 
-std::set< replica_id_t > RaftReplDev::get_active_peers() const {
+std::set< ReplicaId > ReplicaSet::get_active_peers() const {
     auto repl_status = get_replication_status();
-    std::set< replica_id_t > res;
+    std::set< ReplicaId > res;
     auto my_committed_idx = m_commit_upto_lsn.load();
-    auto laggy=HS_DYNAMIC_CONFIG(consensus.laggy_threshold);
+    auto laggy = HS_DYNAMIC_CONFIG(consensus.laggy_threshold);
     uint64_t least_active_repl_idx = my_committed_idx > HS_DYNAMIC_CONFIG(consensus.laggy_threshold)
         ? my_committed_idx - HS_DYNAMIC_CONFIG(consensus.laggy_threshold)
         : 0;
-    // peer's last log idx should also >= leader's start_index-1(ensure existence), otherwise leader can't append log entries to it
-    // and baseline resync will be triggerred. Try to avoid conflict between baseline resync and normal replication.
+    // peer's last log idx should also >= leader's start_index-1(ensure existence), otherwise leader can't append log
+    // entries to it and baseline resync will be triggerred. Try to avoid conflict between baseline resync and normal
+    // replication.
     least_active_repl_idx = std::max(least_active_repl_idx, m_data_journal->start_index() - 1);
     for (auto p : repl_status) {
-        if (p.id_ == m_my_repl_id) { continue; }
+        if (p.id_ == m_my_repl_id) {
+            continue;
+        }
         if (p.replication_idx_ >= least_active_repl_idx) {
             res.insert(p.id_);
             RD_LOGT(NO_TRACE_ID,
@@ -1520,16 +1562,21 @@ std::set< replica_id_t > RaftReplDev::get_active_peers() const {
     return res;
 }
 
-uint32_t RaftReplDev::get_blk_size() const { return data_service().get_blk_size(); }
+uint32_t ReplicaSet::get_blk_size() const {
+    return data_service().get_blk_size();
+}
 
-nuraft_mesg::repl_service_ctx* RaftReplDev::group_msg_service() { return m_repl_svc_ctx.get(); }
-nuraft::raft_server* RaftReplDev::raft_server() { return m_repl_svc_ctx->_server; }
+nuraft::raft_server* ReplicaSet::raft_server() {
+    return m_raft_server.get();
+}
 
 ///////////////////////////////////  Config Serialize/Deserialize Section ////////////////////////////////////
 static nlohmann::json serialize_server_config(std::list< nuraft::ptr< nuraft::srv_config > > const& server_list) {
     auto servers = nlohmann::json::array();
     for (auto const& server_conf : server_list) {
-        if (!server_conf) { continue; }
+        if (!server_conf) {
+            continue;
+        }
         servers.push_back(nlohmann::json{{"id", server_conf->get_id()},
                                          {"dc_id", server_conf->get_dc_id()},
                                          {"endpoint", server_conf->get_endpoint()},
@@ -1587,7 +1634,7 @@ nuraft::ptr< nuraft::cluster_config > deserialize_cluster_config(nlohmann::json 
     return raft_config;
 }
 
-nuraft::ptr< nuraft::cluster_config > RaftReplDev::load_config() {
+nuraft::ptr< nuraft::cluster_config > ReplicaSet::load_config() {
     std::unique_lock lg{m_config_mtx};
     auto& js = *m_raft_config_sb;
 
@@ -1600,14 +1647,14 @@ nuraft::ptr< nuraft::cluster_config > RaftReplDev::load_config() {
     return deserialize_cluster_config(js["config"]);
 }
 
-void RaftReplDev::save_config(const nuraft::cluster_config& config) {
+void ReplicaSet::save_config(const nuraft::cluster_config& config) {
     std::unique_lock lg{m_config_mtx};
     (*m_raft_config_sb)["config"] = serialize_cluster_config(config);
     m_raft_config_sb.write();
     RD_LOGI(NO_TRACE_ID, "Saved config {}", (*m_raft_config_sb)["config"].dump());
 }
 
-void RaftReplDev::save_state(const nuraft::srv_state& state) {
+void ReplicaSet::save_state(const nuraft::srv_state& state) {
     std::unique_lock lg{m_config_mtx};
     (*m_raft_config_sb)["state"] = nlohmann::json{{"term", state.get_term()},
                                                   {"voted_for", state.get_voted_for()},
@@ -1617,7 +1664,7 @@ void RaftReplDev::save_state(const nuraft::srv_state& state) {
     RD_LOGI(NO_TRACE_ID, "Saved state {}", (*m_raft_config_sb)["state"].dump());
 }
 
-nuraft::ptr< nuraft::srv_state > RaftReplDev::read_state() {
+nuraft::ptr< nuraft::srv_state > ReplicaSet::read_state() {
     std::unique_lock lg{m_config_mtx};
     auto& js = *m_raft_config_sb;
     auto state = nuraft::cs_new< nuraft::srv_state >();
@@ -1639,23 +1686,35 @@ nuraft::ptr< nuraft::srv_state > RaftReplDev::read_state() {
     return state;
 }
 
-nuraft::ptr< nuraft::log_store > RaftReplDev::load_log_store() { return m_data_journal; }
+nuraft::ptr< nuraft::log_store > ReplicaSet::load_log_store() {
+    return m_data_journal;
+}
 
-int32_t RaftReplDev::server_id() { return m_raft_server_id; }
+int32_t ReplicaSet::server_id() {
+    return m_raft_server_id;
+}
 
-bool RaftReplDev::is_destroy_pending() const { return (*m_stage.access().get() == repl_dev_stage_t::DESTROYED); }
-bool RaftReplDev::is_destroyed() const { return (*m_stage.access().get() == repl_dev_stage_t::PERMANENT_DESTROYED); }
+bool ReplicaSet::is_destroy_pending() const {
+    return (*m_stage.access().get() == repl_dev_stage_t::DESTROYED);
+}
+bool ReplicaSet::is_destroyed() const {
+    return (*m_stage.access().get() == repl_dev_stage_t::PERMANENT_DESTROYED);
+}
 
-///////////////////////////////////  nuraft_mesg::mesg_state_mgr overrides ////////////////////////////////////
-void RaftReplDev::become_ready() {
+/////////////////////////////  state_mgr overrides ////////////////////////////////
+void ReplicaSet::become_ready() {
     m_stage.update([](auto* stage) { *stage = repl_dev_stage_t::ACTIVE; });
 }
 
-uint32_t RaftReplDev::get_logstore_id() const { return m_data_journal->logstore_id(); }
+uint32_t ReplicaSet::get_logstore_id() const {
+    return m_data_journal->logstore_id();
+}
 
-std::shared_ptr< nuraft::state_machine > RaftReplDev::get_state_machine() { return m_state_machine; }
+std::shared_ptr< nuraft::state_machine > ReplicaSet::get_state_machine() {
+    return m_state_machine;
+}
 
-void RaftReplDev::permanent_destroy() {
+void ReplicaSet::permanent_destroy() {
     RD_LOGI(NO_TRACE_ID, "Permanent destroy for raft repl dev group_id={}", group_id_str());
     // let the listener know at first, so that they can cleanup persistent structures before raft repl dev is destroyed
     m_listener->on_destroy(group_id());
@@ -1669,7 +1728,7 @@ void RaftReplDev::permanent_destroy() {
     m_rd_sb.destroy();
 }
 
-void RaftReplDev::leave() {
+void ReplicaSet::leave() {
     // this will be called in 3 cases :
     //  1. commit log entry of journal_type_t::HS_CTRL_DESTROY
     //  2. it is removed from the cluster and the new config(excluding this node) is being committed on this node
@@ -1681,7 +1740,8 @@ void RaftReplDev::leave() {
 
     // leave() will never be called concurrently, since config change and journal_type_t::HS_CTRL_DESTROY are all log
     // entry, which will be committed sequentially.
-    if (is_destroy_pending()) return;
+    if (is_destroy_pending())
+        return;
 
     // We update that this repl_dev in destroyed state, actual clean up of resources happen in reaper thread later
     m_stage.update([](auto* stage) { *stage = repl_dev_stage_t::DESTROYED; });
@@ -1692,11 +1752,11 @@ void RaftReplDev::leave() {
     m_rd_sb->destroy_pending = 0x1;
     m_rd_sb.write();
 
-    RD_LOGI(NO_TRACE_ID, "RaftReplDev leave group_id={}", group_id_str());
-    m_destroy_promise.setValue(ReplServiceError::OK); // In case proposer is waiting for the destroy to complete
+    RD_LOGI(NO_TRACE_ID, "ReplicaSet leave group_id={}", group_id_str());
+    m_destroy_promise.setValue(ReplError::OK); // In case proposer is waiting for the destroy to complete
 }
 
-nuraft::cb_func::ReturnCode RaftReplDev::raft_event(nuraft::cb_func::Type type, nuraft::cb_func::Param* param) {
+nuraft::cb_func::ReturnCode ReplicaSet::raft_event(nuraft::cb_func::Type type, nuraft::cb_func::Param* param) {
     auto ret = nuraft::cb_func::ReturnCode::Ok;
 
     switch (type) {
@@ -1722,8 +1782,12 @@ nuraft::cb_func::ReturnCode RaftReplDev::raft_event(nuraft::cb_func::Type type, 
             auto& entry = entries[i];
             auto lsn = start_lsn + i;
             auto term = entry->get_term();
-            if (entry->get_val_type() != nuraft::log_val_type::app_log) { continue; }
-            if (entry->get_buf_ptr()->size() == 0) { continue; }
+            if (entry->get_val_type() != nuraft::log_val_type::app_log) {
+                continue;
+            }
+            if (entry->get_buf_ptr()->size() == 0) {
+                continue;
+            }
             // skipping localize for already committed log(dup), they anyway will be discard
             // by nuraft before append_log.
             if (lsn <= last_commit_lsn) {
@@ -1753,12 +1817,14 @@ nuraft::cb_func::ReturnCode RaftReplDev::raft_event(nuraft::cb_func::Type type, 
         std::vector< repl_req_ptr_t > timeout_rreqs;
         if (!wait_for_data_receive(*reqs, HS_DYNAMIC_CONFIG(consensus.data_receive_timeout_ms), &timeout_rreqs)) {
             for (auto const& rreq : timeout_rreqs) {
-                handle_error(rreq, ReplServiceError::TIMEOUT);
+                handle_error(rreq, ReplError::TIMEOUT);
             }
             ret = nuraft::cb_func::ReturnCode::ReturnNull;
         }
         sisl::VectorPool< repl_req_ptr_t >::free(reqs);
-        if (ret == nuraft::cb_func::ReturnCode::Ok) { m_state_machine->inc_next_batch_size_hint(); }
+        if (ret == nuraft::cb_func::ReturnCode::Ok) {
+            m_state_machine->inc_next_batch_size_hint();
+        }
         return ret;
     }
     case nuraft::cb_func::Type::JoinedCluster:
@@ -1776,7 +1842,7 @@ nuraft::cb_func::ReturnCode RaftReplDev::raft_event(nuraft::cb_func::Type type, 
         return nuraft::cb_func::ReturnCode::Ok;
     }
 
-    // RemovedFromCluster will be handled in nuraft_mesg::generic_raft_event_handler where leave() is called
+    // RemovedFromCluster: caller invokes leave().
 
     // TODO: Add more type handler if necessary
     default:
@@ -1785,7 +1851,7 @@ nuraft::cb_func::ReturnCode RaftReplDev::raft_event(nuraft::cb_func::Type type, 
     return nuraft::cb_func::ReturnCode::Ok;
 }
 
-void RaftReplDev::flush_durable_commit_lsn() {
+void ReplicaSet::flush_durable_commit_lsn() {
     auto const lsn = m_commit_upto_lsn.load();
     m_listener->notify_committed_lsn(lsn);
 
@@ -1800,12 +1866,14 @@ void RaftReplDev::flush_durable_commit_lsn() {
     m_rd_sb.write();
 }
 
-void RaftReplDev::check_replace_member_status() {
+void ReplicaSet::check_replace_member_status() {
     if (is_destroyed()) {
         RD_LOGI(NO_TRACE_ID, "Raft repl dev is destroyed, ignore check replace member status");
         return;
     }
-    if (!m_repl_svc_ctx || !is_leader()) { return; }
+    if (!m_repl_svc_ctx || !is_leader()) {
+        return;
+    }
     if (m_rd_sb->replace_member_ctx.replica_in == boost::uuids::nil_uuid() ||
         m_rd_sb->replace_member_ctx.replica_out == boost::uuids::nil_uuid()) {
         RD_LOGT(NO_TRACE_ID, "No replace member in progress, return");
@@ -1842,24 +1910,24 @@ void RaftReplDev::check_replace_member_status() {
             "lsn={}",
             boost::uuids::to_string(replica_in), in_lsn, boost::uuids::to_string(replica_out), out_lsn);
 
-    trace_id_t trace_id = generateRandomTraceId();
+    TraceId trace_id = generateRandomTraceId();
 
     RD_LOGD(trace_id, "Trigger complete_replace_member, replica_in={}, replica_out={}",
             boost::uuids::to_string(replica_in), boost::uuids::to_string(replica_out));
 
-    replica_member_info out{replica_out, ""};
-    replica_member_info in{replica_in, ""};
+    ReplicaMemberInfo out{replica_out, ""};
+    ReplicaMemberInfo in{replica_in, ""};
     auto ret = complete_replace_member(out, in, 0, trace_id).get();
     if (ret.hasError()) {
         RD_LOGE(trace_id, "Failed to complete replace member, next time will retry it, error={}", ret.error());
         return;
     }
-    RD_LOGI(trace_id, "Complete replace member, replica_in={}, replica_out={}",
-            boost::uuids::to_string(replica_in), boost::uuids::to_string(replica_out))
+    RD_LOGI(trace_id, "Complete replace member, replica_in={}, replica_out={}", boost::uuids::to_string(replica_in),
+            boost::uuids::to_string(replica_out))
 }
 
 ///////////////////////////////////  Private metohds ////////////////////////////////////
-void RaftReplDev::cp_flush(CP* cp, cshared< ReplDevCPContext > ctx) {
+void ReplicaSet::cp_flush(CP* cp, cshared< ReplicaSetCPContext > ctx) {
     if (is_destroyed()) {
         RD_LOGI(NO_TRACE_ID, "Raft repl dev is destroyed, ignore cp flush");
         return;
@@ -1887,25 +1955,27 @@ void RaftReplDev::cp_flush(CP* cp, cshared< ReplDevCPContext > ctx) {
             m_next_dsn.load(), cp->to_string());
 }
 
-cshared< ReplDevCPContext > RaftReplDev::get_cp_ctx(CP* cp) {
+cshared< ReplicaSetCPContext > ReplicaSet::get_cp_ctx(CP* cp) {
     auto const cp_lsn = m_commit_upto_lsn.load();
     auto const clsn = m_compact_lsn.load();
     auto const dsn = m_next_dsn.load();
 
     RD_LOGD(NO_TRACE_ID, "getting cp_ctx for raft repl dev {}, cp_lsn={}, clsn={}, next_dsn={}, cp string:{}",
             (void*)this, cp_lsn, clsn, dsn, cp->to_string());
-    auto dev_ctx = std::make_shared< ReplDevCPContext >();
+    auto dev_ctx = std::make_shared< ReplicaSetCPContext >();
     dev_ctx->cp_lsn = cp_lsn;
     dev_ctx->compacted_to_lsn = clsn;
     dev_ctx->last_applied_dsn = dsn;
     return dev_ctx;
 }
 
-void RaftReplDev::cp_cleanup(CP*) {}
+void ReplicaSet::cp_cleanup(CP*) {
+}
 
-void RaftReplDev::gc_repl_reqs() {
+void ReplicaSet::gc_repl_reqs() {
     auto cur_dsn = m_next_dsn.load();
-    if (cur_dsn != 0) cur_dsn = cur_dsn - 1;
+    if (cur_dsn != 0)
+        cur_dsn = cur_dsn - 1;
     // On follower, DSN below cur_dsn should very likely be commited.
     // It is not guaranteed because DSN and LSN are generated separately,
     // DSN in async_alloc_write before pushing data, LSN later when
@@ -1974,9 +2044,11 @@ void RaftReplDev::gc_repl_reqs() {
     }
 }
 
-void RaftReplDev::set_log_store_last_durable_lsn(store_lsn_t lsn) { m_data_journal->set_last_durable_lsn(lsn); }
+void ReplicaSet::set_log_store_last_durable_lsn(store_lsn_t lsn) {
+    m_data_journal->set_last_durable_lsn(lsn);
+}
 
-void RaftReplDev::on_log_found(logstore_seq_num_t lsn, log_buffer buf, void* ctx) {
+void ReplicaSet::on_log_found(logstore_seq_num_t lsn, log_buffer buf, void* ctx) {
     auto repl_lsn = to_repl_lsn(lsn);
     if (need_skip_processing(repl_lsn)) {
         RD_LOGI(NO_TRACE_ID,
@@ -1985,13 +2057,17 @@ void RaftReplDev::on_log_found(logstore_seq_num_t lsn, log_buffer buf, void* ctx
     }
 
     // apply the log entry if the lsn is between checkpoint lsn and durable commit lsn
-    if (repl_lsn <= m_rd_sb->checkpoint_lsn) { return; }
+    if (repl_lsn <= m_rd_sb->checkpoint_lsn) {
+        return;
+    }
 
     // 1. Get the log entry and prepare rreq
     auto const lentry = to_nuraft_log_entry(buf);
 
     // TODO: Handle the case where the log entry is not app_log, example config logs
-    if (lentry->get_val_type() != nuraft::log_val_type::app_log) { return; }
+    if (lentry->get_val_type() != nuraft::log_val_type::app_log) {
+        return;
+    }
 
     repl_journal_entry* jentry = r_cast< repl_journal_entry* >(lentry->get_buf().data_begin());
     RELEASE_ASSERT_EQ(jentry->major_version, repl_journal_entry::JOURNAL_ENTRY_MAJOR,
@@ -2041,7 +2117,7 @@ void RaftReplDev::on_log_found(logstore_seq_num_t lsn, log_buffer buf, void* ctx
     rreq->set_lentry(lentry);
     auto status = init_req_ctx(rreq, rkey, jentry->code, false /* is_proposer */, entry_to_hdr(jentry),
                                entry_to_key(jentry), data_size, m_listener);
-    if (status != ReplServiceError::OK) {
+    if (status != ReplError::OK) {
         RD_LOGE(jentry->traceID, "Initializing rreq failed, rreq=[{}], error={}", rreq->to_string(), status);
     }
 
@@ -2069,7 +2145,7 @@ void RaftReplDev::on_log_found(logstore_seq_num_t lsn, log_buffer buf, void* ctx
     handle_commit(rreq, true /* recovery */);
 }
 
-void RaftReplDev::create_snp_resync_data(raft_buf_ptr_t& data_out) {
+void ReplicaSet::create_snp_resync_data(raft_buf_ptr_t& data_out) {
     snp_repl_dev_data msg;
     auto msg_size = sizeof(snp_repl_dev_data);
     msg.dsn = m_next_dsn;
@@ -2080,7 +2156,7 @@ void RaftReplDev::create_snp_resync_data(raft_buf_ptr_t& data_out) {
     std::memcpy(data_out->data_begin(), &msg, msg_size);
 }
 
-bool RaftReplDev::save_snp_resync_data(nuraft::buffer& data, nuraft::snapshot& s) {
+bool ReplicaSet::save_snp_resync_data(nuraft::buffer& data, nuraft::snapshot& s) {
     auto msg = r_cast< snp_repl_dev_data* >(data.data_begin());
     if (msg->magic_num != HOMESTORE_RESYNC_DATA_MAGIC ||
         msg->protocol_version != HOMESTORE_RESYNC_DATA_PROTOCOL_VERSION_V1) {
@@ -2116,9 +2192,11 @@ bool RaftReplDev::save_snp_resync_data(nuraft::buffer& data, nuraft::snapshot& s
     return true;
 }
 
-void RaftReplDev::on_restart() { m_listener->on_restart(); }
+void ReplicaSet::on_restart() {
+    m_listener->on_restart();
+}
 
-bool RaftReplDev::is_resync_mode() {
+bool ReplicaSet::is_resync_mode() {
     int64_t const leader_commited_lsn = raft_server()->get_leader_committed_log_idx();
     int64_t const my_log_idx = raft_server()->get_last_log_idx();
     auto diff = leader_commited_lsn - my_log_idx;
@@ -2130,7 +2208,7 @@ bool RaftReplDev::is_resync_mode() {
     return resync_mode;
 }
 
-void RaftReplDev::report_blk_metrics_if_needed(repl_req_ptr_t rreq) {
+void ReplicaSet::report_blk_metrics_if_needed(repl_req_ptr_t rreq) {
     auto chunk_id = rreq->local_blkid().chunk_num();
     auto chunk = hs()->device_mgr()->get_chunk(chunk_id);
     if (chunk->get_blk_usage() >= chunk->get_blk_usage_report_threshold()) {
@@ -2143,7 +2221,7 @@ void RaftReplDev::report_blk_metrics_if_needed(repl_req_ptr_t rreq) {
     }
 }
 
-void RaftReplDev::quiesce_reqs() {
+void ReplicaSet::quiesce_reqs() {
     // all the block allocation happens in rreq->init. so after we wait for all the pending req has been initialized we
     // can make sure
     // 1 all the pending reqs has allocated their blocks
@@ -2160,9 +2238,11 @@ void RaftReplDev::quiesce_reqs() {
     }
 }
 
-void RaftReplDev::resume_accepting_reqs() { m_in_quience.store(false, std::memory_order_release); }
+void ReplicaSet::resume_accepting_reqs() {
+    m_in_quience.store(false, std::memory_order_release);
+}
 
-void RaftReplDev::clear_chunk_req(chunk_num_t chunk_id) {
+void ReplicaSet::clear_chunk_req(chunk_num_t chunk_id) {
     RD_LOGD(NO_TRACE_ID,
             "start cleaning all the in-memory rreqs, which has allocated blk on the emergent chunk={} before handling "
             "no_space_left error",
@@ -2198,25 +2278,25 @@ void RaftReplDev::clear_chunk_req(chunk_num_t chunk_id) {
         .wait();
 }
 
-ReplServiceError RaftReplDev::init_req_ctx(repl_req_ptr_t rreq, repl_key rkey, journal_type_t op_code, bool is_proposer,
-                                           sisl::Blob const& user_header, sisl::Blob const& key, uint32_t data_size,
-                                           cshared< ReplDevListener >& listener) {
+ReplError ReplicaSet::init_req_ctx(repl_req_ptr_t rreq, repl_key rkey, journal_type_t op_code, bool is_proposer,
+                                   sisl::Blob const& user_header, sisl::Blob const& key, uint32_t data_size,
+                                   cshared< ReplicaSetListener >& listener) {
     if (!rreq) {
         RD_LOGD(rkey.traceID, "got nullptr for initing req, rkey=[{}]", rkey.to_string());
-        return ReplServiceError::CANCELLED;
+        return ReplError::CANCELLED;
     }
 
     init_req_counter counter(m_pending_init_req_num);
     if (is_in_quience()) {
         // In quience state, reject any new requests.
         RD_LOGD(rkey.traceID, "Rejecting new request in quience state, rkey=[{}]", rkey.to_string());
-        return ReplServiceError::QUIENCE_STATE;
+        return ReplError::QUIENCE_STATE;
     }
 
     return rreq->init(rkey, op_code, is_proposer, user_header, key, data_size, m_listener);
 }
 
-void RaftReplDev::become_leader_cb() {
+void ReplicaSet::become_leader_cb() {
     auto new_gate = raft_server()->get_last_log_idx();
     repl_lsn_t existing_gate = 0;
     if (!m_traffic_ready_lsn.compare_exchange_strong(existing_gate, new_gate)) {
@@ -2226,8 +2306,9 @@ void RaftReplDev::become_leader_cb() {
     RD_LOGD(NO_TRACE_ID, "become_leader_cb: setting traffic_ready_lsn from {} to {}", existing_gate, new_gate);
 }
 
-bool RaftReplDev::is_ready_for_traffic() const {
-    if (is_stopping()) return false;
+bool ReplicaSet::is_ready_for_traffic() const {
+    if (is_stopping())
+        return false;
     auto committed_lsn = m_commit_upto_lsn.load();
     auto gate = m_traffic_ready_lsn.load();
     bool ready = committed_lsn >= gate;

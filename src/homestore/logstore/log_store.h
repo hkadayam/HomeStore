@@ -37,12 +37,20 @@ namespace homestore {
 
 class MetaClient;
 
-using logid_range = std::pair< logid_t, logid_t >; // [from_log_id, to_log_id], both inclusive
+// One rollback event: records the lsn-tail position and the highest log_id that existed at the time of the
+// rollback. A record on disk is suppressed at replay if its lsn falls above above_lsn AND its log_id is ≤
+// max_log_id (i.e. it was written BEFORE the rollback). New writes after the rollback get fresh log_ids
+// strictly greater than max_log_id, so they replay normally even when they land on the same lsn the rollback
+// invalidated. Handles sparse / out-of-order non-append-mode writes without needing multiple logid sub-ranges.
+struct rollback_record {
+    lsn_t   above_lsn{0};
+    logid_t max_log_id{0};
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Persisted per-store sb (single MetaBlk per LogStore: "<dev>_logstore_sb_<store_id>")
 //
-// Layout: { store_id, append_mode, head_lsn, n_rollback_ranges, rollback_ranges[n_rollback_ranges] }.  The
+// Layout: { store_id, append_mode, head_lsn, n_rollback_records, rollback_records[n_rollback_records] }.  The
 // trailing array is variable-size — same trick as AppendByteStreamSb's chunk_ids[].
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma pack(1)
@@ -51,12 +59,12 @@ struct LogStoreSb {
     uint8_t append_mode{0};
     uint8_t _reserved[3]{};
     lsn_t head_lsn{0};
-    uint32_t n_rollback_ranges{0};
-    // followed by logid_range rollback_ranges[n_rollback_ranges]
+    uint32_t n_rollback_records{0};
+    // followed by rollback_record rollback_records[n_rollback_records]
 
-    logid_range* rollback_ranges() { return r_cast< logid_range* >(this + 1); }
-    const logid_range* rollback_ranges() const { return r_cast< const logid_range* >(this + 1); }
-    static size_t size_for(uint32_t n) { return sizeof(LogStoreSb) + n * sizeof(logid_range); }
+    rollback_record* rollback_records() { return r_cast< rollback_record* >(this + 1); }
+    const rollback_record* rollback_records() const { return r_cast< const rollback_record* >(this + 1); }
+    static size_t size_for(uint32_t n) { return sizeof(LogStoreSb) + n * sizeof(rollback_record); }
 };
 #pragma pack()
 static_assert(sizeof(LogStoreSb) == 20, "LogStoreSb header must be 20 bytes on disk");
@@ -140,18 +148,18 @@ public:
 
     /// Auto-assign next lsn (next_lsn_.fetch_add(1)), reserve slot in records_ (active-bit only), enqueue into
     /// the underlying LogStream.  Synchronous; durability via on_write_completion.
-    lsn_t quick_append(const sisl::IoBlob& data);
+    lsn_t quick_append(const LogBlob& data);
 
     /// quick_append + co_await flush_upto(lsn).
-    folly::coro::Task< lsn_t > append_and_flush(const sisl::IoBlob& data);
+    folly::coro::Task< lsn_t > append_and_flush(const LogBlob& data);
 
     // ── Non-append-mode API (asserts !append_mode_) ──────────────────────────
 
     /// Caller-specified lsn write.  Reserve slot, enqueue.  next_lsn_ advances on completion via atomic-update-max.
-    void quick_write(lsn_t lsn, const sisl::IoBlob& data);
+    void quick_write(lsn_t lsn, const LogBlob& data);
 
     /// quick_write + co_await flush_upto(lsn).
-    folly::coro::Task< void > write_and_flush(lsn_t lsn, const sisl::IoBlob& data);
+    folly::coro::Task< void > write_and_flush(lsn_t lsn, const LogBlob& data);
 
     /// Insert an empty record at lsn (used to plug holes in non-append mode so truncate can advance over them).
     void fill_gap(lsn_t lsn);
@@ -171,9 +179,10 @@ public:
     /// notification (used when the manager itself is driving truncate).
     folly::coro::Task< void > truncate(lsn_t upto_lsn, bool in_memory_only = false);
 
-    /// Drains in-flight via stream_->flush(), then under stream_->flush_lock(): captures the log_id range
-    /// [records_.at(to_lsn+1).dev_key.log_id, records_.at(tail_lsn).dev_key.log_id], appends to rollback_ranges_,
-    /// rolls records_ back, rewinds tail_lsn_ and next_lsn_, persists sb.  Returns false if to_lsn out of range.
+    /// Drains in-flight via stream_->flush(), then under stream_->flush_lock(): captures the lsn-tail boundary
+    /// (above_lsn=to_lsn) and the max log_id at the time of rollback, appends to rollback_records_, rolls
+    /// records_ back, rewinds tail_lsn_, persists sb.  Returns false if to_lsn out of range.  Works for sparse
+    /// non-append-mode stores — no requirement that to_lsn+1 be an active slot.
     folly::coro::Task< bool > rollback(lsn_t to_lsn);
 
     // ── Callbacks from LogStream ─────────────────────────────────────────────
@@ -207,12 +216,13 @@ public:
     const MetaBlk& sb_blk() const { return meta_blk_.meta_blk(); }
 
     LogStore(shared< LogStream > stream, MetaBlkWrapper&& mb, logstore_id_t sid, bool is_append_mode,
-             lsn_t head_lsn, std::vector< logid_range > rollback_ranges);
+             lsn_t head_lsn, std::vector< rollback_record > rollback_records);
 
 private:
-    /// True if log_id falls inside any persisted rollback range.  Read by on_log_found during single-threaded
-    /// recovery; written by rollback() under stream_->flush_lock().  No lock needed.
-    bool in_rollback_range(logid_t log_id) const;
+    /// True if (lsn, log_id) was invalidated by any persisted rollback — i.e. lsn lies above some rollback's
+    /// above_lsn AND log_id is ≤ that rollback's max_log_id (was written before the rollback).  Read by
+    /// on_log_found during single-threaded recovery; written by rollback() under stream_->flush_lock().
+    bool in_rollback_range(lsn_t lsn, logid_t log_id) const;
 
     /// Serialise current state into the sb mblk.  Caller holds stream_->flush_lock().
     folly::coro::Task< void > persist_sb();
@@ -232,7 +242,7 @@ private:
 
     // Mutated only by rollback() under stream_->flush_lock(); read by on_log_found during single-threaded
     // recovery (which runs before any rollback can fire).  No additional synchronisation needed.
-    std::vector< logid_range > rollback_ranges_;
+    std::vector< rollback_record > rollback_records_;
 
 };
 

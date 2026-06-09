@@ -34,6 +34,7 @@
 
 #include "homestore/base/homestore_decl.h"
 #include "homestore/blob/append_byte_stream.h"
+#include "homestore/logstore/log_blob.h"
 
 namespace homestore {
 
@@ -139,14 +140,15 @@ public:
 // ─────────────────────────────────────────────────────────────────────────────
 // In-memory: LogRecord (StreamTracker entry)
 //
-// One per appended record awaiting flush.  Holds a shallow IoBlob view of the caller's data buffer — the caller is
-// responsible for keeping the buffer alive until flush() returns.  Carries the owning client* so on flush
-// completion we can dispatch on_write_completion directly without a store_id → client map lookup; store_id itself
-// is fetched via client->store_id() when filling the on-disk record header.
+// One per appended record awaiting flush.  Holds a LogBlob (bounded scatter-gather of IoBlob views) referencing
+// the caller's data buffers — the caller is responsible for keeping the buffers alive until flush() returns.
+// Carries the owning client* so on flush completion we can dispatch on_write_completion directly without a
+// store_id → client map lookup; store_id itself is fetched via client->store_id() when filling the on-disk
+// record header.
 // Trivially copyable for StreamTracker.
 // ─────────────────────────────────────────────────────────────────────────────
 struct LogRecord {
-    sisl::IoBlob data{};
+    LogBlob data{};
     LogStreamClient* client{nullptr};
     lsn_t lsn{0};
 };
@@ -193,9 +195,9 @@ public:
 
     /// Append one record on behalf of a client.  Synchronous, no I/O — record is stashed in the tracker for the
     /// next flush().  Returns the assigned monotonic log_id.  The client pointer is cached in the LogRecord and used
-    /// during flush completion to fire client->on_write_completion directly (no demux).  Caller's data buffer must
-    /// outlive the next flush().
-    logid_t append(LogStreamClient* client, lsn_t lsn, const sisl::IoBlob& data);
+    /// during flush completion to fire client->on_write_completion directly (no demux).  Caller's data buffers
+    /// (each part inside the LogBlob) must outlive the next flush().
+    logid_t append(LogStreamClient* client, lsn_t lsn, const LogBlob& data);
 
     /// Drain the tracker into 1+ LogGroups (loop while more contiguous-active records appear, capped at
     /// max_flush_loops), emplace each group into the parent buffer with CRC chaining, then call

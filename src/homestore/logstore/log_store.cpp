@@ -39,7 +39,7 @@ namespace homestore {
 // ─────────────────────────────────────────────────────────────────────────────
 
 LogStore::LogStore(shared< LogStream > stream, MetaBlkWrapper&& mb, logstore_id_t sid, bool is_append_mode,
-                   lsn_t head_lsn, std::vector< logid_range > rollback_ranges) :
+                   lsn_t head_lsn, std::vector< rollback_record > rollback_records) :
         store_id_{sid},
         stream_{std::move(stream)},
         meta_blk_{std::move(mb)},
@@ -47,7 +47,7 @@ LogStore::LogStore(shared< LogStream > stream, MetaBlkWrapper&& mb, logstore_id_
         head_lsn_{head_lsn},
         tail_lsn_{head_lsn - 1},
         records_{"LogStore", head_lsn - 1},
-        rollback_ranges_{std::move(rollback_ranges)} {
+        rollback_records_{std::move(rollback_records)} {
 }
 
 folly::coro::Task< shared< LogStore > > LogStore::create(logstore_id_t sid, shared< MetaClient > meta_client,
@@ -59,11 +59,11 @@ folly::coro::Task< shared< LogStore > > LogStore::create(logstore_id_t sid, shar
     sb.store_id = sid;
     sb.append_mode = is_append_mode ? 1 : 0;
     sb.head_lsn = 0;
-    sb.n_rollback_ranges = 0;
+    sb.n_rollback_records = 0;
     co_await mb.write(to_u8ptr(&sb), sizeof(sb));
 
     co_return std::make_shared< LogStore >(std::move(stream), std::move(mb), sid, is_append_mode,
-                                           /*head_lsn=*/0, std::vector< logid_range >{});
+                                           /*head_lsn=*/0, std::vector< rollback_record >{});
 }
 
 folly::coro::Task< shared< LogStore > > LogStore::load(shared< LogStream > stream, MetaBlkWrapper&& mb) {
@@ -75,15 +75,15 @@ folly::coro::Task< shared< LogStore > > LogStore::load(shared< LogStream > strea
     const logstore_id_t sid = sb->store_id;
     const bool is_append_mode = (sb->append_mode != 0);
     const lsn_t head_lsn = sb->head_lsn;
-    std::vector< logid_range > ranges;
-    ranges.reserve(sb->n_rollback_ranges);
-    for (uint32_t i = 0; i < sb->n_rollback_ranges; ++i) {
-        ranges.push_back(sb->rollback_ranges()[i]);
+    std::vector< rollback_record > records;
+    records.reserve(sb->n_rollback_records);
+    for (uint32_t i = 0; i < sb->n_rollback_records; ++i) {
+        records.push_back(sb->rollback_records()[i]);
     }
-    LOGINFO("Loaded LogStore sid={} append_mode={} head_lsn={} rollback_ranges={}", sid, is_append_mode, head_lsn,
-            ranges.size());
+    LOGINFO("Loaded LogStore sid={} append_mode={} head_lsn={} rollback_records={}", sid, is_append_mode, head_lsn,
+            records.size());
     co_return std::make_shared< LogStore >(std::move(stream), std::move(mb), sid, is_append_mode, head_lsn,
-                                           std::move(ranges));
+                                           std::move(records));
 }
 
 void LogStore::open(log_replay_cb handler) {
@@ -96,14 +96,14 @@ void LogStore::open(log_replay_cb handler) {
 // Append-mode API
 // ─────────────────────────────────────────────────────────────────────────────
 
-lsn_t LogStore::quick_append(const sisl::IoBlob& data) {
+lsn_t LogStore::quick_append(const LogBlob& data) {
     const lsn_t lsn = tail_lsn_.fetch_add(1, std::memory_order_acq_rel) + 1;
     THIS_LOGSTORE_LOG(TRACE, "quick_append lsn={} size={}", lsn, data.size());
     stream_->append(this, lsn, data);
     return lsn;
 }
 
-folly::coro::Task< lsn_t > LogStore::append_and_flush(const sisl::IoBlob& data) {
+folly::coro::Task< lsn_t > LogStore::append_and_flush(const LogBlob& data) {
     const lsn_t lsn = quick_append(data);
 
     // Wait for a brief time to allow coalescing multiple writes.
@@ -126,13 +126,13 @@ folly::coro::Task< lsn_t > LogStore::append_and_flush(const sisl::IoBlob& data) 
 // Non-append-mode API
 // ─────────────────────────────────────────────────────────────────────────────
 
-void LogStore::quick_write(lsn_t lsn, const sisl::IoBlob& data) {
+void LogStore::quick_write(lsn_t lsn, const LogBlob& data) {
     HS_REL_ASSERT(!append_mode_, "quick_write on append-mode LogStore (store_id={})", store_id_);
     THIS_LOGSTORE_LOG(TRACE, "quick_write lsn={} size={}", lsn, data.size());
     stream_->append(this, lsn, data);
 }
 
-folly::coro::Task< void > LogStore::write_and_flush(lsn_t lsn, const sisl::IoBlob& data) {
+folly::coro::Task< void > LogStore::write_and_flush(lsn_t lsn, const LogBlob& data) {
     quick_write(lsn, data);
 
     // Wait for a brief time to allow coalescing multiple writes.
@@ -208,9 +208,11 @@ folly::coro::Task< void > LogStore::truncate(lsn_t upto_lsn, bool in_memory_only
 folly::coro::Task< bool > LogStore::rollback(lsn_t to_lsn) {
     THIS_LOGSTORE_LOG(INFO, "rollback request to_lsn={} current tail_lsn={} head_lsn={}", to_lsn,
                       tail_lsn_.load(std::memory_order_relaxed), head_lsn_.load(std::memory_order_relaxed));
-    // Drain in-flight via stream flush, then under flush_lock recompute the log_id range to invalidate.  If a
-    // concurrent append slipped in between drain and lock-acquire (next_log_id has advanced past our snapshot
-    // tail's log_id), retry the drain.
+    // Drain in-flight via stream flush, then under flush_lock snapshot the max log_id.  Each rollback persists
+    // (above_lsn=to_lsn, max_log_id=stream_->next_log_id()-1); on_log_found later suppresses records whose lsn
+    // > above_lsn AND log_id ≤ max_log_id.  New writes after the rollback get fresh log_ids strictly greater
+    // than max_log_id so they replay even if they land on the same lsn the rollback invalidated.  No
+    // requirement that to_lsn+1 be an active slot — works for sparse non-append-mode stores.
     while (true) {
         co_await stream_->flush();
         auto lock = co_await stream_->flush_lock().co_scoped_lock();
@@ -225,22 +227,13 @@ folly::coro::Task< bool > LogStore::rollback(lsn_t to_lsn) {
             co_return true;
         }
 
-        const logid_t cur_tail_logid = records_.at(cur_tail).log_id;
-        if (stream_->next_log_id() != cur_tail_logid + 1) {
-            // A racing append assigned a log_id past our snapshot — drain again.
-            continue;
-        }
-
-        // Range of log_ids that are now invalidated for this store.  Persisted in rollback_ranges_; recovery's
-        // on_log_found filters records whose log_id falls inside.
-        const logid_t from_logid = records_.at(to_lsn + 1).log_id;
-        const logid_t to_logid = cur_tail_logid;
-        rollback_ranges_.emplace_back(from_logid, to_logid);
+        const logid_t max_log_id = stream_->next_log_id() - 1;
+        rollback_records_.push_back({to_lsn, max_log_id});
         records_.rollback(to_lsn);
         tail_lsn_.store(to_lsn, std::memory_order_release);
         co_await persist_sb();
-        THIS_LOGSTORE_LOG(INFO, "rollback complete to_lsn={} log_id range=[{},{}] new tail_lsn={}", to_lsn, from_logid,
-                          to_logid, to_lsn);
+        THIS_LOGSTORE_LOG(INFO, "rollback complete to_lsn={} max_log_id={} new tail_lsn={}", to_lsn, max_log_id,
+                          to_lsn);
         co_return true;
     }
 }
@@ -281,7 +274,7 @@ void LogStore::on_log_found(lsn_t lsn, const stream_key& key, const sisl::ByteVi
         THIS_LOGSTORE_LOG(DEBUG, "on_log_found skip lsn={} below head_lsn", lsn);
         return;
     }
-    if (in_rollback_range(key.log_id)) {
+    if (in_rollback_range(lsn, key.log_id)) {
         THIS_LOGSTORE_LOG(DEBUG, "on_log_found skip lsn={} log_id={} in rollback range", lsn, key.log_id);
         return;
     }
@@ -312,9 +305,9 @@ std::optional< uint64_t > LogStore::min_trunc_stream_offset() const {
     return exp.value().trunc_stream_offset;
 }
 
-bool LogStore::in_rollback_range(logid_t log_id) const {
-    for (auto const& r : rollback_ranges_) {
-        if (log_id >= r.first && log_id <= r.second) {
+bool LogStore::in_rollback_range(lsn_t lsn, logid_t log_id) const {
+    for (auto const& r : rollback_records_) {
+        if (lsn > r.above_lsn && log_id <= r.max_log_id) {
             return true;
         }
     }
@@ -322,7 +315,7 @@ bool LogStore::in_rollback_range(logid_t log_id) const {
 }
 
 folly::coro::Task< void > LogStore::persist_sb() {
-    const uint32_t n = to_u32(rollback_ranges_.size());
+    const uint32_t n = to_u32(rollback_records_.size());
     const size_t sz = LogStoreSb::size_for(n);
 
     auto buf = sisl::make_byte_array(to_u32(sz));
@@ -330,9 +323,8 @@ folly::coro::Task< void > LogStore::persist_sb() {
     sb->store_id = store_id_;
     sb->append_mode = append_mode_ ? 1 : 0;
     sb->head_lsn = head_lsn_.load(std::memory_order_acquire);
-    sb->n_rollback_ranges = n;
-    // logid_range is std::pair, not trivially copyable — copy element-wise instead of memcpy.
-    std::copy(rollback_ranges_.begin(), rollback_ranges_.end(), sb->rollback_ranges());
+    sb->n_rollback_records = n;
+    std::copy(rollback_records_.begin(), rollback_records_.end(), sb->rollback_records());
     co_await meta_blk_.write(buf->cbytes(), sz);
 }
 

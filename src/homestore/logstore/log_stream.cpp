@@ -128,7 +128,7 @@ folly::coro::Task< shared< LogStream > > LogStream::load(uint64_t stream_id, Met
     co_return stream;
 }
 
-logid_t LogStream::append(LogStreamClient* client, lsn_t lsn, const sisl::IoBlob& data) {
+logid_t LogStream::append(LogStreamClient* client, lsn_t lsn, const LogBlob& data) {
     const logid_t idx = log_id_.fetch_add(1, std::memory_order_acq_rel);
     const auto sz = to_i64(data.size());
     const int64_t prev = pending_flush_size_.fetch_add(sz, std::memory_order_relaxed);
@@ -261,7 +261,9 @@ uint64_t LogStream::build_and_emplace_group(logid_t from_idx, logid_t upto_idx) 
         hdr->group_size = group_size;
         p += sizeof(log_group_header);
 
-        // log_record_header[i] + data[i] for each record
+        // log_record_header[i] + data[i] for each record. The on-disk record stays contiguous; the scatter-
+        // gather sits only on the in-memory side (LogBlob's parts[]). We coalesce per-record into the group
+        // buffer here — one memcpy per part, same total byte count as the single-IoBlob path.
         for (logid_t i = from_idx; i <= upto_idx; ++i) {
             const auto rec = log_records_->at(i);
             auto* rhdr = r_cast< log_record_header* >(p);
@@ -270,8 +272,10 @@ uint64_t LogStream::build_and_emplace_group(logid_t from_idx, logid_t upto_idx) 
             rhdr->store_lsn = rec.lsn;
             rhdr->size = rec.data.size();
             p += sizeof(log_record_header);
-            std::memcpy(p, rec.data.cbytes(), rec.data.size());
-            p += rec.data.size();
+            for (uint8_t k = 0; k < rec.data.n_parts; ++k) {
+                std::memcpy(p, rec.data.parts[k].cbytes(), rec.data.parts[k].size());
+                p += rec.data.parts[k].size();
+            }
         }
 
         // log_group_footer: prev_crc from the chain so far, cur_crc covers everything written above.

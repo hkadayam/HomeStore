@@ -32,16 +32,18 @@
 
 #include "homestore/base/blk.h" // BlkId, BlkIds, BlkAllocStatus, blk_alloc_hints, blk_count_t
 
-#include "homestore/device/hs_super_blk.h"         // VDevInfo, ChunkInfo, HSSuperBlk
-#include "homestore/device/chunk.h"                // Chunk, ChunkPool
-#include "homestore/device/chunk_selector.h"       // IChunkSelector, ChunkSelectorType, concrete selectors
+#include "homestore/device/hs_super_blk.h"   // VDevInfo, ChunkInfo, HSSuperBlk
+#include "homestore/device/chunk.h"          // Chunk, ChunkPool
+#include "homestore/device/chunk_selector.h" // IChunkSelector, ChunkSelectorType, concrete selectors
 
 namespace homestore {
 
 #define VDEV_LOG(level, vdev, msg, ...) HS_SUBMOD_LOG(level, device, , "vdev", vdev, msg, ##__VA_ARGS__)
 
 class PhysicalDev;
-namespace blkalloc { class BlkAllocator; }
+namespace blkalloc {
+class BlkAllocator;
+}
 
 VENUM(MultiPDevOpts, uint8_t, AllPDevStriped = 0, AllPDevMirrored = 1, SingleFirstPDev = 2, SingleRandomPDev = 3);
 VENUM(BlkAllocatorType, uint8_t, None = 0, SlabCompact = 1, SlabExtend = 2, Append = 3);
@@ -71,7 +73,7 @@ struct VDevParameters {
     uint32_t num_mirrors{0};
     BlkAllocatorType alloc_type{BlkAllocatorType::SlabCompact};
     ChunkSelectorType chunk_sel_type{ChunkSelectorType::RoundRobin};
-    bool persist_blk_alloced{true}; // false only for meta vdev (non-persistent allocator)
+    bool persist_blk_alloced{true};           // false only for meta vdev (non-persistent allocator)
     std::optional< size_t > chunk_pool_limit; // nullopt = no pooling; Some(n) = pool ≤ n per size
 };
 
@@ -153,11 +155,16 @@ public:
     // ──────────────────────────────────────────────────────────────────────────────
     // Public APIs: I/Os
     // ──────────────────────────────────────────────────────────────────────────────
-    folly::coro::Task< void > write(const sisl::IOBuffer& buf, const BlkId& bid);
-    folly::coro::Task< void > writev(const std::vector< sisl::IOBuffer >& bufs, const BlkId& bid);
-    folly::coro::Task< void > writev(const std::vector< sisl::ByteArray >& bufs, const BlkId& bid);
-    folly::coro::Task< std::error_code > read(sisl::IOBuffer& buf, const BlkId& bid);
-    folly::coro::Task< std::error_code > readv(std::vector< sisl::IOBuffer >& bufs, const BlkId& bid);
+    /// Single-buf write/read — buf is any concrete IoBuf subclass (IoBufOwn / IoBufSpan / IoBufView).
+    /// Virtual dispatch on buf.bytes()/size()/is_aligned() selects the right behavior.
+    folly::coro::Task< void > write(sisl::IoBuf const& buf, const BlkId& bid);
+    folly::coro::Task< std::error_code > read(sisl::IoBuf& buf, const BlkId& bid);
+
+    /// Scatter-gather I/O — `sg.bufs` is a polymorphic IoBuf pointer list.  Each element's is_aligned()
+    /// and is_safe() may be asserted at the entry of the call.  Caller guarantees the pointed-to IoBufs
+    /// outlive the await.
+    folly::coro::Task< void > writev(sisl::SgList const& sg, const BlkId& bid);
+    folly::coro::Task< std::error_code > readv(sisl::SgList const& sg, const BlkId& bid);
     folly::coro::Task< void > format();
     folly::coro::Task< void > fsync();
 
@@ -200,11 +207,11 @@ public:
     /// (Re-)construct block allocator for one chunk (or all if chunk == nullptr).
     void init_blk_allocator(cshared< Chunk >& chunk = {});
 
-    /// Recovery: load block allocators from on-disk buffers (chunk_id → ByteArray).
-    void load_blk_allocator(const std::unordered_map< uint32_t, sisl::ByteArray >& chunk_buffers = {});
+    /// Recovery: load block allocators from on-disk buffers (chunk_id → IoBufShared).
+    void load_blk_allocator(const std::unordered_map< uint32_t, sisl::IoBufShared >& chunk_buffers = {});
 
     /// Recovery: load block allocator for a single chunk from its on-disk bitmap buffer.
-    void load_blk_allocator(uint32_t chunk_id, const sisl::ByteArray& buffer);
+    void load_blk_allocator(uint32_t chunk_id, const sisl::IoBufShared& buffer);
 
     /// The chunk size persisted in the vdev's VDevInfo.  Used for chunks created at init time and as the default
     /// size for expand() when callers don't pass an explicit size.  Per-chunk size may differ for chunks added via
@@ -239,7 +246,7 @@ private:
 
     std::pair< uint64_t, shared< Chunk > > to_dev_offset(const BlkId& bid) const;
 
-    void construct_blk_allocator(cshared< Chunk >& chunk, std::optional< sisl::ByteArray > buffer = std::nullopt);
+    void construct_blk_allocator(cshared< Chunk >& chunk, std::optional< sisl::IoBufShared > buffer = std::nullopt);
 
     shared< Chunk > select_chunk_for_alloc(blk_count_t nblks, const blk_alloc_hints& hints,
                                            std::optional< uint32_t > last_failed_id) const;

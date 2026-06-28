@@ -157,10 +157,10 @@ public:
         deserialize(b, copy);
     }
 
-    // Serialize into an owned aligned buffer for overflow I/O. Default copies serialize() into a ByteArray.
-    virtual sisl::ByteArray serialize_to_byte_array() const {
+    // Serialize into an owned aligned buffer for overflow I/O. Default copies serialize() into a IoBufShared.
+    virtual sisl::IoBufShared serialize_to_byte_array() const {
         auto blob = serialize();
-        auto ba = sisl::make_byte_array(blob.size(), 512, sisl::Buftag::btree_node);
+        auto ba = sisl::make_io_buf_shared(blob.size(), 512, sisl::Buftag::btree_node);
         std::memcpy(ba->bytes(), blob.cbytes(), blob.size());
         return ba;
     }

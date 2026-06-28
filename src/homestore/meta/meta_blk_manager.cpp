@@ -25,7 +25,7 @@
 
 namespace homestore {
 
-using sisl::IOBuffer;
+using sisl::IoBufOwn;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // create
@@ -59,7 +59,7 @@ folly::coro::Task< void > MetaBlkManager::create(uint64_t chunk_size) {
     mgr->client_slots_.assign(MAX_META_CLIENTS, 0);
 
     // Write super-header + empty client-info slots in one shot.
-    IOBuffer buf{to_u32(MetaBlkSuperHeader::SIZE + MetaClientInfo::SIZE * MAX_META_CLIENTS)};
+    IoBufOwn buf{to_u32(MetaBlkSuperHeader::SIZE + MetaClientInfo::SIZE * MAX_META_CLIENTS)};
 
     const MetaBlkSuperHeader super = MetaBlkSuperHeader::make();
     std::memcpy(buf.bytes(), &super, MetaBlkSuperHeader::SIZE);
@@ -154,7 +154,7 @@ folly::coro::Task< void > MetaBlkManager::deregister_client(const MetaClient& cl
     const BlkId info_bid{blk_num, static_cast< blk_count_t >(info_nblks), chunk_id};
 
     MetaClientInfo freed = MetaClientInfo::make_free();
-    IOBuffer buf{to_u32(MetaClientInfo::SIZE)};
+    IoBufOwn buf{to_u32(MetaClientInfo::SIZE)};
     std::memcpy(buf.bytes(), &freed, MetaClientInfo::SIZE);
     co_await meta_vdev_->write(buf, info_bid);
 }
@@ -167,7 +167,7 @@ folly::coro::Task< void > MetaBlkManager::load_client_info_from_disk() {
 
     META_LOG(DEBUG, "load_client_info_from_disk: reading {} bytes from blk_num={}", total_sz,
              client_info_bid_.blk_num());
-    IOBuffer buf{to_u32(total_sz)};
+    IoBufOwn buf{to_u32(total_sz)};
     auto err = co_await meta_vdev_->read(buf, client_info_bid_);
     if (err) { throw std::runtime_error{"MetaBlkManager: failed to read client info area"}; }
 

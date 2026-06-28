@@ -139,7 +139,7 @@ public:
         for (uint32_t i = 0; i < n; ++i) {
             auto buf = std::make_shared< std::vector< uint8_t > >(size, static_cast< uint8_t >(0xCD));
             keep.push_back(buf);
-            sisl::IoBlob blob{buf->data(), to_u32(buf->size()), false};
+            sisl::IoBufSpan blob{buf->data(), to_u32(buf->size()), false};
             lsns.push_back(store.quick_append(blob));
         }
         co_await store.flush();
@@ -179,7 +179,7 @@ TEST_F(LogStoreMgrTest, CreateOpenRecover) {
         for (uint32_t i = 0; i < kStores; ++i) {
             auto store = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
             sids.push_back(store->store_id());
-            log_store_mgr().open_log_store(store->store_id(), [](lsn_t, const sisl::ByteView&) {});
+            log_store_mgr().open_log_store(store->store_id(), [](lsn_t, const sisl::IoBufView&) {});
             co_await append_n(*store, kRecordsPer, 128, keep);
         }
     }());
@@ -193,7 +193,7 @@ TEST_F(LogStoreMgrTest, CreateOpenRecover) {
                                 std::map< logstore_id_t, std::atomic< uint32_t > > replay_counts;
                                 for (auto sid : sids) {
                                     auto& cnt = replay_counts[sid];
-                                    log_store_mgr().open_log_store(sid, [&cnt](lsn_t, const sisl::ByteView&) {
+                                    log_store_mgr().open_log_store(sid, [&cnt](lsn_t, const sisl::IoBufView&) {
                                         cnt.fetch_add(1, std::memory_order_relaxed);
                                     });
                                 }
@@ -216,7 +216,7 @@ TEST_F(LogStoreMgrTest, DropUnopenedStores) {
         for (uint32_t i = 0; i < kStores; ++i) {
             auto store = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
             sids.push_back(store->store_id());
-            log_store_mgr().open_log_store(store->store_id(), [](lsn_t, const sisl::ByteView&) {});
+            log_store_mgr().open_log_store(store->store_id(), [](lsn_t, const sisl::IoBufView&) {});
             co_await append_n(*store, 4, 128, keep);
         }
     }());
@@ -228,10 +228,10 @@ TEST_F(LogStoreMgrTest, DropUnopenedStores) {
                                 CO_ASSERT_EQ(log_store_mgr().log_stores().size(), kStores);
 
         std::map< logstore_id_t, std::atomic< uint32_t > > replay_counts;
-        log_store_mgr().open_log_store(sids[0], [&replay_counts, sid = sids[0]](lsn_t, const sisl::ByteView&) {
+        log_store_mgr().open_log_store(sids[0], [&replay_counts, sid = sids[0]](lsn_t, const sisl::IoBufView&) {
             replay_counts[sid].fetch_add(1);
         });
-        log_store_mgr().open_log_store(sids[2], [&replay_counts, sid = sids[2]](lsn_t, const sisl::ByteView&) {
+        log_store_mgr().open_log_store(sids[2], [&replay_counts, sid = sids[2]](lsn_t, const sisl::IoBufView&) {
             replay_counts[sid].fetch_add(1);
         });
 
@@ -271,8 +271,8 @@ TEST_F(LogStoreMgrTest, OrphanRecordsSilentlyDropped) {
                                 auto orphan = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
                                 kept_sid = kept->store_id();
                                 orphan_sid = orphan->store_id();
-                                log_store_mgr().open_log_store(kept_sid, [](lsn_t, const sisl::ByteView&) {});
-                                log_store_mgr().open_log_store(orphan_sid, [](lsn_t, const sisl::ByteView&) {});
+                                log_store_mgr().open_log_store(kept_sid, [](lsn_t, const sisl::IoBufView&) {});
+                                log_store_mgr().open_log_store(orphan_sid, [](lsn_t, const sisl::IoBufView&) {});
                                 co_await append_n(*kept, 5, 128, keep);
                                 co_await append_n(*orphan, 5, 128, keep);
                             }());
@@ -283,7 +283,7 @@ TEST_F(LogStoreMgrTest, OrphanRecordsSilentlyDropped) {
                             [this, kept_sid, orphan_sid]() -> folly::coro::Task< void > {
                                 std::atomic< uint32_t > kept_replay{0};
                                 log_store_mgr().open_log_store(
-                                    kept_sid, [&kept_replay](lsn_t, const sisl::ByteView&) {
+                                    kept_sid, [&kept_replay](lsn_t, const sisl::IoBufView&) {
                                         kept_replay.fetch_add(1);
                                     });
                                 co_await log_store_mgr().recover();
@@ -307,7 +307,7 @@ TEST_F(LogStoreMgrTest, CreateAfterRecoverContinuesIds) {
                                     auto store = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
                                     original_sids.push_back(store->store_id());
                                     log_store_mgr().open_log_store(store->store_id(),
-                                                                    [](lsn_t, const sisl::ByteView&) {});
+                                                                    [](lsn_t, const sisl::IoBufView&) {});
                                     co_await append_n(*store, 2, 64, keep);
                                 }
                             }());
@@ -317,7 +317,7 @@ TEST_F(LogStoreMgrTest, CreateAfterRecoverContinuesIds) {
     iomgr().spawn_and_block(ReactorTarget::any(),
                             [this, &original_sids, kInitialStores]() -> folly::coro::Task< void > {
                                 for (auto sid : original_sids) {
-                                    log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::ByteView&) {});
+                                    log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::IoBufView&) {});
                                 }
                                 co_await log_store_mgr().recover();
                                 CO_ASSERT_EQ(log_store_mgr().log_stores().size(), kInitialStores);

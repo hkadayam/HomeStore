@@ -13,7 +13,7 @@
 
 namespace iomanager {
 
-using sisl::IOBuffer;
+using sisl::IoBuf;
 
 // Called once per reactor thread by IOManager::start(), before the loop runs.
 // Sets up the per-reactor IoUringBackend handle and registers the loopPoll
@@ -70,22 +70,21 @@ public:
 
     // ── Read ──────────────────────────────────────────────────────────────────
 
-    /// Positioned read into buf. Caller retains ownership; buf must remain
-    /// valid until the Task completes (guaranteed when caller co_awaits).
-    folly::coro::Task< std::error_code > read(const IoDevice& dev, IOBuffer& buf, uint64_t offset);
+    /// Positioned read into buf — polymorphic via the IoBuf abstract base.  Caller must keep buf alive
+    /// through the await (guaranteed when caller co_awaits).
+    folly::coro::Task< std::error_code > read(const IoDevice& dev, IoBuf& buf, uint64_t offset);
 
-    /// Scatter read into bufs. Same lifetime contract as read().
-    folly::coro::Task< std::error_code > readv(const IoDevice& dev, std::vector< IOBuffer >& bufs, uint64_t offset);
+    /// Scatter read into `sg.bufs` — polymorphic IoBuf pointer list.  Each element's underlying bytes are
+    /// filled in place; lifetime is the caller's responsibility per element.
+    folly::coro::Task< std::error_code > readv(const IoDevice& dev, sisl::SgList const& sg, uint64_t offset);
 
     // ── Write ─────────────────────────────────────────────────────────────────
 
-    /// Positioned write. `buf` must remain valid until the Task completes
-    /// (guaranteed when the caller co_awaits the returned Task).
-    folly::coro::Task< std::error_code > write(const IoDevice& dev, const IOBuffer& buf, uint64_t offset);
+    /// Positioned write — polymorphic via the IoBuf abstract base.  Same lifetime contract as read.
+    folly::coro::Task< std::error_code > write(const IoDevice& dev, const IoBuf& buf, uint64_t offset);
 
-    /// Gather write. Buffers are read-only; caller retains ownership.
-    folly::coro::Task< std::error_code > writev(const IoDevice& dev, const std::vector< IOBuffer >& bufs, uint64_t offset);
-    folly::coro::Task< std::error_code > writev(const IoDevice& dev, const std::vector< sisl::ByteArray >& bufs, uint64_t offset);
+    /// Gather write — `sg.bufs` is the read-only polymorphic IoBuf pointer list; caller retains ownership.
+    folly::coro::Task< std::error_code > writev(const IoDevice& dev, sisl::SgList const& sg, uint64_t offset);
 
     // ── Misc ──────────────────────────────────────────────────────────────────
 

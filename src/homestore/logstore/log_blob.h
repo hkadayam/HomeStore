@@ -27,28 +27,28 @@ namespace homestore {
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 // LogBlob
 //
-// A bounded scatter-gather record passed to the LogStore / LogStream append APIs.  Up to kMaxParts IoBlob
-// references are stored inline.  Bytes are NOT owned by LogBlob — IoBlob is a non-owning view; callers must
+// A bounded scatter-gather record passed to the LogStore / LogStream append APIs.  Up to kMaxParts IoBufSpan
+// references are stored inline.  Bytes are NOT owned by LogBlob — IoBufSpan is a non-owning view; callers must
 // keep the underlying memory alive until the next flush completes (same lifetime contract LogStream::append
-// always had for its IoBlob argument).
+// always had for its IoBufSpan argument).
 //
 // Trivially copyable so it can be embedded directly inside LogRecord and travel through StreamTracker.
 //
 // When a caller's source chain exceeds kMaxParts, the caller is responsible for coalescing upfront —
 // allocating its own contiguous buffer (e.g., nuraft::buffer::alloc) and constructing a LogBlob from that
-// single IoBlob.  LogBlob itself holds no allocation policy; can_build_trivially() answers the question.
+// single IoBufSpan.  LogBlob itself holds no allocation policy; can_build_trivially() answers the question.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 struct LogBlob {
     static constexpr uint8_t kMaxParts = 4;
 
-    sisl::IoBlob parts[kMaxParts]{};
+    sisl::IoBufSpan parts[kMaxParts]{};
     uint8_t n_parts{0};
 
     LogBlob() = default;
 
-    // Implicit single-IoBlob ctor — keeps existing LogStore callers (test_log_store et al.) working unchanged
-    // when they pass a single IoBlob directly to quick_append / quick_write.
-    LogBlob(sisl::IoBlob const& b) {
+    // Implicit single-IoBufSpan ctor — keeps existing LogStore callers (test_log_store et al.) working unchanged
+    // when they pass a single IoBufSpan directly to quick_append / quick_write.
+    LogBlob(sisl::IoBufSpan const& b) {
         parts[0] = b;
         n_parts = 1;
     }
@@ -69,7 +69,7 @@ struct LogBlob {
 
     // Append a single part to the LogBlob.  Asserts on overflow — caller must have checked
     // can_build_trivially() against the full chain size before starting to append.
-    void append(sisl::IoBlob const& b) {
+    void append(sisl::IoBufSpan const& b) {
         HS_REL_ASSERT_LT(n_parts, kMaxParts, "LogBlob::append overflow; caller should have coalesced upfront");
         parts[n_parts++] = b;
     }

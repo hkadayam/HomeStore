@@ -45,7 +45,7 @@
 
 using namespace homestore;
 using namespace iomanager;
-using sisl::IOBuffer;
+using sisl::IoBuf;
 
 SISL_OPTION_GROUP(test_append_byte_stream,
                   (num_io, "", "num_io", "number of IO operations per test",
@@ -181,7 +181,7 @@ public:
     }
 
     // Read [offset, offset+size) and verify it matches the seed pattern.  AppendByteStream::read() returns a
-    // ByteView pre-sliced to start at byte_offset — index from 0.
+    // IoBufView pre-sliced to start at byte_offset — index from 0.
     static folly::coro::Task< bool > verify_at(AppendByteStream& s, uint64_t offset, size_t size, uint64_t seed) {
         auto [ec, view] = co_await s.read(offset, size);
         if (ec) {
@@ -384,7 +384,7 @@ CORO_TEST_F(AppendByteStreamTest, ReadCursorSequential) {
     uint32_t i = 0;
     uint64_t pos = 0;
     while (cursor.has_more()) {
-        // ReadCursor::next now returns a ByteView pre-sliced to start at pos — index from 0.
+        // ReadCursor::next now returns a IoBufView pre-sliced to start at pos — index from 0.
         auto [view, sz] = co_await cursor.next(kRecSize);
         EXPECT_EQ(sz, kRecSize);
         EXPECT_TRUE(self.verify_pattern(view.bytes(), sz, 0xF500 + i));

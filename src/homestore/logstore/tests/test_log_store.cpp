@@ -71,7 +71,7 @@ static std::vector< std::shared_ptr< std::vector< uint8_t > > > global_keepalive
 class ShadowStore {
 public:
     ShadowStore(shared< LogStore > store) : store_{std::move(store)} {
-        store_->open([this](lsn_t lsn, const sisl::ByteView& data) { record_replay(lsn, data); });
+        store_->open([this](lsn_t lsn, const sisl::IoBufView& data) { record_replay(lsn, data); });
     }
 
     LogStore& store() { return *store_; }
@@ -105,17 +105,17 @@ public:
         return true;
     }
 
-    // Pre-allocate, fill, and stash a buffer that outlives the next flush.  Returns IoBlob view + the keep-alive
+    // Pre-allocate, fill, and stash a buffer that outlives the next flush.  Returns IoBufSpan view + the keep-alive
     // shared_ptr is held internally.
-    sisl::IoBlob materialize(lsn_t lsn, size_t size) {
+    sisl::IoBufSpan materialize(lsn_t lsn, size_t size) {
         auto buf = std::make_shared< std::vector< uint8_t > >(make_data(lsn, size));
         std::lock_guard lk{mtx_};
         keep_alive_.push_back(buf);
-        return sisl::IoBlob{buf->data(), to_u32(buf->size()), false};
+        return sisl::IoBufSpan{buf->data(), to_u32(buf->size()), false};
     }
 
     // ── Replay tracking ─────────────────────────────────────────────────────
-    void record_replay(lsn_t lsn, const sisl::ByteView& data) {
+    void record_replay(lsn_t lsn, const sisl::IoBufView& data) {
         std::lock_guard lk{mtx_};
         replayed_.emplace_back(lsn, std::vector< uint8_t >(data.bytes(), data.bytes() + data.size()));
     }
@@ -234,7 +234,7 @@ CORO_TEST_F(LogStoreTest, SingleStoreAppendReadback) {
     co_await self.bootstrap();
     auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
     auto sid = raw->store_id();
-    log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::ByteView&) {});
+    log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::IoBufView&) {});
     ShadowStore s{raw};
 
     constexpr uint32_t N = 32;
@@ -262,7 +262,7 @@ CORO_TEST_F(LogStoreTest, MultipleStoresOnOneStream) {
     for (uint32_t i = 0; i < kStores; ++i) {
         auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
         auto sid = raw->store_id();
-        log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::ByteView&) {});
+        log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::IoBufView&) {});
         stores.push_back(std::make_unique< ShadowStore >(raw));
     }
 
@@ -293,7 +293,7 @@ CORO_TEST_F(LogStoreTest, MultipleStoresOnOneStream) {
 CORO_TEST_F(LogStoreTest, ConcurrentAppends) {
     co_await self.bootstrap();
     auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
-    log_store_mgr().open_log_store(raw->store_id(), [](lsn_t, const sisl::ByteView&) {});
+    log_store_mgr().open_log_store(raw->store_id(), [](lsn_t, const sisl::IoBufView&) {});
     ShadowStore s{raw};
 
     constexpr uint32_t kThreads = 8;
@@ -308,7 +308,7 @@ CORO_TEST_F(LogStoreTest, ConcurrentAppends) {
                 // We don't know what LSN we'll get; use a placeholder seed for the data and verify after.
                 auto buf = std::make_shared< std::vector< uint8_t > >(128);
                 std::memset(buf->data(), 0xAB, buf->size()); // placeholder; LSN-specific verify is overkill here
-                sisl::IoBlob blob{buf->data(), to_u32(buf->size()), false};
+                sisl::IoBufSpan blob{buf->data(), to_u32(buf->size()), false};
                 s.materialize(0, 0); // hold a slot in keep-alive (lifetime-only)
                 std::lock_guard< std::mutex > _lk{global_keepalive_mtx_};
                 global_keepalive_.push_back(buf);
@@ -330,7 +330,7 @@ CORO_TEST_F(LogStoreTest, ConcurrentAppends) {
 CORO_TEST_F(LogStoreTest, OutOfOrderWritesThenTruncate) {
     co_await self.bootstrap();
     auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/false);
-    log_store_mgr().open_log_store(raw->store_id(), [](lsn_t, const sisl::ByteView&) {});
+    log_store_mgr().open_log_store(raw->store_id(), [](lsn_t, const sisl::IoBufView&) {});
     ShadowStore s{raw};
 
     // Issue LSNs 0..15 in shuffled order; verify reads see them all.
@@ -370,7 +370,7 @@ CORO_TEST_F(LogStoreTest, OutOfOrderWritesThenTruncate) {
 CORO_TEST_F(LogStoreTest, WriteWithHolesAndFillGap) {
     co_await self.bootstrap();
     auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/false);
-    log_store_mgr().open_log_store(raw->store_id(), [](lsn_t, const sisl::ByteView&) {});
+    log_store_mgr().open_log_store(raw->store_id(), [](lsn_t, const sisl::IoBufView&) {});
     ShadowStore s{raw};
 
     // Write LSNs 0,1,2,4,5,7 (holes at 3,6).
@@ -401,8 +401,8 @@ CORO_TEST_F(LogStoreTest, GlobalTruncateMinAcrossStores) {
     //   off:     0          off_b0    off_a1    off_b1
     auto raw_a = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
     auto raw_b = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
-    log_store_mgr().open_log_store(raw_a->store_id(), [](lsn_t, const sisl::ByteView&) {});
-    log_store_mgr().open_log_store(raw_b->store_id(), [](lsn_t, const sisl::ByteView&) {});
+    log_store_mgr().open_log_store(raw_a->store_id(), [](lsn_t, const sisl::IoBufView&) {});
+    log_store_mgr().open_log_store(raw_b->store_id(), [](lsn_t, const sisl::IoBufView&) {});
     ShadowStore a{raw_a};
     ShadowStore b{raw_b};
 
@@ -462,8 +462,8 @@ TEST_F(LogStoreTest, GlobalTruncateAcrossRestart) {
                                 auto raw_b = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
                                 sid_a = raw_a->store_id();
                                 sid_b = raw_b->store_id();
-                                log_store_mgr().open_log_store(sid_a, [](lsn_t, const sisl::ByteView&) {});
-                                log_store_mgr().open_log_store(sid_b, [](lsn_t, const sisl::ByteView&) {});
+                                log_store_mgr().open_log_store(sid_a, [](lsn_t, const sisl::IoBufView&) {});
+                                log_store_mgr().open_log_store(sid_b, [](lsn_t, const sisl::IoBufView&) {});
                                 {
                                     ShadowStore a{raw_a};
                                     ShadowStore b{raw_b};
@@ -509,8 +509,8 @@ CORO_TEST_F(LogStoreTest, GlobalTruncateNoOpWhenStoreEmpty) {
     co_await self.bootstrap();
     auto raw_a = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
     auto raw_b = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
-    log_store_mgr().open_log_store(raw_a->store_id(), [](lsn_t, const sisl::ByteView&) {});
-    log_store_mgr().open_log_store(raw_b->store_id(), [](lsn_t, const sisl::ByteView&) {});
+    log_store_mgr().open_log_store(raw_a->store_id(), [](lsn_t, const sisl::IoBufView&) {});
+    log_store_mgr().open_log_store(raw_b->store_id(), [](lsn_t, const sisl::IoBufView&) {});
     ShadowStore a{raw_a};
     ShadowStore b{raw_b};
 
@@ -550,7 +550,7 @@ TEST_F(LogStoreTest, TruncatePartialAcrossRestart) {
         co_await bootstrap();
         auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
         sid = raw->store_id();
-        log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::ByteView&) {});
+        log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::IoBufView&) {});
         {
             ShadowStore s{raw};
             constexpr uint32_t N = 12;
@@ -588,7 +588,7 @@ TEST_F(LogStoreTest, TruncateAllAcrossRestart) {
         co_await bootstrap();
         auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
         sid = raw->store_id();
-        log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::ByteView&) {});
+        log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::IoBufView&) {});
         {
             ShadowStore s{raw};
             for (uint32_t i = 0; i < 4; ++i) {
@@ -622,7 +622,7 @@ TEST_F(LogStoreTest, BasicReplayPreservesOrder) {
         co_await bootstrap();
         auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
         sid = raw->store_id();
-        log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::ByteView&) {});
+        log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::IoBufView&) {});
         {
             ShadowStore s{raw};
             for (uint32_t i = 0; i < 16; ++i) {
@@ -657,7 +657,7 @@ TEST_F(LogStoreTest, AppendRestartAppendRestart) {
         co_await bootstrap();
         auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
         sid = raw->store_id();
-        log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::ByteView&) {});
+        log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::IoBufView&) {});
         ShadowStore s{raw};
         for (uint32_t i = 0; i < 8; ++i) {
             auto blob = s.materialize(i, 128);
@@ -707,7 +707,7 @@ TEST_F(LogStoreTest, AppendRestartAppendRestart) {
 CORO_TEST_F(LogStoreTest, RollbackBasic) {
     co_await self.bootstrap();
     auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
-    log_store_mgr().open_log_store(raw->store_id(), [](lsn_t, const sisl::ByteView&) {});
+    log_store_mgr().open_log_store(raw->store_id(), [](lsn_t, const sisl::IoBufView&) {});
     ShadowStore s{raw};
 
     for (uint32_t i = 0; i < 10; ++i) {
@@ -743,7 +743,7 @@ TEST_F(LogStoreTest, RollbackPersistsAcrossRestart) {
         co_await bootstrap();
         auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
         sid = raw->store_id();
-        log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::ByteView&) {});
+        log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::IoBufView&) {});
         ShadowStore s{raw};
         for (uint32_t i = 0; i < 10; ++i) {
             auto blob = s.materialize(i, 64);
@@ -784,7 +784,7 @@ TEST_F(LogStoreTest, RollbackAppendRestartCycle) {
                                 co_await bootstrap();
                                 auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
                                 sid = raw->store_id();
-                                log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::ByteView&) {});
+                                log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::IoBufView&) {});
                                 ShadowStore s{raw};
                                 const lsn_t batch_start = s.store().tail_lsn() + 1;
                                 for (uint32_t i = 0; i < kBatchSize; ++i) {
@@ -859,7 +859,7 @@ TEST_F(LogStoreTest, RollbackAppendNoRestartCycle) {
                                 co_await bootstrap();
                                 auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
                                 sid = raw->store_id();
-                                log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::ByteView&) {});
+                                log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::IoBufView&) {});
                                 ShadowStore s{raw};
                                 for (uint32_t cycle = 0; cycle < N_CYCLES; ++cycle) {
                                     const lsn_t batch_start = s.store().tail_lsn() + 1;
@@ -900,7 +900,7 @@ TEST_F(LogStoreTest, RollbackAppendNoRestartCycle) {
 CORO_TEST_F(LogStoreTest, WriteAndFlushReturnsDurable) {
     co_await self.bootstrap();
     auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/false);
-    log_store_mgr().open_log_store(raw->store_id(), [](lsn_t, const sisl::ByteView&) {});
+    log_store_mgr().open_log_store(raw->store_id(), [](lsn_t, const sisl::IoBufView&) {});
     ShadowStore s{raw};
 
     auto blob = s.materialize(/*lsn=*/0, 64);
@@ -917,7 +917,7 @@ CORO_TEST_F(LogStoreTest, WriteAndFlushReturnsDurable) {
 CORO_TEST_F(LogStoreTest, ReadOutOfRangeReturnsEmpty) {
     co_await self.bootstrap();
     auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
-    log_store_mgr().open_log_store(raw->store_id(), [](lsn_t, const sisl::ByteView&) {});
+    log_store_mgr().open_log_store(raw->store_id(), [](lsn_t, const sisl::IoBufView&) {});
     ShadowStore s{raw};
 
     auto blob = s.materialize(/*lsn=*/0, 64);

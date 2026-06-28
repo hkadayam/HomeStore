@@ -52,7 +52,7 @@ public:
 
     ~RangeCache() { m_evictor->unregister_record_family(m_record_family_id); }
 
-    uint32_t insert(const K& base_key, uint32_t offset, uint32_t count, sisl::IoBlob&& value) {
+    uint32_t insert(const K& base_key, uint32_t offset, uint32_t count, sisl::IoBufSpan&& value) {
         uint32_t failed_count{0};
         m_map.insert(RangeKey{base_key, offset, count}, std::move(value));
         if (t_failed_keys.size()) {
@@ -68,7 +68,7 @@ public:
 
     void remove(const K& base_key, uint32_t offset, uint32_t count) { m_map.erase(RangeKey{base_key, offset, count}); }
 
-    std::vector< std::pair< RangeKey< K >, sisl::ByteView > > get(const K& base_key, uint32_t offset, uint32_t count) {
+    std::vector< std::pair< RangeKey< K >, sisl::IoBufView > > get(const K& base_key, uint32_t offset, uint32_t count) {
         return m_map.get(RangeKey{base_key, offset, count});
     }
 
@@ -110,8 +110,8 @@ private:
         }
     }
 
-    sisl::ByteView extract_value(const sisl::ByteView& inp_bytes, uint32_t nth, uint32_t count) {
-        return sisl::ByteView{inp_bytes, nth * m_per_value_size, count * m_per_value_size};
+    sisl::IoBufView extract_value(const sisl::IoBufView& inp_bytes, uint32_t nth, uint32_t count) {
+        return sisl::IoBufView{inp_bytes, nth * m_per_value_size, count * m_per_value_size};
     }
 };
 

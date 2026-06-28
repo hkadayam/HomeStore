@@ -49,6 +49,25 @@ namespace sisl {
 // Non-owning pointer + size.  Debug builds track constness via is_const_;
 // release builds are zero-overhead.  uint32_t size is intentional (4 GB cap).
 
+// ── IoBuf (abstract base) ──────────────────────────────────────────────────
+// Common abstract base implemented by every concrete IO-buffer type — IoBufSpan (non-owning view),
+// IoBufOwn (owning aligned), IoBufView (non-owning slice with shared lifetime).  Lower IO layers
+// (DriveInterface / PhysicalDev / VirtualDev / RawBlkStream) accept `IoBuf const&` / `IoBuf&`
+// and rely on the virtual accessors to extract bytes, length, and alignment for direct IO.
+class IoBuf {
+public:
+    virtual ~IoBuf() = default;
+    virtual uint8_t* bytes() = 0;
+    virtual uint8_t const* cbytes() const = 0;
+    virtual uint32_t size() const = 0;
+    virtual bool is_aligned() const = 0;
+    /// True if this IoBuf manages its own memory lifetime (RAII owning, refcounted, or held-alive via shared
+    /// pointer).  False for pure non-owning views where the caller must guarantee the underlying memory
+    /// outlives all uses.  Used by the vectored I/O path to assert that scatter-gather sources are safe to
+    /// pass across async boundaries.
+    virtual bool is_safe() const = 0;
+};
+
 struct Blob {
 protected:
     uint8_t* bytes_{nullptr};
@@ -93,56 +112,21 @@ public:
     }
 };
 
-// ── SgList / SgIterator ───────────────────────────────────────────────────────
-
-using SgIovs = folly::small_vector< iovec, 4 >;
-
+// ── SgList ────────────────────────────────────────────────────────────────────
+// Scatter-gather list of polymorphic IoBuf pointers.  Used by the device I/O writev/readv path so each
+// element retains its concrete type, alignment, and lifetime semantics through the call.  Each IoBuf*
+// must outlive the await of the operation; SgList itself does not own the buffers.
 struct SgList {
-    uint64_t size{0}; // total size of data pointed by iovs
-    SgIovs iovs;
-};
+    folly::small_vector< IoBuf*, 4 > bufs;
 
-struct SgIterator {
-    SgIterator(const SgIovs& v) : input_iovs_{v} { assert(v.size() > 0); }
-
-    SgIovs next_iovs(uint32_t size) {
-        SgIovs ret_iovs;
-        auto remain_size = size;
-        while ((remain_size > 0) && (cur_index_ < input_iovs_.size())) {
-            const auto& inp_iov = input_iovs_[cur_index_];
-            iovec this_iov;
-            this_iov.iov_base = static_cast< uint8_t* >(inp_iov.iov_base) + cur_offset_;
-            if (remain_size < inp_iov.iov_len - cur_offset_) {
-                this_iov.iov_len = remain_size;
-                cur_offset_ += remain_size;
-            } else {
-                this_iov.iov_len = inp_iov.iov_len - cur_offset_;
-                ++cur_index_;
-                cur_offset_ = 0;
-            }
-            ret_iovs.push_back(this_iov);
-            assert(remain_size >= this_iov.iov_len);
-            remain_size -= this_iov.iov_len;
+    /// Sum of `b->size()` across all entries — total bytes the SG list represents.
+    uint32_t total_size() const {
+        uint32_t s = 0;
+        for (auto const* b : bufs) {
+            s += b->size();
         }
-        return ret_iovs;
+        return s;
     }
-
-    void move_offset(uint32_t size) {
-        auto remain_size = size;
-        const auto n = input_iovs_.size();
-        for (; (remain_size > 0) && (cur_index_ < n); ++cur_index_, cur_offset_ = 0) {
-            const auto& inp_iov = input_iovs_[cur_index_];
-            if (remain_size < inp_iov.iov_len - cur_offset_) {
-                cur_offset_ += remain_size;
-                return;
-            }
-            remain_size -= inp_iov.iov_len - cur_offset_;
-        }
-    }
-
-    const SgIovs& input_iovs_;
-    uint64_t cur_offset_{0};
-    size_t cur_index_{0};
 };
 
 // ── Buftag ────────────────────────────────────────────────────────────────────
@@ -319,29 +303,38 @@ public:
 template < typename T, std::size_t Alignment = 512 >
 using AlignedVector = std::vector< T, AlignedTypeAllocator< T, Alignment > >;
 
-// ── IoBlob ────────────────────────────────────────────────────────────────────
+// ── IoBufSpan ────────────────────────────────────────────────────────────────────
 
-struct IoBlob;
-using IoBlobList = folly::small_vector< sisl::IoBlob, 4 >;
+struct IoBufSpan;
+using IoBufSpanList = folly::small_vector< sisl::IoBufSpan, 4 >;
 
-struct IoBlob : public Blob {
+struct IoBufSpan : public Blob, public IoBuf {
 protected:
     bool aligned_{false};
 
 public:
-    IoBlob() = default;
-    IoBlob(size_t sz, uint32_t align_size = 512, Buftag tag = Buftag::common) {
+    IoBufSpan() = default;
+    IoBufSpan(size_t sz, uint32_t align_size = 512, Buftag tag = Buftag::common) {
 #ifdef _DEBUG
         buf_alloc_and_init(sz, align_size, tag, 0xEE);
 #else
         buf_alloc(sz, align_size, tag);
 #endif
     }
-    IoBlob(uint8_t* bytes, uint32_t size, bool is_aligned) : Blob(bytes, size), aligned_{is_aligned} {
+    IoBufSpan(uint8_t* bytes, uint32_t size, bool is_aligned) : Blob(bytes, size), aligned_{is_aligned} {
     }
-    IoBlob(uint8_t const* bytes, uint32_t size, bool is_aligned) : Blob(bytes, size), aligned_{is_aligned} {
+    IoBufSpan(uint8_t const* bytes, uint32_t size, bool is_aligned) : Blob(bytes, size), aligned_{is_aligned} {
     }
-    ~IoBlob() = default;
+    ~IoBufSpan() override = default;
+
+    // ── IoBuf overrides ────────────────────────────────────────────────────
+    uint8_t* bytes() override { return Blob::bytes(); }
+    uint8_t const* cbytes() const override { return Blob::cbytes(); }
+    uint32_t size() const override { return Blob::size(); }
+    bool is_aligned() const override { return aligned_; }
+    /// Non-owning view — caller must guarantee underlying memory outlives every use.  IoBufOwn overrides
+    /// to true since it RAII-manages its own buffer.
+    bool is_safe() const override { return false; }
 
     void buf_alloc(size_t sz, uint32_t align_size = 512, Buftag tag = Buftag::common) {
         aligned_ = (align_size != 0);
@@ -373,64 +366,55 @@ public:
         Blob::bytes_ = new_buf;
     }
 
-    bool is_aligned() const {
-        return aligned_;
+    static IoBufSpan from_string(const std::string& s) {
+        return IoBufSpan{r_cast< const uint8_t* >(s.data()), uint32_cast(s.size()), false};
     }
 
-    static IoBlob from_string(const std::string& s) {
-        return IoBlob{r_cast< const uint8_t* >(s.data()), uint32_cast(s.size()), false};
-    }
-
-    static IoBlobList sg_list_to_ioblob_list(const SgList& sglist) {
-        IoBlobList ret_list;
-        for (const auto& iov : sglist.iovs) {
-            ret_list.emplace_back(r_cast< uint8_t* >(const_cast< void* >(iov.iov_base)), uint32_cast(iov.iov_len),
-                                  false);
-        }
-        return ret_list;
-    }
 };
 
-// ── IoBlobSafe ────────────────────────────────────────────────────────────────
+// ── IoBufOwn ────────────────────────────────────────────────────────────────
 // Owns its buffer: allocates on construction, frees on destruction.
 
-struct IoBlobSafe final : public IoBlob {
+struct IoBufOwn final : public IoBufSpan {
 public:
     Buftag tag_{Buftag::common};
 
 public:
-    IoBlobSafe() = default;
-    IoBlobSafe(uint32_t sz, uint32_t alignment = 512, Buftag tag = Buftag::common) :
-            IoBlob(sz, alignment, tag), tag_{tag} {}
-    IoBlobSafe(uint8_t* bytes, uint32_t size, bool is_aligned) : IoBlob(bytes, size, is_aligned) {}
-    IoBlobSafe(uint8_t const* bytes, uint32_t size, bool is_aligned) : IoBlob(bytes, size, is_aligned) {}
-    ~IoBlobSafe() {
+    IoBufOwn() = default;
+    IoBufOwn(uint32_t sz, uint32_t alignment = 512, Buftag tag = Buftag::common) :
+            IoBufSpan(sz, alignment, tag), tag_{tag} {}
+    IoBufOwn(uint8_t* bytes, uint32_t size, bool is_aligned) : IoBufSpan(bytes, size, is_aligned) {}
+    IoBufOwn(uint8_t const* bytes, uint32_t size, bool is_aligned) : IoBufSpan(bytes, size, is_aligned) {}
+    ~IoBufOwn() {
         if (Blob::bytes_ != nullptr) {
-            IoBlob::buf_free(tag_);
+            IoBufSpan::buf_free(tag_);
         }
     }
 
-    IoBlobSafe(IoBlobSafe const&) = delete;
-    IoBlobSafe(IoBlobSafe&& other) : IoBlob(std::move(other)), tag_(other.tag_) {
+    /// Owns its buffer via RAII alloc/free.
+    bool is_safe() const override { return true; }
+
+    IoBufOwn(IoBufOwn const&) = delete;
+    IoBufOwn(IoBufOwn&& other) : IoBufSpan(std::move(other)), tag_(other.tag_) {
         other.bytes_ = nullptr;
         other.size_ = 0;
     }
 
-    IoBlobSafe& operator=(IoBlobSafe const&) = delete;
-    IoBlobSafe& operator=(IoBlobSafe&& other) {
+    IoBufOwn& operator=(IoBufOwn const&) = delete;
+    IoBufOwn& operator=(IoBufOwn&& other) {
         if (Blob::bytes_ != nullptr) {
             this->buf_free(tag_);
         }
-        *static_cast< IoBlob* >(this) = std::move(*static_cast< IoBlob* >(&other));
+        *static_cast< IoBufSpan* >(this) = std::move(*static_cast< IoBufSpan* >(&other));
         tag_ = other.tag_;
         other.bytes_ = nullptr;
         other.size_ = 0;
         return *this;
     }
 
-    void buf_alloc(size_t sz, uint32_t align_size = 512) { IoBlob::buf_alloc(sz, align_size, tag_); }
+    void buf_alloc(size_t sz, uint32_t align_size = 512) { IoBufSpan::buf_alloc(sz, align_size, tag_); }
 
-    // Release ownership of the internal buffer into a shared_ptr<uint8_t>.  After this call the IoBlobSafe is empty
+    // Release ownership of the internal buffer into a shared_ptr<uint8_t>.  After this call the IoBufOwn is empty
     // and will NOT free the buffer on destruction.  The returned shared_ptr uses the same free path as buf_free().
     shared< uint8_t > release_to_shared_ptr() {
         auto* p = bytes_;
@@ -442,82 +426,81 @@ public:
     }
 };
 
-// ── IOBuffer ──────────────────────────────────────────────────────────────────
-// Public alias for IoBlobSafe — the canonical aligned heap buffer used across the IO path
-// (drive_interface, virtual_dev, blob streams, meta service). Lives here rather than in
-// iomanager/drive_interface.h so callers that only need the type don't drag in folly::coro.
+// ── IoBufShared / IoBufView ──────────────────────────────────────────────────────
 
-using IOBuffer = IoBlobSafe;
+using IoBufSharedImpl = IoBufOwn;
+using IoBufShared = shared< IoBufOwn >;
 
-// ── ByteArray / ByteView ──────────────────────────────────────────────────────
-
-using ByteArrayImpl = IoBlobSafe;
-using ByteArray = shared< IoBlobSafe >;
-
-inline ByteArray make_byte_array(uint32_t sz, uint32_t alignment = 0, Buftag tag = Buftag::common) {
-    return std::make_shared< IoBlobSafe >(sz, alignment, tag);
+inline IoBufShared make_io_buf_shared(uint32_t sz, uint32_t alignment = 0, Buftag tag = Buftag::common) {
+    return std::make_shared< IoBufOwn >(sz, alignment, tag);
 }
 
-inline ByteArray make_byte_array(IoBlobSafe&& blob) {
-    return std::make_shared< IoBlobSafe >(std::move(blob));
+inline IoBufShared make_io_buf_shared(IoBufOwn&& blob) {
+    return std::make_shared< IoBufOwn >(std::move(blob));
 }
 
-/// Zero-copy ByteArray from a shared_ptr<uint8_t>.  The IoBlobSafe wrapper is heap-allocated (~24 bytes) but the
-/// actual buffer is not copied.  The shared_ptr<uint8_t> is captured in the deleter and freed when the ByteArray
+/// Zero-copy IoBufShared from a shared_ptr<uint8_t>.  The IoBufOwn wrapper is heap-allocated (~24 bytes) but the
+/// actual buffer is not copied.  The shared_ptr<uint8_t> is captured in the deleter and freed when the IoBufShared
 /// refcount reaches 0.
-inline ByteArray make_byte_array(std::shared_ptr< uint8_t > owner, uint32_t size, bool is_aligned = true) {
+inline IoBufShared make_io_buf_shared(std::shared_ptr< uint8_t > owner, uint32_t size, bool is_aligned = true) {
     auto* raw = owner.get();
-    return ByteArray(new IoBlobSafe(raw, size, is_aligned), [o = std::move(owner)](IoBlobSafe* p) {
-        // Null out bytes_ so IoBlobSafe's destructor skips buf_free — the captured `o` shared_ptr owns the buffer.
+    return IoBufShared(new IoBufOwn(raw, size, is_aligned), [o = std::move(owner)](IoBufOwn* p) {
+        // Null out bytes_ so IoBufOwn's destructor skips buf_free — the captured `o` shared_ptr owns the buffer.
         // static_cast is required to disambiguate between the uint8_t* and uint8_t const* overloads of set_bytes.
         p->set_bytes(static_cast< uint8_t* >(nullptr));
         delete p;
     });
 }
 
-struct ByteView {
+class IoBufView : public IoBuf {
 public:
-    ByteView() = default;
-    ByteView(uint32_t sz, uint32_t alignment = 0, Buftag tag = Buftag::common) {
-        base_buf_ = make_byte_array(sz, alignment, tag);
+    IoBufView() = default;
+    IoBufView(uint32_t sz, uint32_t alignment = 0, Buftag tag = Buftag::common) {
+        base_buf_ = make_io_buf_shared(sz, alignment, tag);
         view_.set_bytes(base_buf_->cbytes());
         view_.set_size(base_buf_->size());
     }
-    ByteView(ByteArray buf) {
+    IoBufView(IoBufShared buf) {
         base_buf_ = std::move(buf);
         view_.set_bytes(base_buf_->cbytes());
         view_.set_size(base_buf_->size());
     }
-    ByteView(ByteArray buf, uint32_t offset, uint32_t sz) {
+    IoBufView(IoBufShared buf, uint32_t offset, uint32_t sz) {
         base_buf_ = std::move(buf);
         view_.set_bytes(base_buf_->cbytes() + offset);
         view_.set_size(sz);
     }
-    ByteView(const ByteView& v, uint32_t offset, uint32_t sz) {
+    IoBufView(const IoBufView& v, uint32_t offset, uint32_t sz) {
         DEBUG_ASSERT_GE(v.view_.size(), sz + offset);
         base_buf_ = v.base_buf_;
         view_.set_bytes(v.view_.cbytes() + offset);
         view_.set_size(sz);
     }
-    ByteView(const sisl::IoBlob& b) : ByteView(b.size(), b.is_aligned()) {}
+    IoBufView(const sisl::IoBufSpan& b) : IoBufView(b.size(), b.is_aligned()) {}
 
-    ~ByteView() = default;
-    ByteView(const ByteView&) = default;
-    ByteView& operator=(const ByteView&) = default;
+    ~IoBufView() override = default;
+    IoBufView(const IoBufView&) = default;
+    IoBufView& operator=(const IoBufView&) = default;
 
-    ByteView(ByteView&& other) {
+    IoBufView(IoBufView&& other) {
         base_buf_ = std::move(other.base_buf_);
         view_ = std::move(other.view_);
     }
-    ByteView& operator=(ByteView&& other) {
+    IoBufView& operator=(IoBufView&& other) {
         base_buf_ = std::move(other.base_buf_);
         view_ = std::move(other.view_);
         return *this;
     }
 
     Blob get_blob() const { return view_; }
-    uint8_t const* bytes() const { return view_.cbytes(); }
-    uint32_t size() const { return view_.size(); }
+
+    // ── IoBuf overrides ────────────────────────────────────────────────────
+    uint8_t* bytes() override { return view_.bytes(); }
+    uint8_t const* cbytes() const override { return view_.cbytes(); }
+    uint32_t size() const override { return view_.size(); }
+    bool is_aligned() const override { return base_buf_ ? base_buf_->is_aligned() : false; }
+    /// Underlying memory is kept alive via base_buf_ (shared_ptr to IoBufOwn).
+    bool is_safe() const override { return true; }
 
     void move_forward(uint32_t by) {
         DEBUG_ASSERT_GE(view_.size(), by, "Size greater than move forward request by");
@@ -526,11 +509,11 @@ public:
         validate();
     }
 
-    ByteArray extract(uint32_t alignment = 0) const {
+    IoBufShared extract(uint32_t alignment = 0) const {
         if (can_do_shallow_copy()) {
             return base_buf_;
         }
-        auto base_buf = make_byte_array(view_.size(), alignment, base_buf_->tag_);
+        auto base_buf = make_io_buf_shared(view_.size(), alignment, base_buf_->tag_);
         std::memcpy(base_buf->bytes(), view_.cbytes(), view_.size());
         return base_buf;
     }
@@ -541,12 +524,12 @@ public:
     void set_size(uint32_t sz) { view_.set_size(sz); }
     void validate() const {
         DEBUG_ASSERT_LE((void*)(base_buf_->cbytes() + base_buf_->size()), (void*)(view_.cbytes() + view_.size()),
-                        "Invalid ByteView");
+                        "Invalid IoBufView");
     }
     std::string get_string() const { return std::string(r_cast< const char* >(bytes()), uint64_cast(size())); }
 
 private:
-    ByteArray base_buf_;
+    IoBufShared base_buf_;
     Blob view_;
 };
 
@@ -555,7 +538,7 @@ private:
 struct BufBuilder {
 public:
     BufBuilder(uint32_t sz, uint32_t alignment = 0, Buftag tag = Buftag::common) : alignment_{alignment} {
-        buf_ = make_byte_array(sz, alignment, tag);
+        buf_ = make_io_buf_shared(sz, alignment, tag);
         cur_ptr_ = buf_->bytes();
     }
 
@@ -570,20 +553,20 @@ public:
         cur_ptr_ += incoming_buf.size();
     }
 
-    ByteView view() const { return ByteView{buf_, 0, occupied_space()}; }
+    IoBufView view() const { return IoBufView{buf_, 0, occupied_space()}; }
     uint8_t* bytes() const { return buf_->bytes(); }
     uint32_t occupied_space() const { return cur_ptr_ - buf_->bytes(); }
     uint32_t available_space() const { return buf_->size() - occupied_space(); }
 
 private:
-    ByteArray buf_;
+    IoBufShared buf_;
     uint32_t alignment_{0};
     uint8_t* cur_ptr_{nullptr};
 };
 
 // ── LargeBufBuilder ──────────────────────────────────────────────────────────
-// Chain of fixed-size aligned IoBlobSafe buffers.  append() memcpys into the current buffer; when full, a new one is
-// allocated — no realloc/copy of prior data.  for_each_piece() walks the chain calling cb(IoBlobSafe&) with the
+// Chain of fixed-size aligned IoBufOwn buffers.  append() memcpys into the current buffer; when full, a new one is
+// allocated — no realloc/copy of prior data.  for_each_piece() walks the chain calling cb(IoBufOwn&) with the
 // buffer's size already set to the used byte count, ready to pass directly to I/O layers.
 
 struct LargeBufBuilder {
@@ -632,7 +615,7 @@ public:
 
     // Move all buffers out as a vector; the last (partially filled) buffer's size is set to the used byte count.  All
     // earlier buffers already carry size == buf_capacity_ from construction.  Builder is empty after this call.
-    std::vector< IoBlobSafe > move_all_bufs() {
+    std::vector< IoBufOwn > move_all_bufs() {
         if (!bufs_.empty()) {
             bufs_.back().set_size(cur_offset_);
         }
@@ -641,7 +624,7 @@ public:
     }
 
     // Consume the builder: moves each buffer out to cb with its size set to the used byte count.
-    // The builder is empty after this call.  cb signature: void(IoBlobSafe&&).
+    // The builder is empty after this call.  cb signature: void(IoBufOwn&&).
     template < typename Cb >
     void consume(Cb&& cb) {
         for (size_t i = 0; i < bufs_.size(); ++i) {
@@ -670,7 +653,7 @@ public:
     }
 
 private:
-    std::vector< IoBlobSafe > bufs_;
+    std::vector< IoBufOwn > bufs_;
     uint32_t cur_offset_{0};
     uint32_t buf_capacity_{256 * 4096}; // default 1 MB
     uint32_t alignment_{512};

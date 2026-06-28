@@ -17,7 +17,7 @@
 #include "common/homestore_config.h"
 
 // Dynamic tests spawn spare replica's also which can be used to add and remove from a repl dev.
-class ReplDevDynamicTest : public RaftReplDevTestBase {
+class ReplicaSetDynamicTest : public RaftReplicaSetTestBase {
 private:
     bool is_replica_num_in(const std::set< uint32_t >& replicas) {
         // Check if the current replica process is in this set.
@@ -25,7 +25,7 @@ private:
     }
 };
 
-TEST_F(ReplDevDynamicTest, ReplaceMember) {
+TEST_F(ReplicaSetDynamicTest, ReplaceMember) {
     LOGINFO("ReplaceMember test started replica={}", g_helper->replica_num());
     // Write some IO's, replace a member, validate all members data except which is out.
     auto db = dbs_.back();
@@ -61,10 +61,10 @@ TEST_F(ReplDevDynamicTest, ReplaceMember) {
     g_helper->sync_for_verify_start(num_members);
     LOGINFO("data synced, sync_for_verify_state replica={} ", g_helper->replica_num());
 
-    //wait for background reaper thread to trigger complete_replace_member
+    // wait for background reaper thread to trigger complete_replace_member
     if (g_helper->replica_num() == member_out) {
         // The out member will have the repl dev destroyed.
-        auto repl_dev = std::dynamic_pointer_cast< RaftReplDev >(db->repl_dev());
+        auto repl_dev = std::dynamic_pointer_cast< RaftReplicaSet >(db->repl_dev());
         while (repl_dev && !repl_dev->is_destroyed()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             auto& raft_repl_svc = dynamic_cast< RaftReplService& >(hs()->repl_service());
@@ -78,7 +78,7 @@ TEST_F(ReplDevDynamicTest, ReplaceMember) {
     LOGINFO("ReplaceMember test done replica={}", g_helper->replica_num());
 }
 
-TEST_F(ReplDevDynamicTest, TwoMemberDown) {
+TEST_F(ReplicaSetDynamicTest, TwoMemberDown) {
     LOGINFO("TwoMemberDown test started replica={}", g_helper->replica_num());
 
     // Make two members down in a group and leader cant reach a quorum.
@@ -144,7 +144,7 @@ TEST_F(ReplDevDynamicTest, TwoMemberDown) {
     LOGINFO("TwoMemberDown test done replica={}", g_helper->replica_num());
 }
 
-TEST_F(ReplDevDynamicTest, OutMemberDown) {
+TEST_F(ReplicaSetDynamicTest, OutMemberDown) {
     // replica0(leader) and replica1 up, replica2 is down. Replace replica2 with replica3.
     // replica0 should be able to baseline resync to replica4(new member).
     // Write some IO's, replace a member, validate all members data except which is out.
@@ -167,7 +167,7 @@ TEST_F(ReplDevDynamicTest, OutMemberDown) {
         LOGINFO("Writing on leader num_io={} replica={}", num_io_entries, g_helper->replica_num());
         this->write_on_leader(num_io_entries, true /* wait_for_commit */);
     }
-    //shut down before replace member
+    // shut down before replace member
     this->shutdown_replica(2);
     LOGINFO("Shutdown replica 2");
 
@@ -201,7 +201,7 @@ TEST_F(ReplDevDynamicTest, OutMemberDown) {
         LOGINFO("Start replica 2");
         this->start_replica(2);
         // The out member will have the repl dev destroyed.
-        auto repl_dev = std::dynamic_pointer_cast< RaftReplDev >(db->repl_dev());
+        auto repl_dev = std::dynamic_pointer_cast< RaftReplicaSet >(db->repl_dev());
         while (repl_dev && !repl_dev->is_destroyed()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             auto& raft_repl_svc = dynamic_cast< RaftReplService& >(hs()->repl_service());
@@ -216,7 +216,7 @@ TEST_F(ReplDevDynamicTest, OutMemberDown) {
     LOGINFO("OneMemberDown test done replica={}", g_helper->replica_num());
 }
 
-TEST_F(ReplDevDynamicTest, LeaderReplace) {
+TEST_F(ReplicaSetDynamicTest, LeaderReplace) {
     // replica0(leader) and replica1 and replica2 is up. Replace replica0(leader) with replica3.
     // replica0 will yield leadership and any other replica will be come leader  and leader
     // will do baseline resync to replica4(new member).
@@ -242,8 +242,7 @@ TEST_F(ReplDevDynamicTest, LeaderReplace) {
         // Leader will return error NOT_LEADER and yield leadership, sleep and connect again
         // to the new leader.
         LOGINFO("Replace old leader");
-        replace_member(db, g_helper->replica_id(member_out), g_helper->replica_id(member_in), 0,
-                       ReplServiceError::NOT_LEADER);
+        replace_member(db, g_helper->replica_id(member_out), g_helper->replica_id(member_in), 0, ReplError::NOT_LEADER);
         LOGINFO("Replace member leader yield done");
     }
     std::this_thread::sleep_for(std::chrono::seconds(3));
@@ -268,7 +267,7 @@ TEST_F(ReplDevDynamicTest, LeaderReplace) {
     LOGINFO("data synced, sync_for_verify_state replica={} ", g_helper->replica_num());
     if (g_helper->replica_num() == member_out) {
         // The out member will have the repl dev destroyed.
-        auto repl_dev = std::dynamic_pointer_cast< RaftReplDev >(db->repl_dev());
+        auto repl_dev = std::dynamic_pointer_cast< RaftReplicaSet >(db->repl_dev());
         while (repl_dev && !repl_dev->is_destroyed()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             auto& raft_repl_svc = dynamic_cast< RaftReplService& >(hs()->repl_service());
@@ -283,7 +282,7 @@ TEST_F(ReplDevDynamicTest, LeaderReplace) {
     LOGINFO("LeaderReplace test done replica={}", g_helper->replica_num());
 }
 
-TEST_F(ReplDevDynamicTest, OneMemberRestart) {
+TEST_F(ReplicaSetDynamicTest, OneMemberRestart) {
     // replica0(leader) is up and replica1 is restated, replica2 is down. Replace replica2 with replica3.
     // replica0 should be able to baseline resync to replica4(new member).
     // Write some IO's, replace a member, validate all members data except which is out.
@@ -328,7 +327,7 @@ TEST_F(ReplDevDynamicTest, OneMemberRestart) {
     LOGINFO("data synced, sync_for_verify_state replica={} ", g_helper->replica_num());
     if (g_helper->replica_num() == member_out) {
         // The out member will have the repl dev destroyed.
-        auto repl_dev = std::dynamic_pointer_cast< RaftReplDev >(db->repl_dev());
+        auto repl_dev = std::dynamic_pointer_cast< RaftReplicaSet >(db->repl_dev());
         while (repl_dev && !repl_dev->is_destroyed()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             auto& raft_repl_svc = dynamic_cast< RaftReplService& >(hs()->repl_service());
@@ -342,7 +341,7 @@ TEST_F(ReplDevDynamicTest, OneMemberRestart) {
     LOGINFO("OneMemberRestart test done replica={}", g_helper->replica_num());
 }
 
-TEST_F(ReplDevDynamicTest, ValidateRequest) {
+TEST_F(ReplicaSetDynamicTest, ValidateRequest) {
     LOGINFO("ValidateRequest test started replica={}", g_helper->replica_num());
     HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
         s.consensus.laggy_threshold = 0;
@@ -362,11 +361,11 @@ TEST_F(ReplDevDynamicTest, ValidateRequest) {
 
     g_helper->sync_for_test_start(num_members);
 
-    //shut down before replace member
+    // shut down before replace member
     this->shutdown_replica(1);
     LOGINFO("Shutdown replica 1");
 
-    //wait for shutdown
+    // wait for shutdown
     std::this_thread::sleep_for(std::chrono::seconds(3));
     g_helper->sync_for_verify_start(num_members);
     if (g_helper->replica_num() == 0) {
@@ -377,15 +376,15 @@ TEST_F(ReplDevDynamicTest, ValidateRequest) {
     g_helper->sync_for_verify_start(num_members);
     if (g_helper->replica_num() == 0) {
         // generate uuid
-        replica_id_t fake_member_out = boost::uuids::random_generator()();
-        replica_id_t fake_member_in = boost::uuids::random_generator()();
+        ReplicaId fake_member_out = boost::uuids::random_generator()();
+        ReplicaId fake_member_in = boost::uuids::random_generator()();
         LOGINFO("test SERVER_NOT_FOUND");
-        replace_member(db, fake_member_out, fake_member_in, 0, ReplServiceError::SERVER_NOT_FOUND);
+        replace_member(db, fake_member_out, fake_member_in, 0, ReplError::SERVER_NOT_FOUND);
         LOGINFO("test replace_member already complete");
         replace_member(db, fake_member_out, g_helper->replica_id(0));
         LOGINFO("test QUORUM_NOT_MET", num_io_entries, g_helper->replica_num());
         replace_member(db, g_helper->replica_id(member_out), g_helper->replica_id(member_in), 0,
-                       ReplServiceError::QUORUM_NOT_MET);
+                       ReplError::QUORUM_NOT_MET);
     }
 
     if (g_helper->replica_num() == 1) {

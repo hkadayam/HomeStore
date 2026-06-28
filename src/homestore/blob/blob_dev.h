@@ -67,7 +67,7 @@ class BlobDev {
 public:
     // ── Types ────────────────────────────────────────────────────────────────
 
-    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::ByteView > >;
+    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::IoBufView > >;
 
     struct StreamRecoveryInfo {
         uint32_t blk_size{0}; // 0 = use vdev default
@@ -81,7 +81,7 @@ public:
     /// — chunk list lives in the sb payload.
     struct AppendByteSbInfo {
         MetaBlk sb;
-        sisl::ByteView payload;
+        sisl::IoBufView payload;
     };
     using AppendByteSbMap = std::map< uint64_t, AppendByteSbInfo >;
 

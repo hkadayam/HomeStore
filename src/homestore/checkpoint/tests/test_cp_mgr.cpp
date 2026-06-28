@@ -39,7 +39,7 @@
 
 using namespace homestore;
 using namespace iomanager;
-using sisl::IOBuffer;
+using sisl::IoBuf;
 
 SISL_OPTION_GROUP(test_cp_mgr,
                   (num_records, "", "num_records", "number of record to test",

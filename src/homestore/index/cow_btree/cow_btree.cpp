@@ -15,7 +15,7 @@
 
 namespace homestore {
 
-using sisl::IOBuffer;
+using sisl::IoBufOwn;
 
 // Source the [btree=] prefix from super_blk().btree_name (always present after construction) instead of going
 // through base_btree_, which isn't bound until the BtreeBase ctor runs — and recover() executes before that.
@@ -176,7 +176,7 @@ BtreeResult< Node > COWBtree::read_node(bnodeid_t id, LockType lock_type) {
     COWBT_LOG(DEBUG, "read_node: id={} compact_id={} blkid={}", id, to_compact_nodeid(id), blkid.to_string());
 
     // Read blkid from the stream
-    IOBuffer io_buf{base_btree_->node_size(), node_stream_->block_size(), sisl::Buftag::btree_node};
+    IoBufOwn io_buf{base_btree_->node_size(), node_stream_->block_size(), sisl::Buftag::btree_node};
     auto ec = CO_AWAIT node_stream_->read(io_buf, blkid);
     if (ec) {
         COWBT_LOG(ERROR, "read_node: stream read failed for node_id={} blkid={} ec={}", id, blkid.to_string(),
@@ -282,12 +282,12 @@ uint64_t COWBtree::space_occupied() const {
 // ──────────────────────────────────────────────────────────────────────────────────────────────────
 // Overflow support (RawBlkStream + overflow_cache_)
 //
-// write: alloc BlkId, copy data into IOBuffer, insert into cache + dirty list. No disk I/O.
+// write: alloc BlkId, copy data into IoBufOwn, insert into cache + dirty list. No disk I/O.
 // read:  cache hit → return immediately. Cache miss → co_await stream read, populate cache.
 // delete: evict from cache, add BlkId to deleted list. Actual invalidate happens at flush time.
 // ──────────────────────────────────────────────────────────────────────────────────────────────────
 
-BtreeStatus COWBtree::write_overflow(const sisl::ByteArray& buf, BlkId& out_blkid) {
+BtreeStatus COWBtree::write_overflow(const sisl::IoBufShared& buf, BlkId& out_blkid) {
     auto const blk_sz = overflow_stream_->block_size();
     auto const nblks = s_cast< blk_count_t >((buf->size() + blk_sz - 1) / blk_sz);
 
@@ -305,14 +305,14 @@ BtreeStatus COWBtree::write_overflow(const sisl::ByteArray& buf, BlkId& out_blki
     return BtreeStatus::success;
 }
 
-BtreeTask< BtreeStatus > COWBtree::read_overflow(const BlkId& blkid, sisl::ByteArray& out_buf) const {
+BtreeTask< BtreeStatus > COWBtree::read_overflow(const BlkId& blkid, sisl::IoBufShared& out_buf) const {
     if (auto h = overflow_cache_->find(blkid); h) {
         out_buf = h.value().buf;
         CO_RETURN BtreeStatus::success;
     }
 
     auto const blk_sz = overflow_stream_->block_size();
-    auto ba = sisl::make_byte_array(blkid.blk_count() * blk_sz, blk_sz, sisl::Buftag::btree_node);
+    auto ba = sisl::make_io_buf_shared(blkid.blk_count() * blk_sz, blk_sz, sisl::Buftag::btree_node);
     auto ec = CO_AWAIT overflow_stream_->read(*ba, blkid);
     if (ec) {
         CO_RETURN BtreeStatus::node_read_failed;
@@ -384,7 +384,7 @@ folly::coro::Task< void > flush_dirty_nodes(COWBtree& bt, CP* cp, OnNodeFlushed&
         // write, so we can compare against what comes out on read.  If this differs from node.node_id()
         // (which reads from the cache's NodeCore), the cache and the on-disk buffer are out of sync.
         bnodeid_t const buf_nid = *r_cast< bnodeid_t const* >(node.flush_buf->bytes() + 8);
-        sisl::ByteArray buf = std::move(node.flush_buf);
+        sisl::IoBufShared buf = std::move(node.flush_buf);
         auto bid = bt.node_stream_->quick_append(cp, /*segment_id=*/0, buf);
         if (!bid) {
             flush_futs.push_back(bt.node_stream_->flush(cp).scheduleOn(executor).start());
@@ -710,7 +710,7 @@ folly::coro::Task< void > COWBtree::recover_full_map(cp_id_t cur_cp_id) {
     }
 }
 
-folly::coro::Task< sisl::ByteView > COWBtree::read_from_incr_stream(uint64_t offset, size_t len) {
+folly::coro::Task< sisl::IoBufView > COWBtree::read_from_incr_stream(uint64_t offset, size_t len) {
     if (offset + len > incr_map_stream_->tail_offset()) {
         HS_REL_ASSERT(false, "Expected atleast {} bytes after offset={}, but got eof, tail_offset={}", len, offset,
                       incr_map_stream_->tail_offset());

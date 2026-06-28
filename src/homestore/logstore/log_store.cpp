@@ -67,7 +67,7 @@ folly::coro::Task< shared< LogStore > > LogStore::create(logstore_id_t sid, shar
 }
 
 folly::coro::Task< shared< LogStore > > LogStore::load(shared< LogStream > stream, MetaBlkWrapper&& mb) {
-    sisl::ByteView sb_payload = co_await mb.read();
+    sisl::IoBufView sb_payload = co_await mb.read();
     if (sb_payload.size() < sizeof(LogStoreSb)) {
         throw std::runtime_error(fmt::format("LogStore::load: sb payload too small ({} bytes)", sb_payload.size()));
     }
@@ -162,17 +162,17 @@ void LogStore::fill_gap(lsn_t lsn) {
 // Read / flush / truncate / rollback
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< sisl::ByteView > LogStore::read(lsn_t lsn) {
+folly::coro::Task< sisl::IoBufView > LogStore::read(lsn_t lsn) {
     auto exp = records_.try_at(lsn);
     if (!exp) {
         if (exp.error() == sisl::StreamTrackerError::OutOfRange) {
-            co_return sisl::ByteView{};
+            co_return sisl::IoBufView{};
         }
         // NotActive: may be in-flight, flush and retry once.
         co_await stream_->flush();
         exp = records_.try_at(lsn);
         if (!exp) {
-            co_return sisl::ByteView{};
+            co_return sisl::IoBufView{};
         }
     }
     auto rec = exp.value();
@@ -269,7 +269,7 @@ void LogStore::on_write_completion(lsn_t lsn, const stream_key& key) {
                       key.record_stream_offset, trunc_stream_offset);
 }
 
-void LogStore::on_log_found(lsn_t lsn, const stream_key& key, const sisl::ByteView& data) {
+void LogStore::on_log_found(lsn_t lsn, const stream_key& key, const sisl::IoBufView& data) {
     if (lsn < head_lsn_.load(std::memory_order_acquire)) {
         THIS_LOGSTORE_LOG(DEBUG, "on_log_found skip lsn={} below head_lsn", lsn);
         return;
@@ -318,7 +318,7 @@ folly::coro::Task< void > LogStore::persist_sb() {
     const uint32_t n = to_u32(rollback_records_.size());
     const size_t sz = LogStoreSb::size_for(n);
 
-    auto buf = sisl::make_byte_array(to_u32(sz));
+    auto buf = sisl::make_io_buf_shared(to_u32(sz));
     auto* sb = r_cast< LogStoreSb* >(buf->bytes());
     sb->store_id = store_id_;
     sb->append_mode = append_mode_ ? 1 : 0;

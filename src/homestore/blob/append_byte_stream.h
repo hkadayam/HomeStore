@@ -79,7 +79,7 @@ struct AppendByteStreamSb {
 class AppendByteStream : public StreamBase {
 public:
     // ── FlushBuffer ─────────────────────────────────────────────────────────
-    // Accumulates appended bytes between flushes using LargeBufBuilder (chain of aligned IOBuffers).
+    // Accumulates appended bytes between flushes using LargeBufBuilder (chain of aligned IoBufOwns).
     struct FlushBuffer {
         sisl::LargeBufBuilder builder;
         uint64_t start_offset{0}; // stream byte offset at which the builder's first byte corresponds
@@ -94,8 +94,8 @@ public:
     class ReadCursor {
     public:
         // Returns up to max_bytes from the cursor's current position, plus a `valid` byte count (= view.size()).
-        // The returned ByteView's bytes() points exactly at the cursor position — block alignment is hidden inside.
-        folly::coro::Task< std::pair< sisl::ByteView, uint32_t > > next(size_t max_bytes);
+        // The returned IoBufView's bytes() points exactly at the cursor position — block alignment is hidden inside.
+        folly::coro::Task< std::pair< sisl::IoBufView, uint32_t > > next(size_t max_bytes);
 
         bool has_more() const { return pos_ < end_; }
         uint64_t position() const { return pos_; }
@@ -120,7 +120,7 @@ public:
     static folly::coro::Task< shared< AppendByteStream > > load(uint64_t stream_id, MetaClient& meta_client,
                                                                 const std::string& dev_name,
                                                                 const shared< VirtualDev >& vdev, MetaBlk&& sb,
-                                                                sisl::ByteView sb_payload,
+                                                                sisl::IoBufView sb_payload,
                                                                 bool concurrent_safe = true);
 
     /// Name of the per-stream sb MetaBlk: "<dev>_appendbyte_sb_<stream_id>".
@@ -152,10 +152,10 @@ public:
         return do_emplace(size, std::forward< FillFn >(fill));
     }
 
-    /// Read len bytes starting at byte_offset.  Returns a ByteView whose bytes() points exactly at byte_offset
+    /// Read len bytes starting at byte_offset.  Returns a IoBufView whose bytes() points exactly at byte_offset
     /// (the underlying read is block-aligned, but that's hidden — the slice handles the in-block offset for the
     /// caller).  size() == len.
-    folly::coro::Task< std::pair< std::error_code, sisl::ByteView > > read(uint64_t byte_offset, size_t len);
+    folly::coro::Task< std::pair< std::error_code, sisl::IoBufView > > read(uint64_t byte_offset, size_t len);
 
     ReadCursor open_cursor(uint64_t start_offset = 0) const;
     ReadCursor open_cursor(uint64_t start_offset, uint64_t end_offset) const;
@@ -223,7 +223,7 @@ private:
     }
 
     /// Internal read helper.
-    folly::coro::Task< std::pair< std::error_code, sisl::IOBuffer > > read_blocks(chunk_num_t cid, uint32_t blk_num,
+    folly::coro::Task< std::pair< std::error_code, sisl::IoBufOwn > > read_blocks(chunk_num_t cid, uint32_t blk_num,
                                                                                   blk_count_t nblks);
 
     /// Resolve the chunk_id for the n-th chunk (by vdev_order) in this stream.  Takes a brief RCU read guard.

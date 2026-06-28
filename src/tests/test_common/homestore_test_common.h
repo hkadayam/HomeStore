@@ -26,7 +26,7 @@
 #include <iomgr/iomgr_flip.hpp>
 #include "homestore/homestore.h"
 #include "homestore/index_service.hpp"
-#include "homestore/replication_service.hpp"
+#include "homestore/replication/repl_manager.h"
 #include "homestore/checkpoint/cp_mgr.h"
 #include <device/HSSuperBlk.h>
 #include <iomgr/iomgr_config_generated.h>

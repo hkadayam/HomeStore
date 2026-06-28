@@ -49,9 +49,9 @@ namespace blkalloc {
 ///
 class BitmapBlkAllocator : public BlkAllocator {
 public:
-    // buf: nullopt allocates a fresh zeroed bitset; a ByteArray deserializes from persisted bytes.
+    // buf: nullopt allocates a fresh zeroed bitset; a IoBufShared deserializes from persisted bytes.
     BitmapBlkAllocator(BlkAllocConfig const& cfg, SegmentManager& seg_mgr, chunk_num_t id,
-                       std::optional< sisl::ByteArray > buf = std::nullopt);
+                       std::optional< sisl::IoBufShared > buf = std::nullopt);
     BitmapBlkAllocator(BitmapBlkAllocator const&) = delete;
     BitmapBlkAllocator(BitmapBlkAllocator&&) noexcept = delete;
     BitmapBlkAllocator& operator=(BitmapBlkAllocator const&) = delete;

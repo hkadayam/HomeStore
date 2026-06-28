@@ -56,27 +56,27 @@ bool hs_utils::is_ptr_aligned(void* ptr, std::size_t alignment) {
     return (intptr % alignment) == 0;
 }
 
-sisl::ByteView hs_utils::create_byte_view(const uint64_t size, const bool is_aligned_needed, const sisl::Buftag tag,
+sisl::IoBufView hs_utils::create_byte_view(const uint64_t size, const bool is_aligned_needed, const sisl::Buftag tag,
                                            const size_t alignment) {
-    return (is_aligned_needed) ? sisl::ByteView{static_cast< uint32_t >(aligned_size(size, alignment)),
+    return (is_aligned_needed) ? sisl::IoBufView{static_cast< uint32_t >(aligned_size(size, alignment)),
                                                  static_cast< uint32_t >(alignment), tag}
-                               : sisl::ByteView{static_cast< uint32_t >(size), 0, tag};
+                               : sisl::IoBufView{static_cast< uint32_t >(size), 0, tag};
 }
 
-sisl::IoBlob hs_utils::create_io_blob(const uint64_t size, const bool is_aligned_needed, const sisl::Buftag tag,
+sisl::IoBufSpan hs_utils::create_io_blob(const uint64_t size, const bool is_aligned_needed, const sisl::Buftag tag,
                                        const size_t alignment) {
-    return (is_aligned_needed) ? sisl::IoBlob{size, static_cast< uint32_t >(alignment), tag}
-                               : sisl::IoBlob{size, 0, tag};
+    return (is_aligned_needed) ? sisl::IoBufSpan{size, static_cast< uint32_t >(alignment), tag}
+                               : sisl::IoBufSpan{size, 0, tag};
 }
 
-sisl::ByteArray hs_utils::make_byte_array(const uint64_t size, const bool is_aligned_needed, const sisl::Buftag tag,
+sisl::IoBufShared hs_utils::make_io_buf_shared(const uint64_t size, const bool is_aligned_needed, const sisl::Buftag tag,
                                            const size_t alignment) {
     return (is_aligned_needed)
-        ? sisl::make_byte_array(static_cast< uint32_t >(aligned_size(size, alignment)), alignment, tag)
-        : sisl::make_byte_array(static_cast< uint32_t >(size), 0, tag);
+        ? sisl::make_io_buf_shared(static_cast< uint32_t >(aligned_size(size, alignment)), alignment, tag)
+        : sisl::make_io_buf_shared(static_cast< uint32_t >(size), 0, tag);
 }
 
-sisl::ByteArray hs_utils::extract_byte_array(const sisl::ByteView& b, const bool is_aligned_needed,
+sisl::IoBufShared hs_utils::extract_byte_array(const sisl::IoBufView& b, const bool is_aligned_needed,
                                               const size_t alignment) {
     return (is_aligned_needed) ? b.extract(alignment) : b.extract(0);
 };

@@ -134,13 +134,13 @@ public:
     virtual ~LogStreamClient() = default;
     virtual logstore_id_t store_id() const = 0;
     virtual void on_write_completion(lsn_t lsn, const stream_key& key) = 0;
-    virtual void on_log_found(lsn_t lsn, const stream_key& key, const sisl::ByteView& data) = 0;
+    virtual void on_log_found(lsn_t lsn, const stream_key& key, const sisl::IoBufView& data) = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // In-memory: LogRecord (StreamTracker entry)
 //
-// One per appended record awaiting flush.  Holds a LogBlob (bounded scatter-gather of IoBlob views) referencing
+// One per appended record awaiting flush.  Holds a LogBlob (bounded scatter-gather of IoBufSpan views) referencing
 // the caller's data buffers — the caller is responsible for keeping the buffers alive until flush() returns.
 // Carries the owning client* so on flush completion we can dispatch on_write_completion directly without a
 // store_id → client map lookup; store_id itself is fetched via client->store_id() when filling the on-disk
@@ -178,7 +178,7 @@ public:
     /// opened, so on_log_found dispatch finds its target.
     static folly::coro::Task< shared< LogStream > > load(uint64_t stream_id, MetaClient& meta_client,
                                                          const std::string& dev_name, const shared< VirtualDev >& vdev,
-                                                         MetaBlk&& sb, sisl::ByteView sb_payload);
+                                                         MetaBlk&& sb, sisl::IoBufView sb_payload);
 
     /// Walk the on-disk LogGroup chain forward from head_offset, validating magic + CRC chain at each step.  For
     /// every recovered record, looks up its owning store via `lookup` and (if non-null) dispatches
@@ -207,7 +207,7 @@ public:
     /// Read the data bytes of the record identified by `key`.  Reads the log_record_header at
     /// key.record_stream_offset, validates `log_id` matches, then returns the data slice.  Returns an empty buffer
     /// on stale key or read error.
-    folly::coro::Task< sisl::ByteView > read(const stream_key& key);
+    folly::coro::Task< sisl::IoBufView > read(const stream_key& key);
 
     /// Advance the stream's head to key.group_stream_offset (must be a LogGroup boundary — only stream_keys handed
     /// out by on_write_completion / on_log_found satisfy this) and persist the sb.  Releases any chunks fully before

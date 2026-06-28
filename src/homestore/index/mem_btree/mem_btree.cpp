@@ -66,17 +66,17 @@ uint64_t MemBtree::space_occupied() const {
     return nodes_.size() * base_btree_->bt_config().node_size();
 }
 
-BtreeStatus MemBtree::write_overflow(sisl::ByteArray const& buf, BlkId& out_blkid) {
+BtreeStatus MemBtree::write_overflow(sisl::IoBufShared const& buf, BlkId& out_blkid) {
     auto id = overflow_next_id_.fetch_add(1, std::memory_order_relaxed);
-    // Copy the buffer into a new ByteArray so the caller can free theirs.
-    auto copy = sisl::make_byte_array(buf->size(), 0);
+    // Copy the buffer into a new IoBufShared so the caller can free theirs.
+    auto copy = sisl::make_io_buf_shared(buf->size(), 0);
     std::memcpy(copy->bytes(), buf->cbytes(), buf->size());
     overflow_store_.insert(id, std::move(copy));
     out_blkid = BlkId{static_cast< blk_num_t >(id), 1 /* nblks */, 0 /* chunk */};
     return BtreeStatus::success;
 }
 
-BtreeTask< BtreeStatus > MemBtree::read_overflow(BlkId const& blkid, sisl::ByteArray& out_buf) const {
+BtreeTask< BtreeStatus > MemBtree::read_overflow(BlkId const& blkid, sisl::IoBufShared& out_buf) const {
     auto it = overflow_store_.find(to_u64(blkid.blk_num()));
     if (it == overflow_store_.end()) {
         CO_RETURN BtreeStatus::node_read_failed;

@@ -64,14 +64,14 @@ folly::coro::Task< void > ReplicationManager::start() {
         co_await hs()->meta_blk_mgr().register_client(std::string{kReplDevRaftConfigMetaName}));
 
     co_await rs_meta_client_->for_each_recovered_block(
-        [this](MetaBlk const& blk, sisl::ByteView data) -> folly::coro::Task< void > {
+        [this](MetaBlk const& blk, sisl::IoBufView data) -> folly::coro::Task< void > {
             (void)blk;
             load_replica_set(data);
             co_return;
         });
 
     co_await rs_raft_cfg_meta_client_->for_each_recovered_block(
-        [this](MetaBlk const& blk, sisl::ByteView data) -> folly::coro::Task< void > {
+        [this](MetaBlk const& blk, sisl::IoBufView data) -> folly::coro::Task< void > {
             (void)blk;
             (void)raft_group_config_found(data);
             co_return;
@@ -227,10 +227,10 @@ shared< ReplicaSet > ReplicationManager::create_state_mgr(int32_t /*srv_id*/, Gr
     return nullptr;
 }
 
-void ReplicationManager::load_replica_set(sisl::ByteView const& /*buf*/, void* /*meta_cookie*/) {
+void ReplicationManager::load_replica_set(sisl::IoBufView const& /*buf*/, void* /*meta_cookie*/) {
 }
 
-ReplicaSet* ReplicationManager::raft_group_config_found(sisl::ByteView const& /*buf*/, void* /*meta_cookie*/) {
+ReplicaSet* ReplicationManager::raft_group_config_found(sisl::IoBufView const& /*buf*/, void* /*meta_cookie*/) {
     return nullptr;
 }
 

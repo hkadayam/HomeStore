@@ -25,7 +25,7 @@
 
 namespace homestore {
 
-using sisl::IOBuffer;
+using sisl::IoBufOwn;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Factory methods: create/load
@@ -70,7 +70,7 @@ folly::coro::Task< MetaClient > MetaClient::load(MetaClientInfo info, shared< Vi
     while (current_bid.is_valid()) {
         // Read only the first block of the extent — that's the header + inline data we cache.
         BlkId first_blk{current_bid.blk_num(), 1, current_bid.chunk_num()};
-        auto one_blk = sisl::make_byte_array(blk_sz);
+        auto one_blk = sisl::make_io_buf_shared(blk_sz);
         auto err = co_await vdev->read(*one_blk, first_blk);
         if (err) break;
 
@@ -150,7 +150,7 @@ folly::coro::Task< std::optional< MetaBlk > > MetaClient::get_meta_blk(std::stri
     co_return std::nullopt;
 }
 
-folly::coro::Task< void > MetaClient::write_meta_blk(MetaBlk& mblk, const sisl::ByteArray& data) {
+folly::coro::Task< void > MetaClient::write_meta_blk(MetaBlk& mblk, const sisl::IoBufShared& data) {
     // Write data to disk (inline or overflow). Done *before* acquiring state lock so I/O doesn't hold up other callers.
     co_await mblk.write_data(data, *meta_vdev_);
 
@@ -185,7 +185,7 @@ folly::coro::Task< void > MetaClient::write_meta_blk(MetaBlk& mblk, const sisl::
     }
 }
 
-folly::coro::Task< sisl::ByteView > MetaClient::read_meta_blk(const MetaBlk& mblk) {
+folly::coro::Task< sisl::IoBufView > MetaClient::read_meta_blk(const MetaBlk& mblk) {
     {
         auto lock = co_await state_->mutex.co_scoped_lock();
         if (!state_->meta_blks.count(mblk.blkid)) {
@@ -272,7 +272,7 @@ folly::coro::Task< void > MetaClient::write_client_info(const MetaClientInfo& in
     MetaClientInfo updated = info;
     updated.update_crc();
 
-    IOBuffer buf{to_u32(MetaClientInfo::SIZE)};
+    IoBufOwn buf{to_u32(MetaClientInfo::SIZE)};
     std::memcpy(buf.bytes(), &updated, MetaClientInfo::SIZE);
     co_await meta_vdev_->write(buf, info_bid_);
 }

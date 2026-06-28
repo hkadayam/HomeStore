@@ -86,7 +86,7 @@ folly::coro::Task< shared< LogStream > > LogStream::create(uint64_t stream_id, M
 
 folly::coro::Task< shared< LogStream > > LogStream::load(uint64_t stream_id, MetaClient& meta_client,
                                                          const std::string& dev_name, const shared< VirtualDev >& vdev,
-                                                         MetaBlk&& sb, sisl::ByteView sb_payload) {
+                                                         MetaBlk&& sb, sisl::IoBufView sb_payload) {
     if (sb_payload.size() < sizeof(AppendByteStreamSb)) {
         throw std::runtime_error(
             fmt::format("LogStream::load: sb payload too small for stream {} on {}", stream_id, dev_name));
@@ -263,7 +263,7 @@ uint64_t LogStream::build_and_emplace_group(logid_t from_idx, logid_t upto_idx) 
 
         // log_record_header[i] + data[i] for each record. The on-disk record stays contiguous; the scatter-
         // gather sits only on the in-memory side (LogBlob's parts[]). We coalesce per-record into the group
-        // buffer here — one memcpy per part, same total byte count as the single-IoBlob path.
+        // buffer here — one memcpy per part, same total byte count as the single-IoBufSpan path.
         for (logid_t i = from_idx; i <= upto_idx; ++i) {
             const auto rec = log_records_->at(i);
             auto* rhdr = r_cast< log_record_header* >(p);
@@ -291,17 +291,17 @@ uint64_t LogStream::build_and_emplace_group(logid_t from_idx, logid_t upto_idx) 
     return group_offset;
 }
 
-folly::coro::Task< sisl::ByteView > LogStream::read(const stream_key& key) {
+folly::coro::Task< sisl::IoBufView > LogStream::read(const stream_key& key) {
     // Read the record header first.
     auto [ec_h, hdr_buf] = co_await AppendByteStream::read(key.record_stream_offset, sizeof(log_record_header));
     if (ec_h) {
-        co_return sisl::ByteView{};
+        co_return sisl::IoBufView{};
     }
 
-    // AppendByteStream::read returns a ByteView already sliced to start exactly at byte_offset — index from 0.
+    // AppendByteStream::read returns a IoBufView already sliced to start exactly at byte_offset — index from 0.
     const auto* rhdr = r_cast< const log_record_header* >(hdr_buf.bytes());
     if (rhdr->log_id != key.log_id) {
-        co_return sisl::ByteView{};
+        co_return sisl::IoBufView{};
     }
 
     const uint32_t data_size = rhdr->size;
@@ -309,10 +309,10 @@ folly::coro::Task< sisl::ByteView > LogStream::read(const stream_key& key) {
 
     auto [ec_d, data_buf] = co_await AppendByteStream::read(data_offset, data_size);
     if (ec_d) {
-        co_return sisl::ByteView{};
+        co_return sisl::IoBufView{};
     }
 
-    // data_buf is already a ByteView sliced to start at data_offset with size == data_size — return as-is.
+    // data_buf is already a IoBufView sliced to start at data_offset with size == data_size — return as-is.
     co_return data_buf;
 }
 
@@ -352,7 +352,7 @@ folly::coro::Task< void > LogStream::recover(lookup_store_fn lookup) {
             tail_offset_ = prev_tail;
             break;
         }
-        // AppendByteStream::read returns a ByteView pre-sliced to start at byte_offset — index from 0.
+        // AppendByteStream::read returns a IoBufView pre-sliced to start at byte_offset — index from 0.
         const auto* hdr = r_cast< const log_group_header* >(hdr_buf.bytes());
         if (hdr->magic != LOG_GROUP_MAGIC || hdr->group_size < sizeof(log_group_header) + sizeof(log_group_footer)) {
             tail_offset_ = prev_tail;
@@ -372,8 +372,8 @@ folly::coro::Task< void > LogStream::recover(lookup_store_fn lookup) {
             break;
         }
 
-        // group_buf is a ByteView already sliced to the group's start; per-record sub-views below share its
-        // underlying refcount via the ByteView(ByteView, offset, size) ctor (no extra memcpy).
+        // group_buf is a IoBufView already sliced to the group's start; per-record sub-views below share its
+        // underlying refcount via the IoBufView(IoBufView, offset, size) ctor (no extra memcpy).
         const uint8_t* group_bytes = group_buf.bytes();
         const auto* footer = r_cast< const log_group_footer* >(group_bytes + group_size - sizeof(log_group_footer));
 
@@ -406,7 +406,7 @@ folly::coro::Task< void > LogStream::recover(lookup_store_fn lookup) {
 
             if (auto* client = lookup ? lookup(rhdr->store_id) : nullptr) {
                 // Sub-view sharing group_buf's underlying refcount — no copy, group's buffer outlives the view.
-                sisl::ByteView data_view{group_buf, data_off_in_view, rhdr->size};
+                sisl::IoBufView data_view{group_buf, data_off_in_view, rhdr->size};
                 client->on_log_found(rhdr->store_lsn, stream_key{rhdr->log_id, rec_stream_offset, cursor}, data_view);
             }
             // else: orphan record — store_id was never opened; manager handles cleanup.
@@ -477,7 +477,7 @@ folly::coro::Task< std::optional< uint64_t > > LogStream::probe_for_torn_write(u
         if (ec_h)
             continue;
 
-        // AppendByteStream::read returns a ByteView pre-sliced to start at byte_offset — index from 0.
+        // AppendByteStream::read returns a IoBufView pre-sliced to start at byte_offset — index from 0.
         const auto* hdr = r_cast< const log_group_header* >(hdr_buf.bytes());
         if (hdr->magic != LOG_GROUP_MAGIC)
             continue;

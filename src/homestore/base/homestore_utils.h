@@ -35,13 +35,13 @@ public:
     static uint64_t aligned_size(const size_t size, const size_t alignment);
     static bool mod_aligned_sz(const size_t size_to_check, const size_t align_sz);
     static bool is_ptr_aligned(void* ptr, std::size_t alignment);
-    static sisl::ByteView create_byte_view(const uint64_t size, const bool is_aligned_needed, const sisl::Buftag tag,
+    static sisl::IoBufView create_byte_view(const uint64_t size, const bool is_aligned_needed, const sisl::Buftag tag,
                                             const size_t alignment);
-    static sisl::IoBlob create_io_blob(const uint64_t size, const bool is_aligned_needed, const sisl::Buftag tag,
+    static sisl::IoBufSpan create_io_blob(const uint64_t size, const bool is_aligned_needed, const sisl::Buftag tag,
                                         const size_t alignment);
-    static sisl::ByteArray extract_byte_array(const sisl::ByteView& b, const bool is_aligned_needed,
+    static sisl::IoBufShared extract_byte_array(const sisl::IoBufView& b, const bool is_aligned_needed,
                                                const size_t alignment);
-    static sisl::ByteArray make_byte_array(const uint64_t size, const bool is_aligned_needed, const sisl::Buftag tag,
+    static sisl::IoBufShared make_io_buf_shared(const uint64_t size, const bool is_aligned_needed, const sisl::Buftag tag,
                                             const size_t alignment);
     static uuid_t gen_random_uuid();
 

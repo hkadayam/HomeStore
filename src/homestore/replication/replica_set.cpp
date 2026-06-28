@@ -101,12 +101,24 @@ public:
                      std::string const& log_line) override {
         auto prefix = fmt::format("[{}:{}:{}] [group={}]", source_file, line_number, func_name, group_id_str_);
         switch (level) {
-        case 1: LOGCRITICALMOD(replication, "{} {}", prefix, log_line); break;
-        case 2: LOGERRORMOD(replication,    "{} {}", prefix, log_line); break;
-        case 3: LOGWARNMOD(replication,     "{} {}", prefix, log_line); break;
-        case 4: LOGINFOMOD(replication,     "{} {}", prefix, log_line); break;
-        case 5: LOGDEBUGMOD(replication,    "{} {}", prefix, log_line); break;
-        default: LOGTRACEMOD(replication,   "{} {}", prefix, log_line); break;
+        case 1:
+            LOGCRITICALMOD(replication, "{} {}", prefix, log_line);
+            break;
+        case 2:
+            LOGERRORMOD(replication, "{} {}", prefix, log_line);
+            break;
+        case 3:
+            LOGWARNMOD(replication, "{} {}", prefix, log_line);
+            break;
+        case 4:
+            LOGINFOMOD(replication, "{} {}", prefix, log_line);
+            break;
+        case 5:
+            LOGDEBUGMOD(replication, "{} {}", prefix, log_line);
+            break;
+        default:
+            LOGTRACEMOD(replication, "{} {}", prefix, log_line);
+            break;
         }
     }
 
@@ -137,8 +149,7 @@ private:
 bool ReplicaSet::join_group() {
     // Pin all this raft_server's coro work to one reactor — hash by group_id so each group sticks to one.
     auto& iom = iomanager::iomgr();
-    size_t reactor_id =
-        folly::hash::fnv64_buf(group_id_.data, sizeof(group_id_.data)) % iom.num_reactors();
+    size_t reactor_id = folly::hash::fnv64_buf(group_id_.data, sizeof(group_id_.data)) % iom.num_reactors();
     auto* eb = iom.reactor_for(reactor_id);
 
     // Carry the boost::uuids::uuid GroupId across to nuraft as raw 16 bytes (nuraft::group_id_t is a
@@ -150,20 +161,19 @@ bool ReplicaSet::join_group() {
 
     // ReplicaSet inherits from both state_mgr and state_machine so both slots in the context are `this`.
     auto self = shared_from_this();
-    auto* ctx = new nuraft::context(
-        std::static_pointer_cast< nuraft::state_mgr >(self),
-        std::static_pointer_cast< nuraft::state_machine >(self),
-        std::static_pointer_cast< nuraft::rpc_listener >(mgr_.rpc_listener()),
-        std::make_shared< ReplicaSetLogger >(group_id_),
-        std::static_pointer_cast< nuraft::rpc_client_factory >(mgr_.rpc_client_factory()),
-        std::make_shared< FollyEventBaseScheduler >(eb),
-        params,
-        nullptr, // custom_global_mgr
-        gid);
+    auto* ctx = new nuraft::context(std::static_pointer_cast< nuraft::state_mgr >(self),
+                                    std::static_pointer_cast< nuraft::state_machine >(self),
+                                    std::static_pointer_cast< nuraft::rpc_listener >(mgr_.rpc_listener()),
+                                    std::make_shared< ReplicaSetLogger >(group_id_),
+                                    std::static_pointer_cast< nuraft::rpc_client_factory >(mgr_.rpc_client_factory()),
+                                    std::make_shared< FollyEventBaseScheduler >(eb), params,
+                                    nullptr, // custom_global_mgr
+                                    gid);
     // Capture via weak_ptr — raft callbacks can fire during teardown and must not keep ReplicaSet alive.
-    ctx->set_cb_func([wp = std::weak_ptr< ReplicaSet >(self)](nuraft::cb_func::Type t,
-                                                              nuraft::cb_func::Param* p) {
-        if (auto sp = wp.lock(); sp) { return sp->raft_event(t, p); }
+    ctx->set_cb_func([wp = std::weak_ptr< ReplicaSet >(self)](nuraft::cb_func::Type t, nuraft::cb_func::Param* p) {
+        if (auto sp = wp.lock(); sp) {
+            return sp->raft_event(t, p);
+        }
         return nuraft::cb_func::Ok;
     });
 
@@ -193,6 +203,59 @@ void ReplicaSet::detach_listener() {
         listener_->set_replica_set(nullptr);
         listener_.reset();
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// write — client entry point
+//
+// HS stamps its own fields on `hdr` (code = HS_DATA_INLINE, version, value_size) — app cannot influence those
+// bytes. Each follower's HomeRaftLogStore may rewrite `code` to HS_DATA_INDIRECT in its on-disk shim form when
+// the value exceeds the size threshold, but the in-memory bufs() we replicate stays INLINE so each replica
+// makes its own storage-form decision.
+// The chain is [ReplLogHeader-as-buf (zero-copy via take_ownership of the shared<ReplLogHeader>) ,
+// value-as-buf (zero-copy take_ownership of caller's IoBufSpan bytes)]. log_entry's auto-allocated bufs_[0] (9B
+// [term|val_type] header) sits in front of both. Term=0 at construction; the leader's propose path fills the
+// real term in place via log_entry::set_term.
+//
+// Lifetime: caller MUST keep value bytes alive until this Task<> resolves. ReplLogHeader carries its own
+// storage via the aliasing shared_ptr returned from alloc().
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+folly::coro::Task< ReplResult<> > ReplicaSet::write(shared< ReplLogHeader > hdr, sisl::IoBufSpan value, TraceId tid) {
+    (void)tid;
+    if (!hdr) {
+        co_return folly::makeUnexpected(ReplError::BAD_REQUEST);
+    }
+
+    // Stamp HS-owned fields.
+    hdr->code = to_u8(JournalType::HS_DATA_INLINE);
+    hdr->major_version = ReplLogHeader::kMajor;
+    hdr->minor_version = ReplLogHeader::kMinor;
+    hdr->value_size = to_u32(value.size());
+
+    // Build the value chain — zero copy. hdr bytes flow through ReplLogHeader::to_nuraft_buffer (deleter
+    // captures the shared_ptr keeping storage alive). value bytes flow through buffer::take_ownership; the
+    // deleter holds the IoBufSpan struct by value — caller's lifetime contract keeps the underlying memory
+    // alive until this Task<> resolves.
+    auto hdr_buf = ReplLogHeader::to_nuraft_buffer(std::move(hdr));
+    auto value_buf = nuraft::buffer::take_ownership(value.bytes(), value.size(),
+                                                    [held = value](nuraft::byte*) noexcept { (void)held; });
+
+    nuraft::log_entry_chain chain;
+    chain.push_back(std::move(hdr_buf));
+    chain.push_back(std::move(value_buf));
+
+    std::vector< nuraft::log_entry_chain > chains;
+    chains.push_back(std::move(chain));
+
+    auto result = co_await raft_server_->append_entries_chained(chains);
+
+    if (!result.accepted) {
+        co_return folly::makeUnexpected(ReplicationManager::to_repl_error(result.code));
+    }
+    if (!result.committed) {
+        co_return folly::makeUnexpected(ReplicationManager::to_repl_error(result.code));
+    }
+    co_return ReplResult<>{};
 }
 
 } // namespace homestore

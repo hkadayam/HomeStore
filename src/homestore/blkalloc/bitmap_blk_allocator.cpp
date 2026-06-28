@@ -21,7 +21,7 @@ namespace homestore {
 namespace blkalloc {
 
 BitmapBlkAllocator::BitmapBlkAllocator(BlkAllocConfig const& cfg, SegmentManager& seg_mgr, chunk_num_t id,
-                                       std::optional< sisl::ByteArray > buf) :
+                                       std::optional< sisl::IoBufShared > buf) :
         BlkAllocator{cfg, id}, seg_mgr_{seg_mgr} {
     if (buf.has_value()) {
         bm_ = std::make_unique< sisl::Bitset >(std::move(*buf));

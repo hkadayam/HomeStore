@@ -28,7 +28,7 @@ class IDReserver {
 public:
     IDReserver(uint32_t estimated_ids = 1024) : reserved_bits_(estimated_ids) { assert(estimated_ids != 0); }
 
-    IDReserver(const sisl::ByteArray& b) : reserved_bits_(b) {}
+    IDReserver(const sisl::IoBufShared& b) : reserved_bits_(b) {}
 
     uint32_t reserve() {
         std::unique_lock lg(mutex_);
@@ -61,7 +61,7 @@ public:
         return reserved_bits_.get_bitval(id);
     }
 
-    sisl::ByteArray serialize() {
+    sisl::IoBufShared serialize() {
         std::unique_lock lg(mutex_);
         return reserved_bits_.serialize();
     }

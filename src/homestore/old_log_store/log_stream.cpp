@@ -33,11 +33,11 @@ log_stream_reader::log_stream_reader(off_t device_cursor, shared< JournalVirtual
     m_vdev_jd->lseek(m_first_group_cursor);
 }
 
-sisl::ByteView log_stream_reader::next_group(off_t* out_dev_offset) {
+sisl::IoBufView log_stream_reader::next_group(off_t* out_dev_offset) {
     const uint64_t bulk_read_size =
         uint64_cast(sisl::round_up(HS_DYNAMIC_CONFIG(logstore.bulk_read_size), m_read_size_multiple));
     uint64_t min_needed{m_read_size_multiple};
-    sisl::ByteView ret_buf;
+    sisl::IoBufView ret_buf;
     *out_dev_offset = m_vdev_jd->dev_offset(m_cur_read_bytes);
 
 read_again:
@@ -157,25 +157,25 @@ read_again:
     return ret_buf;
 }
 
-sisl::ByteView log_stream_reader::group_in_next_page() {
+sisl::IoBufView log_stream_reader::group_in_next_page() {
     off_t dev_offset;
     if (m_cur_log_buf.size() > m_read_size_multiple) { m_cur_log_buf.move_forward(m_read_size_multiple); }
     return next_group(&dev_offset);
 }
 
-sisl::ByteView log_stream_reader::read_next_bytes(uint64_t nbytes, bool& end_of_stream) {
+sisl::IoBufView log_stream_reader::read_next_bytes(uint64_t nbytes, bool& end_of_stream) {
     // TODO: Might need to address alignment based on data or fast type
     const auto prev_pos = m_vdev_jd->seeked_pos();
     auto sz_to_read = m_vdev_jd->sync_next_read(nullptr, nbytes);
     if (sz_to_read == -1) {
         end_of_stream = true;
-        return sisl::ByteView{m_cur_log_buf};
+        return sisl::IoBufView{m_cur_log_buf};
     }
 
-    if (sz_to_read == 0) { return sisl::ByteView{m_cur_log_buf}; }
+    if (sz_to_read == 0) { return sisl::IoBufView{m_cur_log_buf}; }
 
     auto out_buf =
-        hs_utils::make_byte_array(sz_to_read + m_cur_log_buf.size(), true, sisl::Buftag::logread, m_vdev->align_size());
+        hs_utils::make_io_buf_shared(sz_to_read + m_cur_log_buf.size(), true, sisl::Buftag::logread, m_vdev->align_size());
     if (m_cur_log_buf.size()) { memcpy(out_buf->bytes(), m_cur_log_buf.bytes(), m_cur_log_buf.size()); }
 
     auto sz_read = m_vdev_jd->sync_next_read(out_buf->bytes() + m_cur_log_buf.size(), sz_to_read);
@@ -184,6 +184,6 @@ sisl::ByteView log_stream_reader::read_next_bytes(uint64_t nbytes, bool& end_of_
     LOGTRACEMOD(logstore,
                 "LogStream read {} bytes req bytes {} from vdev prev offset {} and vdev cur offset {} log_dev={}",
                 sz_read, nbytes, prev_pos, m_vdev_jd->seeked_pos(), m_vdev_jd->logdev_id());
-    return sisl::ByteView{out_buf};
+    return sisl::IoBufView{out_buf};
 }
 } // namespace homestore

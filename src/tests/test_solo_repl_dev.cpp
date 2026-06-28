@@ -29,8 +29,8 @@
 #include "homestore/base/blk.h"
 #include "homestore/homestore.h"
 #include "homestore/homestore_decl.hpp"
-#include "homestore/replication_service.hpp"
-#include "homestore/replication/repl_dev.h"
+#include "homestore/replication/repl_manager.h"
+#include "homestore/replication/replica_set.h"
 #include "common/homestore_config.h"
 #include "common/homestore_assert.h"
 #include "common/homestore_utils.h"
@@ -47,8 +47,6 @@
 using namespace homestore;
 using namespace test_common;
 
- 
-
 static thread_local std::random_device g_rd{};
 static thread_local std::default_random_engine g_re{g_rd()};
 static uint32_t g_block_size;
@@ -58,8 +56,8 @@ static constexpr uint64_t Mi{Ki * Ki};
 static constexpr uint64_t Gi{Ki * Mi};
 
 struct test_repl_req : public repl_req_ctx {
-    sisl::ByteArray header;
-    sisl::ByteArray key;
+    sisl::IoBufShared header;
+    sisl::IoBufShared key;
     sisl::SgList write_sgs;
     std::vector< MultiBlkId > written_blkids;
 
@@ -78,14 +76,14 @@ struct test_repl_req : public repl_req_ctx {
     };
 };
 
-class SoloReplDevTest : public testing::Test {
+class SoloReplicaSetTest : public testing::Test {
 public:
-    class Listener : public ReplDevListener {
+    class Listener : public ReplicaSetListener {
     private:
-        SoloReplDevTest& m_test;
+        SoloReplicaSetTest& m_test;
 
     public:
-        Listener(SoloReplDevTest& test) : m_test{test} {}
+        Listener(SoloReplicaSetTest& test) : m_test{test} {}
         virtual ~Listener() = default;
 
         void on_commit(int64_t lsn, sisl::Blob const& header, sisl::Blob const& key,
@@ -123,44 +121,46 @@ public:
             return blk_alloc_hints{};
         }
 
-        void on_restart() override { LOGINFO("ReplDev restarted"); }
+        void on_restart() override { LOGINFO("ReplicaSet restarted"); }
 
-        void on_error(ReplServiceError error, const sisl::Blob& header, const sisl::Blob& key,
+        void on_error(ReplError error, const sisl::Blob& header, const sisl::Blob& key,
                       cintrusive< repl_req_ctx >& ctx) override {
             LOGINFO("Received error={} on repl_dev", enum_name(error));
         }
-        void on_start_replace_member(const replica_member_info& member_out, const replica_member_info& member_in, trace_id_t tid) override {}
-        void on_complete_replace_member(const replica_member_info& member_out, const replica_member_info& member_in, trace_id_t tid) override {}
-        void on_destroy(const group_id_t& group_id) override {}
+        void on_start_replace_member(const ReplicaMemberInfo& member_out, const ReplicaMemberInfo& member_in,
+                                     TraceId tid) override {}
+        void on_complete_replace_member(const ReplicaMemberInfo& member_out, const ReplicaMemberInfo& member_in,
+                                        TraceId tid) override {}
+        void on_destroy(const GroupId& group_id) override {}
         void notify_committed_lsn(int64_t lsn) override {}
         void on_config_rollback(int64_t lsn) override {}
-        void on_no_space_left(repl_lsn_t lsn, chunk_num_t chunk_id) override {}
+        void on_no_space_left(raft_lsn_t lsn, chunk_num_t chunk_id) override {}
     };
 
     class Application : public ReplApplication {
     private:
-        SoloReplDevTest& m_test;
+        SoloReplicaSetTest& m_test;
 
     public:
-        Application(SoloReplDevTest& test) : m_test{test} {}
+        Application(SoloReplicaSetTest& test) : m_test{test} {}
         virtual ~Application() = default;
 
-        repl_impl_type get_impl_type() const override { return repl_impl_type::solo; }
+        ReplImplType get_impl_type() const override { return ReplImplType::solo; }
         bool need_timeline_consistency() const { return true; }
-        shared< ReplDevListener > create_repl_dev_listener(uuid_t) override {
+        shared< ReplicaSetListener > create_repl_dev_listener(uuid_t) override {
             return std::make_shared< Listener >(m_test);
         }
         void destroy_repl_dev_listener(uuid_t) override {}
         void on_repl_devs_init_completed() { LOGINFO("Repl dev init completed CB called"); }
         std::pair< std::string, uint16_t > lookup_peer(uuid_t uuid) const override { return std::make_pair("", 0u); }
-        replica_id_t get_my_repl_id() const override { return hs_utils::gen_random_uuid(); }
+        ReplicaId get_my_repl_id() const override { return hs_utils::gen_random_uuid(); }
     };
 
 protected:
     test_common::Runner m_io_runner;
     test_common::Waiter m_task_waiter;
-    shared< ReplDev > m_repl_dev1;
-    shared< ReplDev > m_repl_dev2;
+    shared< ReplicaSet > m_repl_dev1;
+    shared< ReplicaSet > m_repl_dev2;
     uuid_t m_uuid1;
     uuid_t m_uuid2;
     test_common::HSTestHelper m_helper;
@@ -198,7 +198,7 @@ public:
 
     void write_io(uint32_t key_size, uint64_t data_size, uint32_t max_size_per_iov) {
         auto req = intrusive< test_repl_req >(new test_repl_req());
-        req->header = sisl::make_byte_array(sizeof(test_repl_req::journal_header));
+        req->header = sisl::make_io_buf_shared(sizeof(test_repl_req::journal_header));
         auto hdr = r_cast< test_repl_req::journal_header* >(req->header->bytes());
         hdr->key_size = key_size;
         hdr->key_pattern = ((long long)rand() << 32) | rand();
@@ -206,7 +206,7 @@ public:
         hdr->data_pattern = ((long long)rand() << 32) | rand();
 
         if (key_size != 0) {
-            req->key = sisl::make_byte_array(key_size);
+            req->key = sisl::make_io_buf_shared(key_size);
             HSTestHelper::fill_data_buf(req->key->bytes(), key_size, hdr->key_pattern);
         }
 
@@ -225,7 +225,7 @@ public:
     void async_write_data_and_journal(uint32_t key_size, uint64_t data_size, uint32_t max_size_per_iov) {
         data_size = data_size == 0 ? g_block_size : data_size;
         auto req = intrusive< test_repl_req >(new test_repl_req());
-        req->header = sisl::make_byte_array(sizeof(test_repl_req::journal_header));
+        req->header = sisl::make_io_buf_shared(sizeof(test_repl_req::journal_header));
         auto hdr = r_cast< test_repl_req::journal_header* >(req->header->bytes());
         hdr->key_size = key_size;
         hdr->key_pattern = ((long long)rand() << 32) | rand();
@@ -233,7 +233,7 @@ public:
         hdr->data_pattern = ((long long)rand() << 32) | rand();
 
         if (key_size != 0) {
-            req->key = sisl::make_byte_array(key_size);
+            req->key = sisl::make_io_buf_shared(key_size);
             HSTestHelper::fill_data_buf(req->key->bytes(), key_size, hdr->key_pattern);
         }
 
@@ -256,7 +256,7 @@ public:
         });
     }
 
-    void validate_replay(ReplDev& rdev, int64_t lsn, sisl::Blob const& header, sisl::Blob const& key,
+    void validate_replay(ReplicaSet& rdev, int64_t lsn, sisl::Blob const& header, sisl::Blob const& key,
                          std::vector< MultiBlkId > const& blkids) {
         if (blkids.empty()) {
             m_task_waiter.one_complete();
@@ -287,7 +287,9 @@ public:
                                  boost::uuids::to_string(rdev.group_id()), lsn, blkid.to_string());
 
                         io_count->fetch_add(1);
-                        if (*io_count == total_io) { m_task_waiter.one_complete(); }
+                        if (*io_count == total_io) {
+                            m_task_waiter.one_complete();
+                        }
                     });
             } else {
                 m_task_waiter.one_complete();
@@ -295,7 +297,7 @@ public:
         }
     }
 
-    void on_write_complete(ReplDev& rdev, intrusive< test_repl_req > req) {
+    void on_write_complete(ReplicaSet& rdev, intrusive< test_repl_req > req) {
         if (req->written_blkids.empty()) {
             m_io_runner.next_task();
             return;
@@ -327,7 +329,9 @@ public:
                             iomanager.iobuf_free(uintptr_cast(iov.iov_base));
                         }
                         io_count->fetch_add(1);
-                        if (*io_count == req->written_blkids.size()) { m_io_runner.next_task(); }
+                        if (*io_count == req->written_blkids.size()) {
+                            m_io_runner.next_task();
+                        }
                     });
             } else {
                 m_io_runner.next_task();
@@ -336,7 +340,7 @@ public:
     }
 };
 
-TEST_F(SoloReplDevTest, TestSingleDataBlock) {
+TEST_F(SoloReplicaSetTest, TestSingleDataBlock) {
     LOGINFO("Step 1: run on worker threads to schedule write for {} Bytes.", g_block_size);
     this->m_io_runner.set_task([this]() { this->write_io(0u, g_block_size, g_block_size); });
     this->m_io_runner.execute().get();
@@ -345,7 +349,7 @@ TEST_F(SoloReplDevTest, TestSingleDataBlock) {
     this->m_task_waiter.start([this]() { this->restart(); }).get();
 }
 
-TEST_F(SoloReplDevTest, TestRandomSizedDataBlock) {
+TEST_F(SoloReplicaSetTest, TestRandomSizedDataBlock) {
     LOGINFO("Step 1: run on worker threads to schedule write for random bytes ranging {}-{}.", 0, 1 * Mi);
     this->m_io_runner.set_task([this]() {
         uint32_t nblks = rand() % ((1 * Mi) / g_block_size);
@@ -358,7 +362,7 @@ TEST_F(SoloReplDevTest, TestRandomSizedDataBlock) {
     this->m_task_waiter.start([this]() { this->restart(); }).get();
 }
 
-TEST_F(SoloReplDevTest, TestHeaderOnly) {
+TEST_F(SoloReplicaSetTest, TestHeaderOnly) {
     LOGINFO("Step 1: run on worker threads to schedule write");
     this->m_io_runner.set_task([this]() { this->write_io(0u, 0u, g_block_size); });
     this->m_io_runner.execute().get();
@@ -366,7 +370,7 @@ TEST_F(SoloReplDevTest, TestHeaderOnly) {
     this->m_task_waiter.start([this]() { this->restart(); }).get();
 }
 
-TEST_F(SoloReplDevTest, TestAsyncWriteJournal) {
+TEST_F(SoloReplicaSetTest, TestAsyncWriteJournal) {
     LOGINFO("Step 1: run on worker threads to schedule write for random bytes ranging {}-{}.", 0, 1 * Mi);
     this->m_io_runner.set_task([this]() {
         uint32_t nblks = rand() % ((1 * Mi) / g_block_size);

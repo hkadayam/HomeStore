@@ -79,7 +79,7 @@ public:
 
     /// Recovery: restore from recovered data (chunk_id → MetaBlk + payload).
     /// Passes stored bitmaps to vdev.load_blk_allocator() to restore allocator state.
-    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::ByteView > >;
+    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::IoBufView > >;
     static folly::coro::Task< shared< RawBlkStream > > load(uint64_t stream_id, MetaClient& meta_client,
                                                             const std::string& dev_name,
                                                             const shared< VirtualDev >& vdev, uint32_t blk_size,
@@ -103,6 +103,10 @@ public:
     /// Commit a previously allocated block, making it durable across recovery.
     BlkAllocStatus commit_blk(CP* cp, const BlkId& bid);
 
+    /// Multi-BlkId commit — loops over bids and issues per-BlkId commit_blk internally.  Returns the first
+    /// non-success status encountered (and stops), else SUCCESS.
+    BlkAllocStatus commit_blks(CP* cp, BlkIds const& bids);
+
     /// Invalidate (free) a block.  Waits for any in-flight reads on the block to complete via BlkReadTracker, then
     /// frees via vdev.
     folly::coro::Task< void > invalidate(CP* cp, const BlkId& bid);
@@ -115,16 +119,37 @@ public:
     /// Write data to the given block.  buffered=true queues for later flush; buffered=false issues VDev I/O
     /// immediately.  Both paths mark the CP session dirty via CPGuard.
     /// TODO: Impl buffered path — currently asserts buffered==false.
-    folly::coro::Task< void > write(const BlkId& bid, const sisl::IOBuffer& buf, bool buffered = false);
+    folly::coro::Task< void > write(const BlkId& bid, const sisl::IoBuf& buf, bool buffered = false);
 
-    /// Scatter-gather write of multiple buffers to a contiguous block range.
-    folly::coro::Task< void > writev(const std::vector< sisl::IOBuffer >& bufs, const BlkId& bid);
+    /// Scatter-gather write — `sg.bufs` is a polymorphic IoBuf pointer list for one contiguous BlkId range.
+    folly::coro::Task< void > writev(sisl::SgList const& sg, const BlkId& bid);
+
+    /// Multi-BlkId write — slices `buf` across `bids` by each BlkId's blk_count * blk_size, issuing one
+    /// per-BlkId VDev write internally.  Slicing happens via transient IoBufSpans that alias `buf`'s
+    /// bytes — zero copy throughout.  `buf.size()` must equal the total bytes the bids cover.  Caller
+    /// keeps `buf` alive across the await.  buffered=true is not yet supported (asserts).
+    folly::coro::Task< void > write_multi(BlkIds const& bids, sisl::IoBuf const& buf, bool buffered = false);
+
+    /// Multi-BlkId scatter-gather write — walks `sg`'s polymorphic IoBuf pointer list and routes bytes to
+    /// each BlkId in `bids` by per-BlkId byte count (blk_count * blk_size).  An IoBuf that straddles a
+    /// BlkId boundary is sliced via a transient IoBufSpan that aliases its underlying bytes — zero copy
+    /// throughout.  `sg.total_size()` may be less than `bids` total bytes; the trailing partial BlkId
+    /// gets a short write and DriveInterface pads to LBA-multiple internally (tail bytes on disk are
+    /// stale until the BlkId is freed and reused — the on-disk record's value_size bounds the reader).
+    folly::coro::Task< void > writev_multi(BlkIds const& bids, sisl::SgList const& sg, bool buffered = false);
 
     /// Read into buf.  Tracks the read via BlkReadTracker so invalidate() can wait for it.
-    folly::coro::Task< std::error_code > read(sisl::IOBuffer& buf, const BlkId& bid);
+    folly::coro::Task< std::error_code > read(sisl::IoBuf& buf, const BlkId& bid);
 
-    /// Scatter-gather read of multiple buffers from a contiguous block range.  Tracked via BlkReadTracker.
-    folly::coro::Task< std::error_code > readv(std::vector< sisl::IOBuffer >& bufs, const BlkId& bid);
+    /// Scatter-gather read — `sg.bufs` is a polymorphic IoBuf pointer list of destinations for one
+    /// contiguous BlkId range.  Tracked via BlkReadTracker.
+    folly::coro::Task< std::error_code > readv(sisl::SgList const& sg, const BlkId& bid);
+
+    /// Multi-BlkId read — slices `buf` across `bids` by each BlkId's blk_count * blk_size, issuing one
+    /// per-BlkId VDev read into the corresponding slice.  Slicing happens via transient IoBufSpans that
+    /// alias `buf`'s bytes — zero copy throughout.  Returns the first non-zero error_code encountered,
+    /// else {}.
+    folly::coro::Task< std::error_code > read_multi(BlkIds const& bids, sisl::IoBuf& buf);
 
     /// Flush all physical devices backing this stream's chunks.
     folly::coro::Task< void > fsync();
@@ -147,7 +172,7 @@ private:
 
     // Per-CP write buffer.  Extends base FlushSessionBase with a lock-free per-thread vector of pending writes.
     struct CPSession : StreamBase::FlushSessionBase {
-        sisl::ConcurrentInsertVector< std::pair< BlkId, sisl::IOBuffer > > writes;
+        sisl::ConcurrentInsertVector< std::pair< BlkId, sisl::IoBuf > > writes;
     };
     CPSession cp_session_[CPManager::max_concurent_cps];
     CPSession& cp_session(cp_id_t cp_id) { return cp_session_[cp_id % CPManager::max_concurent_cps]; }

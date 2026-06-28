@@ -29,7 +29,7 @@
 
 namespace homestore {
 
-using sisl::IOBuffer;
+using sisl::IoBuf;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //                              Factory and Constructor
@@ -108,6 +108,16 @@ BlkAllocStatus RawBlkStream::commit_blk(CP* cp, const BlkId& bid) {
     return status;
 }
 
+BlkAllocStatus RawBlkStream::commit_blks(CP* cp, BlkIds const& bids) {
+    for (auto const& b : bids) {
+        auto status = commit_blk(cp, b);
+        if (status != BlkAllocStatus::SUCCESS) {
+            return status;
+        }
+    }
+    return BlkAllocStatus::SUCCESS;
+}
+
 folly::coro::Task< void > RawBlkStream::invalidate(CP* cp, const BlkId& bid) {
     // Wait for any in-flight reads on this block to complete before freeing.
     co_await blk_read_tracker_.wait_on(bid);
@@ -123,7 +133,7 @@ folly::coro::Task< void > RawBlkStream::expand() {
 // I/O
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > RawBlkStream::write(const BlkId& bid, const IOBuffer& buf, bool buffered) {
+folly::coro::Task< void > RawBlkStream::write(const BlkId& bid, const IoBuf& buf, bool buffered) {
     if (buffered) {
         // TODO: Impl buffered write path — read() must return buffered data for overlapping BlkIds, which requires a
         // concurrent hashmap keyed by BlkId rather than a simple vector.
@@ -133,22 +143,90 @@ folly::coro::Task< void > RawBlkStream::write(const BlkId& bid, const IOBuffer& 
     co_await vdev().write(buf, bid);
 }
 
-folly::coro::Task< void > RawBlkStream::writev(const std::vector< IOBuffer >& bufs, const BlkId& bid) {
-    co_await vdev().writev(bufs, bid);
+folly::coro::Task< void > RawBlkStream::writev(sisl::SgList const& sg, const BlkId& bid) {
+    co_await vdev().writev(sg, bid);
 }
 
-folly::coro::Task< std::error_code > RawBlkStream::read(IOBuffer& buf, const BlkId& bid) {
+folly::coro::Task< void > RawBlkStream::write_multi(BlkIds const& bids, sisl::IoBuf const& buf, bool buffered) {
+    HS_REL_ASSERT(!buffered, "buffered multi-BlkId write not yet implemented");
+    auto const blk_size = block_size();
+    uint32_t off = 0;
+    for (auto const& b : bids) {
+        auto const this_bytes = to_u32(b.blk_count() * blk_size);
+        sisl::IoBufSpan slice{buf.cbytes() + off, this_bytes, buf.is_aligned()};
+        co_await vdev().write(slice, b);
+        off += this_bytes;
+    }
+    co_return;
+}
+
+folly::coro::Task< void > RawBlkStream::writev_multi(BlkIds const& bids, sisl::SgList const& sg, bool buffered) {
+    HS_REL_ASSERT(!buffered, "buffered multi-BlkId writev not yet implemented");
+    auto const blk_size = block_size();
+
+    // Backing storage for sliced IoBufSpans — an IoBuf that straddles a BlkId boundary becomes one span
+    // per slice.  Worst case is one boundary crossing per BlkId, so reserve sg.bufs.size() + bids.size()
+    // to guarantee pointers stay stable across emplace_back.
+    std::vector< sisl::IoBufSpan > spans;
+    spans.reserve(sg.bufs.size() + bids.size());
+
+    size_t buf_idx = 0;
+    uint32_t buf_off = 0; // offset into sg.bufs[buf_idx]
+    for (auto const& bid : bids) {
+        uint32_t want = to_u32(bid.blk_count() * blk_size);
+        sisl::SgList per_bid;
+        while (want > 0 && buf_idx < sg.bufs.size()) {
+            auto* current = sg.bufs[buf_idx];
+            uint32_t buf_remaining = current->size() - buf_off;
+            uint32_t take = std::min(want, buf_remaining);
+            if (buf_off == 0 && take == current->size()) {
+                per_bid.bufs.push_back(current);
+            } else {
+                spans.emplace_back(current->bytes() + buf_off, take, current->is_aligned());
+                per_bid.bufs.push_back(&spans.back());
+            }
+            buf_off += take;
+            want -= take;
+            if (buf_off == current->size()) {
+                ++buf_idx;
+                buf_off = 0;
+            }
+        }
+        // sg may be shorter than the BlkId's full byte capacity — DriveInterface tail-pads to LBA-multiple.
+        co_await vdev().writev(per_bid, bid);
+    }
+    co_return;
+}
+
+folly::coro::Task< std::error_code > RawBlkStream::read(IoBuf& buf, const BlkId& bid) {
     blk_read_tracker_.insert(bid);
     auto ec = co_await vdev().read(buf, bid);
     blk_read_tracker_.remove(bid);
     co_return ec;
 }
 
-folly::coro::Task< std::error_code > RawBlkStream::readv(std::vector< IOBuffer >& bufs, const BlkId& bid) {
+folly::coro::Task< std::error_code > RawBlkStream::readv(sisl::SgList const& sg, const BlkId& bid) {
     blk_read_tracker_.insert(bid);
-    auto ec = co_await vdev().readv(bufs, bid);
+    auto ec = co_await vdev().readv(sg, bid);
     blk_read_tracker_.remove(bid);
     co_return ec;
+}
+
+folly::coro::Task< std::error_code > RawBlkStream::read_multi(BlkIds const& bids, sisl::IoBuf& buf) {
+    auto const blk_size = block_size();
+    uint32_t off = 0;
+    for (auto const& b : bids) {
+        auto const this_bytes = to_u32(b.blk_count() * blk_size);
+        sisl::IoBufSpan slice{buf.bytes() + off, this_bytes, buf.is_aligned()};
+        blk_read_tracker_.insert(b);
+        auto ec = co_await vdev().read(slice, b);
+        blk_read_tracker_.remove(b);
+        if (ec) {
+            co_return ec;
+        }
+        off += this_bytes;
+    }
+    co_return std::error_code{};
 }
 
 folly::coro::Task< void > RawBlkStream::fsync() {

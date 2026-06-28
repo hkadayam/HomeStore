@@ -24,7 +24,7 @@ class BlobDev;
 // Value stored in the overflow cache — pairs the BlkId key with the raw data buffer.
 struct OverflowEntry {
     BlkId blkid;
-    sisl::ByteArray buf;
+    sisl::IoBufShared buf;
 };
 
 } // namespace homestore
@@ -73,12 +73,12 @@ public:
     // the live node's buffer, since the node may receive further mutations after the snapshot.
     struct FlushNodeEntry {
         sisl::CacheHandle< unique< NodeCore > > cache_handle; // pins node in cache until flush completes
-        sisl::ByteArray flush_buf;                            // zero-copy wrap of COW snapshot
+        sisl::IoBufShared flush_buf;                            // zero-copy wrap of COW snapshot
 
         FlushNodeEntry() = default;
         FlushNodeEntry(sisl::CacheHandle< unique< NodeCore > >&& h, std::shared_ptr< uint8_t > b) :
                 cache_handle{std::move(h)},
-                flush_buf{sisl::make_byte_array(std::move(b), cache_handle.value()->node_size())} {}
+                flush_buf{sisl::make_io_buf_shared(std::move(b), cache_handle.value()->node_size())} {}
         FlushNodeEntry(FlushNodeEntry const&) = delete;
         FlushNodeEntry& operator=(FlushNodeEntry const&) = delete;
         FlushNodeEntry(FlushNodeEntry&&) noexcept = default;
@@ -125,8 +125,8 @@ public:
     OpGuard enter_op() override { return OpGuard::make(cp_mgr().cp_guard()); }
 
     // ── Overflow support ─────────────────────────────────────────────────────
-    BtreeStatus write_overflow(const sisl::ByteArray& buf, BlkId& out_blkid) override;
-    BtreeTask< BtreeStatus > read_overflow(const BlkId& blkid, sisl::ByteArray& out_buf) const override;
+    BtreeStatus write_overflow(const sisl::IoBufShared& buf, BlkId& out_blkid) override;
+    BtreeTask< BtreeStatus > read_overflow(const BlkId& blkid, sisl::IoBufShared& out_buf) const override;
     BtreeStatus delete_overflow(const BlkId& blkid) override;
 
     // ── COWBtree-specific ─────────────────────────────────────────────────────
@@ -334,7 +334,7 @@ private:
     CPSession* cp_session(cp_id_t cp_id);
     folly::coro::Task< void > recover_full_map(cp_id_t cur_cp_id);
     folly::coro::Task< uint64_t > recover_one_incr_cp(uint64_t offset, cp_id_t last_full_cp, cp_id_t cur_cp_id);
-    folly::coro::Task< sisl::ByteView > read_from_incr_stream(uint64_t offset, size_t len);
+    folly::coro::Task< sisl::IoBufView > read_from_incr_stream(uint64_t offset, size_t len);
 
     // ── Incremental map journal format (written to incr_map_stream_) ─────────
     //

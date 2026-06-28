@@ -166,10 +166,10 @@ private:
         BitsetImpl* const m_b;
     };
 
-    static sisl::ByteArray make_byte_array_with_deleter(const uint32_t sz, const uint32_t alignment = 0,
+    static sisl::IoBufShared make_io_buf_shared_with_deleter(const uint32_t sz, const uint32_t alignment = 0,
                                                          const Buftag tag = Buftag::bitset) {
-        return std::shared_ptr< ByteArrayImpl >{
-            new ByteArrayImpl{sz, alignment, tag}, [](ByteArrayImpl* const ptr) {
+        return std::shared_ptr< IoBufSharedImpl >{
+            new IoBufSharedImpl{sz, alignment, tag}, [](IoBufSharedImpl* const ptr) {
                 if (ptr) {
                     // The bitset_serialized header is at the start of the blob's buffer, not the blob object itself.
                     bitset_serialized* const bsp{reinterpret_cast< bitset_serialized* >(ptr->bytes())};
@@ -179,7 +179,7 @@ private:
             }};
     }
 
-    sisl::ByteArray m_buf;
+    sisl::IoBufShared m_buf;
     bitset_serialized* m_s{nullptr};
     mutable folly::SharedMutex m_lock;
     static constexpr uint64_t m_word_mask{bitword_type::bits() - 1};
@@ -212,7 +212,7 @@ public:
     explicit BitsetImpl(const uint64_t nbits = 0, const uint64_t m_id = 0, const uint32_t alignment_size = 0) {
         const uint64_t size{(alignment_size > 0) ? round_up(bitset_serialized::nbytes(nbits), alignment_size)
                                                  : bitset_serialized::nbytes(nbits)};
-        m_buf = make_byte_array_with_deleter(static_cast< uint32_t >(size), alignment_size);
+        m_buf = make_io_buf_shared_with_deleter(static_cast< uint32_t >(size), alignment_size);
         m_s = new (m_buf->bytes()) bitset_serialized{m_id, nbits, 0, alignment_size};
     }
 
@@ -224,9 +224,9 @@ public:
         m_s = other.m_s;
     }
 
-    explicit BitsetImpl(const sisl::ByteArray& b,
+    explicit BitsetImpl(const sisl::IoBufShared& b,
                         const std::optional< uint32_t > opt_alignment_size = std::optional< uint32_t >{}) {
-        // NOTE: This assumes that the passed ByteArray already has an initialized bitset_serialized structure
+        // NOTE: This assumes that the passed IoBufShared already has an initialized bitset_serialized structure
         // Also assume that the words byte array contains packed word_t data since packed Word data is illegal
         // with any class besides POD
         assert(b->size() >= sizeof(bitset_serialized));
@@ -238,7 +238,7 @@ public:
         const uint32_t alignment_size{opt_alignment_size ? (*opt_alignment_size) : ptr->m_alignment_size};
         const uint64_t size{(alignment_size > 0) ? round_up(total_bytes, alignment_size) : total_bytes};
         assert(b->size() >= total_bytes);
-        m_buf = make_byte_array_with_deleter(static_cast< uint32_t >(size), alignment_size);
+        m_buf = make_io_buf_shared_with_deleter(static_cast< uint32_t >(size), alignment_size);
         m_s = new (m_buf->bytes()) bitset_serialized{ptr->m_id, nbits, ptr->m_skip_bits, alignment_size, false};
         const word_t* b_words{reinterpret_cast< const word_t* >(b->cbytes() + sizeof(bitset_serialized))};
         // copy the data
@@ -252,7 +252,7 @@ public:
         const uint64_t nbits{static_cast< uint64_t >(num_words) * word_size()};
         const uint64_t size{(alignment_size > 0) ? round_up(bitset_serialized::nbytes(nbits), alignment_size)
                                                  : bitset_serialized::nbytes(nbits)};
-        m_buf = make_byte_array_with_deleter(static_cast< uint32_t >(size), alignment_size);
+        m_buf = make_io_buf_shared_with_deleter(static_cast< uint32_t >(size), alignment_size);
         m_s = new (m_buf->bytes()) bitset_serialized{id, nbits, 0, alignment_size, false};
 
         // copy the data into the uninitialized bitset
@@ -268,7 +268,7 @@ public:
         const uint64_t nbits{static_cast< uint64_t >(num_words) * word_size()};
         const uint64_t size{(alignment_size > 0) ? round_up(bitset_serialized::nbytes(nbits), alignment_size)
                                                  : bitset_serialized::nbytes(nbits)};
-        m_buf = make_byte_array_with_deleter(static_cast< uint32_t >(size), alignment_size);
+        m_buf = make_io_buf_shared_with_deleter(static_cast< uint32_t >(size), alignment_size);
         m_s = new (m_buf->bytes()) bitset_serialized{id, nbits, 0, alignment_size, false};
 
         // copy the data into the unitialized bitset
@@ -491,7 +491,7 @@ public:
                 ReadLockGuard other_lock{&other};
                 // ensure distinct buffers
                 if ((m_buf->size() != other.m_buf->size()) || (m_buf == other.m_buf)) {
-                    m_buf = make_byte_array_with_deleter(other.m_buf->size(), other.m_s->m_alignment_size);
+                    m_buf = make_io_buf_shared_with_deleter(other.m_buf->size(), other.m_s->m_alignment_size);
                     m_s = new (m_buf->bytes())
                         bitset_serialized{other.m_s->m_id, other.m_s->m_nbits, other.m_s->m_skip_bits,
                                           other.m_s->m_alignment_size, false};
@@ -542,7 +542,7 @@ public:
                 bool uninitialized{false};
                 const auto old_words_cap{m_s->m_words_cap};
                 if ((m_buf->size() != size) || (m_buf == other.m_buf)) {
-                    m_buf = make_byte_array_with_deleter(size, alignment_size);
+                    m_buf = make_io_buf_shared_with_deleter(size, alignment_size);
                     uninitialized = true;
                 }
                 m_s = new (m_buf->bytes()) bitset_serialized{other.m_s->m_id, nbits, 0, alignment_size, false};
@@ -641,9 +641,9 @@ public:
      * array may be returned which if other threads are operating on the same bitset can cause corruption if proper
      * locking not used.
      *
-     * @return sisl::ByteArray
+     * @return sisl::IoBufShared
      */
-    const sisl::ByteArray serialize(const std::optional< uint32_t > opt_alignment_size = std::optional< uint32_t >{},
+    const sisl::IoBufShared serialize(const std::optional< uint32_t > opt_alignment_size = std::optional< uint32_t >{},
                                      const bool force_copy = false) const {
         ReadLockGuard lock{this};
         assert(m_s);
@@ -652,7 +652,7 @@ public:
         if (std::is_standard_layout_v< bitword_type > && std::is_trivial_v< value_type > &&
             (sizeof(value_type) == sizeof(bitword_type)) && (alignment_size == m_s->m_alignment_size) && !force_copy) {
             // underlying BitWord class is standard layout and same alignment
-            // so return the underlying ByteArray
+            // so return the underlying IoBufShared
             return m_buf;
         } else {
             // underlying BitWord is not standard layout or different alignment or copy
@@ -662,9 +662,9 @@ public:
             const uint64_t size{(alignment_size > 0) ? round_up(total_bytes, alignment_size) : total_bytes};
 
             // create buffer that only destroys bit_serialized and not underlying words since they are POD
-            auto buf{std::shared_ptr< ByteArrayImpl >{
-                new ByteArrayImpl{static_cast< uint32_t >(size), alignment_size, Buftag::bitset},
-                [](ByteArrayImpl* const ptr) {
+            auto buf{std::shared_ptr< IoBufSharedImpl >{
+                new IoBufSharedImpl{static_cast< uint32_t >(size), alignment_size, Buftag::bitset},
+                [](IoBufSharedImpl* const ptr) {
                     if (ptr) {
                         // beginning of buffer is bitset_serialized
                         bitset_serialized* const bitset_serialized_ptr{reinterpret_cast< bitset_serialized* >(ptr)};
@@ -706,7 +706,7 @@ public:
         if (std::is_standard_layout_v< bitword_type > && std::is_trivial_v< value_type > &&
             (sizeof(value_type) == sizeof(bitword_type)) && (alignment_size == m_s->m_alignment_size) && !force_copy) {
             // underlying BitWord class is standard layout and same alignment
-            // so return the underlying ByteArray
+            // so return the underlying IoBufShared
             return static_cast< uint64_t >(m_buf->size());
         } else {
             // underlying BitWord is not standard layout or different alignment or copy
@@ -1150,7 +1150,7 @@ private:
         const uint64_t new_skip_bits{m_s->m_skip_bits & m_word_mask};
 
         const uint64_t new_nbits{nbits + new_skip_bits};
-        auto new_buf{make_byte_array_with_deleter(bitset_serialized::nbytes(new_nbits), m_s->m_alignment_size)};
+        auto new_buf{make_io_buf_shared_with_deleter(bitset_serialized::nbytes(new_nbits), m_s->m_alignment_size)};
         auto new_s{new (new_buf->bytes())
                        bitset_serialized{m_s->m_id, new_nbits, new_skip_bits, m_s->m_alignment_size, false}};
         const auto new_cap{new_s->m_words_cap};

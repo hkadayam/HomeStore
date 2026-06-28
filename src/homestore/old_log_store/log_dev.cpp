@@ -243,7 +243,7 @@ void LogDev::do_load(off_t device_cursor) {
             const auto* rec = header->nth_record(i);
             const uint32_t data_offset = (rec->offset + (rec->get_inlined() ? 0 : header->oob_data_offset));
             // Do a callback on the found log entry
-            sisl::ByteView b = buf;
+            sisl::IoBufView b = buf;
             b.move_forward(data_offset);
             b.set_size(rec->size);
             if (m_last_truncate_idx == -1) { m_last_truncate_idx = header->start_idx() + i; }
@@ -287,7 +287,7 @@ void LogDev::assert_next_pages(log_stream_reader& lstream) {
     }
 }
 
-int64_t LogDev::append_async(logstore_id_t store_id, logstore_seq_num_t seq_num, const sisl::IoBlob& data,
+int64_t LogDev::append_async(logstore_id_t store_id, logstore_seq_num_t seq_num, const sisl::IoBufSpan& data,
                              void* cb_context) {
     const auto idx = m_log_idx.fetch_add(1, std::memory_order_acq_rel);
     m_pending_flush_size.fetch_add(data.size(), std::memory_order_relaxed);
@@ -298,7 +298,7 @@ int64_t LogDev::append_async(logstore_id_t store_id, logstore_seq_num_t seq_num,
 
 log_buffer LogDev::read(const logdev_key& key) {
     std::unique_lock lg = flush_guard();
-    auto buf = sisl::make_byte_array(initial_read_size, m_flush_size_multiple, sisl::Buftag::logread);
+    auto buf = sisl::make_io_buf_shared(initial_read_size, m_flush_size_multiple, sisl::Buftag::logread);
     auto ec = m_vdev_jd->sync_pread(buf->bytes(), initial_read_size, key.dev_offset);
     if (ec) {
         LOGERROR("Failed to read from Journal vdev log_dev={} {} {}", m_logdev_id, ec.value(), ec.message());
@@ -310,16 +310,16 @@ log_buffer LogDev::read(const logdev_key& key) {
     auto record_header = header->nth_record(key.idx - header->start_log_idx);
     uint32_t const data_offset = (record_header->offset + (record_header->get_inlined() ? 0 : header->oob_data_offset));
 
-    sisl::ByteView ret_view;
+    sisl::IoBufView ret_view;
     if ((data_offset + record_header->size) < initial_read_size) {
-        ret_view = sisl::ByteView{buf, data_offset, record_header->size};
+        ret_view = sisl::IoBufView{buf, data_offset, record_header->size};
     } else {
         auto const rounded_data_offset = sisl::round_down(data_offset, m_vdev->align_size());
         auto const rounded_size =
             sisl::round_up(record_header->size + data_offset - rounded_data_offset, m_vdev->align_size());
-        auto new_buf = sisl::make_byte_array(rounded_size, m_vdev->align_size(), sisl::Buftag::logread);
+        auto new_buf = sisl::make_io_buf_shared(rounded_size, m_vdev->align_size(), sisl::Buftag::logread);
         m_vdev_jd->sync_pread(new_buf->bytes(), rounded_size, key.dev_offset + rounded_data_offset);
-        ret_view = sisl::ByteView{new_buf, s_cast< uint32_t >(data_offset - rounded_data_offset), record_header->size};
+        ret_view = sisl::IoBufView{new_buf, s_cast< uint32_t >(data_offset - rounded_data_offset), record_header->size};
     }
 
     return ret_view;
@@ -327,7 +327,7 @@ log_buffer LogDev::read(const logdev_key& key) {
 
 void LogDev::read_record_header(const logdev_key& key, serialized_log_record& return_record_header) {
     std::unique_lock lg = flush_guard();
-    auto buf = sisl::make_byte_array(initial_read_size, m_flush_size_multiple, sisl::Buftag::logread);
+    auto buf = sisl::make_io_buf_shared(initial_read_size, m_flush_size_multiple, sisl::Buftag::logread);
     auto ec = m_vdev_jd->sync_pread(buf->bytes(), initial_read_size, key.dev_offset);
     if (ec) LOGERROR("Failed to read from Journal vdev log_dev={} {} {}", m_logdev_id, ec.value(), ec.message());
 
@@ -809,13 +809,13 @@ void LogDevMetadata::reset() {
     m_store_info.clear();
 }
 
-void LogDevMetadata::logdev_super_blk_found(const sisl::ByteView& buf, void* meta_cookie) {
+void LogDevMetadata::logdev_super_blk_found(const sisl::IoBufView& buf, void* meta_cookie) {
     m_sb.load(buf, meta_cookie);
     HS_REL_ASSERT_EQ(m_sb->get_magic(), logdev_superblk::LOGDEV_SB_MAGIC, "Invalid logdev metablk, magic mismatch");
     HS_REL_ASSERT_EQ(m_sb->get_version(), logdev_superblk::LOGDEV_SB_VERSION, "Invalid version of logdev metablk");
 }
 
-void LogDevMetadata::rollback_super_blk_found(const sisl::ByteView& buf, void* meta_cookie) {
+void LogDevMetadata::rollback_super_blk_found(const sisl::IoBufView& buf, void* meta_cookie) {
     m_rollback_sb.load(buf, meta_cookie);
     HS_REL_ASSERT_EQ(m_rollback_sb->get_magic(), rollback_superblk::ROLLBACK_SB_MAGIC, "Rollback sb magic mismatch");
     HS_REL_ASSERT_EQ(m_rollback_sb->get_version(), rollback_superblk::ROLLBACK_SB_VERSION,

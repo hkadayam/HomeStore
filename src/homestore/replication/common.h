@@ -65,9 +65,9 @@ struct repl_dev_superblk {
     uuid_t group_id; // group_id of this replica set
     logdev_id_t logdev_id;
     logstore_id_t logstore_id;     // Logstore id for the data journal
-    repl_lsn_t durable_commit_lsn; // LSN upto which this replica has committed
-    repl_lsn_t checkpoint_lsn;     // LSN upto which this replica have checkpointed the Data
-    repl_lsn_t compact_lsn;        // maximum LSN that can be compacted to
+    raft_lsn_t durable_commit_lsn; // LSN upto which this replica has committed
+    raft_lsn_t checkpoint_lsn;     // LSN upto which this replica have checkpointed the Data
+    raft_lsn_t compact_lsn;        // maximum LSN that can be compacted to
     uint64_t group_ordinal;        // Ordinal number which will be used to indicate the rdevXYZ for debugging
     char rdev_name[max_name_len];  // Short name for the group for easy debugging
 

@@ -51,8 +51,8 @@ using AsyncReplResult = AsyncResult< V, ReplError >;
 using ReplicaId = uuid_t;
 using GroupId = uuid_t;
 
-using store_lsn_t = int64_t;
-using repl_lsn_t = int64_t;
+using store_lsn_t = int64_t; // 0-indexed; LogStore's native lsn space
+using raft_lsn_t = int64_t;  // 1-indexed; nuraft's lsn space (= store_lsn + 1)
 using RaftBufferPtr = nuraft::ptr< nuraft::buffer >;
 using RaftClusterConfig = nuraft::ptr< nuraft::cluster_config >;
 using RaftLogEntryPtr = nuraft::ptr< nuraft::log_entry >;

@@ -96,7 +96,7 @@ static_assert(std::is_trivially_copyable_v< LogStoreRecord >, "StreamTracker req
 // ─────────────────────────────────────────────────────────────────────────────
 // Replay handler invoked by LogStore::on_log_found for each recovered record once the store is opened.
 // ─────────────────────────────────────────────────────────────────────────────
-using log_replay_cb = std::function< void(lsn_t lsn, const sisl::ByteView& data) >;
+using log_replay_cb = std::function< void(lsn_t lsn, const sisl::IoBufView& data) >;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LogStore
@@ -167,9 +167,9 @@ public:
     // ── Read / truncate / rollback / flush ───────────────────────────────────
 
     /// Read the data bytes for `lsn`.  Internally awaits flush_upto(lsn) so records_ is populated, then resolves
-    /// the dev_key and reads via the underlying LogStream.  Returns an empty ByteView if lsn is outside
+    /// the dev_key and reads via the underlying LogStream.  Returns an empty IoBufView if lsn is outside
     /// [head_lsn, next_lsn).
-    folly::coro::Task< sisl::ByteView > read(lsn_t lsn);
+    folly::coro::Task< sisl::IoBufView > read(lsn_t lsn);
 
     /// Drains pending records (via stream_->flush()) until tail_lsn_ >= upto_lsn or bounded retry exhausted.
     folly::coro::Task< void > flush();
@@ -194,7 +194,7 @@ public:
     /// Same trunc_key derivation as on_write_completion.  Inserts the record with both keys (recovery path
     /// doesn't reserve via create() at append time), advances tail_lsn_ and next_lsn_, fires the replay handler.
     /// Skips records below head_lsn_ or inside any persisted rollback range.
-    void on_log_found(lsn_t lsn, const stream_key& key, const sisl::ByteView& data) override;
+    void on_log_found(lsn_t lsn, const stream_key& key, const sisl::IoBufView& data) override;
 
     // ── Accessors ────────────────────────────────────────────────────────────
 

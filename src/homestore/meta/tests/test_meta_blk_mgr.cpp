@@ -45,7 +45,7 @@
 
 using namespace homestore;
 using namespace iomanager;
-using sisl::IOBuffer;
+using sisl::IoBuf;
 
 static constexpr uint64_t DEV_SIZE = 256 * 1024 * 1024;      // 256 MB per device
 static constexpr uint64_t META_VDEV_SIZE = 64 * 1024 * 1024; // 64 MB for meta vdev
@@ -53,8 +53,8 @@ static constexpr uint64_t META_VDEV_SIZE = 64 * 1024 * 1024; // 64 MB for meta v
 // ── Pattern helpers ─────────────────────────────────────────────────────────────────────────────────────────────────
 // Each block is identified by a uint64_t id that seeds a deterministic byte pattern, so we can verify data integrity
 // without keeping the original buffer around.
-static sisl::ByteArray make_pattern_buf(uint64_t id, size_t size) {
-    auto buf = sisl::make_byte_array(to_u32(size));
+static sisl::IoBufShared make_pattern_buf(uint64_t id, size_t size) {
+    auto buf = sisl::make_io_buf_shared(to_u32(size));
     auto* p = buf->bytes();
     for (size_t i = 0; i < size; ++i) {
         p[i] = static_cast< uint8_t >((id + i) & 0xFF);
@@ -62,7 +62,7 @@ static sisl::ByteArray make_pattern_buf(uint64_t id, size_t size) {
     return buf;
 }
 
-static bool verify_pattern(const sisl::ByteView& buf, uint64_t id, size_t size) {
+static bool verify_pattern(const sisl::IoBufView& buf, uint64_t id, size_t size) {
     if (buf.size() < size) return false;
     const auto* p = buf.bytes();
     for (size_t i = 0; i < size; ++i) {
@@ -205,7 +205,7 @@ CORO_TEST_F(MetaBlkMgrTest, WriteDataRestartValidate) {
 
             size_t found = 0;
             co_await client.for_each_recovered_block(
-                [&found, &records](const MetaBlk& blk, const sisl::ByteView& data) -> folly::coro::Task< void > {
+                [&found, &records](const MetaBlk& blk, const sisl::IoBufView& data) -> folly::coro::Task< void > {
                     ++found;
                     bool matched = false;
                     for (const auto& rec : records) {
@@ -265,7 +265,7 @@ CORO_TEST_F(MetaBlkMgrTest, RemoveBlocksRestart) {
 
         size_t found = 0;
         co_await client.for_each_recovered_block(
-            [&found, &surviving_ids, data_size](const MetaBlk& blk, const sisl::ByteView& data) -> folly::coro::Task< void > {
+            [&found, &surviving_ids, data_size](const MetaBlk& blk, const sisl::IoBufView& data) -> folly::coro::Task< void > {
                 ++found;
                 bool matched = false;
                 for (uint64_t id : surviving_ids) {
@@ -323,7 +323,7 @@ CORO_TEST_F(MetaBlkMgrTest, RemoveAllBlocksRestart) {
 
         size_t found = 0;
         co_await survivor.for_each_recovered_block(
-            [&found, data_size](const MetaBlk& blk, const sisl::ByteView& data) -> folly::coro::Task< void > {
+            [&found, data_size](const MetaBlk& blk, const sisl::IoBufView& data) -> folly::coro::Task< void > {
                 ++found;
                 bool ok = verify_pattern(data, 300, data_size) || verify_pattern(data, 301, data_size);
                 EXPECT_TRUE(ok) << "Survivor block data mismatch";
@@ -405,7 +405,7 @@ CORO_TEST_F(MetaBlkMgrTest, OverflowBlocks) {
 
         size_t found = 0;
         co_await client.for_each_recovered_block(
-            [&found, small_sz, large_sz, xlarge_sz](const MetaBlk& blk, const sisl::ByteView& data) -> folly::coro::Task< void > {
+            [&found, small_sz, large_sz, xlarge_sz](const MetaBlk& blk, const sisl::IoBufView& data) -> folly::coro::Task< void > {
                 ++found;
                 auto name = blk.name();
                 LOGINFO("OverflowBlocks visitor: found={} name={} data_size={}", found, name, data.size());
@@ -463,7 +463,7 @@ CORO_TEST_F(MetaBlkMgrTest, UpdateInPlace) {
 
         size_t found = 0;
         co_await client.for_each_recovered_block(
-            [&found, data_size](const MetaBlk& blk, const sisl::ByteView& data) -> folly::coro::Task< void > {
+            [&found, data_size](const MetaBlk& blk, const sisl::IoBufView& data) -> folly::coro::Task< void > {
                 ++found;
                 EXPECT_TRUE(verify_pattern(data, 20, data_size)) << "Expected v2 data after restart";
                 co_return;
@@ -523,7 +523,7 @@ CORO_TEST_F(MetaBlkMgrTest, SizeTransitions) {
 
         size_t found = 0;
         co_await client.for_each_recovered_block(
-            [&found, small_sz](const MetaBlk& blk, const sisl::ByteView& data) -> folly::coro::Task< void > {
+            [&found, small_sz](const MetaBlk& blk, const sisl::IoBufView& data) -> folly::coro::Task< void > {
                 ++found;
                 EXPECT_TRUE(verify_pattern(data, 3, small_sz)) << "Small data mismatch after shrink+restart";
                 co_return;
@@ -580,7 +580,7 @@ CORO_TEST_F(MetaBlkMgrTest, MultipleRestarts) {
 
         size_t found = 0;
         co_await client.for_each_recovered_block(
-            [&found, &live_ids, data_size](const MetaBlk& blk, const sisl::ByteView& data) -> folly::coro::Task< void > {
+            [&found, &live_ids, data_size](const MetaBlk& blk, const sisl::IoBufView& data) -> folly::coro::Task< void > {
                 ++found;
                 bool matched = false;
                 for (uint64_t id : live_ids) {
@@ -622,7 +622,7 @@ CORO_TEST_F(MetaBlkMgrTest, ManyClients) {
 
             size_t found = 0;
             co_await client.for_each_recovered_block(
-                [&found, i, data_size](const MetaBlk& blk, const sisl::ByteView& data) -> folly::coro::Task< void > {
+                [&found, i, data_size](const MetaBlk& blk, const sisl::IoBufView& data) -> folly::coro::Task< void > {
                     ++found;
                     EXPECT_TRUE(verify_pattern(data, i, data_size));
                     co_return;

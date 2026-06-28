@@ -20,6 +20,7 @@
 #include <sisl/fds/utils.h>
 #include <sisl/metrics/metrics.h>
 
+#include <libnuraft/buffer.hxx>
 #include <libnuraft/state_machine.hxx>
 #include <libnuraft/state_mgr.hxx>
 #include <libnuraft/snapshot.hxx>
@@ -54,12 +55,71 @@ class ReplicaSet;
 class ReplicaSetListener;
 class ReplicationManager;
 
-VENUM(JournalType, uint16_t,
-      HS_DATA = 0,                  // Application data — payload bytes ride in the log_entry's value buffer.
-      HS_CTRL_DESTROY = 1,          // Control message to destroy the replica set.
-      HS_CTRL_START_REPLACE = 2,    // Control message to start replacing a member.
-      HS_CTRL_COMPLETE_REPLACE = 3, // Control message to complete replacing a member.
+VENUM(JournalType, uint8_t,
+      HS_DATA_INLINE = 0,           // App data — value bytes live inline in the record.
+      HS_DATA_INDIRECT = 1,         // App data — value bytes live on blob_stream; record carries a list of BlkIds.
+      HS_CTRL_DESTROY = 2,          // Control message to destroy the replica set.
+      HS_CTRL_START_REPLACE = 3,    // Control message to start replacing a member.
+      HS_CTRL_COMPLETE_REPLACE = 4, // Control message to complete replacing a member.
 )
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// ReplLogHeader — fixed prefix on every replicated log_entry's value buffer.
+//
+// Layout on the wire / disk / in memory:
+//   | code (1B) | major_version (1B) | minor_version (1B) | _pad (1B) | value_size (4B) | user_header_size_ (4B)
+//   | [user_header bytes ...]
+//
+// `code` / `major_version` / `minor_version` / `value_size` are filled by HS inside ReplicaSet::write — the app
+// cannot set them.  The app writes its own header bytes starting at `user_header_bytes()` (immediately after the
+// fixed 12-byte prefix).  user_header_size_ is stamped by alloc() and used by to_nuraft_buffer() to size the
+// zero-copy take_ownership wrap.
+//
+// Allocated via ReplLogHeader::alloc(user_header_size) which returns shared<ReplLogHeader>; HS converts to a
+// nuraft::buffer via to_nuraft_buffer(hdr) — the deleter captures the shared_ptr so the storage outlives the
+// resulting nuraft::buffer.  Zero copy through the entire write path.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+#pragma pack(1)
+struct ReplLogHeader {
+    static constexpr uint8_t kMajor = 1;
+    static constexpr uint8_t kMinor = 1;
+
+    uint8_t code{0}; // journal_type_t value, set by HS in ReplicaSet::write
+    uint16_t major_version{0};
+    uint8_t minor_version{0};
+    uint32_t value_size{0}; // bytes the app's IOBlob value carries — set by HS
+
+private:
+    uint32_t user_header_size_{0}; // stamped by alloc(); used by to_nuraft_buffer() for the take_ownership span
+
+public:
+    uint32_t user_header_size() const { return user_header_size_; }
+    uint8_t* user_header_bytes() { return r_cast< uint8_t* >(this) + sizeof(ReplLogHeader); }
+    uint8_t const* user_header_bytes() const { return r_cast< uint8_t const* >(this) + sizeof(ReplLogHeader); }
+    size_t total_size() const { return sizeof(ReplLogHeader) + user_header_size_; }
+
+    // Allocate a ReplLogHeader with `user_header_size` trailing bytes.  The full slab (sizeof(ReplLogHeader)
+    // + user_header_size) is allocated once via sisl::make_io_buf_shared; placement-new constructs the prefix in
+    // place and stamps user_header_size_.  Returned shared<ReplLogHeader> aliases the underlying IoBufShared
+    // control block so the storage stays alive as long as either reference is held.
+    static shared< ReplLogHeader > alloc(uint32_t user_header_size) {
+        auto ba = sisl::make_io_buf_shared(sizeof(ReplLogHeader) + user_header_size);
+        auto* hdr = new (ba->bytes()) ReplLogHeader{};
+        hdr->user_header_size_ = user_header_size;
+        return shared< ReplLogHeader >(ba, hdr); // aliasing ctor — ba's deleter frees the IoBufShared
+    }
+
+    // Zero-copy wrap of a shared<ReplLogHeader> as a nuraft::buffer.  The deleter captures `hdr` so the
+    // underlying storage outlives the resulting nuraft::buffer.  Spans `total_size()` bytes (fixed prefix +
+    // trailing user_header).
+    static nuraft::ptr< nuraft::buffer > to_nuraft_buffer(shared< ReplLogHeader > hdr) {
+        size_t total = hdr->total_size();
+        return nuraft::buffer::take_ownership(r_cast< uint8_t* >(hdr.get()), total,
+                                              [held = std::move(hdr)](nuraft::byte*) noexcept { (void)held; });
+    }
+};
+#pragma pack()
+static_assert(sizeof(ReplLogHeader) == 12, "ReplLogHeader fixed prefix must be exactly 12 bytes on the wire/disk");
 
 ENUM(ReplicaSetStage, uint8_t, INIT, ACTIVE, DESTROYING, DESTROYED, PERMANENT_DESTROYED);
 
@@ -69,11 +129,11 @@ class SnapshotContext {
 public:
     SnapshotContext(int64_t lsn) : lsn_(lsn) {}
     explicit SnapshotContext(nuraft::snapshot& snp);
-    explicit SnapshotContext(sisl::IoBlobSafe const& snp_ctx);
+    explicit SnapshotContext(sisl::IoBufOwn const& snp_ctx);
     virtual ~SnapshotContext() = default;
 
-    sisl::IoBlobSafe serialize();
-    void deserialize(sisl::IoBlobSafe const& snp_ctx);
+    sisl::IoBufOwn serialize();
+    void deserialize(sisl::IoBufOwn const& snp_ctx);
     nuraft::ptr< nuraft::snapshot > nuraft_snapshot() { return snapshot_; }
     int64_t get_lsn() const { return lsn_; }
 
@@ -105,7 +165,7 @@ struct ReplicaSetSuperBlk {
     GroupId group_id;
     uint8_t is_timeline_consistent;
     uint8_t destroy_pending;
-    repl_lsn_t last_snapshot_lsn;
+    raft_lsn_t last_snapshot_lsn;
 
     // Per-group log_store ids set by HomeRaftLogStore::create. raft_log_store_id is always valid.
     // free_blks_journal_id is set only when the listener provided a non-null blob_stream() at
@@ -241,10 +301,11 @@ public:
 
     // ── Public client API ────────────────────────────────────────────────────────────────────────────────────
 
-    /// Single client write entry point. Allocates blkids, writes `value` to the blob store, builds the journal
-    /// entry, proposes through raft, resolves on commit (or error). The listener's on_commit() will have fired
-    /// before this returns successfully.
-    folly::coro::Task< ReplResult<> > write(sisl::Blob header, sisl::ByteArray value, TraceId tid = 0);
+    /// Single client write entry point. App pre-fills its own header bytes inside the ReplLogHeader's trailing
+    /// region (after the fixed 12-byte prefix); HS stamps code/major/minor/value_size, wraps both `hdr` and
+    /// `value` zero-copy into a 2-part log_entry chain, and proposes through raft. Resolves when commit fires
+    /// (the listener's on_commit() has already run before this returns successfully) or on error.
+    folly::coro::Task< ReplResult<> > write(shared< ReplLogHeader > hdr, sisl::IoBufSpan const& value, TraceId tid = 0);
 
     // ── Membership / leadership ──────────────────────────────────────────────────────────────────────────────
 
@@ -281,9 +342,9 @@ public:
 
     void set_custom_rset_name(std::string const& name);
 
-    repl_lsn_t get_last_commit_lsn() const { return commit_upto_lsn_.load(); }
-    void set_last_commit_lsn(repl_lsn_t lsn) { commit_upto_lsn_.store(lsn); }
-    repl_lsn_t get_last_append_lsn();
+    raft_lsn_t get_last_commit_lsn() const { return commit_upto_lsn_.load(); }
+    void set_last_commit_lsn(raft_lsn_t lsn) { commit_upto_lsn_.store(lsn); }
+    raft_lsn_t get_last_append_lsn();
     uint32_t get_blk_size() const;
 
     bool is_destroy_pending() const;
@@ -302,7 +363,7 @@ public:
     void stop();
     void clear_chunk_req(chunk_num_t chunk_id);
 
-    shared< SnapshotContext > deserialize_snapshot_context(sisl::IoBlobSafe& snp_ctx);
+    shared< SnapshotContext > deserialize_snapshot_context(sisl::IoBufOwn& snp_ctx);
 
     // ── Hooks invoked by ReplicationManager ─────────────────────────────────────────────────────────────────
 
@@ -312,12 +373,12 @@ public:
     void flush_durable_commit_lsn();
     void check_replace_member_status();
     void gc_repl_reqs();
-    void on_compact(repl_lsn_t upto_lsn) { compact_lsn_.store(upto_lsn); }
+    void on_compact(raft_lsn_t upto_lsn) { compact_lsn_.store(upto_lsn); }
     void on_log_found(logstore_seq_num_t lsn, log_buffer buf, void* ctx);
     void become_leader_cb();
     void become_follower_cb();
     void become_ready();
-    bool need_skip_processing(repl_lsn_t lsn) const { return lsn <= rd_sb_->last_snapshot_lsn; }
+    bool need_skip_processing(raft_lsn_t lsn) const { return lsn <= rd_sb_->last_snapshot_lsn; }
 
     // ── CP integration ──────────────────────────────────────────────────────────────────────────────────────
 
@@ -396,9 +457,9 @@ private:
     std::mutex sb_mtx_;
     std::mutex config_mtx_;
 
-    std::atomic< repl_lsn_t > commit_upto_lsn_{0};
-    std::atomic< repl_lsn_t > compact_lsn_{0};
-    repl_lsn_t last_flushed_commit_lsn_{0};
+    std::atomic< raft_lsn_t > commit_upto_lsn_{0};
+    std::atomic< raft_lsn_t > compact_lsn_{0};
+    raft_lsn_t last_flushed_commit_lsn_{0};
 
     iomanager::CoroTimer sb_flush_timer_;
     Clock::time_point destroyed_time_;

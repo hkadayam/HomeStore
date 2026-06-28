@@ -732,8 +732,8 @@ void ReplicaSet::push_data_to_all_followers(repl_req_ptr_t rreq, sisl::SgList co
         builder.CreateVector(rreq->header().cbytes(), rreq->header().size()),
         builder.CreateVector(rreq->key().cbytes(), rreq->key().size()), data.size, get_time_since_epoch_ms()));
 
-    rreq->m_pkts = sisl::IoBlob::sg_list_to_ioblob_list(data);
-    rreq->m_pkts.insert(rreq->m_pkts.begin(), sisl::IoBlob{builder.GetBufferPointer(), builder.GetSize(), false});
+    rreq->m_pkts = sisl::IoBufSpan::sg_list_to_ioblob_list(data);
+    rreq->m_pkts.insert(rreq->m_pkts.begin(), sisl::IoBufSpan{builder.GetBufferPointer(), builder.GetSize(), false});
 
     /*RD_LOGI("Data Channel: Pushing data to all followers: rreq=[{}] data=[{}]", rreq->to_string(),
            flatbuffers::FlatBufferToString(builder.GetBufferPointer() + sizeof(flatbuffers::uoffset_t),
@@ -1114,7 +1114,7 @@ void ReplicaSet::fetch_data_from_remote(std::vector< repl_req_ptr_t > rreqs) {
     group_msg_service()
         ->data_service_request_bidirectional(
             originator, FETCH_DATA,
-            sisl::IoBlobList{sisl::IoBlob{builder->GetBufferPointer(), builder->GetSize(), false /* is_aligned */}})
+            sisl::IoBufSpanList{sisl::IoBufSpan{builder->GetBufferPointer(), builder->GetSize(), false /* is_aligned */}})
         .via(&folly::InlineExecutor::instance())
         .thenValue([this, builder, rreqs = std::move(rreqs), fetch_start_time](auto response) {
             COUNTER_DECREMENT(m_metrics, outstanding_data_fetch_cnt, 1);
@@ -1215,9 +1215,9 @@ void ReplicaSet::on_fetch_data_received(intrusive< sisl::GenericRpcData >& rpc_d
             RD_LOGT(NO_TRACE_ID, "Data Channel: FetchData data read completed for {} buffers", sgs_vec.size());
 
             // now prepare the io_blob_list to response back to requester;
-            sisl::IoBlobList pkts = sisl::IoBlobList{};
+            sisl::IoBufSpanList pkts = sisl::IoBufSpanList{};
             for (auto const& sgs : sgs_vec) {
-                auto const ret = sisl::IoBlob::sg_list_to_ioblob_list(sgs);
+                auto const ret = sisl::IoBufSpan::sg_list_to_ioblob_list(sgs);
                 pkts.insert(pkts.end(), ret.begin(), ret.end());
             }
 
@@ -1363,7 +1363,7 @@ void ReplicaSet::handle_commit(repl_req_ptr_t rreq, bool recovery) {
         rreq->clear();
 }
 
-void ReplicaSet::handle_config_commit(const repl_lsn_t lsn, raft_cluster_config_ptr_t& new_conf) {
+void ReplicaSet::handle_config_commit(const raft_lsn_t lsn, raft_cluster_config_ptr_t& new_conf) {
     // when reaching here, the new config has already been applied to the cluster.
     // since we didn't create repl req for config change, we just need to update m_commit_upto_lsn here.
     RD_LOGD(NO_TRACE_ID, "config commit on lsn {}", lsn);
@@ -1375,7 +1375,7 @@ void ReplicaSet::handle_config_commit(const repl_lsn_t lsn, raft_cluster_config_
     }
 }
 
-void ReplicaSet::handle_config_rollback(const repl_lsn_t lsn, raft_cluster_config_ptr_t& conf) {
+void ReplicaSet::handle_config_rollback(const raft_lsn_t lsn, raft_cluster_config_ptr_t& conf) {
     RD_LOGD(NO_TRACE_ID, "roll back config on lsn {}", lsn);
     // keep this variable in case it is needed later
     (void)conf;
@@ -1883,9 +1883,9 @@ void ReplicaSet::check_replace_member_status() {
     auto peers = get_replication_status();
     auto replica_in = m_rd_sb->replace_member_ctx.replica_in;
     auto replica_out = m_rd_sb->replace_member_ctx.replica_out;
-    repl_lsn_t in_lsn = 0;
-    repl_lsn_t out_lsn = 0;
-    repl_lsn_t laggy = HS_DYNAMIC_CONFIG(consensus.laggy_threshold);
+    raft_lsn_t in_lsn = 0;
+    raft_lsn_t out_lsn = 0;
+    raft_lsn_t laggy = HS_DYNAMIC_CONFIG(consensus.laggy_threshold);
 
     for (auto& peer : peers) {
         if (peer.id_ == replica_out) {
@@ -2181,7 +2181,7 @@ bool ReplicaSet::save_snp_resync_data(nuraft::buffer& data, nuraft::snapshot& s)
         // The reason is baseline resync will clear existing resources on the upper layer, skipping replay/commit
         // operations can avoid accessing unavailable resources
         std::unique_lock lg{m_sb_mtx};
-        m_rd_sb->last_snapshot_lsn = s_cast< repl_lsn_t >(s.get_last_log_idx());
+        m_rd_sb->last_snapshot_lsn = s_cast< raft_lsn_t >(s.get_last_log_idx());
         m_rd_sb.write();
     }
     if (msg->dsn > m_next_dsn) {
@@ -2298,7 +2298,7 @@ ReplError ReplicaSet::init_req_ctx(repl_req_ptr_t rreq, repl_key rkey, journal_t
 
 void ReplicaSet::become_leader_cb() {
     auto new_gate = raft_server()->get_last_log_idx();
-    repl_lsn_t existing_gate = 0;
+    raft_lsn_t existing_gate = 0;
     if (!m_traffic_ready_lsn.compare_exchange_strong(existing_gate, new_gate)) {
         // was a follower, m_traffic_ready_lsn should be zero on follower.
         RD_REL_ASSERT(!existing_gate, "existing gate should be zero");

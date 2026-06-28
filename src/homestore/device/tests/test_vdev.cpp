@@ -36,7 +36,7 @@
 
 using namespace homestore;
 using namespace iomanager;
-using sisl::IOBuffer;
+using sisl::IoBuf;
 
 static constexpr uint64_t DEV_SIZE = 256 * 1024 * 1024; // 256 MB
 static constexpr uint32_t BLK_SIZE = 4096;
@@ -134,7 +134,7 @@ CORO_TEST_F(VDevTest, FormatZerosData) {
 
     // Read first block from chunk 0 — should be all zeros.
     BlkId bid(0, 1, to_u16(vdev->get_nth_chunk(0)->chunk_id()));
-    IOBuffer rbuf{BLK_SIZE, 512};
+    IoBuf rbuf{BLK_SIZE, 512};
     auto ec = co_await vdev->read(rbuf, bid);
     CO_ASSERT_FALSE(ec);
     for (uint32_t i = 0; i < BLK_SIZE; ++i) {
@@ -153,11 +153,11 @@ CORO_TEST_F(VDevTest, AllocWriteReadSingleBlock) {
     auto status = vdev->alloc_contiguous_blks(1, hints, blkid);
     CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
 
-    IOBuffer wbuf{BLK_SIZE, 512};
+    IoBuf wbuf{BLK_SIZE, 512};
     std::memset(wbuf.bytes(), 0xAA, BLK_SIZE);
     co_await vdev->write(wbuf, blkid);
 
-    IOBuffer rbuf{BLK_SIZE, 512};
+    IoBuf rbuf{BLK_SIZE, 512};
     auto ec = co_await vdev->read(rbuf, blkid);
     CO_ASSERT_FALSE(ec);
     EXPECT_EQ(std::memcmp(wbuf.bytes(), rbuf.bytes(), BLK_SIZE), 0);
@@ -177,13 +177,13 @@ CORO_TEST_F(VDevTest, AllocWriteReadMultiBlock) {
     CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
 
     uint32_t total_size = nblks * BLK_SIZE;
-    IOBuffer wbuf{total_size, 512};
+    IoBuf wbuf{total_size, 512};
     for (uint32_t i = 0; i < total_size; ++i) {
         wbuf.bytes()[i] = to_u8(i & 0xFF);
     }
     co_await vdev->write(wbuf, blkid);
 
-    IOBuffer rbuf{total_size, 512};
+    IoBuf rbuf{total_size, 512};
     auto ec = co_await vdev->read(rbuf, blkid);
     CO_ASSERT_FALSE(ec);
     EXPECT_EQ(std::memcmp(wbuf.bytes(), rbuf.bytes(), total_size), 0);
@@ -203,7 +203,7 @@ CORO_TEST_F(VDevTest, WritevReadv) {
     CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
 
     // Write 4 separate buffers with distinct patterns.
-    std::vector< IOBuffer > wbufs;
+    std::vector< IoBuf > wbufs;
     wbufs.reserve(nblks);
     for (int i = 0; i < nblks; ++i) {
         wbufs.emplace_back(BLK_SIZE, 512);
@@ -218,7 +218,7 @@ CORO_TEST_F(VDevTest, WritevReadv) {
 
     co_await vdev->writev(std::move(wbufs), blkid);
 
-    std::vector< IOBuffer > rbufs;
+    std::vector< IoBuf > rbufs;
     rbufs.reserve(nblks);
     for (int i = 0; i < nblks; ++i) {
         rbufs.emplace_back(BLK_SIZE, 512);
@@ -349,7 +349,7 @@ CORO_TEST_F(VDevTest, LoadRecovery) {
         auto status = vdev->alloc_contiguous_blks(1, hints, written_blk);
         CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
 
-        IOBuffer wbuf{BLK_SIZE, 512};
+        IoBuf wbuf{BLK_SIZE, 512};
         std::memset(wbuf.bytes(), 0xDD, BLK_SIZE);
         co_await vdev->write(wbuf, written_blk);
         co_await vdev->fsync();
@@ -364,7 +364,7 @@ CORO_TEST_F(VDevTest, LoadRecovery) {
         CO_ASSERT_NE(vdev, nullptr);
         EXPECT_EQ(vdev->name(), "test_recovery");
 
-        IOBuffer rbuf{BLK_SIZE, 512};
+        IoBuf rbuf{BLK_SIZE, 512};
         auto ec = co_await vdev->read(rbuf, written_blk);
         CO_ASSERT_FALSE(ec);
         // Verify the pattern we wrote.
@@ -391,7 +391,7 @@ CORO_TEST_F(VDevTest, FullWorkflow) {
 
     // Write.
     uint32_t total_size = 2 * BLK_SIZE;
-    IOBuffer wbuf{total_size, 512};
+    IoBuf wbuf{total_size, 512};
     std::memset(wbuf.bytes(), 0xEE, total_size);
     co_await vdev->write(wbuf, blkid);
 
@@ -399,7 +399,7 @@ CORO_TEST_F(VDevTest, FullWorkflow) {
     co_await vdev->fsync();
 
     // Read + verify.
-    IOBuffer rbuf{total_size, 512};
+    IoBuf rbuf{total_size, 512};
     auto ec = co_await vdev->read(rbuf, blkid);
     CO_ASSERT_FALSE(ec);
     EXPECT_EQ(std::memcmp(wbuf.bytes(), rbuf.bytes(), total_size), 0);

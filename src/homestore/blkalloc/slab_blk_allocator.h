@@ -147,10 +147,10 @@ public:
 ///   ondisk_bm_  — BitmapBlkAllocator: durable state; null if !persistent.
 ///
 /// Persistence is entirely the caller's responsibility. The caller:
-///   - constructs with a ByteArray (from the meta service) for recovery, or nullopt for a fresh start.
+///   - constructs with a IoBufShared (from the meta service) for recovery, or nullopt for a fresh start.
 ///   - calls acquire_buffer() around the CP flush; the returned BufferGuard holds the serialized
-///     ByteArray and releases the ondisk commit buffer on destruction.
-///   - stores the ByteArray (via guard.buf()) through whichever meta service it chooses.
+///     IoBufShared and releases the ondisk commit buffer on destruction.
+///   - stores the IoBufShared (via guard.buf()) through whichever meta service it chooses.
 ///
 /// Alloc path: slab_cache → fill_cache → inmem_bm_.alloc() direct scan.
 /// Free path:  CompactAlloc→slab try_free; ExpandedAlloc→slab try_free + bitmap for remainder.
@@ -158,8 +158,8 @@ public:
 ///
 class SlabBlkAllocator : public BlkAllocator {
 public:
-    // buf: nullopt for a fresh allocator; a serialized ByteArray (from the meta service) for recovery.
-    SlabBlkAllocator(SlabBlkAllocConfig const& cfg, std::optional< sisl::ByteArray > buf, chunk_num_t chunk_id);
+    // buf: nullopt for a fresh allocator; a serialized IoBufShared (from the meta service) for recovery.
+    SlabBlkAllocator(SlabBlkAllocConfig const& cfg, std::optional< sisl::IoBufShared > buf, chunk_num_t chunk_id);
     SlabBlkAllocator(SlabBlkAllocator const&) = delete;
     SlabBlkAllocator(SlabBlkAllocator&&) noexcept = delete;
     SlabBlkAllocator& operator=(SlabBlkAllocator const&) = delete;

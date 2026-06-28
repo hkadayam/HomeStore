@@ -212,7 +212,7 @@ raft_buf_ptr_t RaftStateMachine::commit_ext(nuraft::state_machine::ext_op_params
 void RaftStateMachine::commit_config(const ulong log_idx, raft_cluster_config_ptr_t& new_conf) {
     // when reaching here, the config change log has already been committed, and the new config has been applied to the
     // cluster
-    if (m_rd.need_skip_processing(s_cast< repl_lsn_t >(log_idx))) {
+    if (m_rd.need_skip_processing(s_cast< raft_lsn_t >(log_idx))) {
         RD_LOGI(NO_TRACE_ID, "Raft Channel: Config {} is expected to be handled by snapshot. Skipping commit.",
                 log_idx);
         return;
@@ -242,12 +242,12 @@ void RaftStateMachine::commit_config(const ulong log_idx, raft_cluster_config_pt
             m_rd.group_id_str());
 #endif
 
-    m_rd.handle_config_commit(s_cast< repl_lsn_t >(log_idx), new_conf);
+    m_rd.handle_config_commit(s_cast< raft_lsn_t >(log_idx), new_conf);
 }
 
 void RaftStateMachine::rollback_config(const ulong log_idx, raft_cluster_config_ptr_t& conf) {
     RD_LOGD(NO_TRACE_ID, "Raft channel: Rollback cluster conf , log_idx = {}", log_idx);
-    m_rd.handle_config_rollback(s_cast< repl_lsn_t >(log_idx), conf);
+    m_rd.handle_config_rollback(s_cast< raft_lsn_t >(log_idx), conf);
 }
 
 void RaftStateMachine::rollback_ext(const nuraft::state_machine::ext_op_params& params) {
@@ -345,7 +345,7 @@ int RaftStateMachine::read_logical_snp_obj(nuraft::snapshot& s, void*& user_ctx,
     // This means the durable_commit_lsn is less than the snapshot's log_idx. Upon restart, the changes in
     // uncommitted logs may or may not included in the snapshot data sent by leader,
     // depending on the racing of commit vs snapshot read, leading to data inconsistency.
-    if (s_cast< repl_lsn_t >(s.get_last_log_idx()) > m_rd.get_last_commit_lsn()) {
+    if (s_cast< raft_lsn_t >(s.get_last_log_idx()) > m_rd.get_last_commit_lsn()) {
         RD_LOGW(NO_TRACE_ID,
                 "not ready to read because there are some uncommitted logs in snapshot, "
                 "let nuraft retry later. snapshot log_idx={}, last_commit_lsn={}",
@@ -399,7 +399,7 @@ void RaftStateMachine::save_logical_snp_obj(nuraft::snapshot& s, ulong& obj_id, 
     snp_data->is_last_obj = is_last_obj;
 
     // We are doing a copy here.
-    sisl::IoBlobSafe blob{static_cast< uint32_t >(data.size())};
+    sisl::IoBufOwn blob{static_cast< uint32_t >(data.size())};
     std::memcpy(blob.bytes(), data.data_begin(), data.size());
     snp_data->blob = std::move(blob);
 

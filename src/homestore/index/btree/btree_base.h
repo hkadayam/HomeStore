@@ -47,10 +47,10 @@ public:
     // Optional per-op guard (e.g. CPGuard in COWBtree).  MemBtree returns a no-op default.
     virtual OpGuard enter_op() { return OpGuard{}; }
 
-    virtual BtreeStatus write_overflow(sisl::ByteArray const& buf, BlkId& out_blkid) {
+    virtual BtreeStatus write_overflow(sisl::IoBufShared const& buf, BlkId& out_blkid) {
         return BtreeStatus::not_supported;
     }
-    virtual BtreeTask< BtreeStatus > read_overflow(BlkId const& blkid, sisl::ByteArray& out_buf) const {
+    virtual BtreeTask< BtreeStatus > read_overflow(BlkId const& blkid, sisl::IoBufShared& out_buf) const {
         CO_RETURN BtreeStatus::not_supported;
     }
     virtual BtreeStatus delete_overflow(BlkId const& blkid) { return BtreeStatus::not_supported; }

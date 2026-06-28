@@ -46,7 +46,7 @@
 
 using namespace homestore;
 using namespace iomanager;
-using sisl::IOBuffer;
+using sisl::IoBuf;
 
 SISL_OPTION_GROUP(test_append_blk_stream,
                   (num_io, "", "num_io", "number of IO operations per test",
@@ -161,14 +161,14 @@ public:
         return true;
     }
 
-    // Build a ByteArray of `size` bytes filled with `seed`.
-    static sisl::ByteArray make_bytes(size_t size, uint64_t seed) {
-        auto ba = sisl::make_byte_array(to_u32(size));
+    // Build a IoBufShared of `size` bytes filled with `seed`.
+    static sisl::IoBufShared make_bytes(size_t size, uint64_t seed) {
+        auto ba = sisl::make_io_buf_shared(to_u32(size));
         fill_buf(ba->bytes(), size, seed);
         return ba;
     }
 
-    // Async append wrapper that takes an existing ByteArray (moves into stream).
+    // Async append wrapper that takes an existing IoBufShared (moves into stream).
     static folly::coro::Task< BlkId > append_record(AppendBlkStream& s, CP* cp, uint16_t segment_id, size_t size,
                                                     uint64_t seed) {
         auto ba = make_bytes(size, seed);
@@ -261,7 +261,7 @@ CORO_TEST_F(AppendBlkStreamTest, AppendFlushAndRead) {
     co_await cp_mgr().trigger_cp_flush(true);
 
     for (auto const& [bid, seed] : entries) {
-        IOBuffer rbuf(BLK_SIZE, 512);
+        IoBuf rbuf(BLK_SIZE, 512);
         auto ec = co_await stream->read(rbuf, bid);
         CO_ASSERT_FALSE(ec);
         EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), BLK_SIZE, seed))
@@ -293,7 +293,7 @@ CORO_TEST_F(AppendBlkStreamTest, MultiSegmentAppend) {
 
     for (auto const& [seg, entries] : by_seg) {
         for (auto const& [bid, seed] : entries) {
-            IOBuffer rbuf(BLK_SIZE, 512);
+            IoBuf rbuf(BLK_SIZE, 512);
             auto ec = co_await stream->read(rbuf, bid);
             CO_ASSERT_FALSE(ec);
             EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), BLK_SIZE, seed))
@@ -320,7 +320,7 @@ CORO_TEST_F(AppendBlkStreamTest, MultiBlockAppend) {
     EXPECT_EQ(bid.blk_count(), kNblks);
     co_await cp_mgr().trigger_cp_flush(true);
 
-    IOBuffer rbuf(kSize, 512);
+    IoBuf rbuf(kSize, 512);
     auto ec = co_await stream->read(rbuf, bid);
     CO_ASSERT_FALSE(ec);
     EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), kSize, 0x3A01));
@@ -378,7 +378,7 @@ CORO_TEST_F(AppendBlkStreamTest, CPSwitchoverAndFlush) {
     EXPECT_TRUE(success);
 
     // Read survives the flush.
-    IOBuffer rbuf(BLK_SIZE, 512);
+    IoBuf rbuf(BLK_SIZE, 512);
     auto ec = co_await stream->read(rbuf, bid);
     CO_ASSERT_FALSE(ec);
     EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), BLK_SIZE, 0x5A01));
@@ -442,7 +442,7 @@ CORO_TEST_F(AppendBlkStreamTest, BulkAppendReadVerify) {
 
     for (auto const& [bid, seed] : entries) {
         uint32_t io_size = bid.blk_count() * BLK_SIZE;
-        IOBuffer rbuf(io_size, 512);
+        IoBuf rbuf(io_size, 512);
         auto ec = co_await stream->read(rbuf, bid);
         CO_ASSERT_FALSE(ec);
         EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), io_size, seed))
@@ -488,7 +488,7 @@ CORO_TEST_F(AppendBlkStreamTest, ConcurrentAppendsDifferentSegments) {
 
     for (uint16_t seg = 0; seg < kSegments; ++seg) {
         for (auto const& [bid, seed] : per_seg[seg]) {
-            IOBuffer rbuf(BLK_SIZE, 512);
+            IoBuf rbuf(BLK_SIZE, 512);
             auto ec = co_await stream->read(rbuf, bid);
             CO_ASSERT_FALSE(ec);
             EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), BLK_SIZE, seed));
@@ -531,7 +531,7 @@ TEST_F(AppendBlkStreamTest, RestartRecovery) {
         auto recovered = streams[0];
         EXPECT_EQ(recovered->stream_id(), sid);
         for (auto const& [bid, seed] : entries) {
-            IOBuffer rbuf(BLK_SIZE, 512);
+            IoBuf rbuf(BLK_SIZE, 512);
             auto ec = co_await recovered->read(rbuf, bid);
             CO_ASSERT_FALSE(ec);
             EXPECT_TRUE(verify_buf(rbuf.cbytes(), BLK_SIZE, seed))
@@ -570,7 +570,7 @@ TEST_F(AppendBlkStreamTest, RestartAfterInvalidate) {
     iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, keep_bid]() -> folly::coro::Task< void > {
         auto recovered = blob_dev_->append_blk_streams().at(0);
         EXPECT_EQ(recovered->stream_id(), sid);
-        IOBuffer rbuf(BLK_SIZE, 512);
+        IoBuf rbuf(BLK_SIZE, 512);
         auto ec = co_await recovered->read(rbuf, keep_bid);
         CO_ASSERT_FALSE(ec);
         EXPECT_TRUE(verify_buf(rbuf.cbytes(), BLK_SIZE, 0x9A01));
@@ -606,7 +606,7 @@ TEST_F(AppendBlkStreamTest, RestartRecoveryMultipleStreams) {
                                 auto streams = blob_dev_->append_blk_streams();
                                 CO_ASSERT_EQ(streams.size(), 2u);
                                 for (auto const& s : streams) {
-                                    IOBuffer rbuf(BLK_SIZE, 512);
+                                    IoBuf rbuf(BLK_SIZE, 512);
                                     if (s->stream_id() == sid1) {
                                         auto ec = co_await s->read(rbuf, b1);
                                         CO_ASSERT_FALSE(ec);
@@ -652,7 +652,7 @@ TEST_F(AppendBlkStreamTest, DoubleRestart) {
 
     iomgr().spawn_and_block(ReactorTarget::any(), [this, b1, b2]() -> folly::coro::Task< void > {
         auto recovered2 = blob_dev_->append_blk_streams().at(0);
-        IOBuffer rbuf(BLK_SIZE, 512);
+        IoBuf rbuf(BLK_SIZE, 512);
         auto ec = co_await recovered2->read(rbuf, b1);
         CO_ASSERT_FALSE(ec);
         EXPECT_TRUE(verify_buf(rbuf.cbytes(), BLK_SIZE, 0xDA01));

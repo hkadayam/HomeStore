@@ -14,8 +14,8 @@
  *********************************************************************************/
 #include "test_common/raft_repl_test_base.h"
 
-class RaftReplDevTest : public RaftReplDevTestBase {};
-TEST_F(RaftReplDevTest, Write_Duplicated_Data) {
+class RaftReplicaSetTest : public RaftReplicaSetTestBase {};
+TEST_F(RaftReplicaSetTest, Write_Duplicated_Data) {
     uint64_t total_writes = 1;
     g_helper->runner().qdepth_ = total_writes;
     g_helper->runner().total_tasks_ = total_writes;
@@ -48,13 +48,13 @@ TEST_F(RaftReplDevTest, Write_Duplicated_Data) {
     // 1. write the same data again on leader, should fail
     if (leader_uuid == g_helper->my_replica_id()) {
         auto err = this->write_with_id(id, true /* wait_for_commit */);
-        ASSERT_EQ(ReplServiceError::DATA_DUPLICATED, err);
+        ASSERT_EQ(ReplError::DATA_DUPLICATED, err);
 
         // 2. delete it from the db to simulate duplication in followers(skip the duplication check in leader side)
         dbs_[0]->inmem_db_.erase(stored_key);
         LOGINFO("data with id={} has been deleted from db", id);
         err = this->write_with_id(id, true /* wait_for_commit */);
-        ASSERT_EQ(ReplServiceError::OK, err);
+        ASSERT_EQ(ReplError::OK, err);
     }
     if (leader_uuid != g_helper->my_replica_id()) {
         wait_for_commits(total_writes + 1);
@@ -64,7 +64,7 @@ TEST_F(RaftReplDevTest, Write_Duplicated_Data) {
     g_helper->sync_for_cleanup_start();
 }
 
-TEST_F(RaftReplDevTest, Write_Restart_Write) {
+TEST_F(RaftReplicaSetTest, Write_Restart_Write) {
     LOGINFO("Homestore replica={} setup completed", g_helper->replica_num());
     g_helper->sync_for_test_start();
 
@@ -92,7 +92,7 @@ TEST_F(RaftReplDevTest, Write_Restart_Write) {
 }
 
 #ifdef _PRERELEASE
-TEST_F(RaftReplDevTest, Follower_Fetch_OnActive_ReplicaGroup) {
+TEST_F(RaftReplicaSetTest, Follower_Fetch_OnActive_ReplicaGroup) {
     LOGINFO("Homestore replica={} setup completed", g_helper->replica_num());
     g_helper->sync_for_test_start();
 
@@ -110,7 +110,7 @@ TEST_F(RaftReplDevTest, Follower_Fetch_OnActive_ReplicaGroup) {
     g_helper->sync_for_cleanup_start();
 }
 
-TEST_F(RaftReplDevTest, Write_With_Diabled_Leader_Push_Data) {
+TEST_F(RaftReplicaSetTest, Write_With_Diabled_Leader_Push_Data) {
     g_helper->set_basic_flip("disable_leader_push_data", std::numeric_limits< int >::max(), 100);
     LOGINFO("Homestore replica={} setup completed, all the push_data from leader are disabled",
             g_helper->replica_num());
@@ -128,7 +128,7 @@ TEST_F(RaftReplDevTest, Write_With_Diabled_Leader_Push_Data) {
     g_helper->remove_flip("disable_leader_push_data");
 }
 
-TEST_F(RaftReplDevTest, Write_With_Handling_No_Space_Left) {
+TEST_F(RaftReplicaSetTest, Write_With_Handling_No_Space_Left) {
     g_helper->set_basic_flip("simulate_no_space_left", std::numeric_limits< int >::max(), 50);
     LOGINFO("Homestore replica={} setup completed", g_helper->replica_num());
     g_helper->sync_for_test_start();
@@ -147,7 +147,7 @@ TEST_F(RaftReplDevTest, Write_With_Handling_No_Space_Left) {
 #endif
 
 // do some io before restart;
-TEST_F(RaftReplDevTest, Follower_Incremental_Resync) {
+TEST_F(RaftReplicaSetTest, Follower_Incremental_Resync) {
     LOGINFO("Homestore replica={} setup completed", g_helper->replica_num());
     g_helper->sync_for_test_start();
 
@@ -186,7 +186,7 @@ TEST_F(RaftReplDevTest, Follower_Incremental_Resync) {
 }
 
 #ifdef _PRERELEASE
-TEST_F(RaftReplDevTest, Follower_Reject_Append) {
+TEST_F(RaftReplicaSetTest, Follower_Reject_Append) {
     LOGINFO("Homestore replica={} setup completed", g_helper->replica_num());
     g_helper->sync_for_test_start();
 
@@ -208,7 +208,7 @@ TEST_F(RaftReplDevTest, Follower_Reject_Append) {
 }
 #endif
 
-TEST_F(RaftReplDevTest, Resync_From_Non_Originator) {
+TEST_F(RaftReplicaSetTest, Resync_From_Non_Originator) {
     LOGINFO("Homestore replica={} setup completed", g_helper->replica_num());
     g_helper->sync_for_test_start();
 
@@ -236,7 +236,7 @@ TEST_F(RaftReplDevTest, Resync_From_Non_Originator) {
 
 #if 0
 
-TEST_F(RaftReplDevTest, Leader_Restart) {
+TEST_F(RaftReplicaSetTest, Leader_Restart) {
     LOGINFO("Homestore replica={} setup completed", g_helper->replica_num());
     g_helper->sync_for_test_start();
 
@@ -260,7 +260,7 @@ TEST_F(RaftReplDevTest, Leader_Restart) {
     g_helper->sync_for_cleanup_start();
 }
 
-TEST_F(RaftReplDevTest, Drop_Raft_Entry_Switch_Leader) {
+TEST_F(RaftReplicaSetTest, Drop_Raft_Entry_Switch_Leader) {
     LOGINFO("Homestore replica={} setup completed", g_helper->replica_num());
     g_helper->sync_for_test_start();
 
@@ -297,7 +297,7 @@ TEST_F(RaftReplDevTest, Drop_Raft_Entry_Switch_Leader) {
 // ./bin/test_raft_repl_dev --gtest_filter=*Snapshot_and_Compact* --log_mods replication:debug --num_io=999999
 // --snapshot_distance=200 --num_raft_logs_resv=20000 --res_mgr_audit_timer_ms=120000
 //
-TEST_F(RaftReplDevTest, Snapshot_and_Compact) {
+TEST_F(RaftReplicaSetTest, Snapshot_and_Compact) {
     LOGINFO("Homestore replica={} setup completed", g_helper->replica_num());
     g_helper->sync_for_test_start();
 
@@ -311,11 +311,11 @@ TEST_F(RaftReplDevTest, Snapshot_and_Compact) {
 }
 
 #if 0
-TEST_F(RaftReplDevTest, RemoveReplDev) {
+TEST_F(RaftReplicaSetTest, RemoveReplicaSet) {
     LOGINFO("Homestore replica={} setup completed", g_helper->replica_num());
 
     // Step 1: Create 2 more repldevs
-    LOGINFO("Create 2 more ReplDevs");
+    LOGINFO("Create 2 more ReplicaSets");
     for (uint32_t i{0}; i < 2; ++i) {
         auto db = std::make_shared< TestReplicatedDB >();
         g_helper->register_listener(db);
@@ -367,7 +367,7 @@ TEST_F(RaftReplDevTest, RemoveReplDev) {
 // Garbage collect the replication requests
 // 0. Simulate data push is dropped so that fetch data can be triggered (if both data and raft channel received, we
 // won't have timeout rreqs).
-TEST_F(RaftReplDevTest, GCReplReqs) {
+TEST_F(RaftReplicaSetTest, GCReplReqs) {
     LOGINFO("Homestore replica={} setup completed", g_helper->replica_num());
     g_helper->sync_for_test_start();
 
@@ -409,7 +409,7 @@ TEST_F(RaftReplDevTest, GCReplReqs) {
 }
 #endif
 
-TEST_F(RaftReplDevTest, BaselineTest) {
+TEST_F(RaftReplicaSetTest, BaselineTest) {
     // Testing the baseline resync where leader creates snapshot and truncate entries.
     // To simulate that write 50 entries to leader. Shutdown follower 1.
     // Write to leader again to create num_io entries which follower 1 doesnt have.
@@ -468,7 +468,7 @@ TEST_F(RaftReplDevTest, BaselineTest) {
     LOGINFO("BaselineTest done");
 }
 
-TEST_F(RaftReplDevTest, LargeDataWrite) {
+TEST_F(RaftReplicaSetTest, LargeDataWrite) {
     LOGINFO("Homestore replica={} setup completed", g_helper->replica_num());
     g_helper->sync_for_test_start();
 
@@ -484,7 +484,7 @@ TEST_F(RaftReplDevTest, LargeDataWrite) {
     g_helper->sync_for_cleanup_start();
 }
 
-TEST_F(RaftReplDevTest, PriorityLeaderElection) {
+TEST_F(RaftReplicaSetTest, PriorityLeaderElection) {
     LOGINFO("Homestore replica={} setup completed", g_helper->replica_num());
     g_helper->sync_for_test_start();
     uint64_t entries_per_attempt = SISL_OPTIONS["num_io"].as< uint64_t >();
@@ -500,13 +500,17 @@ TEST_F(RaftReplDevTest, PriorityLeaderElection) {
     g_helper->sync_for_cleanup_start();
 
     LOGINFO("Restart leader");
-    if (g_helper->replica_num() == 0) { g_helper->restart_homestore(); }
+    if (g_helper->replica_num() == 0) {
+        g_helper->restart_homestore();
+    }
     g_helper->sync_for_test_start();
 
     LOGINFO("Validate leader switched");
     std::this_thread::sleep_for(std::chrono::milliseconds{500});
     auto leader = this->wait_and_get_leader_id();
-    if (g_helper->replica_num() == 0) { ASSERT_NE(leader, g_helper->my_replica_id()); }
+    if (g_helper->replica_num() == 0) {
+        ASSERT_NE(leader, g_helper->my_replica_id());
+    }
     g_helper->sync_for_verify_start();
 
     if (leader == g_helper->my_replica_id()) {
@@ -519,7 +523,9 @@ TEST_F(RaftReplDevTest, PriorityLeaderElection) {
     std::this_thread::sleep_for(std::chrono::milliseconds{500});
     leader = this->wait_and_get_leader_id();
     LOGINFO("Validate leader switched back to initial replica");
-    if (g_helper->replica_num() == 0) { ASSERT_EQ(leader, g_helper->my_replica_id()); }
+    if (g_helper->replica_num() == 0) {
+        ASSERT_EQ(leader, g_helper->my_replica_id());
+    }
     g_helper->sync_for_verify_start();
 
     LOGINFO("Post restart write the data again on the leader");
@@ -530,7 +536,7 @@ TEST_F(RaftReplDevTest, PriorityLeaderElection) {
     g_helper->sync_for_cleanup_start();
 }
 
-TEST_F(RaftReplDevTest, ComputePriority) {
+TEST_F(RaftReplicaSetTest, ComputePriority) {
     g_helper->sync_for_test_start();
     auto& raftService = dynamic_cast< RaftReplService& >(hs()->repl_service());
 

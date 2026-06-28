@@ -105,49 +105,107 @@ folly::coro::Task< uint64_t > DriveInterface::get_size(const IoDevice& dev) {
     co_return to_u64(st.st_size);
 }
 
-folly::coro::Task< std::error_code > DriveInterface::read(const IoDevice& dev, IOBuffer& buf, uint64_t offset) {
+folly::coro::Task< std::error_code > DriveInterface::read(const IoDevice& dev, IoBuf& buf, uint64_t offset) {
     if (!t_dr) {
         co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), read(dev, buf, offset));
     }
     DRIVE_LOG(TRACE, dev, "read: size={} offset={}", buf.size(), offset);
     folly::Promise< int > p;
     auto sf = p.getSemiFuture();
-    t_dr->uring->queueRead(dev.fd, buf.bytes(), to_u32(buf.size()), (off_t)offset,
-                           [p = std::move(p)](int res) mutable { p.setValue(res); });
-    auto ec = to_ec(co_await std::move(sf).via(t_dr->eb));
-    DRIVE_LOG(TRACE, dev, "read: size={} offset={} completed ec={}", buf.size(), offset, ec.message());
+    // Direct-IO alignment fallback: io_uring requires aligned buffers.  If buf isn't aligned, alloc an
+    // aligned temp, read into it, and copy out to buf after the IO completes.
+    if (buf.is_aligned()) {
+        t_dr->uring->queueRead(dev.fd, buf.bytes(), to_u32(buf.size()), (off_t)offset,
+                               [p = std::move(p)](int res) mutable { p.setValue(res); });
+        auto ec = to_ec(co_await std::move(sf).via(t_dr->eb));
+        DRIVE_LOG(TRACE, dev, "read: size={} offset={} completed ec={}", buf.size(), offset, ec.message());
+        co_return ec;
+    } else {
+        sisl::IoBufOwn temp{buf.size(), 512};
+        t_dr->uring->queueRead(dev.fd, temp.bytes(), to_u32(buf.size()), (off_t)offset,
+                               [p = std::move(p)](int res) mutable { p.setValue(res); });
+        auto ec = to_ec(co_await std::move(sf).via(t_dr->eb));
+        if (!ec) {
+            std::memcpy(buf.bytes(), temp.cbytes(), buf.size());
+        }
+        DRIVE_LOG(TRACE, dev, "read[unaligned-fallback]: size={} offset={} completed ec={}", buf.size(), offset,
+                  ec.message());
+    }
     co_return ec;
 }
 
-folly::coro::Task< std::error_code > DriveInterface::write(const IoDevice& dev, const IOBuffer& buf, uint64_t offset) {
+folly::coro::Task< std::error_code > DriveInterface::write(const IoDevice& dev, const IoBuf& buf, uint64_t offset) {
     if (!t_dr) {
         co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), write(dev, buf, offset));
     }
     DRIVE_LOG(TRACE, dev, "write: size={} offset={}", buf.size(), offset);
     folly::Promise< int > p;
     auto sf = p.getSemiFuture();
-    t_dr->uring->queueWrite(dev.fd, buf.cbytes(), to_u32(buf.size()), (off_t)offset,
-                            [p = std::move(p)](int res) mutable { p.setValue(res); });
-    auto ec = to_ec(co_await std::move(sf).via(t_dr->eb));
-    DRIVE_LOG(TRACE, dev, "write: size={} offset={} completed ec={}", buf.size(), offset, ec.message());
+    if (buf.is_aligned()) {
+        t_dr->uring->queueWrite(dev.fd, buf.cbytes(), to_u32(buf.size()), (off_t)offset,
+                                [p = std::move(p)](int res) mutable { p.setValue(res); });
+        auto ec = to_ec(co_await std::move(sf).via(t_dr->eb));
+        DRIVE_LOG(TRACE, dev, "write: size={} offset={} completed ec={}", buf.size(), offset, ec.message());
+        co_return ec;
+    } else {
+        sisl::IoBufOwn temp{buf.size(), 512};
+        std::memcpy(temp.bytes(), buf.cbytes(), buf.size());
+        t_dr->uring->queueWrite(dev.fd, temp.cbytes(), to_u32(buf.size()), (off_t)offset,
+                                [p = std::move(p)](int res) mutable { p.setValue(res); });
+        auto ec = to_ec(co_await std::move(sf).via(t_dr->eb));
+        DRIVE_LOG(TRACE, dev, "write[unaligned-fallback]: size={} offset={} completed ec={}", buf.size(), offset,
+                  ec.message());
+    }
     co_return ec;
 }
 
-folly::coro::Task< std::error_code > DriveInterface::readv(const IoDevice& dev, std::vector< IOBuffer >& bufs,
-                                                           uint64_t offset) {
+folly::coro::Task< std::error_code > DriveInterface::readv(const IoDevice& dev, sisl::SgList const& sg,
+                                                            uint64_t offset) {
     if (!t_dr) {
-        co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), readv(dev, bufs, offset));
+        co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), readv(dev, sg, offset));
     }
     folly::Promise< int > p;
     auto sf = p.getSemiFuture();
+
+    // Per-element alignment check.  Aligned entries pass through with no copy.  Unaligned entries get a
+    // same-indexed aligned temp; the iovec slot points at the temp; after the IO completes we copy each
+    // temp back into its original buf.  aligned_temps / copy_back stay zero-alloc until the first unaligned
+    // entry forces a reserve (common case is all-aligned — no allocation).
+    std::vector< sisl::IoBufOwn > aligned_temps;
+    std::vector< std::pair< sisl::IoBuf*, sisl::IoBufOwn* > > copy_back; // (dst, src) for unaligned
     std::vector< struct iovec > iovs;
-    iovs.reserve(bufs.size());
-    for (auto& b : bufs)
-        iovs.push_back({b.bytes(), b.size()});
-    // queueReadv copies iovecs into IoSqe; iovs only needs to survive this call.
+    iovs.reserve(sg.bufs.size() + 1); // +1 for the optional tail pad
+    uint64_t total = 0;
+    for (auto* b : sg.bufs) {
+        total += b->size();
+        if (b->is_aligned()) {
+            iovs.push_back({b->bytes(), b->size()});
+        } else {
+            if (aligned_temps.empty()) {
+                aligned_temps.reserve(sg.bufs.size() + 1);
+                copy_back.reserve(sg.bufs.size());
+            }
+            aligned_temps.emplace_back(b->size(), 512);
+            iovs.push_back({aligned_temps.back().bytes(), b->size()});
+            copy_back.emplace_back(b, &aligned_temps.back());
+        }
+    }
+    // O_DIRECT requires block-multiple total bytes.  If the SgList's total isn't 512-multiple, append a
+    // pad iov reading into a throwaway aligned temp — bytes are discarded (no copy_back entry).
+    if (auto const rem = total % 512; rem != 0) {
+        if (aligned_temps.empty()) { aligned_temps.reserve(1); }
+        aligned_temps.emplace_back(to_u32(512 - rem), 512);
+        iovs.push_back({aligned_temps.back().bytes(), 512 - rem});
+    }
     t_dr->uring->queueReadv(dev.fd, {iovs.data(), iovs.data() + iovs.size()}, (off_t)offset,
                             [p = std::move(p)](int res) mutable { p.setValue(res); });
-    co_return to_ec(co_await std::move(sf).via(t_dr->eb));
+    auto ec = to_ec(co_await std::move(sf).via(t_dr->eb));
+    if (!ec) {
+        for (auto& [dst, src] : copy_back) {
+            std::memcpy(dst->bytes(), src->cbytes(), src->size());
+        }
+    }
+    co_return ec;
 }
 
 folly::coro::Task< std::error_code > DriveInterface::do_writev(const IoDevice& dev, std::vector< struct iovec >&& iovs,
@@ -162,21 +220,39 @@ folly::coro::Task< std::error_code > DriveInterface::do_writev(const IoDevice& d
     co_return to_ec(co_await std::move(sf).via(t_dr->eb));
 }
 
-folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev, const std::vector< IOBuffer >& bufs,
-                                                            uint64_t offset) {
+folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev, sisl::SgList const& sg,
+                                                              uint64_t offset) {
+    // Per-element alignment check.  Aligned sources pass through with no copy.  Unaligned sources get a
+    // same-indexed aligned temp (memcpy'd from the source); the iovec slot points at the temp.  Temps live
+    // until do_writev's await completes.  aligned_temps stays zero-alloc until the first unaligned entry
+    // forces a reserve (common case is all-aligned — no allocation).
+    std::vector< sisl::IoBufOwn > aligned_temps;
     std::vector< struct iovec > iovs;
-    iovs.reserve(bufs.size());
-    for (auto& b : bufs)
-        iovs.push_back({const_cast< uint8_t* >(b.cbytes()), b.size()});
-    co_return co_await do_writev(dev, std::move(iovs), offset);
-}
-
-folly::coro::Task< std::error_code >
-DriveInterface::writev(const IoDevice& dev, const std::vector< sisl::ByteArray >& bufs, uint64_t offset) {
-    std::vector< struct iovec > iovs;
-    iovs.reserve(bufs.size());
-    for (auto& b : bufs)
-        iovs.push_back({b->bytes(), b->size()});
+    iovs.reserve(sg.bufs.size() + 1); // +1 for the optional tail pad
+    uint64_t total = 0;
+    for (auto const* b : sg.bufs) {
+        total += b->size();
+        if (b->is_aligned()) {
+            iovs.push_back({const_cast< uint8_t* >(b->cbytes()), b->size()});
+        } else {
+            if (aligned_temps.empty()) {
+                aligned_temps.reserve(sg.bufs.size() + 1);
+            }
+            aligned_temps.emplace_back(b->size(), 512);
+            std::memcpy(aligned_temps.back().bytes(), b->cbytes(), b->size());
+            iovs.push_back({aligned_temps.back().bytes(), b->size()});
+        }
+    }
+    // O_DIRECT requires block-multiple total bytes.  If the SgList's total isn't 512-multiple, append a
+    // zero-filled pad iov so the kernel sees a valid IO size.  Pad bytes land on disk but are unread —
+    // the on-disk record's value_size tells the reader how much to consume.
+    if (auto const rem = total % 512; rem != 0) {
+        if (aligned_temps.empty()) { aligned_temps.reserve(1); }
+        aligned_temps.emplace_back(to_u32(512 - rem), 512);
+        std::memset(aligned_temps.back().bytes(), 0, 512 - rem);
+        iovs.push_back({aligned_temps.back().bytes(), 512 - rem});
+    }
+    // aligned_temps live in this coroutine frame — suspended through do_writev's await, so they outlive the IO.
     co_return co_await do_writev(dev, std::move(iovs), offset);
 }
 
@@ -236,7 +312,7 @@ folly::coro::Task< uint64_t > DriveInterface::get_size(const IoDevice& dev) {
     co_return static_cast< uint64_t >(st.st_size);
 }
 
-folly::coro::Task< std::error_code > DriveInterface::read(const IoDevice& dev, IOBuffer& buf, uint64_t offset) {
+folly::coro::Task< std::error_code > DriveInterface::read(const IoDevice& dev, IoBuf& buf, uint64_t offset) {
     int fd = dev.fd;
     void* ptr = buf.bytes();
     size_t sz = buf.size();
@@ -246,7 +322,7 @@ folly::coro::Task< std::error_code > DriveInterface::read(const IoDevice& dev, I
     }).scheduleOn(folly::getGlobalCPUExecutor().get());
 }
 
-folly::coro::Task< std::error_code > DriveInterface::write(const IoDevice& dev, const IOBuffer& buf, uint64_t offset) {
+folly::coro::Task< std::error_code > DriveInterface::write(const IoDevice& dev, const IoBuf& buf, uint64_t offset) {
     int fd = dev.fd;
     const void* ptr = buf.cbytes();
     size_t sz = buf.size();
@@ -256,16 +332,17 @@ folly::coro::Task< std::error_code > DriveInterface::write(const IoDevice& dev, 
     }).scheduleOn(folly::getGlobalCPUExecutor().get());
 }
 
-folly::coro::Task< std::error_code > DriveInterface::readv(const IoDevice& dev, std::vector< IOBuffer >& bufs,
-                                                           uint64_t offset) {
+folly::coro::Task< std::error_code > DriveInterface::readv(const IoDevice& dev, sisl::SgList const& sg,
+                                                            uint64_t offset) {
     int fd = dev.fd;
-    auto* bufs_ptr = &bufs;
+    auto const* bufs_ptr = &sg.bufs;
     co_return co_await folly::coro::co_invoke([fd, bufs_ptr, offset]() mutable -> folly::coro::Task< std::error_code > {
-        for (auto& b : *bufs_ptr) {
-            ssize_t n = ::pread(fd, b.bytes(), b.size(), (off_t)offset);
-            if (n < 0)
+        for (auto* b : *bufs_ptr) {
+            ssize_t n = ::pread(fd, b->bytes(), b->size(), (off_t)offset);
+            if (n < 0) {
                 co_return std::error_code(errno, std::generic_category());
-            offset += b.size();
+            }
+            offset += b->size();
         }
         co_return std::error_code{};
     }).scheduleOn(folly::getGlobalCPUExecutor().get());
@@ -278,29 +355,22 @@ folly::coro::Task< std::error_code > DriveInterface::do_writev(const IoDevice& d
                                                offset]() mutable -> folly::coro::Task< std::error_code > {
         for (auto& iov : iovs) {
             ssize_t n = ::pwrite(fd, iov.iov_base, iov.iov_len, (off_t)offset);
-            if (n < 0)
+            if (n < 0) {
                 co_return std::error_code(errno, std::generic_category());
+            }
             offset += iov.iov_len;
         }
         co_return std::error_code{};
     }).scheduleOn(folly::getGlobalCPUExecutor().get());
 }
 
-folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev, const std::vector< IOBuffer >& bufs,
-                                                            uint64_t offset) {
+folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev, sisl::SgList const& sg,
+                                                              uint64_t offset) {
     std::vector< struct iovec > iovs;
-    iovs.reserve(bufs.size());
-    for (auto& b : bufs)
-        iovs.push_back({const_cast< uint8_t* >(b.cbytes()), b.size()});
-    co_return co_await do_writev(dev, std::move(iovs), offset);
-}
-
-folly::coro::Task< std::error_code >
-DriveInterface::writev(const IoDevice& dev, const std::vector< sisl::ByteArray >& bufs, uint64_t offset) {
-    std::vector< struct iovec > iovs;
-    iovs.reserve(bufs.size());
-    for (auto& b : bufs)
-        iovs.push_back({b->bytes(), b->size()});
+    iovs.reserve(sg.bufs.size());
+    for (auto const* b : sg.bufs) {
+        iovs.push_back({const_cast< uint8_t* >(b->cbytes()), b->size()});
+    }
     co_return co_await do_writev(dev, std::move(iovs), offset);
 }
 
@@ -321,7 +391,7 @@ folly::coro::Task< std::error_code > DriveInterface::write_zero(const IoDevice& 
     int fd = dev.fd;
     co_return co_await folly::coro::co_invoke([fd, size, offset]() -> folly::coro::Task< std::error_code > {
         static constexpr size_t kChunk = 1u << 20; // 1 MiB
-        IOBuffer zbuf{static_cast< uint32_t >(std::min(size, (uint64_t)kChunk))};
+        IoBuf zbuf{static_cast< uint32_t >(std::min(size, (uint64_t)kChunk))};
         std::memset(zbuf.bytes(), 0, zbuf.size());
         uint64_t rem = size, off = offset;
         while (rem > 0) {

@@ -79,12 +79,12 @@ folly::coro::Task< void > LogStoreManager::load() {
     // 1. Scan MetaBlks for the LogStream sb (logstream_sb_<sid>) and per-store sbs (LogStore_<sid>).  We have a
     //    single stream so collect just its mblk; collect each per-store mblk indexed by store_id.
     std::optional< MetaBlk > stream_blk;
-    sisl::ByteView stream_payload;
-    std::map< logstore_id_t, std::pair< MetaBlk, sisl::ByteView > > store_blks;
+    sisl::IoBufView stream_payload;
+    std::map< logstore_id_t, std::pair< MetaBlk, sisl::IoBufView > > store_blks;
     logstore_id_t max_store_id = 0;
     bool any_store = false;
 
-    co_await meta_client->for_each_recovered_block([&](MetaBlk blk, sisl::ByteView data) -> folly::coro::Task< void > {
+    co_await meta_client->for_each_recovered_block([&](MetaBlk blk, sisl::IoBufView data) -> folly::coro::Task< void > {
         const auto& name = blk.name();
         // Per-store sb: "LogStore_<store_id>"
         if (name.size() > kLogStoreSbPrefix.size() &&

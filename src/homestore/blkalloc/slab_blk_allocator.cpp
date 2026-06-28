@@ -24,7 +24,7 @@
 namespace homestore {
 namespace blkalloc {
 
-SlabBlkAllocator::SlabBlkAllocator(SlabBlkAllocConfig const& cfg, std::optional< sisl::ByteArray > buf,
+SlabBlkAllocator::SlabBlkAllocator(SlabBlkAllocConfig const& cfg, std::optional< sisl::IoBufShared > buf,
                                    chunk_num_t chunk_id) :
         BlkAllocator{cfg, chunk_id},
         cfg_{cfg},

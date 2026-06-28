@@ -36,7 +36,7 @@
 
 using namespace homestore;
 using namespace iomanager;
-using sisl::IOBuffer;
+using sisl::IoBuf;
 
 static constexpr uint64_t DEV_SIZE = 128 * 1024 * 1024; // 128 MB
 static constexpr uint32_t BLK_SIZE = 4096;
@@ -241,13 +241,13 @@ CORO_TEST_F(PDevTest, ChunkDeactivateReactivate) {
 CORO_TEST_F(PDevTest, WriteReadSingleBlock) {
     auto pdev = co_await PhysicalDev::create(self.make_dev_info(0), OFLAGS, /*pdev_id=*/0, self.fbhdr_);
 
-    IOBuffer wbuf{BLK_SIZE, 512};
+    IoBuf wbuf{BLK_SIZE, 512};
     std::memset(wbuf.bytes(), 0x42, BLK_SIZE);
     uint64_t offset = pdev->data_start_offset();
 
     co_await pdev->write(wbuf, offset);
 
-    IOBuffer rbuf{BLK_SIZE, 512};
+    IoBuf rbuf{BLK_SIZE, 512};
     auto ec = co_await pdev->read(rbuf, offset);
     CO_ASSERT_FALSE(ec);
     EXPECT_EQ(std::memcmp(wbuf.bytes(), rbuf.bytes(), BLK_SIZE), 0);
@@ -260,7 +260,7 @@ CORO_TEST_F(PDevTest, WriteReadLargeBuffer) {
     auto pdev = co_await PhysicalDev::create(self.make_dev_info(0), OFLAGS, /*pdev_id=*/0, self.fbhdr_);
 
     constexpr uint32_t large_size = 256 * 1024; // 256 KB
-    IOBuffer wbuf{large_size, 512};
+    IoBuf wbuf{large_size, 512};
     for (uint32_t i = 0; i < large_size; ++i) {
         wbuf.bytes()[i] = to_u8(i & 0xFF);
     }
@@ -268,7 +268,7 @@ CORO_TEST_F(PDevTest, WriteReadLargeBuffer) {
 
     co_await pdev->write(wbuf, offset);
 
-    IOBuffer rbuf{large_size, 512};
+    IoBuf rbuf{large_size, 512};
     auto ec = co_await pdev->read(rbuf, offset);
     CO_ASSERT_FALSE(ec);
     EXPECT_EQ(std::memcmp(wbuf.bytes(), rbuf.bytes(), large_size), 0);
@@ -281,7 +281,7 @@ CORO_TEST_F(PDevTest, WritevReadv) {
     auto pdev = co_await PhysicalDev::create(self.make_dev_info(0), OFLAGS, /*pdev_id=*/0, self.fbhdr_);
 
     constexpr uint32_t num_bufs = 4;
-    std::vector< IOBuffer > wbufs;
+    std::vector< IoBuf > wbufs;
     wbufs.reserve(num_bufs);
     for (uint32_t i = 0; i < num_bufs; ++i) {
         wbufs.emplace_back(BLK_SIZE, 512);
@@ -290,16 +290,16 @@ CORO_TEST_F(PDevTest, WritevReadv) {
 
     uint64_t offset = pdev->data_start_offset();
     // writev takes rvalue ref to vector.
-    std::vector< IOBuffer > wbufs_copy;
+    std::vector< IoBuf > wbufs_copy;
     wbufs_copy.reserve(num_bufs);
     for (auto& wb : wbufs) {
-        IOBuffer copy{BLK_SIZE, 512};
+        IoBuf copy{BLK_SIZE, 512};
         std::memcpy(copy.bytes(), wb.bytes(), BLK_SIZE);
         wbufs_copy.push_back(std::move(copy));
     }
     co_await pdev->writev(std::move(wbufs_copy), offset);
 
-    std::vector< IOBuffer > rbufs;
+    std::vector< IoBuf > rbufs;
     rbufs.reserve(num_bufs);
     for (uint32_t i = 0; i < num_bufs; ++i) {
         rbufs.emplace_back(BLK_SIZE, 512);
@@ -318,13 +318,13 @@ CORO_TEST_F(PDevTest, WritevReadv) {
 CORO_TEST_F(PDevTest, Fsync) {
     auto pdev = co_await PhysicalDev::create(self.make_dev_info(0), OFLAGS, /*pdev_id=*/0, self.fbhdr_);
 
-    IOBuffer wbuf{BLK_SIZE, 512};
+    IoBuf wbuf{BLK_SIZE, 512};
     std::memset(wbuf.bytes(), 0xBB, BLK_SIZE);
     uint64_t offset = pdev->data_start_offset();
     co_await pdev->write(wbuf, offset);
     co_await pdev->fsync();
 
-    IOBuffer rbuf{BLK_SIZE, 512};
+    IoBuf rbuf{BLK_SIZE, 512};
     auto ec = co_await pdev->read(rbuf, offset);
     CO_ASSERT_FALSE(ec);
     EXPECT_EQ(std::memcmp(wbuf.bytes(), rbuf.bytes(), BLK_SIZE), 0);

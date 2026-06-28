@@ -84,7 +84,7 @@ public:
 /// commit:            mark a blkid as durably allocated in the persistent layer (no-op for inmem allocators).
 ///                    CP-safe: calls arriving while acquire_buffer() is held are buffered and replayed on
 ///                    release_buffer().
-/// acquire_buffer:    serialize the current persistent bitmap into a ByteArray for a CP flush.
+/// acquire_buffer:    serialize the current persistent bitmap into a IoBufShared for a CP flush.
 ///                    New commits arriving while the buffer is held accumulate in an internal list.
 /// release_buffer:    drain the accumulated commit list back into the persistent bitmap.
 ///
@@ -118,7 +118,7 @@ public:
     virtual nlohmann::json get_status(int log_level) const = 0;
 
     /// RAII buffer handle returned by acquire_buffer().
-    /// Holds the serialized bitmap ByteArray for a CP flush. On destruction the allocator's
+    /// Holds the serialized bitmap IoBufShared for a CP flush. On destruction the allocator's
     /// pending commit list is drained back into the bitmap.
     class BufferGuard {
     public:
@@ -127,13 +127,13 @@ public:
         BufferGuard& operator=(BufferGuard&&) = delete;
         BufferGuard(BufferGuard const&) = delete;
         BufferGuard& operator=(BufferGuard const&) = delete;
-        sisl::ByteArray const& buf() const { return buf_; }
+        sisl::IoBufShared const& buf() const { return buf_; }
 
     private:
         friend class BlkAllocator;
-        BufferGuard(sisl::ByteArray buf, std::function< void() > release_fn) :
+        BufferGuard(sisl::IoBufShared buf, std::function< void() > release_fn) :
                 buf_{std::move(buf)}, release_fn_{std::move(release_fn)} {}
-        sisl::ByteArray buf_;
+        sisl::IoBufShared buf_;
         std::function< void() > release_fn_;
     };
 
@@ -145,7 +145,7 @@ public:
     uint32_t get_blk_size() const { return blk_size_; }
 
 protected:
-    static BufferGuard make_buffer_guard(sisl::ByteArray buf, std::function< void() > release_fn) {
+    static BufferGuard make_buffer_guard(sisl::IoBufShared buf, std::function< void() > release_fn) {
         return BufferGuard{std::move(buf), std::move(release_fn)};
     }
 

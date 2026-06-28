@@ -34,8 +34,8 @@
 #include "homestore/homestore.h"
 #include "homestore/homestore_decl.hpp"
 #include "homestore/blkdata_service.hpp"
-#include "homestore/replication_service.hpp"
-#include "homestore/replication/repl_dev.h"
+#include "homestore/replication/repl_manager.h"
+#include "homestore/replication/replica_set.h"
 #include "common/homestore_config.h"
 #include "common/homestore_assert.h"
 #include "common/homestore_utils.h"
@@ -61,12 +61,11 @@ SISL_OPTION_GROUP(test_raft_repl_dev,
                   (res_mgr_audit_timer_ms, "", "res_mgr_audit_timer_ms", "resource manager audit timer",
                    ::cxxopts::value< uint32_t >()->default_value("0"), "number"));
 
-
 static std::unique_ptr< test_common::HSReplTestHelper > g_helper;
 static std::random_device g_rd{};
 static std::default_random_engine g_re{g_rd()};
 
-class TestReplicatedDB : public homestore::ReplDevListener {
+class TestReplicatedDB : public homestore::ReplicaSetListener {
 public:
     struct Key {
         uint64_t id_;
@@ -145,7 +144,9 @@ public:
             ++commit_count_;
         }
 
-        if (ctx->is_proposer()) { g_helper->runner().next_task(); }
+        if (ctx->is_proposer()) {
+            g_helper->runner().next_task();
+        }
     }
 
     bool on_pre_commit(int64_t lsn, const sisl::Blob& header, const sisl::Blob& key,
@@ -165,11 +166,11 @@ public:
                    boost::uuids::to_string(repl_dev()->group_id()));
     }
 
-    void on_error(ReplServiceError error, const sisl::Blob& header, const sisl::Blob& key,
+    void on_error(ReplError error, const sisl::Blob& header, const sisl::Blob& key,
                   cintrusive< repl_req_ctx >& ctx) override {
         LOGINFOMOD(replication, "[Replica={}] Received error={} on key={}", g_helper->replica_num(), enum_name(error),
                    *(r_cast< uint64_t const* >(key.cbytes())));
-        g_helper->runner().comp_promise_.setException(folly::make_exception_wrapper< ReplServiceError >(error));
+        g_helper->runner().comp_promise_.setException(folly::make_exception_wrapper< ReplError >(error));
     }
 
     void notify_committed_lsn(int64_t lsn) override {
@@ -179,7 +180,7 @@ public:
     void on_config_rollback(int64_t lsn) override {
         LOGINFOMOD(replication, "[Replica={}] Received config rollback at lsn={}", g_helper->replica_num(), lsn);
     }
-    void on_no_space_left(repl_lsn_t lsn, chunk_num_t chunk_id) override {
+    void on_no_space_left(raft_lsn_t lsn, chunk_num_t chunk_id) override {
         LOGINFOMOD(replication, "[Replica={}] Received no_space_left at lsn={}, chunk_id={}", g_helper->replica_num(),
                    lsn, chunk_id);
     }
@@ -210,7 +211,7 @@ public:
         int64_t next_lsn = get_next_lsn(snp_data->offset);
         if (next_lsn == 0) {
             snp_data->is_last_obj = false;
-            snp_data->blob = sisl::IoBlobSafe(sizeof(ulong));
+            snp_data->blob = sisl::IoBufOwn(sizeof(ulong));
             LOGINFOMOD(replication,
                        "[Replica={}] Read logical snapshot callback first message obj_id={} term={} idx={}",
                        g_helper->replica_num(), snp_data->offset, s->get_last_log_term(), s->get_last_log_idx());
@@ -226,7 +227,9 @@ public:
             kv_snapshot_obj.emplace_back(Key{v.id_}, v);
             LOGTRACEMOD(replication, "[Replica={}] Read logical snapshot callback fetching lsn={} size={} pattern={}",
                         g_helper->replica_num(), v.lsn_, v.data_size_, v.data_pattern_);
-            if (kv_snapshot_obj.size() >= 10) { break; }
+            if (kv_snapshot_obj.size() >= 10) {
+                break;
+            }
         }
 
         if (kv_snapshot_obj.size() == 0) {
@@ -236,7 +239,7 @@ public:
         }
 
         int64_t kv_snapshot_obj_size = sizeof(KeyValuePair) * kv_snapshot_obj.size();
-        sisl::IoBlobSafe blob{static_cast< uint32_t >(kv_snapshot_obj_size)};
+        sisl::IoBufOwn blob{static_cast< uint32_t >(kv_snapshot_obj_size)};
         std::memcpy(blob.bytes(), kv_snapshot_obj.data(), kv_snapshot_obj_size);
         snp_data->blob = std::move(blob);
         snp_data->is_last_obj = false;
@@ -265,7 +268,7 @@ public:
         int64_t next_lsn = get_next_lsn(snp_data->offset);
         auto s = std::dynamic_pointer_cast< nuraft_snapshot_context >(context)->nuraft_snapshot();
         auto last_committed_idx =
-            std::dynamic_pointer_cast< RaftReplDev >(repl_dev())->raft_server()->get_committed_log_idx();
+            std::dynamic_pointer_cast< RaftReplicaSet >(repl_dev())->raft_server()->get_committed_log_idx();
         if (next_lsn == 0) {
             snp_data->offset = last_committed_lsn + 1;
             set_resync_msg_type_bit(snp_data->offset);
@@ -275,7 +278,8 @@ public:
         }
 
         size_t kv_snapshot_obj_size = snp_data->blob.size();
-        if (kv_snapshot_obj_size == 0) return;
+        if (kv_snapshot_obj_size == 0)
+            return;
 
         size_t num_items = kv_snapshot_obj_size / sizeof(KeyValuePair);
         std::unique_lock lk(db_mtx_);
@@ -317,7 +321,8 @@ public:
 
     shared< snapshot_context > last_snapshot() override {
         std::lock_guard< std::mutex > lock(m_snapshot_lock);
-        if (!m_last_snapshot) return nullptr;
+        if (!m_last_snapshot)
+            return nullptr;
 
         auto s = std::dynamic_pointer_cast< nuraft_snapshot_context >(m_last_snapshot)->nuraft_snapshot();
         LOGINFOMOD(replication, "[Replica={}] Last snapshot term={} idx={}", g_helper->replica_num(),
@@ -340,17 +345,19 @@ public:
         }
         return blk_alloc_hints{};
     }
-    void on_start_replace_member(const replica_member_info& member_out, const replica_member_info& member_in, trace_id_t tid) override {
+    void on_start_replace_member(const ReplicaMemberInfo& member_out, const ReplicaMemberInfo& member_in,
+                                 TraceId tid) override {
         LOGINFO("[Replica={}] start replace member out {} in {}", g_helper->replica_num(),
                 boost::uuids::to_string(member_out.id), boost::uuids::to_string(member_in.id));
     }
 
-    void on_complete_replace_member(const replica_member_info& member_out, const replica_member_info& member_in, trace_id_t tid) override {
+    void on_complete_replace_member(const ReplicaMemberInfo& member_out, const ReplicaMemberInfo& member_in,
+                                    TraceId tid) override {
         LOGINFO("[Replica={}] complete replace member out {} in {}", g_helper->replica_num(),
                 boost::uuids::to_string(member_out.id), boost::uuids::to_string(member_in.id));
     }
 
-    void on_destroy(const group_id_t& group_id) override {
+    void on_destroy(const GroupId& group_id) override {
         LOGINFOMOD(replication, "[Replica={}] Group={} is being destroyed", g_helper->replica_num(),
                    boost::uuids::to_string(group_id));
         g_helper->unregister_listener(group_id);
@@ -428,13 +435,13 @@ public:
     }
 
     void create_snapshot() {
-        auto raft_repl_dev = std::dynamic_pointer_cast< RaftReplDev >(repl_dev());
+        auto raft_repl_dev = std::dynamic_pointer_cast< RaftReplicaSet >(repl_dev());
         ulong snapshot_idx = raft_repl_dev->raft_server()->create_snapshot();
         LOGINFO("Manually create snapshot got index {}", snapshot_idx);
     }
 
     void truncate(int num_reserved_entries) {
-        auto raft_repl_dev = std::dynamic_pointer_cast< RaftReplDev >(repl_dev());
+        auto raft_repl_dev = std::dynamic_pointer_cast< RaftReplicaSet >(repl_dev());
         // raft_repl_dev->truncate(num_reserved_entries);
         LOGINFO("Manually truncated");
     }
@@ -456,7 +463,7 @@ private:
     bool zombie_{false};
 };
 
-class RaftReplDevTestBase : public testing::Test {
+class RaftReplicaSetTestBase : public testing::Test {
 public:
     void SetUp() override {
         // By default it will create one db
@@ -469,17 +476,22 @@ public:
 
     void TearDown() override {
         for (auto const& db : dbs_) {
-            if (db->is_zombie()) { continue; }
+            if (db->is_zombie()) {
+                continue;
+            }
             run_on_leader(db, [this, db]() {
                 auto err = hs()->repl_service().remove_repl_dev(db->repl_dev()->group_id()).get();
-                ASSERT_EQ(err, ReplServiceError::OK) << "Error in destroying the group";
+                ASSERT_EQ(err, ReplError::OK) << "Error in destroying the group";
             });
         }
 
         for (auto const& db : dbs_) {
-            if (db->is_zombie()) { continue; }
-            auto repl_dev = std::dynamic_pointer_cast< RaftReplDev >(db->repl_dev());
-            if (!repl_dev) continue;
+            if (db->is_zombie()) {
+                continue;
+            }
+            auto repl_dev = std::dynamic_pointer_cast< RaftReplicaSet >(db->repl_dev());
+            if (!repl_dev)
+                continue;
             int i = 0;
             bool force_leave = false;
             do {
@@ -502,7 +514,9 @@ public:
     }
 
     void generate_writes(uint64_t data_size, uint32_t max_size_per_iov, shared< TestReplicatedDB > db = nullptr) {
-        if (db == nullptr) { db = pick_one_db(); }
+        if (db == nullptr) {
+            db = pick_one_db();
+        }
         // LOGINFO("Writing on group_id={}", db->repl_dev()->group_id());
         db->db_write(data_size, max_size_per_iov);
     }
@@ -517,7 +531,9 @@ public:
                 total_writes += db->db_commit_count();
             }
 
-            if (total_writes >= exp_writes) { break; }
+            if (total_writes >= exp_writes) {
+                break;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             LOGINFO("Replica={} received {} commits but expected {}", g_helper->replica_num(), total_writes,
                     exp_writes);
@@ -548,10 +564,12 @@ public:
             }
         } else {
             for (auto const& db : dbs_) {
-                homestore::replica_id_t leader_uuid;
+                homestore::ReplicaId leader_uuid;
                 while (true) {
                     leader_uuid = db->repl_dev()->get_leader_id();
-                    if (!leader_uuid.is_nil() && (g_helper->member_id(leader_uuid) == replica)) { break; }
+                    if (!leader_uuid.is_nil() && (g_helper->member_id(leader_uuid) == replica)) {
+                        break;
+                    }
 
                     LOGINFO("Waiting for replica={} to become leader", replica);
                     std::this_thread::sleep_for(std::chrono::milliseconds{500});
@@ -583,7 +601,8 @@ public:
 
     void write_on_leader(uint32_t num_entries, bool wait_for_commit = true, shared< TestReplicatedDB > db = nullptr,
                          uint64_t* data_size = nullptr) {
-        if (dbs_[0]->repl_dev() == nullptr) return;
+        if (dbs_[0]->repl_dev() == nullptr)
+            return;
 
         do {
             auto repl_dev = dbs_[0]->repl_dev();
@@ -609,7 +628,9 @@ public:
                         data_size == nullptr ? std::abs(std::lround(num_blks_gen(g_re))) * block_size : *data_size;
                     this->generate_writes(size, block_size, db);
                 });
-                if (wait_for_commit) { g_helper->runner().execute().get(); }
+                if (wait_for_commit) {
+                    g_helper->runner().execute().get();
+                }
                 break;
             } else {
                 LOGINFO("{} entries were written on the leader_uuid={} my_uuid={}", num_entries,
@@ -619,9 +640,11 @@ public:
         } while (true);
 
         written_entries_ += num_entries;
-        if (wait_for_commit) { this->wait_for_all_commits(); }
+        if (wait_for_commit) {
+            this->wait_for_all_commits();
+        }
     }
-    replica_id_t wait_and_get_leader_id() {
+    ReplicaId wait_and_get_leader_id() {
         do {
             auto leader_uuid = dbs_[0]->repl_dev()->get_leader_id();
             if (leader_uuid.is_nil()) {
@@ -633,9 +656,12 @@ public:
         } while (true);
     }
 
-    ReplServiceError write_with_id(uint64_t id, bool wait_for_commit = true, shared< TestReplicatedDB > db = nullptr) {
-        if (dbs_[0]->repl_dev() == nullptr) return ReplServiceError::FAILED;
-        if (db == nullptr) { db = pick_one_db(); }
+    ReplError write_with_id(uint64_t id, bool wait_for_commit = true, shared< TestReplicatedDB > db = nullptr) {
+        if (dbs_[0]->repl_dev() == nullptr)
+            return ReplError::FAILED;
+        if (db == nullptr) {
+            db = pick_one_db();
+        }
         LOGINFO("Writing data {} since I am the leader my_uuid={}", id,
                 boost::uuids::to_string(g_helper->my_replica_id()));
         auto const block_size = SISL_OPTIONS["block_size"].as< uint32_t >();
@@ -666,11 +692,13 @@ public:
             db->repl_dev()->async_alloc_write(req->header_blob(), req->key_blob(), req->write_sgs, req);
         });
 
-        if (!wait_for_commit) { return ReplServiceError::OK; }
+        if (!wait_for_commit) {
+            return ReplError::OK;
+        }
         try {
             g_helper->runner().execute().get();
             LOGDEBUG("write data task complete, id={}", id)
-        } catch (const ReplServiceError& e) {
+        } catch (const ReplError& e) {
             LOGERRORMOD(replication, "[Replica={}] Error in writing data: id={}, error={}", g_helper->replica_num(), id,
                         enum_name(e));
             return e;
@@ -679,13 +707,13 @@ public:
         written_entries_ += 1;
         LOGINFO("wait_for_commit={}", written_entries_);
         this->wait_for_all_commits();
-        return ReplServiceError::OK;
+        return ReplError::OK;
     }
 
     void remove_db(std::shared_ptr< TestReplicatedDB > db, bool wait_for_removal) {
         this->run_on_leader(db, [this, db]() {
             auto err = hs()->repl_service().remove_repl_dev(db->repl_dev()->group_id()).get();
-            ASSERT_EQ(err, ReplServiceError::OK) << "Error in destroying the group";
+            ASSERT_EQ(err, ReplError::OK) << "Error in destroying the group";
         });
 
         // Remove the db from the dbs_ list and check if count matches with repl_device
@@ -696,13 +724,17 @@ public:
             }
         }
 
-        if (wait_for_removal) { wait_for_listener_destroy(dbs_.size()); }
+        if (wait_for_removal) {
+            wait_for_listener_destroy(dbs_.size());
+        }
     }
 
     void wait_for_listener_destroy(uint64_t exp_listeners) {
         while (true) {
             auto total_listeners = g_helper->num_listeners();
-            if (total_listeners == exp_listeners) { break; }
+            if (total_listeners == exp_listeners) {
+                break;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
@@ -738,16 +770,16 @@ public:
     void create_snapshot() { dbs_[0]->create_snapshot(); }
     void truncate(int num_reserved_entries) { dbs_[0]->truncate(num_reserved_entries); }
 
-    void replace_member(std::shared_ptr< TestReplicatedDB > db, replica_id_t member_out, replica_id_t member_in,
-                        uint32_t commit_quorum = 0, ReplServiceError error = ReplServiceError::OK) {
+    void replace_member(std::shared_ptr< TestReplicatedDB > db, ReplicaId member_out, ReplicaId member_in,
+                        uint32_t commit_quorum = 0, ReplError error = ReplError::OK) {
         this->run_on_leader(db, [this, error, db, member_out, member_in, commit_quorum]() {
             LOGINFO("Start replace member out={} in={}", boost::uuids::to_string(member_out),
                     boost::uuids::to_string(member_in));
 
-            replica_member_info out{member_out, ""};
-            replica_member_info in{member_in, ""};
+            ReplicaMemberInfo out{member_out, ""};
+            ReplicaMemberInfo in{member_in, ""};
             auto result = hs()->repl_service().replace_member(db->repl_dev()->group_id(), out, in, commit_quorum).get();
-            if (error == ReplServiceError::OK) {
+            if (error == ReplError::OK) {
                 ASSERT_EQ(result.hasError(), false) << "Error in replacing member, err=" << result.error();
             } else {
                 ASSERT_EQ(result.hasError(), true);

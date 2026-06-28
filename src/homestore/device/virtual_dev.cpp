@@ -29,7 +29,7 @@
 
 namespace homestore {
 using namespace iomanager;
-using sisl::IOBuffer;
+using sisl::IoBuf;
 using namespace blkalloc;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -238,33 +238,28 @@ folly::coro::Task< void > VirtualDev::destroy() {
 // ──────────────────────────────────────────────────────────────────────────────
 // Public APIs: I/Os
 // ──────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< void > VirtualDev::write(const IOBuffer& buf, const BlkId& bid) {
+folly::coro::Task< void > VirtualDev::write(sisl::IoBuf const& buf, const BlkId& bid) {
     auto [dev_offset, chunk] = to_dev_offset(bid);
     VDEV_LOG(DEBUG, name_, "write: blk_num={} nblks={} chunk={} dev_offset={} buf_size={}", bid.blk_num(),
              bid.blk_count(), bid.chunk_num(), dev_offset, buf.size());
     co_await chunk->physical_dev()->write(buf, dev_offset);
 }
 
-folly::coro::Task< void > VirtualDev::writev(const std::vector< IOBuffer >& bufs, const BlkId& bid) {
-    auto [dev_offset, chunk] = to_dev_offset(bid);
-    co_await chunk->physical_dev()->writev(bufs, dev_offset);
-}
-
-folly::coro::Task< void > VirtualDev::writev(const std::vector< sisl::ByteArray >& bufs, const BlkId& bid) {
-    auto [dev_offset, chunk] = to_dev_offset(bid);
-    co_await chunk->physical_dev()->writev(bufs, dev_offset);
-}
-
-folly::coro::Task< std::error_code > VirtualDev::read(IOBuffer& buf, const BlkId& bid) {
+folly::coro::Task< std::error_code > VirtualDev::read(sisl::IoBuf& buf, const BlkId& bid) {
     auto [dev_offset, chunk] = to_dev_offset(bid);
     VDEV_LOG(DEBUG, name_, "read: blk_num={} nblks={} chunk={} dev_offset={} buf_size={}", bid.blk_num(),
              bid.blk_count(), bid.chunk_num(), dev_offset, buf.size());
     co_return co_await chunk->physical_dev()->read(buf, dev_offset);
 }
 
-folly::coro::Task< std::error_code > VirtualDev::readv(std::vector< IOBuffer >& bufs, const BlkId& bid) {
+folly::coro::Task< void > VirtualDev::writev(sisl::SgList const& sg, const BlkId& bid) {
     auto [dev_offset, chunk] = to_dev_offset(bid);
-    co_return co_await chunk->physical_dev()->readv(bufs, dev_offset);
+    co_await chunk->physical_dev()->writev(sg, dev_offset);
+}
+
+folly::coro::Task< std::error_code > VirtualDev::readv(sisl::SgList const& sg, const BlkId& bid) {
+    auto [dev_offset, chunk] = to_dev_offset(bid);
+    co_return co_await chunk->physical_dev()->readv(sg, dev_offset);
 }
 
 folly::coro::Task< void > VirtualDev::format() {
@@ -381,7 +376,7 @@ void VirtualDev::init_blk_allocator(cshared< Chunk >& chunk) {
     }
 }
 
-void VirtualDev::load_blk_allocator(const std::unordered_map< uint32_t, sisl::ByteArray >& chunk_buffers) {
+void VirtualDev::load_blk_allocator(const std::unordered_map< uint32_t, sisl::IoBufShared >& chunk_buffers) {
     auto state = load_state();
     for (auto& [chunk_id, c] : state->all_chunks) {
         auto it = chunk_buffers.find(chunk_id);
@@ -393,7 +388,7 @@ void VirtualDev::load_blk_allocator(const std::unordered_map< uint32_t, sisl::By
     }
 }
 
-void VirtualDev::load_blk_allocator(uint32_t chunk_id, const sisl::ByteArray& buffer) {
+void VirtualDev::load_blk_allocator(uint32_t chunk_id, const sisl::IoBufShared& buffer) {
     auto state = load_state();
     auto it = state->all_chunks.find(chunk_id);
     if (it == state->all_chunks.end()) {
@@ -671,7 +666,7 @@ folly::coro::Task< void > VirtualDev::write_vdev_info() {
     }
     vinfo.compute_checksum();
 
-    IOBuffer buf{sizeof(VDevInfo)};
+    IoBuf buf{sizeof(VDevInfo)};
     std::memcpy(buf.bytes(), vinfo.to_bytes(), sizeof(VDevInfo));
 
     const uint64_t offset = VDevInfo::vdev_info_offset(vdev_id_);
@@ -683,7 +678,7 @@ folly::coro::Task< void > VirtualDev::write_vdev_info() {
 // ──────────────────────────────────────────────────────────────────────────────
 // Private Helpers - Blk Allocator management
 // ──────────────────────────────────────────────────────────────────────────────
-void VirtualDev::construct_blk_allocator(cshared< Chunk >& chunk, std::optional< sisl::ByteArray > buffer) {
+void VirtualDev::construct_blk_allocator(cshared< Chunk >& chunk, std::optional< sisl::IoBufShared > buffer) {
     if (allocator_type_ == BlkAllocatorType::None) {
         return;
     }

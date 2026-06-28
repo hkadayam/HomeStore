@@ -88,6 +88,7 @@ using cintrusive = const boost::intrusive_ptr< T >;
 #define to_size(v) static_cast< size_t >(v)
 #define to_double(v) static_cast< double >(v)
 #define to_float(v) static_cast< float >(v)
+#define to_ulong(v) static_cast< ulong >(v)
 
 #define to_u8ptr(p) reinterpret_cast< uint8_t* >(p)
 #define to_cu8ptr(p) reinterpret_cast< const uint8_t* >(p)

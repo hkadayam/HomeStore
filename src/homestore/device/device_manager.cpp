@@ -34,7 +34,7 @@
 namespace homestore {
 
 using namespace iomanager;
-using sisl::IOBuffer;
+using sisl::IoBufOwn;
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
@@ -377,7 +377,7 @@ folly::coro::Task< void > DeviceManager::load_vdevs() {
     const uint64_t bitmap_offset = HSSuperBlk::vdev_sb_offset();
     const uint32_t bitmap_size = HSSuperBlk::vdev_slot_bitmap_size();
 
-    auto ba = sisl::make_byte_array(bitmap_size, first_pdev->align_size());
+    auto ba = sisl::make_io_buf_shared(bitmap_size, first_pdev->align_size());
     if (auto ec = co_await first_pdev->read_super_block(*ba, bitmap_offset); ec) {
         throw std::system_error(ec, "Failed to read vdev slot bitmap");
     }
@@ -410,7 +410,7 @@ folly::coro::Task< void > DeviceManager::load_vdevs() {
     auto read_vinfo_from = [](const shared< PhysicalDev >& pdev,
                               uint32_t vdev_id) -> folly::coro::Task< std::optional< VDevInfo > > {
         const uint64_t off = VDevInfo::vdev_info_offset(vdev_id);
-        IOBuffer buf{to_u32(VDevInfo::SIZE)};
+        IoBufOwn buf{to_u32(VDevInfo::SIZE)};
         if (auto ec = co_await pdev->read_super_block(buf, off); ec) {
             co_return std::nullopt;
         }
@@ -523,7 +523,7 @@ folly::coro::Task< void > DeviceManager::cleanup_stale_slot_vdevs(const std::vec
 folly::coro::Task< void > DeviceManager::write_vdev_slot_bitmap() {
     const uint64_t offset = HSSuperBlk::vdev_sb_offset();
 
-    sisl::ByteArray ba;
+    sisl::IoBufShared ba;
     std::vector< shared< PhysicalDev > > pdevs;
     {
         std::lock_guard lg{state_mutex_};
@@ -545,7 +545,7 @@ folly::coro::Task< void > DeviceManager::write_vdev_slot_bitmap() {
 // static
 folly::coro::Task< VDevInfo > DeviceManager::read_vdev_info(cshared< PhysicalDev >& pdev, uint32_t vdev_id) {
     const uint64_t offset = VDevInfo::vdev_info_offset(vdev_id);
-    IOBuffer buf{VDevInfo::SIZE};
+    IoBufOwn buf{VDevInfo::SIZE};
     if (auto ec = co_await pdev->read_super_block(buf, offset); ec) {
         throw std::system_error(ec, "Failed to read VDevInfo");
     }

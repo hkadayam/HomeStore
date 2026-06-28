@@ -83,10 +83,10 @@ public:
     /// - New block (is_fresh == true): data written, block appended to the tail, client info updated on disk,
     ///   and is_fresh set to false so subsequent calls overwrite in-place.
     /// - Existing block (is_fresh == false): data is overwritten in-place; no relinking.
-    folly::coro::Task< void > write_meta_blk(MetaBlk& blk, const sisl::ByteArray& data);
+    folly::coro::Task< void > write_meta_blk(MetaBlk& blk, const sisl::IoBufShared& data);
 
     /// Read the payload from an existing MetaBlk.
-    folly::coro::Task< sisl::ByteView > read_meta_blk(const MetaBlk& blk);
+    folly::coro::Task< sisl::IoBufView > read_meta_blk(const MetaBlk& blk);
 
     /// Remove a MetaBlk from the chain and free all its blocks on the vdev.
     folly::coro::Task< void > remove_meta_blk(const MetaBlk& blk);
@@ -95,10 +95,10 @@ public:
 
     /// Iterate over all recovered blocks lazily, one block at a time.
     ///
-    /// visitor signature: folly::coro::Task<void>(const MetaBlk&, sisl::ByteView)
+    /// visitor signature: folly::coro::Task<void>(const MetaBlk&, sisl::IoBufView)
     ///
-    /// For inline data the ByteView is a zero-copy window into the cached block buffer. For overflow data the ByteView
-    /// wraps a freshly read ByteArray that is released after the visitor returns.
+    /// For inline data the IoBufView is a zero-copy window into the cached block buffer. For overflow data the IoBufView
+    /// wraps a freshly read IoBufShared that is released after the visitor returns.
     template < typename Visitor >
     folly::coro::Task< void > for_each_recovered_block(Visitor visitor);
 
@@ -150,7 +150,7 @@ folly::coro::Task< void > MetaClient::for_each_recovered_block(Visitor visitor) 
 
         META_LOG(DEBUG, "for_each_recovered_block: [{}/{}] name={} blk_num={} reading data", i, blk_ids.size(),
                  blk_copy.name(), id.blk_num());
-        sisl::ByteView data = co_await blk_copy.read_data(*meta_vdev_);
+        sisl::IoBufView data = co_await blk_copy.read_data(*meta_vdev_);
         META_LOG(DEBUG, "for_each_recovered_block: [{}/{}] name={} read done, calling visitor", i, blk_ids.size(),
                  blk_copy.name());
         co_await visitor(blk_copy, std::move(data));

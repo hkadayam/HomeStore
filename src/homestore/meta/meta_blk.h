@@ -28,7 +28,7 @@
 #include "common/defs.h"                // shared<>, unique<>, to_u32
 #include "homestore/base/homestore_assert.h"    // HS_SUBMOD_LOG
 
-#include "sisl/fds/buffer.h"            // ByteArray, make_byte_array
+#include "sisl/fds/buffer.h"            // IoBufShared, make_io_buf_shared
 
 namespace homestore {
 
@@ -100,7 +100,7 @@ static_assert(sizeof(MetaBlkHeader) == META_BLK_HEADER_SIZE,
 // MetaBlk
 //
 // One metadata block owned by a MetaClient. Caches exactly one disk block
-// (header + inline data) in a ByteArray (shared<IoBlobSafe>). Overflow data
+// (header + inline data) in a IoBufShared (shared<IoBufOwn>). Overflow data
 // lives in separate blocks referenced by overflow_bid — never cached here.
 //
 // prev_bid is kept in memory only (not persisted in the header) to support
@@ -112,21 +112,21 @@ class MetaBlk {
 public:
     BlkId blkid{};              // Block ID on the vdev
     BlkId prev_bid{};           // Previous block in chain (in-memory only)
-    sisl::ByteArray buffer;     // Exactly one block: header (64 B) + inline data (shared ownership)
+    sisl::IoBufShared buffer;     // Exactly one block: header (64 B) + inline data (shared ownership)
     bool is_fresh{true};        // true until first write into the client's chain
 
     // ── Factory ──────────────────────────────────────────────────────────────
     static MetaBlk create(BlkId blkid, uint32_t blk_sz, std::string_view name) {
         MetaBlk blk;
         blk.blkid = blkid;
-        blk.buffer = sisl::make_byte_array(blk_sz);
+        blk.buffer = sisl::make_io_buf_shared(blk_sz);
         blk.is_fresh = true;
         MetaBlkHeader hdr = MetaBlkHeader::make(name);
         std::memcpy(blk.buffer->bytes(), &hdr, MetaBlkHeader::SIZE);
         return blk;
     }
 
-    static MetaBlk load(BlkId blkid, BlkId prev_bid, sisl::ByteArray buf) {
+    static MetaBlk load(BlkId blkid, BlkId prev_bid, sisl::IoBufShared buf) {
         MetaBlk blk;
         blk.blkid = blkid;
         blk.prev_bid = prev_bid;
@@ -155,11 +155,11 @@ public:
 
     /// Write payload to disk. Stores inline if it fits in one block, allocates overflow blocks otherwise. Updates
     /// data_size/data_crc in the header, writes the block, then frees any previous overflow block.
-    folly::coro::Task< void > write_data(const sisl::ByteArray& data, VirtualDev& vdev);
+    folly::coro::Task< void > write_data(const sisl::IoBufShared& data, VirtualDev& vdev);
 
-    /// Read the payload. Returns a ByteView into the cached buffer for inline data (zero copy, zero I/O) or reads
-    /// overflow blocks from disk into a new ByteArray and wraps it in a ByteView.
-    folly::coro::Task< sisl::ByteView > read_data(VirtualDev& vdev) const;
+    /// Read the payload. Returns a IoBufView into the cached buffer for inline data (zero copy, zero I/O) or reads
+    /// overflow blocks from disk into a new IoBufShared and wraps it in a IoBufView.
+    folly::coro::Task< sisl::IoBufView > read_data(VirtualDev& vdev) const;
 
     /// Free this block (and any overflow blocks) on the vdev.
     folly::coro::Task< void > free(VirtualDev& vdev);
@@ -199,7 +199,7 @@ public:
     }
 
     folly::coro::Task< void > write(const uint8_t* data, size_t len);
-    folly::coro::Task< sisl::ByteView > read();
+    folly::coro::Task< sisl::IoBufView > read();
 
     const MetaBlk& meta_blk() const { return meta_blk_; }
     MetaBlk& meta_blk() { return meta_blk_; }

@@ -93,12 +93,12 @@ struct serialized_log_record {
 
 /* This structure represents the in-memory representation of a log record */
 struct log_record {
-    sisl::IoBlob data;
+    sisl::IoBufSpan data;
     void* context;
     logstore_id_t store_id;
     logstore_seq_num_t seq_num;
 
-    log_record(const logstore_id_t& sid, const logstore_seq_num_t snum, const sisl::IoBlob& d, void* const ctx) :
+    log_record(const logstore_id_t& sid, const logstore_seq_num_t snum, const sisl::IoBufSpan& d, void* const ctx) :
             data{d}, context{ctx}, store_id{sid}, seq_num{snum} {}
     log_record(const log_record&) = delete;
     log_record& operator=(const log_record&) = delete;
@@ -383,7 +383,7 @@ std::basic_ostream< charT, traits >& operator<<(std::basic_ostream< charT, trait
 } // namespace homestore
 
 namespace homestore {
-using log_buffer = sisl::ByteView;
+using log_buffer = sisl::IoBufView;
 
 struct truncation_request_t {
     logstore_id_t store_id;
@@ -510,8 +510,8 @@ public:
     uint32_t num_rollback_records(logstore_id_t store_id) const;
     bool is_rolled_back(logstore_id_t store_id, logid_t logid) const;
 
-    void logdev_super_blk_found(const sisl::ByteView& buf, void* meta_cookie);
-    void rollback_super_blk_found(const sisl::ByteView& buf, void* meta_cookie);
+    void logdev_super_blk_found(const sisl::IoBufView& buf, void* meta_cookie);
+    void rollback_super_blk_found(const sisl::IoBufView& buf, void* meta_cookie);
     void destroy();
 
 private:
@@ -547,16 +547,16 @@ public:
     log_stream_reader& operator=(log_stream_reader&&) noexcept = delete;
     ~log_stream_reader() = default;
 
-    sisl::ByteView next_group(off_t* out_dev_offset);
-    sisl::ByteView group_in_next_page();
+    sisl::IoBufView next_group(off_t* out_dev_offset);
+    sisl::IoBufView group_in_next_page();
 
 private:
-    sisl::ByteView read_next_bytes(uint64_t nbytes, bool& end_of_stream);
+    sisl::IoBufView read_next_bytes(uint64_t nbytes, bool& end_of_stream);
 
 private:
     std::shared_ptr< JournalVirtualDev > m_vdev;
     shared< JournalVirtualDev::Descriptor > m_vdev_jd; // Journal descriptor.
-    sisl::ByteView m_cur_log_buf;
+    sisl::IoBufView m_cur_log_buf;
     off_t m_first_group_cursor;
     off_t m_cur_read_bytes{0};
     crc32_t m_prev_crc{0};
@@ -630,7 +630,7 @@ public:
      *
      * @return logid_t : log_idx of the log of the data.
      */
-    logid_t append_async(logstore_id_t store_id, logstore_seq_num_t seq_num, const sisl::IoBlob& data,
+    logid_t append_async(logstore_id_t store_id, logstore_seq_num_t seq_num, const sisl::IoBufSpan& data,
                          void* cb_context);
 
     /**

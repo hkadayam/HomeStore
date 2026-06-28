@@ -60,7 +60,7 @@ void HomeLogStore::write_async(logstore_req* req, const log_req_comp_cb_t& cb) {
     m_logdev->append_async(m_store_id, req->seq_num, req->data, static_cast< void* >(req));
 }
 
-void HomeLogStore::write_async(logstore_seq_num_t seq_num, const sisl::IoBlob& b, void* cookie,
+void HomeLogStore::write_async(logstore_seq_num_t seq_num, const sisl::IoBufSpan& b, void* cookie,
                                const log_write_comp_cb_t& cb) {
     // Form an internal request and issue the write
     auto* req = logstore_req::make(this, seq_num, b);
@@ -72,14 +72,14 @@ void HomeLogStore::write_async(logstore_seq_num_t seq_num, const sisl::IoBlob& b
     });
 }
 
-logstore_seq_num_t HomeLogStore::append_async(const sisl::IoBlob& b, void* cookie, const log_write_comp_cb_t& cb) {
+logstore_seq_num_t HomeLogStore::append_async(const sisl::IoBufSpan& b, void* cookie, const log_write_comp_cb_t& cb) {
     HS_DBG_ASSERT_EQ(m_append_mode, true, "append_async can be called only on append only mode");
     const auto seq_num = m_next_lsn.fetch_add(1, std::memory_order_acq_rel);
     write_async(seq_num, b, cookie, cb);
     return seq_num;
 }
 
-void HomeLogStore::write_and_flush(logstore_seq_num_t seq_num, const sisl::IoBlob& b) {
+void HomeLogStore::write_and_flush(logstore_seq_num_t seq_num, const sisl::IoBufSpan& b) {
     HS_LOG_ASSERT(iomanager.am_i_sync_io_capable(),
                   "Write and flush is a blocking IO, which can't run in this thread, please reschedule to a fiber");
     if (seq_num > m_next_lsn.load(std::memory_order_relaxed)) m_next_lsn.store(seq_num + 1, std::memory_order_relaxed);

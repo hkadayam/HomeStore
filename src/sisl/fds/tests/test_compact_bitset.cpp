@@ -29,7 +29,7 @@ using namespace sisl;
 
 class CompactBitsetTest : public testing::Test {
 protected:
-    sisl::IoBlobSafe m_buf;
+    sisl::IoBufOwn m_buf;
     std::unique_ptr< CompactBitSet > m_bset;
 
 public:

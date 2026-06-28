@@ -45,7 +45,7 @@
 
 using namespace homestore;
 using namespace iomanager;
-using sisl::IOBuffer;
+using sisl::IoBuf;
 
 SISL_OPTION_GROUP(test_raw_blk_stream,
                   (num_io, "", "num_io", "number of IO operations per test",
@@ -238,12 +238,12 @@ CORO_TEST_F(RawBlkStreamTest, SingleBlockWriteRead) {
     }
 
     // Write a pattern.
-    IOBuffer wbuf(BLK_SIZE, 512);
+    IoBuf wbuf(BLK_SIZE, 512);
     self.fill_buf(wbuf.bytes(), BLK_SIZE, 0xDEAD);
     co_await stream->write(bid, wbuf);
 
     // Read back and verify.
-    IOBuffer rbuf(BLK_SIZE, 512);
+    IoBuf rbuf(BLK_SIZE, 512);
     auto ec = co_await stream->read(rbuf, bid);
     CO_ASSERT_FALSE(ec);
     EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), BLK_SIZE, 0xDEAD));
@@ -272,11 +272,11 @@ CORO_TEST_F(RawBlkStreamTest, MultiBlockWriteRead) {
     }
 
     const uint32_t total_size = nblks * BLK_SIZE;
-    IOBuffer wbuf(total_size, 512);
+    IoBuf wbuf(total_size, 512);
     self.fill_buf(wbuf.bytes(), total_size, 0xBEEF);
     co_await stream->write(bid, wbuf);
 
-    IOBuffer rbuf(total_size, 512);
+    IoBuf rbuf(total_size, 512);
     auto ec = co_await stream->read(rbuf, bid);
     CO_ASSERT_FALSE(ec);
     EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), total_size, 0xBEEF));
@@ -303,7 +303,7 @@ CORO_TEST_F(RawBlkStreamTest, AllocCommitInvalidate) {
     }
 
     // Write data before invalidating.
-    IOBuffer wbuf(BLK_SIZE, 512);
+    IoBuf wbuf(BLK_SIZE, 512);
     self.fill_buf(wbuf.bytes(), BLK_SIZE, 0xCAFE);
     co_await stream->write(bid, wbuf);
 
@@ -386,7 +386,7 @@ CORO_TEST_F(RawBlkStreamTest, BulkWriteReadVerify) {
 
         uint64_t seed = 0x1000 + i;
         uint32_t io_size = bid.blk_count() * BLK_SIZE;
-        IOBuffer wbuf(io_size, 512);
+        IoBuf wbuf(io_size, 512);
         self.fill_buf(wbuf.bytes(), io_size, seed);
         co_await stream->write(bid, wbuf);
 
@@ -399,7 +399,7 @@ CORO_TEST_F(RawBlkStreamTest, BulkWriteReadVerify) {
     // Read back and verify each entry.
     for (auto& [bid, seed] : entries) {
         uint32_t io_size = bid.blk_count() * BLK_SIZE;
-        IOBuffer rbuf(io_size, 512);
+        IoBuf rbuf(io_size, 512);
         auto ec = co_await stream->read(rbuf, bid);
         CO_ASSERT_FALSE(ec);
         EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), io_size, seed))
@@ -428,7 +428,7 @@ CORO_TEST_F(RawBlkStreamTest, CPFlush) {
         stream->commit_blk(guard.get(), bid);
     }
 
-    IOBuffer wbuf(BLK_SIZE, 512);
+    IoBuf wbuf(BLK_SIZE, 512);
     self.fill_buf(wbuf.bytes(), BLK_SIZE, 0xF00D);
     co_await stream->write(bid, wbuf);
 
@@ -437,7 +437,7 @@ CORO_TEST_F(RawBlkStreamTest, CPFlush) {
     EXPECT_TRUE(success);
 
     // Read back data to verify it survived the flush.
-    IOBuffer rbuf(BLK_SIZE, 512);
+    IoBuf rbuf(BLK_SIZE, 512);
     auto ec = co_await stream->read(rbuf, bid);
     CO_ASSERT_FALSE(ec);
     EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), BLK_SIZE, 0xF00D));
@@ -464,17 +464,17 @@ CORO_TEST_F(RawBlkStreamTest, ScatterGatherIO) {
         stream->commit_blk(guard.get(), bid);
     }
 
-    // Build scatter-gather write buffers — one IOBuffer per block with distinct patterns.
-    std::vector< IOBuffer > wbufs;
+    // Build scatter-gather write buffers — one IoBuf per block with distinct patterns.
+    std::vector< IoBuf > wbufs;
     for (blk_count_t i = 0; i < nblks; ++i) {
-        IOBuffer buf(BLK_SIZE, 512);
+        IoBuf buf(BLK_SIZE, 512);
         self.fill_buf(buf.bytes(), BLK_SIZE, 0xAA00 + i);
         wbufs.push_back(std::move(buf));
     }
     co_await stream->writev(wbufs, bid);
 
     // Read back with readv.
-    std::vector< IOBuffer > rbufs;
+    std::vector< IoBuf > rbufs;
     for (blk_count_t i = 0; i < nblks; ++i) {
         rbufs.emplace_back(BLK_SIZE, 512);
     }
@@ -506,12 +506,12 @@ CORO_TEST_F(RawBlkStreamTest, InvalidateWaitsForReads) {
         stream->commit_blk(guard.get(), bid);
     }
 
-    IOBuffer wbuf(BLK_SIZE, 512);
+    IoBuf wbuf(BLK_SIZE, 512);
     self.fill_buf(wbuf.bytes(), BLK_SIZE, 0xFACE);
     co_await stream->write(bid, wbuf);
 
     // Issue a read (which registers with BlkReadTracker).
-    IOBuffer rbuf(BLK_SIZE, 512);
+    IoBuf rbuf(BLK_SIZE, 512);
     auto ec = co_await stream->read(rbuf, bid);
     CO_ASSERT_FALSE(ec);
     EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), BLK_SIZE, 0xFACE));
@@ -549,7 +549,7 @@ CORO_TEST_F(RawBlkStreamTest, WriteFlushFreeFlush) {
         stream->commit_blk(guard.get(), bid);
     }
 
-    IOBuffer wbuf(bid.blk_count() * BLK_SIZE, 512);
+    IoBuf wbuf(bid.blk_count() * BLK_SIZE, 512);
     self.fill_buf(wbuf.bytes(), wbuf.size(), 0x1234);
     co_await stream->write(bid, wbuf);
 
@@ -593,7 +593,7 @@ CORO_TEST_F(RawBlkStreamTest, Fsync) {
         stream->commit_blk(guard.get(), bid);
     }
 
-    IOBuffer wbuf(BLK_SIZE, 512);
+    IoBuf wbuf(BLK_SIZE, 512);
     self.fill_buf(wbuf.bytes(), BLK_SIZE, 0x5678);
     co_await stream->write(bid, wbuf);
 
@@ -601,7 +601,7 @@ CORO_TEST_F(RawBlkStreamTest, Fsync) {
     co_await stream->fsync();
 
     // Read back to confirm data persisted.
-    IOBuffer rbuf(BLK_SIZE, 512);
+    IoBuf rbuf(BLK_SIZE, 512);
     auto ec = co_await stream->read(rbuf, bid);
     CO_ASSERT_FALSE(ec);
     EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), BLK_SIZE, 0x5678));
@@ -646,7 +646,7 @@ TEST_F(RawBlkStreamTest, RestartRecoverySingleBlock) {
             auto guard = cp_mgr().cp_guard();
             stream->commit_blk(guard.get(), bid);
         }
-        IOBuffer wbuf(BLK_SIZE, 512);
+        IoBuf wbuf(BLK_SIZE, 512);
         fill_buf(wbuf.bytes(), BLK_SIZE, 0xABCD0001);
         co_await stream->write(bid, wbuf);
         auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
@@ -662,7 +662,7 @@ TEST_F(RawBlkStreamTest, RestartRecoverySingleBlock) {
         auto recovered = streams[0];
         EXPECT_EQ(recovered->stream_id(), sid);
         EXPECT_EQ(recovered->num_chunks(), 1u);
-        IOBuffer rbuf(BLK_SIZE, 512);
+        IoBuf rbuf(BLK_SIZE, 512);
         auto ec = co_await recovered->read(rbuf, bid);
         CO_ASSERT_FALSE(ec);
         EXPECT_TRUE(verify_buf(rbuf.cbytes(), BLK_SIZE, 0xABCD0001));
@@ -701,7 +701,7 @@ TEST_F(RawBlkStreamTest, RestartRecoveryMultiChunk) {
             }
             uint64_t seed = 0x2000 + i;
             uint32_t io_size = bid.blk_count() * BLK_SIZE;
-            IOBuffer wbuf(io_size, 512);
+            IoBuf wbuf(io_size, 512);
             fill_buf(wbuf.bytes(), io_size, seed);
             co_await stream->write(bid, wbuf);
             entries.push_back({bid, seed});
@@ -719,7 +719,7 @@ TEST_F(RawBlkStreamTest, RestartRecoveryMultiChunk) {
         auto recovered = streams[0];
         for (auto& [bid, seed] : entries) {
             uint32_t io_size = bid.blk_count() * BLK_SIZE;
-            IOBuffer rbuf(io_size, 512);
+            IoBuf rbuf(io_size, 512);
             auto ec = co_await recovered->read(rbuf, bid);
             CO_ASSERT_FALSE(ec);
             EXPECT_TRUE(verify_buf(rbuf.cbytes(), io_size, seed))
@@ -749,7 +749,7 @@ TEST_F(RawBlkStreamTest, RestartRecoveryMultipleStreams) {
                                     auto guard = cp_mgr().cp_guard();
                                     s1->commit_blk(guard.get(), bid1);
                                 }
-                                IOBuffer w1(BLK_SIZE, 512);
+                                IoBuf w1(BLK_SIZE, 512);
                                 fill_buf(w1.bytes(), BLK_SIZE, 0xAAAA);
                                 co_await s1->write(bid1, w1);
 
@@ -759,7 +759,7 @@ TEST_F(RawBlkStreamTest, RestartRecoveryMultipleStreams) {
                                     auto guard = cp_mgr().cp_guard();
                                     s2->commit_blk(guard.get(), bid2);
                                 }
-                                IOBuffer w2(BLK_SIZE, 512);
+                                IoBuf w2(BLK_SIZE, 512);
                                 fill_buf(w2.bytes(), BLK_SIZE, 0xBBBB);
                                 co_await s2->write(bid2, w2);
 
@@ -778,13 +778,13 @@ TEST_F(RawBlkStreamTest, RestartRecoveryMultipleStreams) {
                                 CO_ASSERT_EQ(streams.size(), 2u);
                                 for (auto& s : streams) {
                                     if (s->stream_id() == sid1) {
-                                        IOBuffer rbuf(BLK_SIZE, 512);
+                                        IoBuf rbuf(BLK_SIZE, 512);
                                         auto ec = co_await s->read(rbuf, bid1);
                                         CO_ASSERT_FALSE(ec);
                                         EXPECT_TRUE(verify_buf(rbuf.cbytes(), BLK_SIZE, 0xAAAA));
                                     } else {
                                         EXPECT_EQ(s->stream_id(), sid2);
-                                        IOBuffer rbuf(BLK_SIZE, 512);
+                                        IoBuf rbuf(BLK_SIZE, 512);
                                         auto ec = co_await s->read(rbuf, bid2);
                                         CO_ASSERT_FALSE(ec);
                                         EXPECT_TRUE(verify_buf(rbuf.cbytes(), BLK_SIZE, 0xBBBB));
@@ -809,7 +809,7 @@ TEST_F(RawBlkStreamTest, RestartAfterFree) {
             auto guard = cp_mgr().cp_guard();
             stream->commit_blk(guard.get(), bid);
         }
-        IOBuffer wbuf(BLK_SIZE, 512);
+        IoBuf wbuf(BLK_SIZE, 512);
         fill_buf(wbuf.bytes(), BLK_SIZE, 0xF00DF00D);
         co_await stream->write(bid, wbuf);
         auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
@@ -852,7 +852,7 @@ TEST_F(RawBlkStreamTest, DoubleRestart) {
             auto guard = cp_mgr().cp_guard();
             stream->commit_blk(guard.get(), bid1);
         }
-        IOBuffer w1(BLK_SIZE, 512);
+        IoBuf w1(BLK_SIZE, 512);
         fill_buf(w1.bytes(), BLK_SIZE, 0x1111);
         co_await stream->write(bid1, w1);
         auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
@@ -872,7 +872,7 @@ TEST_F(RawBlkStreamTest, DoubleRestart) {
             auto guard = cp_mgr().cp_guard();
             stream->commit_blk(guard.get(), bid2);
         }
-        IOBuffer w2(BLK_SIZE, 512);
+        IoBuf w2(BLK_SIZE, 512);
         fill_buf(w2.bytes(), BLK_SIZE, 0x2222);
         co_await stream->write(bid2, w2);
         auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
@@ -885,11 +885,11 @@ TEST_F(RawBlkStreamTest, DoubleRestart) {
         auto streams = blob_dev_->raw_blk_streams();
         CO_ASSERT_EQ(streams.size(), 1u);
         auto recovered = streams[0];
-        IOBuffer r1(BLK_SIZE, 512);
+        IoBuf r1(BLK_SIZE, 512);
         auto ec = co_await recovered->read(r1, bid1);
         CO_ASSERT_FALSE(ec);
         EXPECT_TRUE(verify_buf(r1.cbytes(), BLK_SIZE, 0x1111));
-        IOBuffer r2(BLK_SIZE, 512);
+        IoBuf r2(BLK_SIZE, 512);
         ec = co_await recovered->read(r2, bid2);
         CO_ASSERT_FALSE(ec);
         EXPECT_TRUE(verify_buf(r2.cbytes(), BLK_SIZE, 0x2222));
@@ -924,12 +924,12 @@ CORO_TEST_F(RawBlkStreamTest, BlockSizeMultiplier) {
     }
 
     // Write at the stream's block size.
-    IOBuffer wbuf(STREAM_BLK_SIZE, 512);
+    IoBuf wbuf(STREAM_BLK_SIZE, 512);
     self.fill_buf(wbuf.bytes(), STREAM_BLK_SIZE, 0xB1C2);
     co_await stream->write(bid, wbuf);
 
     // Read back and verify.
-    IOBuffer rbuf(STREAM_BLK_SIZE, 512);
+    IoBuf rbuf(STREAM_BLK_SIZE, 512);
     auto ec = co_await stream->read(rbuf, bid);
     CO_ASSERT_FALSE(ec);
     EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), STREAM_BLK_SIZE, 0xB1C2));
@@ -947,11 +947,11 @@ CORO_TEST_F(RawBlkStreamTest, BlockSizeMultiplier) {
     }
 
     const uint32_t multi_size = 3 * STREAM_BLK_SIZE;
-    IOBuffer wbuf2(multi_size, 512);
+    IoBuf wbuf2(multi_size, 512);
     self.fill_buf(wbuf2.bytes(), multi_size, 0xD3E4);
     co_await stream->write(bid2, wbuf2);
 
-    IOBuffer rbuf2(multi_size, 512);
+    IoBuf rbuf2(multi_size, 512);
     ec = co_await stream->read(rbuf2, bid2);
     CO_ASSERT_FALSE(ec);
     EXPECT_TRUE(self.verify_buf(rbuf2.cbytes(), multi_size, 0xD3E4));
@@ -960,7 +960,7 @@ CORO_TEST_F(RawBlkStreamTest, BlockSizeMultiplier) {
     auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
     EXPECT_TRUE(success);
 
-    IOBuffer rbuf3(STREAM_BLK_SIZE, 512);
+    IoBuf rbuf3(STREAM_BLK_SIZE, 512);
     ec = co_await stream->read(rbuf3, bid);
     CO_ASSERT_FALSE(ec);
     EXPECT_TRUE(self.verify_buf(rbuf3.cbytes(), STREAM_BLK_SIZE, 0xB1C2));
@@ -989,7 +989,7 @@ TEST_F(RawBlkStreamTest, BlockSizeMultiplierRestart) {
             auto guard = cp_mgr().cp_guard();
             stream->commit_blk(guard.get(), bid);
         }
-        IOBuffer wbuf(STREAM_BLK_SIZE, 512);
+        IoBuf wbuf(STREAM_BLK_SIZE, 512);
         fill_buf(wbuf.bytes(), STREAM_BLK_SIZE, 0xABCD04);
         co_await stream->write(bid, wbuf);
         auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
@@ -1006,7 +1006,7 @@ TEST_F(RawBlkStreamTest, BlockSizeMultiplierRestart) {
         EXPECT_EQ(recovered->stream_id(), sid);
         EXPECT_EQ(recovered->block_size(), STREAM_BLK_SIZE);
         EXPECT_EQ(recovered->blk_multiplier(), 4u);
-        IOBuffer rbuf(STREAM_BLK_SIZE, 512);
+        IoBuf rbuf(STREAM_BLK_SIZE, 512);
         auto ec = co_await recovered->read(rbuf, bid);
         CO_ASSERT_FALSE(ec);
         EXPECT_TRUE(verify_buf(rbuf.cbytes(), STREAM_BLK_SIZE, 0xABCD04));

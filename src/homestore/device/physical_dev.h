@@ -93,10 +93,10 @@ public:
     // ── Super block ───────────────────────────────────────────────────────────
 
     /// Write buf to offset (and optionally mirrored to the footer).
-    folly::coro::Task< void > write_super_block(const sisl::IOBuffer& buf, uint64_t offset);
+    folly::coro::Task< void > write_super_block(const sisl::IoBuf& buf, uint64_t offset);
 
     /// Read into buf. Caller retains ownership; returns error_code.
-    folly::coro::Task< std::error_code > read_super_block(sisl::IOBuffer& buf, uint64_t offset);
+    folly::coro::Task< std::error_code > read_super_block(sisl::IoBuf& buf, uint64_t offset);
 
     /// Mark formatting as complete: reads FirstBlock back, sets formatting_done=1, recomputes checksum, writes back.
     folly::coro::Task< void > commit_formatting();
@@ -106,13 +106,14 @@ public:
     // ── Data IO ───────────────────────────────────────────────────────────────
     // All async IO methods
 
-    folly::coro::Task< void > write(const sisl::IOBuffer& buf, uint64_t offset);
-    folly::coro::Task< void > writev(const std::vector< sisl::IOBuffer >& bufs, uint64_t offset);
-    folly::coro::Task< void > writev(const std::vector< sisl::ByteArray >& bufs, uint64_t offset);
+    /// Single-buf write/read — any concrete IoBuf subclass via virtual dispatch.
+    folly::coro::Task< void > write(const sisl::IoBuf& buf, uint64_t offset);
+    folly::coro::Task< std::error_code > read(sisl::IoBuf& buf, uint64_t offset);
 
-    folly::coro::Task< std::error_code > read(sisl::IOBuffer& buf, uint64_t offset);
-
-    folly::coro::Task< std::error_code > readv(std::vector< sisl::IOBuffer >& bufs, uint64_t offset);
+    /// Scatter-gather I/O — `sg.bufs` is a polymorphic IoBuf pointer list.  Caller guarantees the
+    /// pointed-to IoBufs outlive the await.
+    folly::coro::Task< void > writev(sisl::SgList const& sg, uint64_t offset);
+    folly::coro::Task< std::error_code > readv(sisl::SgList const& sg, uint64_t offset);
 
     folly::coro::Task< void > write_zero(uint64_t size, uint64_t offset);
     folly::coro::Task< void > fsync();

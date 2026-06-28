@@ -95,7 +95,7 @@ class HashBucket;
 
 ENUM(hash_op_t, uint8_t, CREATE, ACCESS, DELETE, RESIZE)
 
-typedef std::function< sisl::ByteView(const sisl::ByteView&, big_offset_t, big_count_t) > value_extractor_cb_t;
+typedef std::function< sisl::IoBufView(const sisl::IoBufView&, big_offset_t, big_count_t) > value_extractor_cb_t;
 
 class ValueEntryRange;
 
@@ -127,8 +127,8 @@ public:
     RangeHashMap(uint32_t nBuckets, value_extractor_cb_t value_extractor, key_access_cb_t< K > access_cb = nullptr);
     ~RangeHashMap();
 
-    void insert(const RangeKey< K >& key, const sisl::IoBlob& value);
-    std::vector< std::pair< RangeKey< K >, sisl::ByteView > > get(const RangeKey< K >& input_key);
+    void insert(const RangeKey< K >& key, const sisl::IoBufSpan& value);
+    std::vector< std::pair< RangeKey< K >, sisl::IoBufView > > get(const RangeKey< K >& input_key);
     void erase(const RangeKey< K >& key);
 
     static void set_current_instance(RangeHashMap< K >* hmap) { s_cur_hash_map = hmap; }
@@ -144,7 +144,7 @@ public:
     }
 
     template < typename... Args >
-    static sisl::ByteView extract_value(Args&&... args) {
+    static sisl::IoBufView extract_value(Args&&... args) {
         return (get_current_instance()->m_value_extractor)(std::forward< Args >(args)...);
     }
 
@@ -171,9 +171,9 @@ private:
     /////////////////////////////////////////////// ValueEntryRange Declaration ///////////////////////////////////
     struct ValueEntryRange : public ValueEntryBase {
         small_range_t m_range;
-        sisl::ByteView m_val;
+        sisl::IoBufView m_val;
 
-        ValueEntryRange(const small_range_t& range, const sisl::ByteView& val) :
+        ValueEntryRange(const small_range_t& range, const sisl::IoBufView& val) :
                 ValueEntryBase{}, m_range{range}, m_val{val} {}
         ValueEntryRange(const ValueEntryRange&) = default;
         ValueEntryRange& operator=(const ValueEntryRange&) = default;
@@ -260,7 +260,7 @@ public:
     MultiEntryHashNode(const K& base_key, big_offset_t nth) : m_base_key{base_key}, m_base_nth{nth} {}
 
     small_count_t get(const RangeKey< K >& input_key,
-                      std::vector< std::pair< RangeKey< K >, sisl::ByteView > >& out_values) const {
+                      std::vector< std::pair< RangeKey< K >, sisl::IoBufView > >& out_values) const {
         small_count_t count{0};
         small_range_t input_range = to_relative_range(input_key);
 
@@ -284,7 +284,7 @@ public:
         return count;
     }
 
-    void insert(const RangeKey< K >& input_key, sisl::ByteView&& value) {
+    void insert(const RangeKey< K >& input_key, sisl::IoBufView&& value) {
         const small_range_t input_range = to_relative_range(input_key);
 
         auto [l_idx, l_found] = binary_search(-1, int_cast(m_values.size()), input_range.first);
@@ -438,7 +438,7 @@ private:
         return std::make_pair<>(m_base_nth + range.first, m_base_nth + range.second);
     }
 
-    std::pair< RangeKey< K >, sisl::ByteView > extract_matched_kv(const ValueEntryRange& ventry,
+    std::pair< RangeKey< K >, sisl::IoBufView > extract_matched_kv(const ValueEntryRange& ventry,
                                                                    const small_range_t& input_range) const {
         small_range_t key_range{std::max(ventry.m_range.first, input_range.first),
                                 std::min(ventry.m_range.second, input_range.second)};
@@ -449,7 +449,7 @@ private:
                                 RangeHashMap< K >::extract_value(ventry.m_val, val_start, val_count));
     }
 
-    sisl::ByteView extract_matched_value(const ValueEntryRange& ventry, const small_range_t& input_range) const {
+    sisl::IoBufView extract_matched_value(const ValueEntryRange& ventry, const small_range_t& input_range) const {
         small_range_t key_range{std::max(ventry.m_range.first, input_range.first),
                                 std::min(ventry.m_range.second, input_range.second)};
         auto val_start = ventry.offset_within(key_range.first);
@@ -485,7 +485,7 @@ public:
         }
     }
 
-    void insert(const RangeKey< K >& input_key, sisl::ByteView&& value) {
+    void insert(const RangeKey< K >& input_key, sisl::IoBufView&& value) {
 #ifndef GLOBAL_HASHSET_LOCK
         folly::SharedMutexWritePriority::WriteHolder holder(m_lock);
 #endif
@@ -513,7 +513,7 @@ public:
     }
 
     big_count_t get(const RangeKey< K >& input_key,
-                    std::vector< std::pair< RangeKey< K >, sisl::ByteView > >& out_values) {
+                    std::vector< std::pair< RangeKey< K >, sisl::IoBufView > >& out_values) {
 #ifndef GLOBAL_HASHSET_LOCK
         folly::SharedMutexWritePriority::ReadHolder holder(m_lock);
 #endif
@@ -596,7 +596,7 @@ RangeHashMap< K >::~RangeHashMap() {
 }
 
 template < typename K >
-void RangeHashMap< K >::insert(const RangeKey< K >& input_key, const sisl::IoBlob& value) {
+void RangeHashMap< K >::insert(const RangeKey< K >& input_key, const sisl::IoBufSpan& value) {
 #ifdef GLOBAL_HASHSET_LOCK
     std::lock_guard< std::mutex > lk(m);
 #endif
@@ -605,7 +605,7 @@ void RangeHashMap< K >::insert(const RangeKey< K >& input_key, const sisl::IoBlo
     auto cur_val_nth = 0;
     auto max_this_node = max_n_per_node - (input_key.m_nth - input_key.rounded_nth());
     RangeKey< K > node_key = input_key; // TODO: Can optimize this by avoiding base_key copy by doing some sort of view
-    const sisl::ByteView base_val{value};
+    const sisl::IoBufView base_val{value};
 
     while (cur_key_nth <= input_key.end_nth()) {
         const auto count = std::min(max_this_node, input_key.end_nth() - cur_key_nth + 1);
@@ -613,7 +613,7 @@ void RangeHashMap< K >::insert(const RangeKey< K >& input_key, const sisl::IoBlo
         node_key.m_count = count;
         auto& hb = get_bucket(node_key);
 
-        sisl::ByteView node_val = m_value_extractor(base_val, cur_val_nth, count);
+        sisl::IoBufView node_val = m_value_extractor(base_val, cur_val_nth, count);
         hb.insert(node_key, std::move(node_val));
 
         cur_key_nth += count;
@@ -623,13 +623,13 @@ void RangeHashMap< K >::insert(const RangeKey< K >& input_key, const sisl::IoBlo
 }
 
 template < typename K >
-std::vector< std::pair< RangeKey< K >, sisl::ByteView > > RangeHashMap< K >::get(const RangeKey< K >& input_key) {
+std::vector< std::pair< RangeKey< K >, sisl::IoBufView > > RangeHashMap< K >::get(const RangeKey< K >& input_key) {
 #ifdef GLOBAL_HASHSET_LOCK
     std::lock_guard< std::mutex > lk(m);
 #endif
     set_current_instance(this);
 
-    std::vector< std::pair< RangeKey< K >, sisl::ByteView > > out_vals;
+    std::vector< std::pair< RangeKey< K >, sisl::IoBufView > > out_vals;
     auto cur_key_nth = input_key.m_nth;
     auto cur_val_nth = 0;
     auto max_this_node = max_n_per_node - (input_key.m_nth - input_key.rounded_nth());

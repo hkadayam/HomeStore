@@ -36,7 +36,7 @@ folly::coro::Task< void > COWBtreeManager::load() {
     // optional user_sb).  Stash them in pending_btrees_ so the upper layer can iterate via list_persisted_btrees()
     // and call load_cow_btree<K,V>() for each one with the right K/V types.
     co_await mgr->meta_client_->for_each_recovered_block(
-        [&mgr](MetaBlk const& blk, sisl::ByteView data) -> folly::coro::Task< void > {
+        [&mgr](MetaBlk const& blk, sisl::IoBufView data) -> folly::coro::Task< void > {
             HS_REL_ASSERT_GE(data.size(), sizeof(COWBtreeSuperBlock), "COWBtree metablk too small: {} bytes",
                              data.size());
             PersistedBtreeInfo info;

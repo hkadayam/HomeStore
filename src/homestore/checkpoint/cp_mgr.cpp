@@ -33,7 +33,7 @@
 namespace homestore {
 
 using namespace iomanager;
-using sisl::IOBuffer;
+using sisl::IoBufOwn;
 
 ////////////////////////////////////////////////////////////////////////////
 // CPGuard — per-thread CP stack owned by CPManager

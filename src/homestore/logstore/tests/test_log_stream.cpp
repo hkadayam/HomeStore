@@ -92,7 +92,7 @@ public:
         completions_.push_back(Record{lsn, key, {}});
     }
 
-    void on_log_found(lsn_t lsn, const stream_key& key, const sisl::ByteView& data) override {
+    void on_log_found(lsn_t lsn, const stream_key& key, const sisl::IoBufView& data) override {
         std::lock_guard lk{mtx_};
         Record r;
         r.lsn = lsn;
@@ -214,13 +214,13 @@ public:
         struct PendingSb {
             uint64_t stream_id;
             MetaBlk sb;
-            sisl::ByteView payload;
+            sisl::IoBufView payload;
         };
         std::vector< PendingSb > pending;
         const auto sb_prefix = fmt::format("{}_logstream_sb_", vdev_name_);
 
         co_await meta_client_->for_each_recovered_block(
-            [&pending, &sb_prefix](MetaBlk blk, sisl::ByteView data) -> folly::coro::Task< void > {
+            [&pending, &sb_prefix](MetaBlk blk, sisl::IoBufView data) -> folly::coro::Task< void > {
                 // MetaBlk::name() returns std::string by value — bind to a string, not a string_view, so it
                 // outlives this statement.
                 std::string name = blk.name();
@@ -282,7 +282,7 @@ public:
     // Holds the data buffer alive until flush completes.
     struct PendingAppend {
         std::vector< uint8_t > buf;
-        sisl::IoBlob blob() { return sisl::IoBlob{buf.data(), to_u32(buf.size()), false}; }
+        sisl::IoBufSpan blob() { return sisl::IoBufSpan{buf.data(), to_u32(buf.size()), false}; }
     };
 
     static logid_t append_pattern(LogStream& s, ShadowStore& store, lsn_t lsn, size_t size, uint64_t seed,
@@ -317,7 +317,7 @@ public:
         const uint64_t pdev_offset = chunk->start_offset() + aligned_in_chunk;
         const uint32_t in_block = to_u32(in_chunk - aligned_in_chunk);
 
-        sisl::IOBuffer iobuf{block, block};
+        sisl::IoBuf iobuf{block, block};
         auto ec = co_await chunk->physical_dev()->read(iobuf, pdev_offset);
         EXPECT_FALSE(ec) << "RMW read for corruption helper failed";
         std::memcpy(iobuf.bytes() + in_block, bytes, len);
@@ -557,7 +557,7 @@ CORO_TEST_F(LogStreamTest, HighlyConcurrentAppendTimerFlush) {
     constexpr uint32_t kPerThread = 200;
     constexpr uint32_t kTotal = kThreads * kPerThread;
 
-    // append() is lock-free; the IoBlob points at the keep-alive buffer so we hold one shared keep-alive vector.
+    // append() is lock-free; the IoBufSpan points at the keep-alive buffer so we hold one shared keep-alive vector.
     std::mutex keep_mtx;
     std::vector< std::shared_ptr< LogStreamTest::PendingAppend > > keep;
     keep.reserve(kTotal);

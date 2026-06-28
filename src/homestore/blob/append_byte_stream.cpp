@@ -29,7 +29,7 @@
 
 namespace homestore {
 
-using sisl::IOBuffer;
+using sisl::IoBufOwn;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Private constructor
@@ -68,7 +68,7 @@ folly::coro::Task< shared< AppendByteStream > > AppendByteStream::create(uint64_
 folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(uint64_t stream_id, MetaClient& meta_client,
                                                                        const std::string& dev_name,
                                                                        const shared< VirtualDev >& vdev, MetaBlk&& sb,
-                                                                       sisl::ByteView sb_payload,
+                                                                       sisl::IoBufView sb_payload,
                                                                        bool concurrent_safe) {
     // Parse {chunk_size, head, tail, chunk_ids} from the stream sb payload.  The sb is always written by create()
     // and persist_stream_sb(), so any stream that was created should have a valid payload here.
@@ -198,10 +198,10 @@ folly::coro::Task< void > AppendByteStream::truncate(uint64_t upto_offset) {
 // read
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< std::pair< std::error_code, sisl::ByteView > > AppendByteStream::read(uint64_t byte_offset,
+folly::coro::Task< std::pair< std::error_code, sisl::IoBufView > > AppendByteStream::read(uint64_t byte_offset,
                                                                                          size_t len) {
     if (byte_offset < head_offset_ || byte_offset + len > tail_offset_) {
-        co_return {std::make_error_code(std::errc::invalid_argument), sisl::ByteView{}};
+        co_return {std::make_error_code(std::errc::invalid_argument), sisl::IoBufView{}};
     }
     auto [cid, offset_in_chunk] = resolve(byte_offset);
     const uint32_t blk_sz = block_size();
@@ -210,17 +210,17 @@ folly::coro::Task< std::pair< std::error_code, sisl::ByteView > > AppendByteStre
 
     auto [ec, buf] = co_await read_blocks(cid, blk_num, nblks);
     if (ec) {
-        co_return {ec, sisl::ByteView{}};
+        co_return {ec, sisl::IoBufView{}};
     }
     // Slice the block-aligned buf so bytes() lands exactly at byte_offset and size() is len.  Zero-copy: the
-    // ByteView holds a shared_ptr to the underlying IOBuffer via make_byte_array.
+    // IoBufView holds a shared_ptr to the underlying IoBufOwn via make_io_buf_shared.
     co_return {std::error_code{},
-               sisl::ByteView{sisl::make_byte_array(std::move(buf)), to_u32(byte_offset % blk_sz), to_u32(len)}};
+               sisl::IoBufView{sisl::make_io_buf_shared(std::move(buf)), to_u32(byte_offset % blk_sz), to_u32(len)}};
 }
 
-folly::coro::Task< std::pair< std::error_code, IOBuffer > >
+folly::coro::Task< std::pair< std::error_code, IoBufOwn > >
 AppendByteStream::read_blocks(chunk_num_t cid, uint32_t blk_num, blk_count_t nblks) {
-    IOBuffer buf{to_u32(nblks) * block_size(), block_size()};
+    IoBufOwn buf{to_u32(nblks) * block_size(), block_size()};
     const BlkId bid{blk_num, nblks, cid};
     auto ec = co_await vdev().read(buf, bid);
     co_return {ec, std::move(buf)};
@@ -242,9 +242,9 @@ AppendByteStream::ReadCursor AppendByteStream::open_cursor(uint64_t start_offset
     return ReadCursor{const_cast< AppendByteStream& >(*this), start_offset, end_offset};
 }
 
-folly::coro::Task< std::pair< sisl::ByteView, uint32_t > > AppendByteStream::ReadCursor::next(size_t max_bytes) {
+folly::coro::Task< std::pair< sisl::IoBufView, uint32_t > > AppendByteStream::ReadCursor::next(size_t max_bytes) {
     if (pos_ >= end_) {
-        co_return {sisl::ByteView{}, 0};
+        co_return {sisl::IoBufView{}, 0};
     }
 
     auto [cid, offset_in_chunk] = stream_.resolve(pos_);
@@ -259,13 +259,13 @@ folly::coro::Task< std::pair< sisl::ByteView, uint32_t > > AppendByteStream::Rea
 
     auto [ec, buf] = co_await stream_.read_blocks(cid, blk_num, nblks);
     if (ec) {
-        co_return {sisl::ByteView{}, 0};
+        co_return {sisl::IoBufView{}, 0};
     }
 
-    // Slice so the returned ByteView's bytes() lands at pos_ — same logic as AppendByteStream::read().  Zero-copy.
+    // Slice so the returned IoBufView's bytes() lands at pos_ — same logic as AppendByteStream::read().  Zero-copy.
     const uint32_t in_buf = to_u32(offset_in_chunk % blk_sz);
     pos_ += valid;
-    co_return {sisl::ByteView{sisl::make_byte_array(std::move(buf)), in_buf, valid}, valid};
+    co_return {sisl::IoBufView{sisl::make_io_buf_shared(std::move(buf)), in_buf, valid}, valid};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -274,7 +274,7 @@ folly::coro::Task< std::pair< sisl::ByteView, uint32_t > > AppendByteStream::Rea
 
 folly::coro::Task< bool > AppendByteStream::flush() {
     FlushBuffer old_buf;
-    std::vector< sisl::IOBuffer > bufs;
+    std::vector< sisl::IoBufOwn > bufs;
     uint64_t total = 0;
 
     // Under lock: swap the buffer, drain it, and if the last buf has a partial (non-block-aligned) tail, inject
@@ -346,7 +346,7 @@ folly::coro::Task< bool > AppendByteStream::flush() {
             } else {
                 // Chunk-straddle: copy this chunk's slice into a fresh aligned buffer.  All quantities are
                 // block-aligned so no padding is involved.
-                IOBuffer wbuf{write_len, block_size()};
+                IoBufOwn wbuf{write_len, block_size()};
                 std::memcpy(wbuf.bytes(), buf.bytes() + buf_offset, write_len);
                 co_await vdev().write(wbuf, BlkId{cur_blk_num, nblks, chunk_id});
             }
@@ -382,7 +382,7 @@ folly::coro::Task< void > AppendByteStream::persist_stream_sb() {
     }
 
     const size_t payload_bytes = AppendByteStreamSb::size_for(to_u32(cids.size()));
-    auto buf = sisl::make_byte_array(to_u32(payload_bytes));
+    auto buf = sisl::make_io_buf_shared(to_u32(payload_bytes));
     auto* sb = reinterpret_cast< AppendByteStreamSb* >(buf->bytes());
     sb->chunk_size = chunk_size();
     sb->head_offset = head_offset_;

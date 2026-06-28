@@ -82,7 +82,7 @@ public:
     /// - If `size` is nullopt, sizeof(T) is used as the buffer size.
     /// - On first call (no existing data): T is default-constructed in the buffer; the block is allocated but NOT
     ///   written until write() is called.
-    /// - On recovery (existing data found): the recovered ByteArray is used directly; the T it contains is accessible
+    /// - On recovery (existing data found): the recovered IoBufShared is used directly; the T it contains is accessible
     ///   immediately.
     static folly::coro::Task< ModuleMetaBlk< T > > open(std::string name, std::optional< size_t > size = std::nullopt) {
         if (name.empty()) {
@@ -142,7 +142,7 @@ public:
     /// Reallocate the buffer to new_size and reinitialise T with T{}.
     /// The caller must re-populate fields and call write() afterwards.
     T& resize(size_t new_size) {
-        buffer_ = sisl::make_byte_array(to_u32(new_size));
+        buffer_ = sisl::make_io_buf_shared(to_u32(new_size));
         T default_val{};
         std::memcpy(buffer_->bytes(), &default_val, sizeof(T));
         return *get();
@@ -158,7 +158,7 @@ public:
 private:
     MetaClient client_;
     MetaBlk meta_blk_;
-    sisl::ByteArray buffer_;
+    sisl::IoBufShared buffer_;
     std::string name_;
     bool is_persisted_{false};
 
@@ -170,7 +170,7 @@ private:
         bool found = false;
 
         co_await client.for_each_recovered_block(
-            [&m, &found](const MetaBlk& blk, const sisl::ByteView& data) -> folly::coro::Task< void > {
+            [&m, &found](const MetaBlk& blk, const sisl::IoBufView& data) -> folly::coro::Task< void > {
                 if (!found) {
                     if (data.size() < sizeof(T)) {
                         throw std::runtime_error{"ModuleMetaBlk::load_existing: recovered data too small"};
@@ -194,7 +194,7 @@ private:
 
     static folly::coro::Task< ModuleMetaBlk< T > > create_new(MetaClient client, std::string name, size_t buf_sz) {
         ModuleMetaBlk< T > m;
-        m.buffer_ = sisl::make_byte_array(to_u32(buf_sz));
+        m.buffer_ = sisl::make_io_buf_shared(to_u32(buf_sz));
 
         // Placement-initialise T with its default value.
         T default_val{};
@@ -263,7 +263,7 @@ public:
     folly::coro::Task< void > write() {
         const auto packed = nlohmann::json::to_msgpack(json_);
         const auto sz = packed.size();
-        sisl::ByteArray buf = sisl::make_byte_array(to_u32(sz));
+        sisl::IoBufShared buf = sisl::make_io_buf_shared(to_u32(sz));
         std::memcpy(buf->bytes(), packed.data(), sz);
         co_await client_.write_meta_blk(meta_blk_, buf);
         is_persisted_ = true;
@@ -301,7 +301,7 @@ private:
         bool found = false;
 
         co_await client.for_each_recovered_block(
-            [&m, &found](const MetaBlk& blk, const sisl::ByteView& data) -> folly::coro::Task< void > {
+            [&m, &found](const MetaBlk& blk, const sisl::IoBufView& data) -> folly::coro::Task< void > {
                 if (!found) {
                     try {
                         std::string_view const sv{c_charptr_cast(data.bytes()), data.size()};

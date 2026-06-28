@@ -27,7 +27,7 @@ namespace homestore {
 // ──────────────────────────────────────────────────────────────────────────────
 // MetaBlk Public APIs
 // ──────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< void > MetaBlk::write_data(const sisl::ByteArray& data, VirtualDev& vdev) {
+folly::coro::Task< void > MetaBlk::write_data(const sisl::IoBufShared& data, VirtualDev& vdev) {
     const BlkId old_ovf = header().overflow_bid;
 
     if (data->size() <= max_inline_data_size()) {
@@ -59,23 +59,23 @@ folly::coro::Task< void > MetaBlk::write_data(const sisl::ByteArray& data, Virtu
     if (old_ovf.is_valid()) { vdev.free_blk(old_ovf); }
 }
 
-folly::coro::Task< sisl::ByteView > MetaBlk::read_data(VirtualDev& vdev) const {
+folly::coro::Task< sisl::IoBufView > MetaBlk::read_data(VirtualDev& vdev) const {
     const uint32_t data_sz = header().data_size;
 
     if (!header().overflow_bid.is_valid()) {
         META_LOG(DEBUG, "read_data: name={} inline data_size={} blk_num={}", name(), data_sz, blkid.blk_num());
-        co_return sisl::ByteView{buffer, to_u32(MetaBlkHeader::SIZE), data_sz};
+        co_return sisl::IoBufView{buffer, to_u32(MetaBlkHeader::SIZE), data_sz};
     }
 
-    // Overflow: read from overflow blocks on disk into a new ByteArray, then wrap as ByteView.
+    // Overflow: read from overflow blocks on disk into a new IoBufShared, then wrap as IoBufView.
     const BlkId ovf = header().overflow_bid;
     META_LOG(DEBUG, "read_data: name={} overflow data_size={} ovf_blk_num={} ovf_nblks={}", name(), data_sz,
              ovf.blk_num(), ovf.blk_count());
-    auto out = sisl::make_byte_array(data_sz);
+    auto out = sisl::make_io_buf_shared(data_sz);
     auto err = co_await vdev.read(*out, ovf);
     if (err) { throw std::system_error{err, "MetaBlk::read_data: overflow read failed"}; }
     META_LOG(DEBUG, "read_data: name={} overflow read complete", name());
-    co_return sisl::ByteView{std::move(out)};
+    co_return sisl::IoBufView{std::move(out)};
 }
 
 folly::coro::Task< void > MetaBlk::free(VirtualDev& vdev) {
@@ -106,12 +106,12 @@ folly::coro::Task< MetaBlkWrapper > MetaBlkWrapper::create(shared< MetaClient > 
 }
 
 folly::coro::Task< void > MetaBlkWrapper::write(const uint8_t* data, size_t len) {
-    auto buf = sisl::make_byte_array(to_u32(len));
+    auto buf = sisl::make_io_buf_shared(to_u32(len));
     std::memcpy(buf->bytes(), data, len);
     co_await client_->write_meta_blk(meta_blk_, buf);
 }
 
-folly::coro::Task< sisl::ByteView > MetaBlkWrapper::read() {
+folly::coro::Task< sisl::IoBufView > MetaBlkWrapper::read() {
     co_return co_await client_->read_meta_blk(meta_blk_);
 }
 

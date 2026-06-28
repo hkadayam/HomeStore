@@ -29,7 +29,7 @@
 
 namespace homestore {
 
-using sisl::IOBuffer;
+using sisl::IoBuf;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constructor and Factory
@@ -103,7 +103,7 @@ folly::coro::Task< BlkId > AppendBlkStream::alloc_or_expand(blk_count_t nblks, c
 // ─────────────────────────────────────────────────────────────────────────────
 
 std::optional< BlkId > AppendBlkStream::do_quick_append(CPSession& session, uint16_t segment_id,
-                                                        unique< WriteUnit > new_wu, sisl::ByteArray& buf) {
+                                                        unique< WriteUnit > new_wu, sisl::IoBufShared& buf) {
     std::lock_guard lk{mu_};
 
     // Install the new WriteUnit if provided.
@@ -142,7 +142,15 @@ folly::coro::Task< void > AppendBlkStream::flush_write_units(const std::vector< 
 
         const BlkId used_bid{wu->alloc_blkid.blk_num(), static_cast< blk_count_t >(wu->used_nblks),
                              wu->alloc_blkid.chunk_num()};
-        co_await vdev().writev(wu->bufs, used_bid);
+        // Build the polymorphic IoBuf pointer list — each shared_ptr in wu->bufs dereferences to an IoBufOwn
+        // (IS-A IoBuf), so .get() gives the IoBuf*.  SgList is non-owning; wu->bufs keeps the underlying
+        // IoBufOwns alive across the await.
+        sisl::SgList sg;
+        sg.bufs.reserve(wu->bufs.size());
+        for (auto const& b : wu->bufs) {
+            sg.bufs.push_back(b.get());
+        }
+        co_await vdev().writev(sg, used_bid);
         vdev().commit_blk(used_bid);
 
         // Free any over-allocated tail blocks.
@@ -159,14 +167,14 @@ folly::coro::Task< void > AppendBlkStream::flush_write_units(const std::vector< 
 // IO APIs
 // ─────────────────────────────────────────────────────────────────────────────
 
-std::optional< BlkId > AppendBlkStream::quick_append(CP* cp, uint16_t segment_id, sisl::ByteArray& buf) {
+std::optional< BlkId > AppendBlkStream::quick_append(CP* cp, uint16_t segment_id, sisl::IoBufShared& buf) {
     if (segment_id >= CPSession::MAX_SEGMENTS) {
         return std::nullopt;
     }
     return do_quick_append(cp_session(cp->id()), segment_id, /*new_wu=*/nullptr, buf);
 }
 
-folly::coro::Task< BlkId > AppendBlkStream::append(CP* cp, uint16_t segment_id, sisl::ByteArray&& buf) {
+folly::coro::Task< BlkId > AppendBlkStream::append(CP* cp, uint16_t segment_id, sisl::IoBufShared&& buf) {
     if (segment_id >= CPSession::MAX_SEGMENTS) {
         throw std::invalid_argument{"AppendBlkStream: segment_id out of range"};
     }
@@ -201,7 +209,7 @@ void AppendBlkStream::invalidate(CP* cp, const BlkId& bid) {
     cp_session(cp->id()).mark_chunk_dirty(bid.chunk_num());
 }
 
-folly::coro::Task< std::error_code > AppendBlkStream::read(IOBuffer& buf, const BlkId& bid) {
+folly::coro::Task< std::error_code > AppendBlkStream::read(IoBuf& buf, const BlkId& bid) {
     co_return co_await vdev().read(buf, bid);
 }
 

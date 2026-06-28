@@ -29,7 +29,7 @@
 namespace homestore {
 
 using namespace iomanager;
-using sisl::IOBuffer;
+using sisl::IoBuf;
 
 // ── Global device cache ───────────────────────────────────────────────────────
 // We use a plain std::mutex here because open/close are rare, cold-path operations that don't need to yield.
@@ -89,7 +89,7 @@ folly::coro::Task< FirstBlock > PhysicalDev::read_first_block(const std::string&
     auto iodev = co_await open_and_cache_dev(devname, oflags);
 
     DriveInterface di{};
-    IOBuffer buf{FirstBlock::s_io_fb_size};
+    IoBuf buf{FirstBlock::s_io_fb_size};
     auto ec = co_await di.read(*iodev, buf, HSSuperBlk::first_block_offset());
     if (ec) {
         throw std::system_error(ec, "read_first_block failed on " + devname);
@@ -112,7 +112,7 @@ folly::coro::Task< void > PhysicalDev::write_first_block(const FirstBlockHeader&
     fb.checksum =
         crc32_ieee(hs_init_crc_32, reinterpret_cast< const unsigned char* >(&fb), FirstBlock::s_atomic_fb_size);
 
-    IOBuffer buf{FirstBlock::s_io_fb_size};
+    IoBuf buf{FirstBlock::s_io_fb_size};
     std::memset(buf.bytes(), 0, FirstBlock::s_io_fb_size);
     std::memcpy(buf.bytes(), &fb, sizeof(FirstBlock));
 
@@ -120,7 +120,7 @@ folly::coro::Task< void > PhysicalDev::write_first_block(const FirstBlockHeader&
 }
 
 folly::coro::Task< void > PhysicalDev::commit_formatting() {
-    IOBuffer buf{FirstBlock::s_io_fb_size};
+    IoBuf buf{FirstBlock::s_io_fb_size};
     auto ec = co_await read_super_block(buf, HSSuperBlk::first_block_offset());
     if (ec) {
         throw std::system_error(ec, "commit_formatting: failed to read first block on " + devname_);
@@ -215,7 +215,7 @@ folly::coro::Task< shared< PhysicalDev > > PhysicalDev::load(const DevInfo& dinf
 
 // ── Super block ───────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > PhysicalDev::write_super_block(const IOBuffer& buf, uint64_t offset) {
+folly::coro::Task< void > PhysicalDev::write_super_block(const IoBuf& buf, uint64_t offset) {
     auto ec = co_await drive_iface_->write(*iodev_, buf, offset);
     if (ec) {
         throw std::system_error(ec, "write_super_block failed on " + devname_);
@@ -229,7 +229,7 @@ folly::coro::Task< void > PhysicalDev::write_super_block(const IOBuffer& buf, ui
     }
 }
 
-folly::coro::Task< std::error_code > PhysicalDev::read_super_block(IOBuffer& buf, uint64_t offset) {
+folly::coro::Task< std::error_code > PhysicalDev::read_super_block(IoBuf& buf, uint64_t offset) {
     co_return co_await drive_iface_->read(*iodev_, buf, offset);
 }
 
@@ -248,33 +248,26 @@ folly::coro::Task< void > PhysicalDev::close_device() {
 
 // ── Data IO ───────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > PhysicalDev::write(const IOBuffer& buf, uint64_t offset) {
+folly::coro::Task< void > PhysicalDev::write(const IoBuf& buf, uint64_t offset) {
     auto ec = co_await drive_iface_->write(*iodev_, buf, offset);
     if (ec) {
         throw std::system_error(ec, "write failed on " + devname_);
     }
 }
 
-folly::coro::Task< void > PhysicalDev::writev(const std::vector< IOBuffer >& bufs, uint64_t offset) {
-    auto ec = co_await drive_iface_->writev(*iodev_, bufs, offset);
-    if (ec) {
-        throw std::system_error(ec, "writev failed on " + devname_);
-    }
-}
-
-folly::coro::Task< void > PhysicalDev::writev(const std::vector< sisl::ByteArray >& bufs, uint64_t offset) {
-    auto ec = co_await drive_iface_->writev(*iodev_, bufs, offset);
-    if (ec) {
-        throw std::system_error(ec, "writev failed on " + devname_);
-    }
-}
-
-folly::coro::Task< std::error_code > PhysicalDev::read(IOBuffer& buf, uint64_t offset) {
+folly::coro::Task< std::error_code > PhysicalDev::read(IoBuf& buf, uint64_t offset) {
     co_return co_await drive_iface_->read(*iodev_, buf, offset);
 }
 
-folly::coro::Task< std::error_code > PhysicalDev::readv(std::vector< IOBuffer >& bufs, uint64_t offset) {
-    co_return co_await drive_iface_->readv(*iodev_, bufs, offset);
+folly::coro::Task< void > PhysicalDev::writev(sisl::SgList const& sg, uint64_t offset) {
+    auto ec = co_await drive_iface_->writev(*iodev_, sg, offset);
+    if (ec) {
+        throw std::system_error(ec, "writev failed on " + devname_);
+    }
+}
+
+folly::coro::Task< std::error_code > PhysicalDev::readv(sisl::SgList const& sg, uint64_t offset) {
+    co_return co_await drive_iface_->readv(*iodev_, sg, offset);
 }
 
 folly::coro::Task< void > PhysicalDev::write_zero(uint64_t size, uint64_t offset) {
@@ -326,7 +319,7 @@ folly::coro::Task< shared< Chunk > > PhysicalDev::create_chunk(uint32_t vdev_id,
     populate_chunk_info_locked(prov, cinfo, vdev_id, size, chunk_id, vdev_order, user_private_data, up_size);
 
     // Write this chunk's metadata to the superblock.
-    IOBuffer cinfo_buf{ChunkInfo::SIZE};
+    IoBuf cinfo_buf{ChunkInfo::SIZE};
     std::memcpy(cinfo_buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
     co_await write_super_block(cinfo_buf, chunk_info_offset_nth(to_u32(cslot)));
 
@@ -363,7 +356,7 @@ PhysicalDev::create_chunks(uint32_t vdev_id, uint32_t num_chunks, uint64_t size,
         }
 
         // Build all chunk_infos for this contiguous block.
-        IOBuffer buf{to_u32(ChunkInfo::SIZE * b.nbits)};
+        IoBuf buf{to_u32(ChunkInfo::SIZE * b.nbits)};
         uint8_t* ptr = buf.bytes();
 
         std::vector< shared< Chunk > > batch_chunks;
@@ -407,14 +400,14 @@ folly::coro::Task< std::unordered_map< uint32_t, std::vector< shared< Chunk > > 
 
     // Read the chunk slot bitmap from disk.
     const uint32_t bm_size = to_u32(chunk_info_bitmap_size());
-    IOBuffer bm_buf{bm_size};
+    IoBuf bm_buf{bm_size};
     auto ec = co_await drive_iface_->read(*iodev_, bm_buf, chunk_sb_offset());
     if (ec) {
         throw std::system_error(ec, "load_chunks: bitmap read failed");
     }
 
-    // Deserialise bitmap — wrap the IOBuffer as a ByteArray and construct directly (zero-copy).
-    sisl::Bitset bitset{sisl::make_byte_array(std::move(bm_buf))};
+    // Deserialise bitmap — wrap the IoBuf as a IoBufShared and construct directly (zero-copy).
+    sisl::Bitset bitset{sisl::make_io_buf_shared(std::move(bm_buf))};
 
     std::unordered_map< uint32_t, std::vector< shared< Chunk > > > chunks_by_vdev;
 
@@ -426,7 +419,7 @@ folly::coro::Task< std::unordered_map< uint32_t, std::vector< shared< Chunk > > 
         }
 
         // Read the chunk_info for this slot.
-        IOBuffer ci_buf{ChunkInfo::SIZE};
+        IoBuf ci_buf{ChunkInfo::SIZE};
         auto ec2 = co_await drive_iface_->read(*iodev_, ci_buf, chunk_info_offset_nth(to_u32(b)));
         if (ec2) {
             throw std::system_error(ec2, "load_chunks: chunk_info read failed");
@@ -473,7 +466,7 @@ folly::coro::Task< void > PhysicalDev::remove_chunk(cshared< Chunk >& chunk) {
     prov.chunks.erase(chunk_id);
     free_chunk_info_locked(prov, cinfo);
 
-    IOBuffer freed_buf{ChunkInfo::SIZE};
+    IoBuf freed_buf{ChunkInfo::SIZE};
     std::memcpy(freed_buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
     co_await write_super_block(freed_buf, chunk_info_offset_nth(slot));
 
@@ -497,7 +490,7 @@ folly::coro::Task< void > PhysicalDev::remove_chunks(const std::vector< shared< 
         ChunkInfo cinfo = chunk->info();
         prov.chunks.erase(cinfo.chunk_id);
         free_chunk_info_locked(prov, cinfo);
-        IOBuffer freed_buf{ChunkInfo::SIZE};
+        IoBuf freed_buf{ChunkInfo::SIZE};
         std::memcpy(freed_buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
         co_await write_super_block(freed_buf, chunk_info_offset_nth(chunk->slot_number()));
         prov.chunk_info_slots->reset_bit(chunk->slot_number());
@@ -532,7 +525,7 @@ folly::coro::Task< void > PhysicalDev::deactivate_chunk(cshared< Chunk >& chunk)
     cinfo.set_free();
     cinfo.compute_checksum();
 
-    IOBuffer buf{ChunkInfo::SIZE};
+    IoBuf buf{ChunkInfo::SIZE};
     std::memcpy(buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
     co_await write(buf, chunk_info_offset_nth(chunk->slot_number()));
 
@@ -547,7 +540,7 @@ folly::coro::Task< void > PhysicalDev::reactivate_chunk(cshared< Chunk >& chunk,
     cinfo.chunk_vdev_order = new_vdev_order;
     cinfo.compute_checksum();
 
-    IOBuffer buf{ChunkInfo::SIZE};
+    IoBuf buf{ChunkInfo::SIZE};
     std::memcpy(buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
     co_await write(buf, chunk_info_offset_nth(chunk->slot_number()));
 

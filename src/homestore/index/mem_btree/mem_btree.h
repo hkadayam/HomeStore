@@ -89,8 +89,8 @@ public:
     }
 
     // ── Overflow support (in-memory) ─────────────────────────────────────────
-    BtreeStatus write_overflow(sisl::ByteArray const& buf, BlkId& out_blkid) override;
-    BtreeTask< BtreeStatus > read_overflow(BlkId const& blkid, sisl::ByteArray& out_buf) const override;
+    BtreeStatus write_overflow(sisl::IoBufShared const& buf, BlkId& out_blkid) override;
+    BtreeTask< BtreeStatus > read_overflow(BlkId const& blkid, sisl::IoBufShared& out_buf) const override;
     BtreeStatus delete_overflow(BlkId const& blkid) override;
 
     // Called by MemBtreeDrainer — applies pending ops to nodes_.
@@ -103,7 +103,7 @@ private:
     sisl::ThreadVector< unique< NodeCore > > pending_creates_;
     sisl::ThreadVector< NodeCore* > pending_removes_;
 
-    mutable folly::ConcurrentHashMap< uint64_t, sisl::ByteArray > overflow_store_;
+    mutable folly::ConcurrentHashMap< uint64_t, sisl::IoBufShared > overflow_store_;
     std::atomic< uint64_t > overflow_next_id_{1};
 };
 

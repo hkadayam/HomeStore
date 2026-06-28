@@ -125,7 +125,7 @@ public:
             auto* d = prepare_data(lsn, io_memory);
             m_log_store->write_async(
                 lsn, {uintptr_cast(d), d->total_size(), false}, nullptr,
-                [io_memory, d, this](logstore_seq_num_t seq_num, const sisl::IoBlob& b, logdev_key ld_key, void* ctx) {
+                [io_memory, d, this](logstore_seq_num_t seq_num, const sisl::IoBufSpan& b, logdev_key ld_key, void* ctx) {
                     assert(ld_key);
                     if (io_memory) {
                         iomanager.iobuf_free(uintptr_cast(d));

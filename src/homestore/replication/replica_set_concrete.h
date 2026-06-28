@@ -27,7 +27,7 @@ struct raft_repl_dev_superblk : public repl_dev_superblk {
     uint8_t is_timeline_consistent; // Flag to indicate whether the recovery of followers need to be timeline consistent
     uint64_t last_applied_dsn;      // Last applied data sequence number
     uint8_t destroy_pending;        // Flag to indicate whether the group is in destroy pending state
-    repl_lsn_t last_snapshot_lsn;   // Last snapshot LSN follower received from leader
+    raft_lsn_t last_snapshot_lsn;   // Last snapshot LSN follower received from leader
     replace_member_ctx_superblk replace_member_ctx; // Replace members context, used to track the replace member status
 
     uint32_t get_raft_sb_version() const { return raft_sb_version; }
@@ -117,8 +117,8 @@ public:
 class RaftReplService;
 class CP;
 struct ReplicaSetCPContext {
-    repl_lsn_t cp_lsn;
-    repl_lsn_t compacted_to_lsn;
+    raft_lsn_t cp_lsn;
+    raft_lsn_t compacted_to_lsn;
     uint64_t last_applied_dsn;
 };
 
@@ -129,17 +129,17 @@ public:
         snapshot_ = nuraft::snapshot::deserialize(*snp_buf);
     }
 
-    nuraft_snapshot_context(sisl::IoBlobSafe const& snp_ctx) : snapshot_context(0) { deserialize(snp_ctx); }
+    nuraft_snapshot_context(sisl::IoBufOwn const& snp_ctx) : snapshot_context(0) { deserialize(snp_ctx); }
 
-    sisl::IoBlobSafe serialize() override {
+    sisl::IoBufOwn serialize() override {
         // Dump the context from nuraft buffer to the io blob.
         auto snp_buf = snapshot_->serialize();
-        sisl::IoBlobSafe blob{s_cast< size_t >(snp_buf->size())};
+        sisl::IoBufOwn blob{s_cast< size_t >(snp_buf->size())};
         std::memcpy(blob.bytes(), snp_buf->data_begin(), snp_buf->size());
         return blob;
     }
 
-    void deserialize(const sisl::IoBlobSafe& snp_ctx) {
+    void deserialize(const sisl::IoBufOwn& snp_ctx) {
         // Load the context from the io blob to nuraft buffer.
         auto snp_buf = nuraft::buffer::alloc(snp_ctx.size());
         snp_buf->put_raw(snp_ctx.cbytes(), snp_ctx.size());
@@ -185,15 +185,15 @@ private:
     mutable folly::SharedMutexWritePriority m_sb_lock; // Lock to protect staged sb and persisting sb
     raft_repl_dev_superblk sb_in_mem_;                 // Cached version which is used to read and for staging
 
-    std::atomic< repl_lsn_t > commit_upto_lsn_{0}; // LSN which was lastly committed, to track flushes
-    std::atomic< repl_lsn_t > compact_lsn_{0};     // LSN upto which it was compacted, it is used to track where to
+    std::atomic< raft_lsn_t > commit_upto_lsn_{0}; // LSN which was lastly committed, to track flushes
+    std::atomic< raft_lsn_t > compact_lsn_{0};     // LSN upto which it was compacted, it is used to track where to
 
     // The `traffic_ready_lsn` variable holds the Log Sequence Number (LSN) up to which
     // the state machine should committed to before accepting traffic. This threshold ensures that
     // all potential committed log be committed before handling incoming requests.
-    std::atomic< repl_lsn_t > traffic_ready_lsn_{0};
+    std::atomic< raft_lsn_t > traffic_ready_lsn_{0};
 
-    repl_lsn_t last_flushed_commit_lsn_{0}; // LSN upto which it was flushed to persistent store
+    raft_lsn_t last_flushed_commit_lsn_{0}; // LSN upto which it was flushed to persistent store
 
     Clock::time_point destroyed_time_;
     folly::Promise< ReplError > m_destroy_promise;
@@ -268,9 +268,9 @@ public:
     std::string identify_str() const { return m_identify_str; };
     std::string my_replica_id_str() const { return boost::uuids::to_string(m_my_repl_id); }
     uint32_t get_blk_size() const override;
-    repl_lsn_t get_last_commit_lsn() const override { return m_commit_upto_lsn.load(); }
-    void set_last_commit_lsn(repl_lsn_t lsn) { m_commit_upto_lsn.store(lsn); }
-    repl_lsn_t get_last_append_lsn() override { return raft_server()->get_last_log_idx(); }
+    raft_lsn_t get_last_commit_lsn() const override { return m_commit_upto_lsn.load(); }
+    void set_last_commit_lsn(raft_lsn_t lsn) { m_commit_upto_lsn.store(lsn); }
+    raft_lsn_t get_last_append_lsn() override { return raft_server()->get_last_log_idx(); }
     bool is_destroy_pending() const;
     bool is_destroyed() const;
 
@@ -279,7 +279,7 @@ public:
     // purge all resources (e.g., logs in logstore) is a very dangerous operation, it is not supported yet.
     void purge() override { RD_REL_ASSERT(false, "NOT SUPPORTED YET"); }
 
-    std::shared_ptr< snapshot_context > deserialize_snapshot_context(sisl::IoBlobSafe& snp_ctx) override {
+    std::shared_ptr< snapshot_context > deserialize_snapshot_context(sisl::IoBufOwn& snp_ctx) override {
         return std::make_shared< nuraft_snapshot_context >(snp_ctx);
     }
 
@@ -291,9 +291,9 @@ public:
     //////////////// Methods needed for other Raft classes to access /////////////////
     void use_config(json_superblk raft_config_sb);
     void handle_commit(repl_req_ptr_t rreq, bool recovery = false);
-    void handle_config_commit(const repl_lsn_t lsn, raft_cluster_config_ptr_t& new_conf);
+    void handle_config_commit(const raft_lsn_t lsn, raft_cluster_config_ptr_t& new_conf);
     void handle_rollback(repl_req_ptr_t rreq);
-    void handle_config_rollback(const repl_lsn_t lsn, raft_cluster_config_ptr_t& old_conf);
+    void handle_config_rollback(const raft_lsn_t lsn, raft_cluster_config_ptr_t& old_conf);
     repl_req_ptr_t repl_key_to_req(repl_key const& rkey) const;
     repl_req_ptr_t applier_create_req(repl_key const& rkey, journal_type_t code, sisl::Blob const& user_header,
                                       sisl::Blob const& key, uint32_t data_size, bool is_data_channel,
@@ -316,7 +316,7 @@ public:
     /// @brief This method is called when the data journal is compacted
     ///
     /// @param upto_lsn : LSN upto which the data journal was compacted
-    void on_compact(repl_lsn_t upto_lsn) { m_compact_lsn.store(upto_lsn); }
+    void on_compact(raft_lsn_t upto_lsn) { m_compact_lsn.store(upto_lsn); }
 
     /**
      * \brief Handles the creation of a snapshot.
@@ -381,7 +381,7 @@ public:
      * \param lsn The LSN to be checked.
      * \return true if the LSN is within the last snapshot LSN, false otherwise.
      */
-    bool need_skip_processing(const repl_lsn_t lsn) {
+    bool need_skip_processing(const raft_lsn_t lsn) {
         return lsn <= m_rd_sb->last_snapshot_lsn;
     }
 

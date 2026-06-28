@@ -120,10 +120,10 @@ public:
 
 private:
     /// Reconstruct a ReplicaSet from its persisted repl_dev superblk during start().
-    void load_replica_set(sisl::ByteView const& buf, void* meta_cookie);
+    void load_replica_set(sisl::IoBufView const& buf, void* meta_cookie);
 
     /// Match a raft-group-config superblk to its already-loaded ReplicaSet and attach it.
-    ReplicaSet* raft_group_config_found(sisl::ByteView const& buf, void* meta_cookie);
+    ReplicaSet* raft_group_config_found(sisl::IoBufView const& buf, void* meta_cookie);
 
     /// Construct the per-group raft state_mgr instance.
     shared< ReplicaSet > create_state_mgr(int32_t srv_id, GroupId const& group_id);

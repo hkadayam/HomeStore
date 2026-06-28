@@ -108,8 +108,56 @@ public:
     }
 };
 
-/// A small collection of BlkIds, stack-allocated for up to 4 pieces.
-using BlkIds = folly::small_vector< BlkId, 4 >;
+/// A small collection of BlkIds, stack-allocated for up to 4 pieces, with symmetric serialize / deserialize
+/// over a self-describing wire format: [count : uint32_t][BlkId.serialized × count].  Inherits the full
+/// small_vector interface (push_back, emplace_back, operator[], iterators, ...) so the existing allocator
+/// / scatter-gather code paths use this type unchanged.
+struct BlkIds : public folly::small_vector< BlkId, 4 > {
+    using folly::small_vector< BlkId, 4 >::small_vector; // inherit ctors
+
+    uint32_t serialized_size() const { return to_u32(sizeof(uint32_t) + size() * sizeof(BlkId)); }
+
+    /// Sum of blk_count() across all BlkIds in this list.  Multiply by stream block_size() to get the
+    /// total byte coverage of the range.  Distinct from folly::small_vector::size() which is the BlkId
+    /// element count.
+    uint32_t total_blks() const {
+        uint32_t n = 0;
+        for (auto const& bi : *this) {
+            n += bi.blk_count();
+        }
+        return n;
+    }
+
+    /// Pack into a freshly-allocated owning buffer; caller owns the bytes.
+    sisl::IoBufOwn serialize() const {
+        sisl::IoBufOwn buf{serialized_size(), /*alignment=*/8};
+        auto* p = buf.bytes();
+        auto count = to_u32(size());
+        std::memcpy(p, &count, sizeof(uint32_t));
+        p += sizeof(uint32_t);
+        for (auto const& bi : *this) {
+            auto bb = bi.serialize();
+            std::memcpy(p, bb.cbytes(), bb.size());
+            p += bb.size();
+        }
+        return buf;
+    }
+
+    /// Read [count][BlkIds...] from `b` into this list, replacing prior content.
+    void deserialize(sisl::Blob const& b) {
+        clear();
+        auto const* p = b.cbytes();
+        auto count = *r_cast< uint32_t const* >(p);
+        p += sizeof(uint32_t);
+        reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            BlkId bi;
+            bi.deserialize(sisl::Blob{p, to_u32(sizeof(BlkId))}, /*copy=*/false);
+            push_back(bi);
+            p += sizeof(BlkId);
+        }
+    }
+};
 
 } // namespace homestore
 

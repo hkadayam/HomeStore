@@ -39,14 +39,14 @@ static uint64_t g_dev_size{64 * 1024 * 1024};
 static constexpr size_t kBlockSize{4096};
 
 // Fill buf with the pattern: every sizeof(uint64_t) bytes = offset.
-static void fill_pattern(IOBuffer& buf, uint64_t offset) {
+static void fill_pattern(IoBuf& buf, uint64_t offset) {
     auto* p = reinterpret_cast<uint64_t*>(buf.bytes());
     for (size_t i = 0; i < buf.size() / sizeof(uint64_t); ++i) {
         p[i] = offset;
     }
 }
 
-static bool verify_pattern(const IOBuffer& buf, uint64_t offset) {
+static bool verify_pattern(const IoBuf& buf, uint64_t offset) {
     const auto* p = reinterpret_cast<const uint64_t*>(buf.cbytes());
     for (size_t i = 0; i < buf.size() / sizeof(uint64_t); ++i) {
         if (p[i] != offset) return false;
@@ -103,13 +103,13 @@ TEST_F(DriveTest, SingleReactorWriteReadVerify) {
                 const uint64_t offset = i * kBlockSize;
 
                 // Write
-                IOBuffer wbuf{static_cast<uint32_t>(kBlockSize)};
+                IoBuf wbuf{static_cast<uint32_t>(kBlockSize)};
                 fill_pattern(wbuf, offset);
                 auto wec = co_await drive.write(*m_iodev, wbuf, offset);
                 EXPECT_FALSE(wec) << "write failed at offset " << offset << ": " << wec.message();
 
                 // Read back
-                IOBuffer rbuf{static_cast<uint32_t>(kBlockSize)};
+                IoBuf rbuf{static_cast<uint32_t>(kBlockSize)};
                 auto rec = co_await drive.read(*m_iodev, rbuf, offset);
                 EXPECT_FALSE(rec) << "read failed at offset " << offset << ": " << rec.message();
                 EXPECT_TRUE(verify_pattern(rbuf, offset)) << "data mismatch at offset " << offset;
@@ -148,13 +148,13 @@ TEST_F(DriveTest, MultiReactorConcurrentWriteReadVerify) {
                     if (aligned + kBlockSize > region_end) continue;
 
                     // Write
-                    IOBuffer wbuf{static_cast<uint32_t>(kBlockSize)};
+                    IoBuf wbuf{static_cast<uint32_t>(kBlockSize)};
                     fill_pattern(wbuf, aligned);
                     auto wec = co_await drive.write(*m_iodev, wbuf, aligned);
                     EXPECT_FALSE(wec) << "write error: " << wec.message();
 
                     // Read back
-                    IOBuffer rbuf{static_cast<uint32_t>(kBlockSize)};
+                    IoBuf rbuf{static_cast<uint32_t>(kBlockSize)};
                     auto rec = co_await drive.read(*m_iodev, rbuf, aligned);
                     EXPECT_FALSE(rec) << "read error: " << rec.message();
                     EXPECT_TRUE(verify_pattern(rbuf, aligned)) << "mismatch at " << aligned;
@@ -185,7 +185,7 @@ TEST_F(DriveTest, WriteZeroThenVerify) {
         [this, &drive, offset, size]() -> folly::coro::Task<void> {
             // First write a non-zero pattern.
             for (uint64_t off = offset; off < offset + size; off += kBlockSize) {
-                IOBuffer wbuf{static_cast<uint32_t>(kBlockSize)};
+                IoBuf wbuf{static_cast<uint32_t>(kBlockSize)};
                 fill_pattern(wbuf, off + 1);  // non-zero
                 co_await drive.write(*m_iodev, wbuf, off);
             }
@@ -196,7 +196,7 @@ TEST_F(DriveTest, WriteZeroThenVerify) {
 
             // Verify zeros.
             for (uint64_t off = offset; off < offset + size; off += kBlockSize) {
-                IOBuffer rbuf{static_cast<uint32_t>(kBlockSize)};
+                IoBuf rbuf{static_cast<uint32_t>(kBlockSize)};
                 auto rec = co_await drive.read(*m_iodev, rbuf, off);
                 EXPECT_FALSE(rec) << "read failed: " << rec.message();
                 const auto* p = reinterpret_cast<const uint64_t*>(rbuf.cbytes());
@@ -214,7 +214,7 @@ TEST_F(DriveTest, FsyncAfterWrite) {
 
     iomgr().spawn_and_block(ReactorTarget::reactor(0),
         [this, &drive]() -> folly::coro::Task<void> {
-            IOBuffer wbuf{static_cast<uint32_t>(kBlockSize)};
+            IoBuf wbuf{static_cast<uint32_t>(kBlockSize)};
             fill_pattern(wbuf, 0);
             co_await drive.write(*m_iodev, wbuf, 0);
             auto ec = co_await drive.fsync(*m_iodev);

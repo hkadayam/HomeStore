@@ -162,7 +162,7 @@ folly::coro::Task< void > BlobDevManager::load() {
     std::unordered_map< std::string, DevRecovery > dev_map;
 
     co_await mgr->meta_client_.for_each_recovered_block(
-        [&dev_map](MetaBlk blk, sisl::ByteView data) -> folly::coro::Task< void > {
+        [&dev_map](MetaBlk blk, sisl::IoBufView data) -> folly::coro::Task< void > {
             auto parsed = parse_mblk_name(blk.name());
             if (!parsed) {
                 co_return;

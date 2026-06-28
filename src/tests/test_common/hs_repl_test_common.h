@@ -112,18 +112,19 @@ public:
         TestReplApplication(HSReplTestHelper& h) : helper_{h} {}
         virtual ~TestReplApplication() = default;
 
-        homestore::repl_impl_type get_impl_type() const override { return homestore::repl_impl_type::server_side; }
+        homestore::ReplImplType get_impl_type() const override { return homestore::ReplImplType::server_side; }
         bool need_timeline_consistency() const { return false; }
 
-        std::shared_ptr< homestore::ReplDevListener >
-        create_repl_dev_listener(homestore::group_id_t group_id) override {
+        std::shared_ptr< homestore::ReplicaSetListener >
+        create_repl_dev_listener(homestore::GroupId group_id) override {
             return helper_.get_listener(group_id);
         }
-        void destroy_repl_dev_listener(homestore::group_id_t) override {}
+        void destroy_repl_dev_listener(homestore::GroupId) override {}
 
         void on_repl_devs_init_completed() { LOGINFO("Repl dev init completed CB called"); }
 
-        std::pair< std::string, uint16_t > lookup_peer(homestore::replica_id_t replica_id) const override {
+        std::pair< std::string, uint16_t > lookup_peer(homestore::ReplicaId replica_id,
+                                                       homestore::GroupId /*group_id*/) const override {
             uint16_t port;
             if (auto it = helper_.members_.find(replica_id); it != helper_.members_.end()) {
                 port = SISL_OPTIONS["base_port"].as< uint16_t >() + it->second;
@@ -134,7 +135,7 @@ public:
             return std::make_pair(std::string("127.0.0.1"), port);
         }
 
-        homestore::replica_id_t get_my_repl_id() const override { return helper_.my_replica_id_; }
+        homestore::ReplicaId get_my_repl_id() const override { return helper_.my_replica_id_; }
     };
 
 public:
@@ -264,15 +265,15 @@ public:
     }
 
     uint16_t replica_num() const { return replica_num_; }
-    homestore::replica_id_t my_replica_id() const { return my_replica_id_; }
-    homestore::replica_id_t replica_id(uint16_t member_id) const {
+    homestore::ReplicaId my_replica_id() const { return my_replica_id_; }
+    homestore::ReplicaId replica_id(uint16_t member_id) const {
         auto it = std::find_if(members_.begin(), members_.end(),
                                [member_id](auto const& p) { return p.second == member_id; });
         if (it != members_.end()) { return it->first; }
         return boost::uuids::nil_uuid();
     }
 
-    uint16_t member_id(homestore::replica_id_t replica_id) const {
+    uint16_t member_id(homestore::ReplicaId replica_id) const {
         auto it = members_.find(replica_id);
         if (it != members_.end()) { return it->second; }
         return members_.size();
@@ -280,20 +281,20 @@ public:
 
     Runner& runner() { return io_runner_; }
 
-    void register_listener(std::shared_ptr< ReplDevListener > listener) {
+    void register_listener(std::shared_ptr< ReplicaSetListener > listener) {
         if (replica_num_ != 0) { pending_listeners_.emplace_back(std::move(listener)); }
 
         ipc_data_->sync_for_member_start();
 
         if (replica_num_ == 0) {
-            std::set< homestore::replica_id_t > members;
+            std::set< homestore::ReplicaId > members;
             // By default we create repl dev with number of members equal to replicas argument.
             // We dont add spare replica's to the group by default.
             for (auto& m : members_) {
                 if (m.second < SISL_OPTIONS["replicas"].as< uint32_t >()) { members.insert(m.first); }
             }
 
-            group_id_t repl_group_id = hs_utils::gen_random_uuid();
+            GroupId repl_group_id = hs_utils::gen_random_uuid();
             {
                 std::unique_lock lg(groups_mtx_);
                 repl_groups_.insert({repl_group_id, std::move(listener)});
@@ -319,7 +320,7 @@ public:
         }
     }
 
-    std::shared_ptr< ReplDevListener > get_listener(homestore::group_id_t group_id) {
+    std::shared_ptr< ReplicaSetListener > get_listener(homestore::GroupId group_id) {
         std::unique_lock lg(groups_mtx_);
 
         auto it = repl_groups_.find(group_id);
@@ -335,14 +336,14 @@ public:
         return listener;
     }
 
-    void unregister_listener(homestore::group_id_t group_id) {
+    void unregister_listener(homestore::GroupId group_id) {
         {
             std::unique_lock lg(groups_mtx_);
             repl_groups_.erase(group_id);
         }
     }
 
-    void add_listener(std::shared_ptr< ReplDevListener > listener) {
+    void add_listener(std::shared_ptr< ReplicaSetListener > listener) {
         std::unique_lock lg(groups_mtx_);
         pending_listeners_.emplace_back(listener);
     }
@@ -395,11 +396,11 @@ private:
 
     std::mutex groups_mtx_;
     std::condition_variable group_created_cv_;
-    std::map< homestore::group_id_t, std::shared_ptr< homestore::ReplDevListener > > repl_groups_;
-    std::vector< std::shared_ptr< homestore::ReplDevListener > > pending_listeners_; // pending to join raft group
-    std::map< homestore::replica_id_t, uint32_t > members_;
+    std::map< homestore::GroupId, std::shared_ptr< homestore::ReplicaSetListener > > repl_groups_;
+    std::vector< std::shared_ptr< homestore::ReplicaSetListener > > pending_listeners_; // pending to join raft group
+    std::map< homestore::ReplicaId, uint32_t > members_;
     std::set< uint32_t > up_members_;
-    homestore::replica_id_t my_replica_id_;
+    homestore::ReplicaId my_replica_id_;
 
     std::mutex wakeup_mtx_;
     uint32_t wokenup_replicas_{0};

@@ -32,7 +32,7 @@
 
 using namespace homestore;
 using namespace iomanager;
-using sisl::IOBuffer;
+using sisl::IoBuf;
 
 static constexpr uint64_t DEV_SIZE = 128 * 1024 * 1024; // 128 MB
 static constexpr uint32_t BLK_SIZE = 4096;

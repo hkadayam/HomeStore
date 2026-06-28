@@ -47,7 +47,7 @@ class VirtualDev;
 struct WriteUnit {
     BlkId alloc_blkid;            // full pre-allocated range
     uint32_t used_nblks{0};       // blocks actually written
-    std::vector< sisl::ByteArray > bufs; // pending buffers in write order (shared ownership)
+    std::vector< sisl::IoBufShared > bufs; // pending buffers in write order (shared ownership)
 
     explicit WriteUnit(BlkId bid) : alloc_blkid{bid} {}
     WriteUnit(const WriteUnit&) = delete;
@@ -104,7 +104,7 @@ public:
                                                                  const shared< VirtualDev >& vdev, uint64_t chunk_size,
                                                                  uint32_t blk_size = 0);
 
-    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::ByteView > >;
+    using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::IoBufView > >;
     static folly::coro::Task< shared< AppendBlkStream > > load(uint64_t stream_id, MetaClient& meta_client,
                                                                const std::string& dev_name,
                                                                const shared< VirtualDev >& vdev, uint32_t blk_size,
@@ -121,11 +121,11 @@ public:
     /// Synchronous fast-path: locks mu_, tries the active WriteUnit for the segment.  On success, moves buf out and
     /// returns the BlkId.  On failure (no active unit or unit full), returns std::nullopt and leaves buf untouched —
     /// caller should fall back to append().
-    std::optional< BlkId > quick_append(CP* cp, uint16_t segment_id, sisl::ByteArray& buf);
+    std::optional< BlkId > quick_append(CP* cp, uint16_t segment_id, sisl::IoBufShared& buf);
 
     /// Async append: allocates a new WriteUnit (possibly expanding the stream), installs it, and appends buf.
     /// No disk I/O — caller must call flush() separately to write filled WriteUnits to disk.
-    folly::coro::Task< BlkId > append(CP* cp, uint16_t segment_id, sisl::ByteArray&& buf);
+    folly::coro::Task< BlkId > append(CP* cp, uint16_t segment_id, sisl::IoBufShared&& buf);
 
     /// Grab all filled WriteUnits and write them to disk (writev + commit + free excess).
     /// Caller can fire on an executor and collectAll later to overlap I/O with CPU work.
@@ -134,7 +134,7 @@ public:
     /// Invalidate (free) a previously-appended block.  Marks owning chunk dirty.
     void invalidate(CP* cp, const BlkId& bid);
 
-    folly::coro::Task< std::error_code > read(sisl::IOBuffer& buf, const BlkId& bid);
+    folly::coro::Task< std::error_code > read(sisl::IoBuf& buf, const BlkId& bid);
 
     // ── CP hooks ──────────────────────────────────────────────────────────────
 
@@ -157,7 +157,7 @@ private:
     /// Core append logic (called under mu_).  If new_wu is provided, installs it into the session first.  Then tries
     /// the active WriteUnit for the segment — on success moves buf and returns BlkId, else returns nullopt.
     std::optional< BlkId > do_quick_append(CPSession& session, uint16_t segment_id, unique< WriteUnit > new_wu,
-                                           sisl::ByteArray& buf);
+                                           sisl::IoBufShared& buf);
 
     /// Swap out all WriteUnits from the session (under mu_).  Clears active and all_units.
     std::vector< unique< WriteUnit > > grab_write_units(CPSession& session);

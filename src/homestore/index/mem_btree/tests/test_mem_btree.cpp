@@ -31,7 +31,7 @@
 
 using namespace homestore;
 using namespace iomanager;
-using sisl::IOBuffer;
+using sisl::IoBuf;
 
 SISL_OPTION_GROUP(
     test_mem_btree,

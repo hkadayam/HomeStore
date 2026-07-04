@@ -25,6 +25,13 @@ class rpc_exception;
 namespace homestore::replication {
 
 class ReplicationManager;
+class FollyRpcListener;
+
+// Holds every live InboundConnection.  Owned by FollyRpcListener (strong); accessed by each connection via
+// std::weak_ptr so a connection that outlives its listener (e.g. an in-flight Task still running when
+// shutdown() returned) can safely no-op its self-unregister.  Defined fully after FollyRpcListener so we
+// can name its nested InboundConnection type.
+struct ConnectionRegistry;
 
 // ------------------------------------------------------------------------------------------------------------
 //                                         FollyRpcListener
@@ -53,8 +60,10 @@ public:
     // and are torn down individually via their own readEOF/readErr paths.
     void stop() override;
 
-    // Final teardown — called by raft_server during shutdown. Closes the server socket and waits for all
-    // InboundConnections to finish their last write before returning.
+    // Final teardown — called by raft_server during shutdown. Stops accepting, then walks the connection
+    // registry and posts closeNow() to each connection's owning reactor.  Does NOT wait for in-flight
+    // dispatch_request Tasks to finish — those Tasks captured shared_from_this() and run to completion
+    // asynchronously; their post-shutdown writes silently no-op via the closed_ guard.
     void shutdown() override;
 
 private:
@@ -66,6 +75,9 @@ private:
     ReplicationManager* mgr_;
     folly::AsyncServerSocket::UniquePtr server_;
     unique< AcceptCb > accept_cb_;
+    // Strong ref keeps every accepted InboundConnection alive past AcceptCb's lambda — the lambda inserts
+    // here before exiting, fixing the original lifetime bug where the only shared_ptr died with the lambda.
+    shared< ConnectionRegistry > registry_;
 };
 
 // ------------------------------------------------------------------------------------------------------------
@@ -101,7 +113,8 @@ class FollyRpcListener::InboundConnection : public folly::AsyncReader::ReadCallb
                                             public folly::AsyncWriter::WriteCallback,
                                             public std::enable_shared_from_this< FollyRpcListener::InboundConnection > {
 public:
-    InboundConnection(folly::EventBase* eb, folly::AsyncSocket::UniquePtr sock, ReplicationManager* mgr);
+    InboundConnection(folly::EventBase* eb, folly::AsyncSocket::UniquePtr sock, ReplicationManager* mgr,
+                      shared< ConnectionRegistry > registry);
     ~InboundConnection() override;
 
     // Called on eb_ after construction to enable SO_ZEROCOPY and start the read loop.
@@ -130,12 +143,19 @@ private:
                                                nuraft::ptr< nuraft::buffer > body);
 
     // Build a response wire frame (header echoing req_id with is_response flag set, plus encoded resp_msg
-    // payload) and writeChain it on this socket with MSG_ZEROCOPY.
+    // payload) and writeChain it on this socket with MSG_ZEROCOPY.  Called from any thread — uses
+    // eb_->isInEventBaseThread() to write directly when on the connection's reactor, or hops via
+    // runInEventBaseThread(...) when off it (slow_executor path, post-await resumption off-eb_, etc.).
     void send_response(nuraft::group_id_t const& gid, uint64_t req_id, nuraft::ptr< nuraft::resp_msg > resp);
+
+    // Erase this connection from its registry under the registry's mutex.  No-op if the registry weak_ptr
+    // has expired (listener has already destructed).
+    void unregister_self();
 
     folly::EventBase* eb_;
     folly::AsyncSocket::UniquePtr sock_;
     ReplicationManager* mgr_;
+    std::weak_ptr< ConnectionRegistry > registry_;
 
     // RX state machine — same shape as PeerOutboundSocket's but reading into the request buffer rather than
     // the response buffer.
@@ -147,7 +167,9 @@ private:
     nuraft::ptr< nuraft::buffer > rx_body_;
     size_t rx_body_filled_{0};
 
-    std::atomic< bool > closed_{false};
+    // Set on terminal state (readEOF/readErr/writeErr/shutdown close).  Read by send_response inside an
+    // eb_ thread.  All accesses are on eb_ — plain bool, no atomic needed.
+    bool closed_{false};
 };
 
 // ------------------------------------------------------------------------------------------------------------
@@ -160,7 +182,8 @@ private:
 // receiver reactor's thread for the connection's lifetime.
 class FollyRpcListener::AcceptCb : public folly::AsyncServerSocket::AcceptCallback {
 public:
-    explicit AcceptCb(ReplicationManager* mgr) : mgr_(mgr) {}
+    AcceptCb(ReplicationManager* mgr, shared< ConnectionRegistry > registry) :
+            mgr_(mgr), registry_(std::move(registry)) {}
 
     void connectionAccepted(folly::NetworkSocket fd, folly::SocketAddress const& client_addr,
                             AcceptInfo info) noexcept override;
@@ -168,6 +191,13 @@ public:
 
 private:
     ReplicationManager* mgr_;
+    shared< ConnectionRegistry > registry_;
+};
+
+// Now that FollyRpcListener::InboundConnection is a complete type we can define the registry.
+struct ConnectionRegistry {
+    std::mutex mtx;
+    std::unordered_map< FollyRpcListener::InboundConnection*, shared< FollyRpcListener::InboundConnection > > conns;
 };
 
 } // namespace homestore::replication

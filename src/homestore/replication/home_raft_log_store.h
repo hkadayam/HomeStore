@@ -78,7 +78,10 @@ public:
     HomeRaftLogStore& operator=(HomeRaftLogStore&&) = delete;
     virtual ~HomeRaftLogStore() = default;
 
-    folly::coro::Task< void > remove_store();
+    /// Tear down everything this raft log store owns — frees indirect-handler BlkIds, destroys the
+    /// free_blks_journal LogStore, and destroys the main raft LogStore.  Accessing this object after
+    /// destroy() returns is undefined.
+    folly::coro::Task< void > destroy();
 
     /// The first available slot of the store, starts with 1.
     /// @return Last log index number + 1
@@ -98,16 +101,10 @@ public:
     /// @return Log index number.
     virtual ulong append(RaftLogEntryPtr& entry) override;
 
-    // An alternate method on entries already serialized into the raft buffer
-    ulong append(RaftBufferPtr& buffer);
-
     /// Overwrite a log entry at the given `index`.
     /// @param index Log index number to overwrite.
     /// @param entry New log entry to overwrite.
     virtual void write_at(ulong index, RaftLogEntryPtr& entry) override;
-
-    // An alternate method on entries already serialized into the raft buffer
-    void write_at(ulong index, RaftBufferPtr& buffer);
 
     /// Invoked after a batch of logs is written as a part of a single append_entries request.
     /// @param start The start log index number (inclusive)
@@ -175,25 +172,13 @@ public:
 public:
     ///////////////////// All Additional methods specific to HomeRaftLogStore //////////////////////////
 
-    /// Returns the last completed index in the log store.
-    /// @return The last completed index in the log store.
-    ulong last_index() const;
-
-    /// Truncates the log store
-    /// @param num_reserved_cnt The number of log entries to be reserved.
-    /// @param compact_lsn This is the truncation barrier passed down by raft server. Truncation should not
-    ///        across this LSN;
-    void truncate(uint32_t num_reserved_cnt, raft_lsn_t compact_lsn);
-
     /// Purge all logs in the log store. It is a dangerous operation and to be used with care
     folly::coro::Task< void > purge_all_logs();
 
     void set_last_durable_lsn(raft_lsn_t lsn);
 
-    /// Wire the owning raft_server. ReplicaSet calls this once raft_server has been constructed in
-    /// join_group — chicken-and-egg with the state_mgr::load_log_store contract forces a post-construction
-    /// set rather than a ctor arg. ReplicaSet MUST null this back via set_raft_server(nullptr) before
-    /// raft_server is destroyed (ReplicaSet owns both, so it can guarantee the order).
+    /// Stores a non-owning pointer to the raft_server.  Caller must null it back via
+    /// set_raft_server(nullptr) before raft_server is destroyed.
     void set_raft_server(nuraft::raft_server* rs) { raft_server_ = rs; }
 
     /// Applicable only if large value optimization is turned on.
@@ -202,11 +187,10 @@ public:
     /// — deferred intents persist with the same durability semantics as the main log.
     folly::coro::Task< void > deferred_free(BlkId blkid, raft_lsn_t referenced_lsn);
 
-    /// Applicable only if large value optimization is turned on.
-    /// If the entry at `index` was written via the large-value optimization, return the BlkId where its value
-    /// lives. nullopt for inline entries or when the optimization is off. Used by ReplicaSet::commit_ext_chained
-    /// to surface blob_ref on the listener's on_commit.
-    std::optional< BlkId > blkid_at(ulong index) const;
+    /// Promotes the indirect entry's BlkIds at `lsn` from uncommitted to committed (CP-durable) and
+    /// returns them.  Past this point the BlkIds are app-owned; only deferred_free brings them back.
+    /// Returns an empty BlkIds for inline entries and when the large-value optimization is off.
+    BlkIds on_commit(raft_lsn_t lsn);
 
     // ─────────────────────────────────────────────────────────────────────────────────────────────────────
     // IndirectBlkHandler — nested helper that owns the large-value optimization machinery for this
@@ -214,26 +198,22 @@ public:
     // are written to blob_stream_ and the journal record carries only a shim (marker + BlkId list) — this
     // keeps the journal compact and avoids round-tripping multi-MB values through it.
     //
-    // Locking: indirect_mtx_ protects head_lsn_/tail_lsn_/pending_blkids_; mutations of free_blks_journal_
-    // (quick_write, rollback, truncate, flush) happen OUTSIDE the lock because LogStore does NOT support
-    // concurrent quick_append + rollback, and a slow journal write shouldn't stall the critical section.
+    // Locking: indirect_mtx_ protects uncommitted_blkids_ / deferred_free_blkids_ + serializes the
+    // journal mutations.  LogStore does NOT support concurrent quick_append + rollback, so we hold the
+    // lock across the journal call too.
     // ─────────────────────────────────────────────────────────────────────────────────────────────────────
     class IndirectBlkHandler {
     public:
-        // First-boot factory — creates a fresh free_blks_journal LogStore (non-append mode).  Records the
-        // assigned id back into sb so it survives restart.  Constructor can't be a coroutine, hence the
-        // static factory pattern.  `main_log_store` is the outer HomeRaftLogStore's main raft LogStore;
-        // borrowed non-owning (HomeRaftLogStore outlives indirect_), needed for lazy seed_window().
-        static folly::coro::Task< unique< IndirectBlkHandler > >
-        create(shared< RawBlkStream > blob_stream, superblk< ReplicaSetSuperBlk >& sb, LogStore* main_log_store);
+        // Constructs with a pre-acquired free_blks_journal LogStore.  main_log_store is borrowed
+        // non-owning.
+        IndirectBlkHandler(shared< RawBlkStream > blob_stream, shared< LogStore > free_blks_journal,
+                           LogStore* main_log_store);
 
-        // Restart factory — opens the existing free_blks_journal LogStore using the id persisted in sb, and
-        // registers an on_log_found callback that walks every persisted (lsn → BlkId list) record to
-        // rebuild pending_blkids_ in memory.  After this returns the handler is fully replayed except for
-        // head_lsn_/tail_lsn_ — those stay zero until the first deferred_free/compact/rollback lazy-seeds
-        // them from main_log_store_ under indirect_mtx_.
-        static folly::coro::Task< unique< IndirectBlkHandler > >
-        load(shared< RawBlkStream > blob_stream, superblk< ReplicaSetSuperBlk > const& sb, LogStore* main_log_store);
+        // Constructs by synchronously opening free_blks_journal_id and registering an on_log_found
+        // handler (capturing `this`) that populates deferred_free_blkids_ when LogStoreManager::recover()
+        // walks the journal records.  Throws if open returns null.
+        IndirectBlkHandler(shared< RawBlkStream > blob_stream, logstore_id_t free_blks_journal_id,
+                           LogStore* main_log_store);
 
         ~IndirectBlkHandler() = default;
         IndirectBlkHandler(IndirectBlkHandler const&) = delete;
@@ -241,46 +221,49 @@ public:
         IndirectBlkHandler(IndirectBlkHandler&&) = delete;
         IndirectBlkHandler& operator=(IndirectBlkHandler&&) = delete;
 
-        // Hot path — leader/follower entry write.  Writes the entry's value bytes (bufs_[2..]) to
-        // blob_stream_, allocates the shim slab (nuraft hdr + ReplLogHdr + user_header + BlkId list, with
-        // ReplLogHdr.code rewritten to HS_DATA_INDIRECT), attaches it via entry->set_private_buf().  Returns
-        // a LogBlob that points at the shim (single contiguous part) for log_store_->quick_append.
-        LogBlob write(RaftLogEntryPtr& entry);
+        // Allocates BlkIds for the entry's value bytes, writes the value to blob_stream_, builds the
+        // on-disk shim (9B nuraft hdr + ReplLogHdr(INDIRECT) + user_header + BlkIds trailer), parks the
+        // shim on entry->set_private_buf(), and returns (LogBlob over the shim, allocated BlkIds).  Use
+        // on_blkids_written() to bind the returned BlkIds to the lsn once the LogBlob is appended.
+        std::pair< LogBlob, BlkIds > write(RaftLogEntryPtr& entry);
 
-        // For an on-disk entry whose ReplLogHdr.code reads HS_DATA_INDIRECT, reconstruct() parses the on-disk
-        // record straight from entry's bufs_[0] (ReplLogHdr + user_header + BlkIds trailer), reads value bytes
-        // from blob_stream_, builds a combined buffer with the header flipped to HS_DATA_INLINE, and installs
-        // it via change_buf so the entry's chain matches the shape of an INLINE-written entry.
+        // Records `bids` in uncommitted_blkids_[lsn] under the mutex.
+        void on_blkids_written(raft_lsn_t lsn, BlkIds bids);
+
+        // Promotes the entry's uncommitted BlkIds at `lsn` to committed via blob_stream_->commit_blks and
+        // erases the lsn from uncommitted_blkids_.  Returns the promoted BlkIds (now app-owned; only
+        // deferred_free brings them back).  Returns empty for inline entries or already-committed lsns.
+        BlkIds on_commit(raft_lsn_t lsn);
+
+        // Parses the indirect on-disk record carried in entry.bufs()[0] (9B nuraft hdr + ReplLogHdr +
+        // user_header + BlkIds trailer), reads the value bytes from blob_stream_ into a fresh buf, flips
+        // the header code to HS_DATA_INLINE, and installs the (hdr_buf, value_buf) chain via replace_chain.
         folly::coro::Task< void > reconstruct(nuraft::log_entry& entry);
 
-        // App's deferred free.  If `referenced_lsn` is in [head_lsn_, tail_lsn_], record to
-        // free_blks_journal_ at that lsn + push BlkId into pending_blkids_[lsn]; otherwise (already
-        // truncated / rolled back) free immediately via blob_stream_->invalidate.  Returns true if deferred.
+        // If `referenced_lsn` is in [head_lsn, tail_lsn], records to free_blks_journal_ at that lsn +
+        // pushes blkid into deferred_free_blkids_[lsn] and returns true.  Otherwise (referenced lsn is
+        // already truncated / rolled back), free immediately via blob_stream_->invalidate_blk and return
+        // false.
         folly::coro::Task< bool > deferred_free(BlkId blkid, raft_lsn_t referenced_lsn);
 
-        // Called by HomeRaftLogStore::rollback after the main log rolled back.  Frees BlkIds for pending
-        // entries with lsn > to_lsn eagerly (deferred intent is moot), prunes pending_blkids_, updates
-        // tail_lsn_ under the lock; drives free_blks_journal_->rollback(to_lsn) outside the lock.
+        // Drains uncommitted_blkids_ and deferred_free_blkids_ for lsn > to_lsn, rolls back
+        // free_blks_journal_ to to_lsn, and bulk-invalidates the drained BlkIds against blob_stream_.
+        // Atomic under indirect_mtx_.
         folly::coro::Task< void > rollback(raft_lsn_t to_lsn);
 
-        // Called by HomeRaftLogStore::compact after the main log truncated up to upto_lsn.  Frees BlkIds for
-        // pending entries at or below that lsn (referencing main lsn is gone), prunes pending_blkids_,
-        // advances head_lsn_ under the lock; drives free_blks_journal truncate outside.
+        // Drains deferred_free_blkids_ at or below upto_lsn, truncates free_blks_journal_ to upto_lsn,
+        // and bulk-invalidates the drained BlkIds against blob_stream_.  Atomic under indirect_mtx_.
         folly::coro::Task< void > compact(raft_lsn_t upto_lsn);
 
-        // CP hook — flushes free_blks_journal_ so any deferred-free records written since the previous CP
-        // become durable with this CP boundary.  Driven by ReplicationManager's CPCallback.
+        // Flushes free_blks_journal_ so any deferred-free records written since the previous CP become
+        // durable.
         folly::coro::Task< void > cp_flush();
 
-    private:
-        // Used by the two static factories — already-opened free_blks_journal + the non-owning main log
-        // back-ref handed in.  No cached head/tail — every deferred_free reads main_log_store_->head_lsn()
-        // / tail_lsn() fresh under indirect_mtx_.  HomeRaftLogStore::compact and write_at order their main
-        // log mutation BEFORE calling into indirect_, so the fresh reads under mtx see the post-mutation
-        // values.
-        IndirectBlkHandler(shared< RawBlkStream > blob_stream, shared< LogStore > free_blks_journal,
-                           LogStore* main_log_store);
+        // Invalidates every BlkId still tracked (uncommitted_blkids_ + deferred_free_blkids_) and
+        // destroys the free_blks_journal LogStore.
+        folly::coro::Task< void > destroy();
 
+    private:
         shared< RawBlkStream > blob_stream_;
         shared< LogStore > free_blks_journal_;
         // Non-owning back-ref to the outer HomeRaftLogStore's main raft LogStore.  Lifetime is fine —
@@ -288,10 +271,15 @@ public:
         LogStore* main_log_store_;
 
         std::mutex indirect_mtx_;
-        // Pending deferred-free intents keyed by the referencing raft lsn.  Multiple BlkIds can pile up
-        // against the same lsn (app may free several at once).  Ordered by lsn so rollback/compact can do
-        // range walks via upper_bound / lower_bound.
-        std::map< raft_lsn_t, BlkIds > pending_blkids_;
+        // BlkIds allocated by write() for entries that have not yet been raft-committed.  Pure in-memory
+        // bookkeeping — never persisted; the underlying BlkAllocator state has them in its uncommitted
+        // bitmap.  on_commit promotes them to committed; rollback/destroy invalidates them.  Ordered by
+        // lsn so rollback can range-walk via upper_bound.
+        std::map< raft_lsn_t, BlkIds > uncommitted_blkids_;
+        // App's deferred-free intents keyed by the referencing raft lsn — populated by deferred_free() and
+        // by recovery from free_blks_journal_.  Multiple BlkIds can pile up against the same lsn.  Ordered
+        // by lsn for upper_bound/lower_bound range walks in rollback/compact.
+        std::map< raft_lsn_t, BlkIds > deferred_free_blkids_;
     };
 
 private:
@@ -299,8 +287,12 @@ private:
 
     // Sync read that bridges nuraft's sync contract over the new LogStore's async read. Tries entry_cache_
     // first; on miss, blockingWait on LogStore::read and assemble. Only called via paths the transport routes
-    // to slow_executor (or hot paths whose data is always cached).
-    RaftLogEntryPtr fetch_entry_sync(ulong index) const;
+    // to slow_executor (or hot paths whose data is always cached).  When need_value=false on a cache miss,
+    // the indirect reconstruct (blob_stream read) is skipped — the returned entry's bufs_[0] is the raw
+    // on-disk record and only the 9B header (term + val_type) is meaningful.  Pass false if you only want
+    // headers to skip the blob read. If the value is inline, you would still get the value, applicable only
+    // if you have indirect value.
+    RaftLogEntryPtr fetch_entry_sync(ulong index, bool need_value = true) const;
 
     // Inline-path LogBlob builder.  Walks the entry's chain into a LogBlob scatter-gather; if the chain
     // exceeds LogBlob::kMaxParts the bytes are coalesced into a single nuraft::buffer and stashed back on

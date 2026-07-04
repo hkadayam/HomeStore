@@ -11,6 +11,7 @@
 #include <folly/io/async/AsyncSocket.h>
 #include <folly/io/async/AsyncTransport.h>
 #include <folly/io/async/EventBase.h>
+#include <folly/io/async/HHWheelTimer.h>
 #include <libnuraft/rpc_cli.hxx>
 #include <libnuraft/async.hxx>
 #include <libnuraft/basic_types.hxx>
@@ -41,12 +42,9 @@ class FollyRpcClientFactory;
 // The wire-level multiplexing across raft groups is done via WireFrame.group_id, not by maintaining a separate
 // FollyRpcClient socket per group. So N FollyRpcClient instances pointing at the same peer share the same
 // underlying TCP connection (per local reactor) — no extra sockets per group.
-class FollyRpcClient : public nuraft::rpc_client {
+class FollyRpcClient : public nuraft::rpc_client, public std::enable_shared_from_this< FollyRpcClient > {
 public:
-    FollyRpcClient(FollyRpcClientFactory* factory,
-                   std::string peer_host,
-                   uint16_t peer_port,
-                   uint64_t client_id);
+    FollyRpcClient(FollyRpcClientFactory* factory, std::string peer_host, uint16_t peer_port, uint64_t client_id);
     ~FollyRpcClient() override;
 
     // nuraft::rpc_client API. when_done fires on the outbound socket's owning reactor (= the same reactor
@@ -58,16 +56,20 @@ public:
 
     uint64_t get_id() const override { return client_id_; }
 
-    // Becomes true once the bundle's underlying socket has hit a non-recoverable error and we've torn down
-    // every pending request on it. nuraft's peer logic consults this to decide whether to drop the peer.
+    // Becomes true once the underlying outbound socket has hit a non-recoverable error.  nuraft's peer
+    // logic consults this to drop the client and request a fresh one on the next round.
     bool is_abandoned() const override { return abandoned_.load(std::memory_order_acquire); }
+
+    // Marked by PeerOutboundSocket when its socket fails — flips abandoned_ so subsequent send() calls
+    // short-circuit with rpc_exception("client abandoned") and nuraft drops us.
+    void set_abandoned() { abandoned_.store(true, std::memory_order_release); }
 
 private:
     FollyRpcClientFactory* factory_; // non-owning; the factory outlives every client it created
-    std::string            peer_host_;
-    uint16_t               peer_port_;
-    uint64_t               client_id_;
-    std::atomic< bool >    abandoned_{false};
+    std::string peer_host_;
+    uint16_t peer_port_;
+    uint64_t client_id_;
+    std::atomic< bool > abandoned_{false};
 };
 
 // ------------------------------------------------------------------------------------------------------------
@@ -113,10 +115,13 @@ public:
     // pending_[req_id]={handler, msg_type}, wraps the nuraft buffer zero-copy, chains the wire header,
     // writeChain() with MSG_ZEROCOPY. If the socket isn't connected yet, the work is queued and flushed once
     // the connect callback fires. The msg_type is retained so the response-side path can route hot vs slow.
-    void send(nuraft::group_id_t const& group_id,
-              uint8_t msg_type,
+    void send(nuraft::group_id_t const& group_id, uint8_t msg_type,
               unique< folly::IOBuf > payload, // takeOwnership-wrapped nuraft::buffer; no copies
               nuraft::rpc_handler when_done, std::chrono::milliseconds timeout);
+
+    // Register a FollyRpcClient that has routed through this socket so that it can be marked abandoned on
+    // a socket-level failure.  Deduplicated by raw pointer identity; expired weaks are tolerated.
+    void register_client(std::weak_ptr< FollyRpcClient > client);
 
     folly::EventBase* event_base() const { return eb_; }
 
@@ -139,7 +144,17 @@ public:
 
 private:
     void open_connection();
-    void fail_all_pending(nuraft::ptr< nuraft::rpc_exception > ex);
+    // Mark every registered FollyRpcClient as abandoned, then fail every pending request.  All error
+    // callbacks (connectErr/writeErr/readErr/readEOF/dtor) funnel through here.
+    void fail_socket(nuraft::ptr< nuraft::rpc_exception > ex);
+    // Invoked by a per-request TimeoutCallback when its timer fires.  Looks up the pending entry, removes
+    // it, and invokes the handler with rpc_exception("send timeout").  No-op if the entry has already been
+    // resolved or drained.
+    void fail_pending_request(uint64_t req_id);
+
+    // HHWheelTimer::Callback subclass implemented in the cpp — forward-declared here so PendingEntry can
+    // hold a unique<TimeoutCallback>.
+    struct TimeoutCallback;
 
     folly::EventBase* eb_;
     std::string host_;
@@ -147,15 +162,27 @@ private:
     folly::Executor* slow_executor_; // non-owning; for routing slow-RPC response callbacks off this reactor
     folly::AsyncSocket::UniquePtr sock_;
 
+    // Per-EventBase timer wheel that drives every per-request timeout on this socket.  Constructed in the
+    // ctor via folly::HHWheelTimer::newTimer(eb_).
+    folly::HHWheelTimer::UniquePtr timer_wheel_;
+
     // Pending requests sent from this socket, awaiting their response. Single-threaded — accessed only on eb_.
     // sent_msg_type is recorded at send time so the response-arrival path can route slow-RPC handlers onto the
-    // slow executor without re-decoding the wire payload.
+    // slow executor without re-decoding the wire payload.  `timeout` is non-null only when send_timeout_ms>0;
+    // its dtor is invoked when the entry is erased — caller must cancelTimeout() first to avoid a stale
+    // pointer inside the timer wheel.
     struct PendingEntry {
         nuraft::rpc_handler when_done;
         uint8_t sent_msg_type;
+        unique< TimeoutCallback > timeout;
     };
     std::unordered_map< uint64_t /*req_id*/, PendingEntry > pending_;
     uint64_t next_req_id_{1};
+
+    // Every FollyRpcClient that has sent through this socket, in weak form so they're not kept alive past
+    // their natural lifetime.  On socket-level failure, lock() each and call set_abandoned().  Accessed only
+    // on eb_ — no synchronization.
+    std::vector< std::weak_ptr< FollyRpcClient > > clients_;
 
     // Inbound parser state machine. Two phases per frame: read 36-byte header, then read payload_len bytes
     // into a freshly allocated nuraft::buffer so the deserialize step does not need to copy again.

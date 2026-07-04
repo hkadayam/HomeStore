@@ -36,10 +36,10 @@ using sisl::IoBuf;
 // ─────────────────────────────────────────────────────────────────────────────
 folly::coro::Task< shared< RawBlkStream > > RawBlkStream::create(uint64_t stream_id, MetaClient& meta_client,
                                                                  const std::string& dev_name,
-                                                                 const shared< VirtualDev >& vdev,
-                                                                 uint64_t chunk_size, uint32_t blk_size) {
-    auto stream =
-        shared< RawBlkStream >{new RawBlkStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_size, blk_size}};
+                                                                 const shared< VirtualDev >& vdev, uint64_t chunk_size,
+                                                                 uint32_t blk_size) {
+    auto stream = shared< RawBlkStream >{
+        new RawBlkStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_size, blk_size}};
     co_await stream->expand_to(0);
     co_return stream;
 }
@@ -118,11 +118,17 @@ BlkAllocStatus RawBlkStream::commit_blks(CP* cp, BlkIds const& bids) {
     return BlkAllocStatus::SUCCESS;
 }
 
-folly::coro::Task< void > RawBlkStream::invalidate(CP* cp, const BlkId& bid) {
+folly::coro::Task< void > RawBlkStream::invalidate_blk(CP* cp, const BlkId& bid) {
     // Wait for any in-flight reads on this block to complete before freeing.
     co_await blk_read_tracker_.wait_on(bid);
     vdev().free_blk(bid);
     cp_session(cp->id()).mark_chunk_dirty(bid.chunk_num());
+}
+
+folly::coro::Task< void > RawBlkStream::invalidate_blks(CP* cp, BlkIds const& bids) {
+    for (auto const& bid : bids) {
+        co_await invalidate_blk(cp, bid);
+    }
 }
 
 folly::coro::Task< void > RawBlkStream::expand() {
@@ -247,13 +253,17 @@ folly::coro::Task< bool > RawBlkStream::cp_flush(CP* cp) {
     co_await buffered_write_flush();
 
     auto dirty = cp_session(cp->id()).gather_dirty_chunks();
-    if (dirty.empty()) { co_return true; }
+    if (dirty.empty()) {
+        co_return true;
+    }
 
     // Persist allocator bitmaps only for chunks dirtied during this CP epoch.
     auto lock = co_await mblk_mutex_.co_scoped_lock();
     for (auto chunk_id : dirty) {
         auto it = chunk_mblks_.find(chunk_id);
-        if (it == chunk_mblks_.end()) { continue; }
+        if (it == chunk_mblks_.end()) {
+            continue;
+        }
 
         auto chunk = vdev().get_chunk(chunk_id);
         auto buf_guard = chunk->blk_allocator_mutable()->acquire_buffer();

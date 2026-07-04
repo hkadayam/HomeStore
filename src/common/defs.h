@@ -77,6 +77,7 @@ using cintrusive = const boost::intrusive_ptr< T >;
 #define dp_cast std::dynamic_pointer_cast
 #define sp_cast std::static_pointer_cast
 
+#define to_int(v) static_cast< int >(v)
 #define to_i64(v) static_cast< int64_t >(v)
 #define to_u64(v) static_cast< uint64_t >(v)
 #define to_u32(v) static_cast< uint32_t >(v)
@@ -89,6 +90,7 @@ using cintrusive = const boost::intrusive_ptr< T >;
 #define to_double(v) static_cast< double >(v)
 #define to_float(v) static_cast< float >(v)
 #define to_ulong(v) static_cast< ulong >(v)
+#define to_bool(v) static_cast< bool >(v)
 
 #define to_u8ptr(p) reinterpret_cast< uint8_t* >(p)
 #define to_cu8ptr(p) reinterpret_cast< const uint8_t* >(p)

@@ -23,6 +23,7 @@
 #include <folly/hash/Hash.h>
 #include <folly/io/async/EventBase.h>
 
+#include <libnuraft/cluster_config.hxx>
 #include <libnuraft/context.hxx>
 #include <libnuraft/delayed_task.hxx>
 #include <libnuraft/delayed_task_scheduler.hxx>
@@ -31,6 +32,10 @@
 #include <libnuraft/raft_server.hxx>
 #include <libnuraft/rpc_cli_factory.hxx>
 #include <libnuraft/rpc_listener.hxx>
+#include <libnuraft/srv_config.hxx>
+#include <libnuraft/srv_state.hxx>
+
+#include <nlohmann/json.hpp>
 
 #include "sisl/logging/logging.h"
 
@@ -51,25 +56,16 @@ namespace homestore {
 // Construction / destruction
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-ReplicaSet::ReplicaSet(ReplicationManager& mgr, superblk< ReplicaSetSuperBlk >&& rd_sb, bool load_existing) :
+ReplicaSet::ReplicaSet(ReplicationManager& mgr, ModuleMetaBlk< ReplicaSetSuperBlk >&& rs_sb, bool load_existing) :
         mgr_{mgr},
-        group_id_{rd_sb->group_id},
+        group_id_{rs_sb->group_id},
         my_uuid_{mgr.get_my_repl_id()},
         raft_server_id_{to_server_id(my_uuid_)},
-        rd_sb_{std::move(rd_sb)} {
+        rs_sb_{std::move(rs_sb)} {
 
-    if (load_existing) {
-        // Existing replica set — fields recovered from the persisted superblk.
-        rset_name_ = rd_sb_->rset_name;
-    } else {
-        // Fresh replica set — initialize superblk with defaults and persist.
-        rset_name_ = fmt::format("rset_{}", boost::uuids::to_string(group_id_).substr(0, 8));
-        rd_sb_->set_rset_name(rset_name_);
-        rd_sb_->destroy_pending = 0;
-        rd_sb_->last_snapshot_lsn = 0;
-        rd_sb_.write();
-    }
-
+    // The sb is durable and fully populated by the caller (create_replica_set_for_group for fresh-create,
+    // or recovery for load-existing).  Ctor just reads.
+    rset_name_ = rs_sb_->rset_name;
     identify_str_ = rset_name_ + ":" + group_id_str();
     metrics_ = std::make_unique< ReplicaSetMetrics >(identify_str_.c_str());
 
@@ -140,6 +136,47 @@ private:
     folly::EventBase* eb_;
 };
 
+// ── cluster_config / srv_config JSON serde ─────────────────────────────────────────────────────────────────────
+
+nlohmann::json serialize_server_config(std::list< nuraft::ptr< nuraft::srv_config > > const& server_list) {
+    auto servers = nlohmann::json::array();
+    for (auto const& server_conf : server_list) {
+        if (!server_conf) {
+            continue;
+        }
+        servers.push_back(nlohmann::json{{"id", server_conf->get_id()},
+                                         {"dc_id", server_conf->get_dc_id()},
+                                         {"endpoint", server_conf->get_endpoint()},
+                                         {"aux", server_conf->get_aux()},
+                                         {"learner", server_conf->is_learner()},
+                                         {"priority", server_conf->get_priority()}});
+    }
+    return servers;
+}
+
+nlohmann::json serialize_cluster_config(nuraft::cluster_config const& config) {
+    return nlohmann::json{{"log_idx", config.get_log_idx()},
+                          {"prev_log_idx", config.get_prev_log_idx()},
+                          {"eventual_consistency", config.is_async_replication()},
+                          {"user_ctx", config.get_user_ctx()},
+                          {"servers", serialize_server_config(config.get_servers())}};
+}
+
+nuraft::ptr< nuraft::srv_config > deserialize_server_config(nlohmann::json const& server) {
+    return nuraft::cs_new< nuraft::srv_config >(to_i32(server["id"]), to_i32(server["dc_id"]), server["endpoint"],
+                                                server["aux"], server["learner"], to_i32(server["priority"]));
+}
+
+nuraft::ptr< nuraft::cluster_config > deserialize_cluster_config(nlohmann::json const& cluster_config) {
+    auto raft_config = nuraft::cs_new< nuraft::cluster_config >(
+        cluster_config["log_idx"], cluster_config["prev_log_idx"], cluster_config["eventual_consistency"]);
+    raft_config->set_user_ctx(cluster_config["user_ctx"]);
+    for (auto const& server_json : cluster_config["servers"]) {
+        raft_config->get_servers().push_back(deserialize_server_config(server_json));
+    }
+    return raft_config;
+}
+
 } // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -206,42 +243,38 @@ void ReplicaSet::detach_listener() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
-// write — client entry point
-//
-// HS stamps its own fields on `hdr` (code = HS_DATA_INLINE, version, value_size) — app cannot influence those
-// bytes. Each follower's HomeRaftLogStore may rewrite `code` to HS_DATA_INDIRECT in its on-disk shim form when
-// the value exceeds the size threshold, but the in-memory bufs() we replicate stays INLINE so each replica
-// makes its own storage-form decision.
-// The chain is [ReplLogHeader-as-buf (zero-copy via take_ownership of the shared<ReplLogHeader>) ,
-// value-as-buf (zero-copy take_ownership of caller's IoBufSpan bytes)]. log_entry's auto-allocated bufs_[0] (9B
-// [term|val_type] header) sits in front of both. Term=0 at construction; the leader's propose path fills the
-// real term in place via log_entry::set_term.
-//
-// Lifetime: caller MUST keep value bytes alive until this Task<> resolves. ReplLogHeader carries its own
-// storage via the aliasing shared_ptr returned from alloc().
+// write — single client entry point.  Replicates the user's (header, value) through raft.  Resolves after
+// the entry is committed across the quorum (the listener's on_commit has already fired), or with a
+// ReplError if replication couldn't complete (not leader, alloc failure, no quorum, etc).
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< ReplResult<> > ReplicaSet::write(shared< ReplLogHeader > hdr, sisl::IoBufSpan value, TraceId tid) {
+folly::coro::Task< ReplResult<> > ReplicaSet::write(sisl::IoBuf const& user_header, sisl::IoBufView value,
+                                                    TraceId tid) {
     (void)tid;
-    if (!hdr) {
-        co_return folly::makeUnexpected(ReplError::BAD_REQUEST);
+
+    auto const uh_size = user_header.size();
+    auto const v_size = value.size();
+
+    // Allocate the header slab — fixed ReplLogHeader prefix + trailing user_header bytes.
+    auto hdr_slab = nuraft::buffer::alloc(sizeof(ReplLogHeader) + uh_size);
+    auto* h = new (hdr_slab->data_begin()) ReplLogHeader{};
+    h->code = to_u8(JournalType::HS_DATA_INLINE);
+    h->major_version = ReplLogHeader::kMajor;
+    h->minor_version = ReplLogHeader::kMinor;
+    h->value_size = to_u32(v_size);
+    h->user_header_size_ = to_u32(uh_size);
+    if (uh_size > 0) {
+        std::memcpy(hdr_slab->data_begin() + sizeof(ReplLogHeader), user_header.cbytes(), uh_size);
     }
 
-    // Stamp HS-owned fields.
-    hdr->code = to_u8(JournalType::HS_DATA_INLINE);
-    hdr->major_version = ReplLogHeader::kMajor;
-    hdr->minor_version = ReplLogHeader::kMinor;
-    hdr->value_size = to_u32(value.size());
-
-    // Build the value chain — zero copy. hdr bytes flow through ReplLogHeader::to_nuraft_buffer (deleter
-    // captures the shared_ptr keeping storage alive). value bytes flow through buffer::take_ownership; the
-    // deleter holds the IoBufSpan struct by value — caller's lifetime contract keeps the underlying memory
-    // alive until this Task<> resolves.
-    auto hdr_buf = ReplLogHeader::to_nuraft_buffer(std::move(hdr));
-    auto value_buf = nuraft::buffer::take_ownership(value.bytes(), value.size(),
-                                                    [held = value](nuraft::byte*) noexcept { (void)held; });
+    // Value buf — zero-copy via IoBufView::extract (IoBufShared) + buffer::take_ownership.  The captured
+    // IoBufShared keeps the value bytes alive until folly drops the nuraft::buffer (post wire send / disk
+    // write / blob_stream write).
+    auto ba = value.extract();
+    auto value_buf =
+        nuraft::buffer::take_ownership(ba->bytes(), ba->size(), [held = ba](nuraft::byte*) noexcept { (void)held; });
 
     nuraft::log_entry_chain chain;
-    chain.push_back(std::move(hdr_buf));
+    chain.push_back(std::move(hdr_slab));
     chain.push_back(std::move(value_buf));
 
     std::vector< nuraft::log_entry_chain > chains;
@@ -256,6 +289,76 @@ folly::coro::Task< ReplResult<> > ReplicaSet::write(shared< ReplLogHeader > hdr,
         co_return folly::makeUnexpected(ReplicationManager::to_repl_error(result.code));
     }
     co_return ReplResult<>{};
+}
+
+void ReplicaSet::use_config(JsonMetaBlk raft_config_sb) {
+    std::unique_lock lg{config_mtx_};
+    raft_config_sb_ = std::move(raft_config_sb);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// nuraft::state_mgr overrides
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+nuraft::ptr< nuraft::cluster_config > ReplicaSet::load_config() {
+    std::unique_lock lg{config_mtx_};
+    auto& js = *raft_config_sb_;
+    if (!js.contains("config")) {
+        auto cluster_conf = nuraft::cs_new< nuraft::cluster_config >();
+        cluster_conf->get_servers().push_back(nuraft::cs_new< nuraft::srv_config >(
+            raft_server_id_, 0, my_replica_id_str(), "", false, raft_leader_priority));
+        js["config"] = serialize_cluster_config(*cluster_conf);
+    }
+    return deserialize_cluster_config(js["config"]);
+}
+
+void ReplicaSet::save_config(nuraft::cluster_config const& config) {
+    std::unique_lock lg{config_mtx_};
+    (*raft_config_sb_)["config"] = serialize_cluster_config(config);
+    iomanager::blocking_wait(raft_config_sb_.write());
+}
+
+void ReplicaSet::save_state(nuraft::srv_state const& state) {
+    std::unique_lock lg{config_mtx_};
+    (*raft_config_sb_)["state"] = nlohmann::json{{"term", state.get_term()},
+                                                 {"voted_for", state.get_voted_for()},
+                                                 {"election_timer_allowed", state.is_election_timer_allowed()},
+                                                 {"catching_up", state.is_catching_up()}};
+    iomanager::blocking_wait(raft_config_sb_.write());
+}
+
+nuraft::ptr< nuraft::srv_state > ReplicaSet::read_state() {
+    std::unique_lock lg{config_mtx_};
+    auto& js = *raft_config_sb_;
+    auto state = nuraft::cs_new< nuraft::srv_state >();
+    if (!js.contains("state") || js["state"].empty()) {
+        js["state"] = nlohmann::json{{"term", state->get_term()},
+                                     {"voted_for", state->get_voted_for()},
+                                     {"election_timer_allowed", state->is_election_timer_allowed()},
+                                     {"catching_up", state->is_catching_up()}};
+    } else {
+        try {
+            state->set_term(to_u64(js["state"]["term"]));
+            state->set_voted_for(to_int(js["state"]["voted_for"]));
+            state->allow_election_timer(to_bool(js["state"]["election_timer_allowed"]));
+            state->set_catching_up(to_bool(js["state"]["catching_up"]));
+        } catch (std::out_of_range const&) {
+            LOGWARNMOD(replication, "Persisted state not in the expected format [group_id={}]", group_id_str());
+        }
+    }
+    return state;
+}
+
+nuraft::ptr< nuraft::log_store > ReplicaSet::load_log_store() {
+    return log_store_;
+}
+
+int32_t ReplicaSet::server_id() {
+    return raft_server_id_;
+}
+
+void ReplicaSet::system_exit(int exit_code) {
+    LOGINFOMOD(replication, "System exit signal received [group_id={} exit_code={}]", group_id_str(), exit_code);
 }
 
 } // namespace homestore

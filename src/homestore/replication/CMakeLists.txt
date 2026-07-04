@@ -11,5 +11,6 @@ target_sources(hs_replication PRIVATE
     transport/folly_rpc_client.cpp
     transport/folly_rpc_client_factory.cpp
     transport/folly_rpc_listener.cpp
+    transport/nuraft_codec.cpp
     )
 target_link_libraries(hs_replication PRIVATE ${COMMON_DEPS} hs_common)

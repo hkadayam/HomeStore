@@ -69,7 +69,7 @@ private:
     };
 
     folly::Executor* slow_executor_; // non-owning; lifetime managed by ReplicationManager
-    std::atomic< uint64_t >                client_id_seq_{1};
+    std::atomic< uint64_t > client_id_seq_{1};
     iomanager::ReactorLocal< PerReactorState > outbound_;
 };
 

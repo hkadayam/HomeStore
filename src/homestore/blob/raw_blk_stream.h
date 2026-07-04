@@ -109,7 +109,10 @@ public:
 
     /// Invalidate (free) a block.  Waits for any in-flight reads on the block to complete via BlkReadTracker, then
     /// frees via vdev.
-    folly::coro::Task< void > invalidate(CP* cp, const BlkId& bid);
+    folly::coro::Task< void > invalidate_blk(CP* cp, const BlkId& bid);
+
+    /// Bulk invalidate — sequentially invalidates each BlkId via invalidate_blk.
+    folly::coro::Task< void > invalidate_blks(CP* cp, BlkIds const& bids);
 
     /// Expand stream by one chunk.
     folly::coro::Task< void > expand();

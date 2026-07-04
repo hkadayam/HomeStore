@@ -15,6 +15,7 @@
 
 #include "homestore/replication/repl_manager.h"
 
+#include <fmt/format.h>
 #include <boost/uuid/uuid_io.hpp>
 #include <folly/executors/thread_factory/NamedThreadFactory.h>
 
@@ -134,51 +135,57 @@ nuraft::ptr< nuraft::raft_server > ReplicationManager::lookup_raft_server(nuraft
     return rs.value()->raft_server();
 }
 
-nuraft::ptr< nuraft::raft_server >
-ReplicationManager::lookup_or_create_raft_server(nuraft::group_id_t const& gid) {
+folly::coro::Task< nuraft::ptr< nuraft::raft_server > >
+ReplicationManager::create_replica_set_for_group(nuraft::group_id_t const& gid) {
     GroupId group_id;
     std::memcpy(group_id.data, gid.data(), gid.size());
 
-    // Fast path: existing group under a shared lock.
+    // Double-check the registry — another caller may have created this group between the listener's miss
+    // detection and our call.
     {
-        std::shared_lock lk{rs_mtx_};
+        std::unique_lock lk{rs_mtx_};
         if (auto it = replica_sets_.find(group_id); it != replica_sets_.end() && it->second) {
-            return it->second->raft_server();
+            co_return it->second->raft_server();
         }
-    }
-
-    // Slow path: ask the application whether this unknown group should be admitted; if so construct the
-    // ReplicaSet, attach the listener it returned, and bring up the raft_server.
-    std::unique_lock lk{rs_mtx_};
-    if (auto it = replica_sets_.find(group_id); it != replica_sets_.end() && it->second) {
-        // Lost the race; somebody else already created it.
-        return it->second->raft_server();
     }
 
     auto listener = repl_app_->create_replica_set_listener(group_id);
     if (!listener) {
         LOGINFOMOD(replication, "Application rejected unknown group_id={}", boost::uuids::to_string(group_id));
-        return nullptr;
+        co_return nullptr;
     }
 
-    superblk< ReplicaSetSuperBlk > sb{std::string{kReplDevMetaName}};
-    sb.create();
+    auto sb = co_await ModuleMetaBlk< ReplicaSetSuperBlk >::open(std::string{kReplDevMetaName});
     sb->group_id = group_id;
     sb->is_timeline_consistent = repl_app_->need_timeline_consistency() ? 1 : 0;
     sb->destroy_pending = 0;
     sb->last_snapshot_lsn = 0;
+    sb->set_rset_name(fmt::format("rset_{}", boost::uuids::to_string(group_id).substr(0, 8)));
+    co_await sb.write();
 
     auto rs = std::make_shared< ReplicaSet >(*this, std::move(sb), /*load_existing=*/false);
+
+    auto raft_cfg = co_await JsonMetaBlk::open(std::string{kReplDevRaftConfigMetaName});
+    rs->use_config(std::move(raft_cfg));
+
     rs->attach_listener(std::move(listener));
     if (!rs->join_group()) {
         LOGERRORMOD(replication, "join_group failed for newly-created group_id={}",
                     boost::uuids::to_string(group_id));
-        return nullptr;
+        co_return nullptr;
     }
 
-    replica_sets_.emplace(group_id, rs);
+    {
+        std::unique_lock lk{rs_mtx_};
+        // Final check inside the lock — another caller could have raced past our earlier check while we
+        // were awaiting on the meta-blk opens.  If they got there first, drop our rs and use theirs.
+        if (auto it = replica_sets_.find(group_id); it != replica_sets_.end() && it->second) {
+            co_return it->second->raft_server();
+        }
+        replica_sets_.emplace(group_id, rs);
+    }
     LOGINFOMOD(replication, "Created ReplicaSet on demand for group_id={}", boost::uuids::to_string(group_id));
-    return rs->raft_server();
+    co_return rs->raft_server();
 }
 
 void ReplicationManager::add_replica_set(GroupId group_id, shared< ReplicaSet > rs) {

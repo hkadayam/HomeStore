@@ -30,7 +30,7 @@
 #include "homestore/blkdata_service.hpp"
 #include "homestore/logstore/log_store.hpp"
 #include "homestore/replication/repl_decls.h"
-#include "homestore/superblk_handler.hpp"
+#include "homestore/meta/module_meta_blk.h"
 #include "iomanager/coro_timer.h"
 
 namespace nuraft {
@@ -64,59 +64,28 @@ VENUM(JournalType, uint8_t,
 )
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
-// ReplLogHeader — fixed prefix on every replicated log_entry's value buffer.
+// ReplLogHeader — fixed prefix on every replicated log_entry's value buffer.  HS-internal: ReplicaSet::write
+// allocates the slab, stamps the fields, and prefixes the user_header bytes.  The app never constructs one.
 //
 // Layout on the wire / disk / in memory:
-//   | code (1B) | major_version (1B) | minor_version (1B) | _pad (1B) | value_size (4B) | user_header_size_ (4B)
+//   | code (1B) | major_version (2B) | minor_version (1B) | value_size (4B) | user_header_size_ (4B)
 //   | [user_header bytes ...]
-//
-// `code` / `major_version` / `minor_version` / `value_size` are filled by HS inside ReplicaSet::write — the app
-// cannot set them.  The app writes its own header bytes starting at `user_header_bytes()` (immediately after the
-// fixed 12-byte prefix).  user_header_size_ is stamped by alloc() and used by to_nuraft_buffer() to size the
-// zero-copy take_ownership wrap.
-//
-// Allocated via ReplLogHeader::alloc(user_header_size) which returns shared<ReplLogHeader>; HS converts to a
-// nuraft::buffer via to_nuraft_buffer(hdr) — the deleter captures the shared_ptr so the storage outlives the
-// resulting nuraft::buffer.  Zero copy through the entire write path.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 #pragma pack(1)
 struct ReplLogHeader {
     static constexpr uint8_t kMajor = 1;
     static constexpr uint8_t kMinor = 1;
 
-    uint8_t code{0}; // journal_type_t value, set by HS in ReplicaSet::write
+    uint8_t code{0};
     uint16_t major_version{0};
     uint8_t minor_version{0};
-    uint32_t value_size{0}; // bytes the app's IOBlob value carries — set by HS
+    uint32_t value_size{0};
+    uint32_t user_header_size_{0};
 
-private:
-    uint32_t user_header_size_{0}; // stamped by alloc(); used by to_nuraft_buffer() for the take_ownership span
-
-public:
     uint32_t user_header_size() const { return user_header_size_; }
     uint8_t* user_header_bytes() { return r_cast< uint8_t* >(this) + sizeof(ReplLogHeader); }
     uint8_t const* user_header_bytes() const { return r_cast< uint8_t const* >(this) + sizeof(ReplLogHeader); }
     size_t total_size() const { return sizeof(ReplLogHeader) + user_header_size_; }
-
-    // Allocate a ReplLogHeader with `user_header_size` trailing bytes.  The full slab (sizeof(ReplLogHeader)
-    // + user_header_size) is allocated once via sisl::make_io_buf_shared; placement-new constructs the prefix in
-    // place and stamps user_header_size_.  Returned shared<ReplLogHeader> aliases the underlying IoBufShared
-    // control block so the storage stays alive as long as either reference is held.
-    static shared< ReplLogHeader > alloc(uint32_t user_header_size) {
-        auto ba = sisl::make_io_buf_shared(sizeof(ReplLogHeader) + user_header_size);
-        auto* hdr = new (ba->bytes()) ReplLogHeader{};
-        hdr->user_header_size_ = user_header_size;
-        return shared< ReplLogHeader >(ba, hdr); // aliasing ctor — ba's deleter frees the IoBufShared
-    }
-
-    // Zero-copy wrap of a shared<ReplLogHeader> as a nuraft::buffer.  The deleter captures `hdr` so the
-    // underlying storage outlives the resulting nuraft::buffer.  Spans `total_size()` bytes (fixed prefix +
-    // trailing user_header).
-    static nuraft::ptr< nuraft::buffer > to_nuraft_buffer(shared< ReplLogHeader > hdr) {
-        size_t total = hdr->total_size();
-        return nuraft::buffer::take_ownership(r_cast< uint8_t* >(hdr.get()), total,
-                                              [held = std::move(hdr)](nuraft::byte*) noexcept { (void)held; });
-    }
 };
 #pragma pack()
 static_assert(sizeof(ReplLogHeader) == 12, "ReplLogHeader fixed prefix must be exactly 12 bytes on the wire/disk");
@@ -290,7 +259,7 @@ class ReplicaSet : public nuraft::state_machine,
                    public nuraft::state_mgr,
                    public std::enable_shared_from_this< ReplicaSet > {
 public:
-    ReplicaSet(ReplicationManager& mgr, superblk< ReplicaSetSuperBlk >&& rd_sb, bool load_existing);
+    ReplicaSet(ReplicationManager& mgr, ModuleMetaBlk< ReplicaSetSuperBlk >&& rs_sb, bool load_existing);
     ~ReplicaSet() override;
 
     ReplicaSet(ReplicaSet const&) = delete;
@@ -301,11 +270,13 @@ public:
 
     // ── Public client API ────────────────────────────────────────────────────────────────────────────────────
 
-    /// Single client write entry point. App pre-fills its own header bytes inside the ReplLogHeader's trailing
-    /// region (after the fixed 12-byte prefix); HS stamps code/major/minor/value_size, wraps both `hdr` and
-    /// `value` zero-copy into a 2-part log_entry chain, and proposes through raft. Resolves when commit fires
-    /// (the listener's on_commit() has already run before this returns successfully) or on error.
-    folly::coro::Task< ReplResult<> > write(shared< ReplLogHeader > hdr, sisl::IoBufSpan const& value, TraceId tid = 0);
+    /// ReplicaSet single write entry point.  Caller could pass its own header bytes as any sisl::IoBuf flavor (Span,
+    /// View, Own, ...).  The value is taken as IoBufView; and its ownership is taken over and flow as is as zero-copy.
+    /// If its a large value and LargeValueOptimization is turned on, it will be written to indirect blk and on_commit
+    /// callback will get the Blkids where the value is written. If its small or optimization is off, then it gets
+    /// inlined with header. Appln co_await this call will get done only after entire replication is committed or
+    /// failed.
+    folly::coro::Task< ReplResult<> > write(sisl::IoBuf const& user_header, sisl::IoBufView value, TraceId tid = 0);
 
     // ── Membership / leadership ──────────────────────────────────────────────────────────────────────────────
 
@@ -367,7 +338,7 @@ public:
 
     // ── Hooks invoked by ReplicationManager ─────────────────────────────────────────────────────────────────
 
-    void use_config(json_superblk raft_config_sb);
+    void use_config(JsonMetaBlk raft_config_sb);
     void on_restart();
     void force_leave();
     void flush_durable_commit_lsn();
@@ -378,7 +349,7 @@ public:
     void become_leader_cb();
     void become_follower_cb();
     void become_ready();
-    bool need_skip_processing(raft_lsn_t lsn) const { return lsn <= rd_sb_->last_snapshot_lsn; }
+    bool need_skip_processing(raft_lsn_t lsn) const { return lsn <= rs_sb_->last_snapshot_lsn; }
 
     // ── CP integration ──────────────────────────────────────────────────────────────────────────────────────
 
@@ -450,9 +421,9 @@ private:
 
     sisl::urcu_scoped_ptr< ReplicaSetStage > stage_;
 
-    superblk< ReplicaSetSuperBlk > rd_sb_;
+    ModuleMetaBlk< ReplicaSetSuperBlk > rs_sb_;
     ReplicaSetSuperBlk sb_in_mem_;
-    json_superblk raft_config_sb_;
+    JsonMetaBlk raft_config_sb_;
 
     std::mutex sb_mtx_;
     std::mutex config_mtx_;

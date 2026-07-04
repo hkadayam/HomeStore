@@ -22,8 +22,6 @@
 #include <stdexcept>
 #include <system_error>
 
-#include <folly/coro/BlockingWait.h>
-
 #include "homestore/device/physical_dev.h"
 
 namespace homestore {

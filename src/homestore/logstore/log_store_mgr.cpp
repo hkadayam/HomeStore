@@ -227,22 +227,38 @@ folly::coro::Task< void > LogStoreManager::recover() {
 }
 
 folly::coro::Task< void > LogStoreManager::drop_unopened_stores() {
-    std::vector< shared< LogStore > > to_drop;
+    std::vector< logstore_id_t > to_drop;
     {
         std::shared_lock lk{stores_mutex_};
-        for (auto& [_, s] : log_stores_) {
+        for (auto& [sid, s] : log_stores_) {
             if (!s->is_open()) {
-                to_drop.push_back(s);
+                to_drop.push_back(sid);
             }
         }
     }
-    for (auto& s : to_drop) {
-        const auto sid = s->store_id();
+    for (auto sid : to_drop) {
         LOGWARN("LogStoreManager: dropping unopened log_store sid={}", sid);
-        // Remove sb mblk so a subsequent restart won't re-discover this store.
-        co_await meta_client_->remove_meta_blk(s->sb_blk());
+        co_await destroy_log_store(sid);
+    }
+    co_return;
+}
+
+folly::coro::Task< void > LogStoreManager::destroy_log_store(logstore_id_t store_id) {
+    shared< LogStore > s;
+    {
+        std::shared_lock lk{stores_mutex_};
+        auto it = log_stores_.find(store_id);
+        if (it == log_stores_.end()) {
+            LOGWARN("LogStoreManager::destroy_log_store: unknown sid={}", store_id);
+            co_return;
+        }
+        s = it->second;
+    }
+    // Remove sb mblk so a subsequent restart won't re-discover this store.
+    co_await meta_client_->remove_meta_blk(s->sb_blk());
+    {
         std::unique_lock lk{stores_mutex_};
-        log_stores_.erase(sid);
+        log_stores_.erase(store_id);
     }
     co_return;
 }

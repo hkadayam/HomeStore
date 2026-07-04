@@ -18,6 +18,8 @@
 #include <folly/coro/Sleep.h>
 #include <folly/coro/Invoke.h>
 
+#include <sisl/logging/logging.h>
+
 namespace iomanager {
 
 // Extracts T from folly::coro::Task<T>
@@ -213,6 +215,16 @@ template < typename Fn >
 auto spawn_waitable_all(Fn&& fn)
     -> folly::coro::Task< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
                                               std::vector< task_value_t< Fn, size_t > > > >;
+
+/// Synchronously drive `task` to completion on the calling thread.  Debug-asserts the caller is NOT on an iomgr
+/// reactor — blocking a reactor deadlocks any work whose continuation routes back to that same reactor.  Use
+/// this everywhere instead of folly::coro::blockingWait so reactor-context misuse is caught at debug time.
+template < typename T >
+T blocking_wait(folly::coro::Task< T >&& task) {
+    DEBUG_ASSERT(::iomgr().current_reactor_id() >= ::iomgr().num_reactors(),
+                 "iomanager::blocking_wait called from reactor — would deadlock");
+    return folly::coro::blockingWait(std::move(task));
+}
 
 } // namespace iomanager
 

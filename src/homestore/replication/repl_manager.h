@@ -98,12 +98,11 @@ public:
     /// set is registered for that group.
     nuraft::ptr< nuraft::raft_server > lookup_raft_server(nuraft::group_id_t const& gid) const;
 
-    /// Same as lookup_raft_server but on a miss, attempts to construct a new ReplicaSet by asking the
-    /// application via ReplApplication::create_replica_set_listener. If the application returns nullptr
-    /// (rejecting the unknown group), this also returns nullptr. Called by the folly transport's
-    /// InboundConnection on every inbound request — first contact from a leader that added us via add_srv
-    /// arrives here.
-    nuraft::ptr< nuraft::raft_server > lookup_or_create_raft_server(nuraft::group_id_t const& gid);
+    /// Construct a new ReplicaSet for an unknown group_id by asking the application via
+    /// ReplApplication::create_replica_set_listener.  Returns nullptr if the application rejects the group,
+    /// or if joining the raft group fails.  Resolves after the new replica's raft_server is up.
+    folly::coro::Task< nuraft::ptr< nuraft::raft_server > >
+    create_replica_set_for_group(nuraft::group_id_t const& gid);
 
     /// Folly transport — used by per-group ReplicaSet's join_group to build the nuraft::context.
     shared< replication::FollyRpcClientFactory > rpc_client_factory() const { return rpc_client_factory_; }
@@ -145,7 +144,7 @@ private:
     ReplicaId my_uuid_;
 
     // CPU thread pool for slow-path RPCs and slow internal callbacks. Sized small (2 threads by default) —
-    // these paths are infrequent and serialised against each other is fine.
+    // these paths are infrequent and serialized against each other is fine.
     unique< folly::CPUThreadPoolExecutor > slow_executor_;
 
     // Outbound RPC client factory holds per-reactor sockets to each peer.

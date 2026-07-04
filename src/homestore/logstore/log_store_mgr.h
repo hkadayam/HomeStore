@@ -87,6 +87,10 @@ public:
     /// nullptr if no store with that id exists.
     shared< LogStore > open_log_store(logstore_id_t store_id, log_replay_cb handler);
 
+    /// Destroy a single LogStore by id — removes its meta_blk so it won't be re-discovered on restart, then
+    /// erases it from in-memory state.  Idempotent (warns and returns for unknown ids).
+    folly::coro::Task< void > destroy_log_store(logstore_id_t store_id);
+
     // ── Recovery ─────────────────────────────────────────────────────────────
 
     /// Triggers LogStream::recover with our lookup_store callback.  on_log_found fires per record into the

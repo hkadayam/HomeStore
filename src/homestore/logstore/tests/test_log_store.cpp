@@ -29,7 +29,7 @@
 #include <gtest/gtest.h>
 
 #include <fmt/format.h>
-#include <folly/coro/Sleep.h>
+#include "common/async.h"
 #include "sisl/logging/logging.h"
 #include "sisl/options/options.h"
 #include "sisl/fds/buffer.h"
@@ -183,7 +183,7 @@ public:
         return infos;
     }
 
-    folly::coro::Task< void > bootstrap() {
+    Async< void > bootstrap() {
         dm_ = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
         co_await MetaBlkManager::create(META_VDEV_SIZE);
 
@@ -199,7 +199,7 @@ public:
     // requires the main thread because stop_iomgr joins reactor threads — a reactor calling it would
     // self-join.  Two coroutine phases bracket the cycle.
     void reload_sync() {
-        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> Async< void > {
             co_await log_store_mgr().shutdown();
             co_await cp_mgr().shutdown();
             co_await dm_->close_devices();
@@ -207,7 +207,7 @@ public:
         }());
         iomanager::stop_iomgr();
         iomanager::init_iomgr(2);
-        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> Async< void > {
             dm_ = DeviceManager::create(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
             co_await dm_->load_devices();
             co_await MetaBlkManager::load();
@@ -217,7 +217,7 @@ public:
         }());
     }
 
-    folly::coro::Task< void > shutdown() {
+    Async< void > shutdown() {
         co_await log_store_mgr().shutdown();
         co_await cp_mgr().shutdown();
         co_await dm_->close_devices();
@@ -406,7 +406,7 @@ CORO_TEST_F(LogStoreTest, GlobalTruncateMinAcrossStores) {
     ShadowStore a{raw_a};
     ShadowStore b{raw_b};
 
-    auto append_batch = [](ShadowStore& s, uint32_t n) -> folly::coro::Task< void > {
+    auto append_batch = [](ShadowStore& s, uint32_t n) -> Async< void > {
         for (uint32_t i = 0; i < n; ++i) {
             auto blob = s.materialize(s.store().tail_lsn() + 1, 128);
             s.store().quick_append(blob);
@@ -455,54 +455,52 @@ TEST_F(LogStoreTest, GlobalTruncateAcrossRestart) {
     logstore_id_t sid_a{}, sid_b{};
     uint64_t pre_restart_head{0};
 
-    iomgr().spawn_and_block(ReactorTarget::any(),
-                            [this, &sid_a, &sid_b, &pre_restart_head]() -> folly::coro::Task< void > {
-                                co_await bootstrap();
-                                auto raw_a = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
-                                auto raw_b = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
-                                sid_a = raw_a->store_id();
-                                sid_b = raw_b->store_id();
-                                log_store_mgr().open_log_store(sid_a, [](lsn_t, const sisl::IoBufView&) {});
-                                log_store_mgr().open_log_store(sid_b, [](lsn_t, const sisl::IoBufView&) {});
-                                {
-                                    ShadowStore a{raw_a};
-                                    ShadowStore b{raw_b};
-                                    for (uint32_t i = 0; i < 5; ++i) {
-                                        a.store().quick_append(a.materialize(i, 128));
-                                    }
-                                    co_await a.store().flush();
-                                    for (uint32_t i = 0; i < 5; ++i) {
-                                        b.store().quick_append(b.materialize(i, 128));
-                                    }
-                                    co_await b.store().flush();
-                                    for (uint32_t i = 5; i < 10; ++i) {
-                                        a.store().quick_append(a.materialize(i, 128));
-                                    }
-                                    co_await a.store().flush();
-                                    co_await a.store().truncate(4);
-                                    co_await log_store_mgr().global_truncate();
-                                }
-                                pre_restart_head = log_store_mgr().log_stream()->head_offset();
-                                EXPECT_GT(pre_restart_head, 0u) << "stream head advanced after global_truncate";
-                            }());
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid_a, &sid_b, &pre_restart_head]() -> Async< void > {
+        co_await bootstrap();
+        auto raw_a = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+        auto raw_b = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+        sid_a = raw_a->store_id();
+        sid_b = raw_b->store_id();
+        log_store_mgr().open_log_store(sid_a, [](lsn_t, const sisl::IoBufView&) {});
+        log_store_mgr().open_log_store(sid_b, [](lsn_t, const sisl::IoBufView&) {});
+        {
+            ShadowStore a{raw_a};
+            ShadowStore b{raw_b};
+            for (uint32_t i = 0; i < 5; ++i) {
+                a.store().quick_append(a.materialize(i, 128));
+            }
+            co_await a.store().flush();
+            for (uint32_t i = 0; i < 5; ++i) {
+                b.store().quick_append(b.materialize(i, 128));
+            }
+            co_await b.store().flush();
+            for (uint32_t i = 5; i < 10; ++i) {
+                a.store().quick_append(a.materialize(i, 128));
+            }
+            co_await a.store().flush();
+            co_await a.store().truncate(4);
+            co_await log_store_mgr().global_truncate();
+        }
+        pre_restart_head = log_store_mgr().log_stream()->head_offset();
+        EXPECT_GT(pre_restart_head, 0u) << "stream head advanced after global_truncate";
+    }());
 
     reload_sync();
 
-    iomgr().spawn_and_block(ReactorTarget::any(),
-                            [this, sid_a, sid_b, pre_restart_head]() -> folly::coro::Task< void > {
-                                EXPECT_EQ(log_store_mgr().log_stream()->head_offset(), pre_restart_head)
-                                    << "stream head_offset persisted across restart";
-                                auto recov_a = log_store_mgr().get_log_store(sid_a);
-                                auto recov_b = log_store_mgr().get_log_store(sid_b);
-                                CO_ASSERT_NE(recov_a, nullptr);
-                                CO_ASSERT_NE(recov_b, nullptr);
-                                ShadowStore a2{recov_a};
-                                ShadowStore b2{recov_b};
-                                co_await log_store_mgr().recover();
-                                EXPECT_EQ(a2.replayed_count(), 5u) << "A's surviving records replay";
-                                EXPECT_EQ(b2.replayed_count(), 5u) << "B's records replay";
-                                co_await shutdown();
-                            }());
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid_a, sid_b, pre_restart_head]() -> Async< void > {
+        EXPECT_EQ(log_store_mgr().log_stream()->head_offset(), pre_restart_head)
+            << "stream head_offset persisted across restart";
+        auto recov_a = log_store_mgr().get_log_store(sid_a);
+        auto recov_b = log_store_mgr().get_log_store(sid_b);
+        CO_ASSERT_NE(recov_a, nullptr);
+        CO_ASSERT_NE(recov_b, nullptr);
+        ShadowStore a2{recov_a};
+        ShadowStore b2{recov_b};
+        co_await log_store_mgr().recover();
+        EXPECT_EQ(a2.replayed_count(), 5u) << "A's surviving records replay";
+        EXPECT_EQ(b2.replayed_count(), 5u) << "B's records replay";
+        co_await shutdown();
+    }());
 }
 
 CORO_TEST_F(LogStoreTest, GlobalTruncateNoOpWhenStoreEmpty) {
@@ -546,7 +544,7 @@ CORO_TEST_F(LogStoreTest, GlobalTruncateNoOpWhenStoreEmpty) {
 TEST_F(LogStoreTest, TruncatePartialAcrossRestart) {
     logstore_id_t sid{};
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> Async< void > {
         co_await bootstrap();
         auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
         sid = raw->store_id();
@@ -565,7 +563,7 @@ TEST_F(LogStoreTest, TruncatePartialAcrossRestart) {
 
     reload_sync();
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid]() -> Async< void > {
         auto recovered_raw = log_store_mgr().get_log_store(sid);
         CO_ASSERT_NE(recovered_raw, nullptr);
         ShadowStore s2{recovered_raw};
@@ -584,7 +582,7 @@ TEST_F(LogStoreTest, TruncatePartialAcrossRestart) {
 TEST_F(LogStoreTest, TruncateAllAcrossRestart) {
     logstore_id_t sid{};
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> Async< void > {
         co_await bootstrap();
         auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
         sid = raw->store_id();
@@ -602,7 +600,7 @@ TEST_F(LogStoreTest, TruncateAllAcrossRestart) {
 
     reload_sync();
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid]() -> Async< void > {
         auto recovered_raw = log_store_mgr().get_log_store(sid);
         CO_ASSERT_NE(recovered_raw, nullptr);
         ShadowStore s2{recovered_raw};
@@ -618,7 +616,7 @@ TEST_F(LogStoreTest, TruncateAllAcrossRestart) {
 TEST_F(LogStoreTest, BasicReplayPreservesOrder) {
     logstore_id_t sid{};
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> Async< void > {
         co_await bootstrap();
         auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
         sid = raw->store_id();
@@ -635,7 +633,7 @@ TEST_F(LogStoreTest, BasicReplayPreservesOrder) {
 
     reload_sync();
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid]() -> Async< void > {
         auto recovered_raw = log_store_mgr().get_log_store(sid);
         CO_ASSERT_NE(recovered_raw, nullptr);
         ShadowStore s2{recovered_raw};
@@ -653,7 +651,7 @@ TEST_F(LogStoreTest, AppendRestartAppendRestart) {
     logstore_id_t sid{};
 
     // Cycle 1: bootstrap, append 8, flush.
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> Async< void > {
         co_await bootstrap();
         auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
         sid = raw->store_id();
@@ -669,7 +667,7 @@ TEST_F(LogStoreTest, AppendRestartAppendRestart) {
     reload_sync();
 
     // Cycle 2: recover, verify 8 replayed, append 8 more (LSNs 8..15), flush.
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid]() -> Async< void > {
         auto raw2 = log_store_mgr().get_log_store(sid);
         CO_ASSERT_NE(raw2, nullptr);
         ShadowStore s2{raw2};
@@ -687,7 +685,7 @@ TEST_F(LogStoreTest, AppendRestartAppendRestart) {
     reload_sync();
 
     // Final: recover, verify all 16 replay in order.
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid]() -> Async< void > {
         auto raw3 = log_store_mgr().get_log_store(sid);
         CO_ASSERT_NE(raw3, nullptr);
         ShadowStore s3{raw3};
@@ -739,7 +737,7 @@ CORO_TEST_F(LogStoreTest, RollbackBasic) {
 TEST_F(LogStoreTest, RollbackPersistsAcrossRestart) {
     logstore_id_t sid{};
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> Async< void > {
         co_await bootstrap();
         auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
         sid = raw->store_id();
@@ -755,7 +753,7 @@ TEST_F(LogStoreTest, RollbackPersistsAcrossRestart) {
 
     reload_sync();
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid]() -> Async< void > {
         auto raw2 = log_store_mgr().get_log_store(sid);
         CO_ASSERT_NE(raw2, nullptr);
         ShadowStore s2{raw2};
@@ -779,70 +777,65 @@ TEST_F(LogStoreTest, RollbackAppendRestartCycle) {
     lsn_t expected_max_alive_lsn = -1;
 
     // Cycle 0: bootstrap, append batch, rollback half.
-    iomgr().spawn_and_block(ReactorTarget::any(),
-                            [this, &sid, &expected_max_alive_lsn]() -> folly::coro::Task< void > {
-                                co_await bootstrap();
-                                auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
-                                sid = raw->store_id();
-                                log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::IoBufView&) {});
-                                ShadowStore s{raw};
-                                const lsn_t batch_start = s.store().tail_lsn() + 1;
-                                for (uint32_t i = 0; i < kBatchSize; ++i) {
-                                    const lsn_t lsn = batch_start + i;
-                                    auto blob = s.materialize(lsn, 128);
-                                    auto got = s.store().quick_append(blob);
-                                    EXPECT_EQ(got, lsn);
-                                }
-                                co_await s.store().flush();
-                                const lsn_t rollback_to = batch_start + (kBatchSize / 2) - 1;
-                                EXPECT_TRUE(co_await s.store().rollback(rollback_to));
-                                EXPECT_EQ(s.store().tail_lsn(), rollback_to);
-                                expected_max_alive_lsn = rollback_to;
-                            }());
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid, &expected_max_alive_lsn]() -> Async< void > {
+        co_await bootstrap();
+        auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+        sid = raw->store_id();
+        log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::IoBufView&) {});
+        ShadowStore s{raw};
+        const lsn_t batch_start = s.store().tail_lsn() + 1;
+        for (uint32_t i = 0; i < kBatchSize; ++i) {
+            const lsn_t lsn = batch_start + i;
+            auto blob = s.materialize(lsn, 128);
+            auto got = s.store().quick_append(blob);
+            EXPECT_EQ(got, lsn);
+        }
+        co_await s.store().flush();
+        const lsn_t rollback_to = batch_start + (kBatchSize / 2) - 1;
+        EXPECT_TRUE(co_await s.store().rollback(rollback_to));
+        EXPECT_EQ(s.store().tail_lsn(), rollback_to);
+        expected_max_alive_lsn = rollback_to;
+    }());
 
     reload_sync();
 
     // Cycle 1: recover, verify carryover, append batch, rollback half.
-    iomgr().spawn_and_block(ReactorTarget::any(),
-                            [this, sid, &expected_max_alive_lsn]() -> folly::coro::Task< void > {
-                                auto raw = log_store_mgr().get_log_store(sid);
-                                CO_ASSERT_NE(raw, nullptr);
-                                ShadowStore s{raw};
-                                co_await log_store_mgr().recover();
-                                EXPECT_EQ(s.replayed_count(), to_size(expected_max_alive_lsn + 1))
-                                    << "cycle=1 replay count mismatch";
-                                s.reset_replay();
-                                const lsn_t batch_start = s.store().tail_lsn() + 1;
-                                for (uint32_t i = 0; i < kBatchSize; ++i) {
-                                    const lsn_t lsn = batch_start + i;
-                                    auto blob = s.materialize(lsn, 128);
-                                    auto got = s.store().quick_append(blob);
-                                    EXPECT_EQ(got, lsn);
-                                }
-                                co_await s.store().flush();
-                                const lsn_t rollback_to = batch_start + (kBatchSize / 2) - 1;
-                                EXPECT_TRUE(co_await s.store().rollback(rollback_to));
-                                EXPECT_EQ(s.store().tail_lsn(), rollback_to);
-                                expected_max_alive_lsn = rollback_to;
-                            }());
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, &expected_max_alive_lsn]() -> Async< void > {
+        auto raw = log_store_mgr().get_log_store(sid);
+        CO_ASSERT_NE(raw, nullptr);
+        ShadowStore s{raw};
+        co_await log_store_mgr().recover();
+        EXPECT_EQ(s.replayed_count(), to_size(expected_max_alive_lsn + 1)) << "cycle=1 replay count mismatch";
+        s.reset_replay();
+        const lsn_t batch_start = s.store().tail_lsn() + 1;
+        for (uint32_t i = 0; i < kBatchSize; ++i) {
+            const lsn_t lsn = batch_start + i;
+            auto blob = s.materialize(lsn, 128);
+            auto got = s.store().quick_append(blob);
+            EXPECT_EQ(got, lsn);
+        }
+        co_await s.store().flush();
+        const lsn_t rollback_to = batch_start + (kBatchSize / 2) - 1;
+        EXPECT_TRUE(co_await s.store().rollback(rollback_to));
+        EXPECT_EQ(s.store().tail_lsn(), rollback_to);
+        expected_max_alive_lsn = rollback_to;
+    }());
 
     reload_sync();
 
     // Final: recover, verify replay order against kept prefix.
-    iomgr().spawn_and_block(ReactorTarget::any(),
-                            [this, sid, expected_max_alive_lsn]() -> folly::coro::Task< void > {
-                                auto final_raw = log_store_mgr().get_log_store(sid);
-                                CO_ASSERT_NE(final_raw, nullptr);
-                                ShadowStore final_s{final_raw};
-                                co_await log_store_mgr().recover();
-                                auto rec = final_s.replayed();
-                                CO_ASSERT_EQ(rec.size(), to_size(expected_max_alive_lsn + 1));
-                                for (size_t i = 0; i < rec.size(); ++i) {
-                                    EXPECT_EQ(rec[i].first, to_i64(i))
-                                        << "final replay order mismatch at index " << i;
-                                }
-                                co_await shutdown();
-                            }());
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, expected_max_alive_lsn]() -> Async< void > {
+        auto final_raw = log_store_mgr().get_log_store(sid);
+        CO_ASSERT_NE(final_raw, nullptr);
+        ShadowStore final_s{final_raw};
+        co_await log_store_mgr().recover();
+        auto rec = final_s.replayed();
+        CO_ASSERT_EQ(rec.size(), to_size(expected_max_alive_lsn + 1));
+        for (size_t i = 0; i < rec.size(); ++i) {
+            EXPECT_EQ(rec[i].first, to_i64(i)) << "final replay order mismatch at index " << i;
+        }
+        co_await shutdown();
+    }());
 }
 
 // Same intent as RollbackAppendRestartCycle but without reboots between cycles — the in-memory chain stays
@@ -854,45 +847,42 @@ TEST_F(LogStoreTest, RollbackAppendNoRestartCycle) {
     logstore_id_t sid{};
     lsn_t expected_max_alive_lsn = -1;
 
-    iomgr().spawn_and_block(ReactorTarget::any(),
-                            [this, &sid, &expected_max_alive_lsn]() -> folly::coro::Task< void > {
-                                co_await bootstrap();
-                                auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
-                                sid = raw->store_id();
-                                log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::IoBufView&) {});
-                                ShadowStore s{raw};
-                                for (uint32_t cycle = 0; cycle < N_CYCLES; ++cycle) {
-                                    const lsn_t batch_start = s.store().tail_lsn() + 1;
-                                    for (uint32_t i = 0; i < kBatchSize; ++i) {
-                                        const lsn_t lsn = batch_start + i;
-                                        auto blob = s.materialize(lsn, 128);
-                                        auto got = s.store().quick_append(blob);
-                                        EXPECT_EQ(got, lsn) << "cycle=" << cycle;
-                                    }
-                                    co_await s.store().flush();
-                                    const lsn_t rollback_to = batch_start + (kBatchSize / 2) - 1;
-                                    EXPECT_TRUE(co_await s.store().rollback(rollback_to));
-                                    EXPECT_EQ(s.store().tail_lsn(), rollback_to);
-                                    expected_max_alive_lsn = rollback_to;
-                                }
-                            }());
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid, &expected_max_alive_lsn]() -> Async< void > {
+        co_await bootstrap();
+        auto raw = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+        sid = raw->store_id();
+        log_store_mgr().open_log_store(sid, [](lsn_t, const sisl::IoBufView&) {});
+        ShadowStore s{raw};
+        for (uint32_t cycle = 0; cycle < N_CYCLES; ++cycle) {
+            const lsn_t batch_start = s.store().tail_lsn() + 1;
+            for (uint32_t i = 0; i < kBatchSize; ++i) {
+                const lsn_t lsn = batch_start + i;
+                auto blob = s.materialize(lsn, 128);
+                auto got = s.store().quick_append(blob);
+                EXPECT_EQ(got, lsn) << "cycle=" << cycle;
+            }
+            co_await s.store().flush();
+            const lsn_t rollback_to = batch_start + (kBatchSize / 2) - 1;
+            EXPECT_TRUE(co_await s.store().rollback(rollback_to));
+            EXPECT_EQ(s.store().tail_lsn(), rollback_to);
+            expected_max_alive_lsn = rollback_to;
+        }
+    }());
 
     reload_sync();
 
-    iomgr().spawn_and_block(ReactorTarget::any(),
-                            [this, sid, expected_max_alive_lsn]() -> folly::coro::Task< void > {
-                                auto final_raw = log_store_mgr().get_log_store(sid);
-                                CO_ASSERT_NE(final_raw, nullptr);
-                                ShadowStore final_s{final_raw};
-                                co_await log_store_mgr().recover();
-                                auto rec = final_s.replayed();
-                                CO_ASSERT_EQ(rec.size(), to_size(expected_max_alive_lsn + 1));
-                                for (size_t i = 0; i < rec.size(); ++i) {
-                                    EXPECT_EQ(rec[i].first, to_i64(i))
-                                        << "final replay order mismatch at index " << i;
-                                }
-                                co_await shutdown();
-                            }());
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, expected_max_alive_lsn]() -> Async< void > {
+        auto final_raw = log_store_mgr().get_log_store(sid);
+        CO_ASSERT_NE(final_raw, nullptr);
+        ShadowStore final_s{final_raw};
+        co_await log_store_mgr().recover();
+        auto rec = final_s.replayed();
+        CO_ASSERT_EQ(rec.size(), to_size(expected_max_alive_lsn + 1));
+        for (size_t i = 0; i < rec.size(); ++i) {
+            EXPECT_EQ(rec[i].first, to_i64(i)) << "final replay order mismatch at index " << i;
+        }
+        co_await shutdown();
+    }());
 }
 
 // ── Sync API ────────────────────────────────────────────────────────────────────────────────────────────────────

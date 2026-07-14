@@ -15,6 +15,7 @@
  ***************************************************************************/
 
 #include <algorithm>
+#include "common/async.h"
 #include <charconv>
 #include <stdexcept>
 #include <string_view>
@@ -43,7 +44,7 @@ namespace homestore {
 // create
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > BlobDevManager::create() {
+Async< void > BlobDevManager::create() {
     LOGINFO("BlobDevManager: first boot — creating fresh manager");
     auto mgr = shared< BlobDevManager >(new BlobDevManager{co_await meta_mgr().register_client("BlobDevManager")});
     Managers::init_blob_dev_mgr(mgr);
@@ -146,7 +147,7 @@ std::optional< ParsedMblkName > parse_mblk_name(std::string_view name) {
 
 } // anonymous namespace
 
-folly::coro::Task< void > BlobDevManager::load() {
+Async< void > BlobDevManager::load() {
     LOGINFO("BlobDevManager: starting recovery scan");
     auto mgr = shared< BlobDevManager >(new BlobDevManager{co_await meta_mgr().register_client("BlobDevManager")});
 
@@ -161,58 +162,57 @@ folly::coro::Task< void > BlobDevManager::load() {
 
     std::unordered_map< std::string, DevRecovery > dev_map;
 
-    co_await mgr->meta_client_.for_each_recovered_block(
-        [&dev_map](MetaBlk blk, sisl::IoBufView data) -> folly::coro::Task< void > {
-            auto parsed = parse_mblk_name(blk.name());
-            if (!parsed) {
-                co_return;
-            }
-
-            LOGDEBUG("Recovered MetaBlk '{}' dev={} stream_id={} chunk_id={} is_sb={}", blk.name(), parsed->dev_name,
-                     parsed->stream_id, parsed->chunk_id, parsed->is_sb);
-
-            auto vdev = device_mgr().get_vdev(parsed->dev_name);
-            if (!vdev) {
-                LOGWARN("MetaBlk '{}' references unknown VDev '{}' — skipping", blk.name(), parsed->dev_name);
-                co_return;
-            }
-
-            DevRecovery& dev = dev_map[parsed->dev_name];
-
-            if (parsed->is_sb) {
-                // Single per-stream sb MetaBlk (AppendByteStream) — no chunk lookup here; chunk_ids are inside the
-                // sb payload and resolved when the stream itself loads.
-                dev.append_byte_sbs[parsed->stream_id] = BlobDev::AppendByteSbInfo{std::move(blk), std::move(data)};
-                co_return;
-            }
-
-            // Per-chunk MetaBlk — validate the chunk still exists.
-            auto chunk = vdev->get_chunk(parsed->chunk_id);
-            if (!chunk) {
-                LOGERROR("MetaBlk '{}' references chunk_id={} not found in VDev '{}' — skipping", blk.name(),
-                         parsed->chunk_id, parsed->dev_name);
-                co_return;
-            }
-
-            auto entry = std::make_pair(std::move(blk), std::move(data));
-            auto populate = [&](StreamMblkMap& m) {
-                auto& info = m[parsed->stream_id];
-                info.blk_size = parsed->blk_size;
-                info.chunk_mblks.emplace(parsed->chunk_id, std::move(entry));
-            };
-            switch (parsed->stream_type) {
-            case StreamType::RawBlk:
-                populate(dev.raw_blk_mblks);
-                break;
-            case StreamType::AppendBlk:
-                populate(dev.append_blk_mblks);
-                break;
-            case StreamType::AppendByte:
-                // Per-chunk form is not produced for AppendByte — fall through without populating.
-                break;
-            }
+    co_await mgr->meta_client_.for_each_recovered_block([&dev_map](MetaBlk blk, sisl::IoBufView data) -> Async< void > {
+        auto parsed = parse_mblk_name(blk.name());
+        if (!parsed) {
             co_return;
-        });
+        }
+
+        LOGDEBUG("Recovered MetaBlk '{}' dev={} stream_id={} chunk_id={} is_sb={}", blk.name(), parsed->dev_name,
+                 parsed->stream_id, parsed->chunk_id, parsed->is_sb);
+
+        auto vdev = device_mgr().get_vdev(parsed->dev_name);
+        if (!vdev) {
+            LOGWARN("MetaBlk '{}' references unknown VDev '{}' — skipping", blk.name(), parsed->dev_name);
+            co_return;
+        }
+
+        DevRecovery& dev = dev_map[parsed->dev_name];
+
+        if (parsed->is_sb) {
+            // Single per-stream sb MetaBlk (AppendByteStream) — no chunk lookup here; chunk_ids are inside the
+            // sb payload and resolved when the stream itself loads.
+            dev.append_byte_sbs[parsed->stream_id] = BlobDev::AppendByteSbInfo{std::move(blk), std::move(data)};
+            co_return;
+        }
+
+        // Per-chunk MetaBlk — validate the chunk still exists.
+        auto chunk = vdev->get_chunk(parsed->chunk_id);
+        if (!chunk) {
+            LOGERROR("MetaBlk '{}' references chunk_id={} not found in VDev '{}' — skipping", blk.name(),
+                     parsed->chunk_id, parsed->dev_name);
+            co_return;
+        }
+
+        auto entry = std::make_pair(std::move(blk), std::move(data));
+        auto populate = [&](StreamMblkMap& m) {
+            auto& info = m[parsed->stream_id];
+            info.blk_size = parsed->blk_size;
+            info.chunk_mblks.emplace(parsed->chunk_id, std::move(entry));
+        };
+        switch (parsed->stream_type) {
+        case StreamType::RawBlk:
+            populate(dev.raw_blk_mblks);
+            break;
+        case StreamType::AppendBlk:
+            populate(dev.append_blk_mblks);
+            break;
+        case StreamType::AppendByte:
+            // Per-chunk form is not produced for AppendByte — fall through without populating.
+            break;
+        }
+        co_return;
+    });
 
     LOGINFO("scan complete — {} device(s) found", dev_map.size());
 
@@ -247,8 +247,7 @@ folly::coro::Task< void > BlobDevManager::load() {
 // create_blob_dev
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< shared< BlobDev > > BlobDevManager::create_blob_dev(std::string&& dev_name,
-                                                                       VDevParameters&& params) {
+Async< shared< BlobDev > > BlobDevManager::create_blob_dev(std::string&& dev_name, VDevParameters&& params) {
     LOGINFOMOD(blob_dev, "Creating BlobDev '{}'", dev_name);
     params.vdev_name = dev_name;
     auto vdev = co_await device_mgr().create_vdev(std::move(params));
@@ -291,7 +290,7 @@ void BlobDevManager::shutdown() {
 void BlobDevManager::on_switchover_cp(CP* /*cur_cp*/, CP* /*new_cp*/) {
 }
 
-folly::coro::Task< bool > BlobDevManager::cp_flush(CP* cp) {
+Async< bool > BlobDevManager::cp_flush(CP* cp) {
     std::unordered_map< std::string, shared< BlobDev > > devs;
     {
         std::lock_guard lk{devices_mutex_};

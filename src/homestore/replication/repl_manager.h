@@ -13,7 +13,7 @@
 #include <string>
 #include <utility>
 
-#include <folly/coro/Task.h>
+#include "common/async.h"
 #include <folly/executors/CPUThreadPoolExecutor.h>
 
 #include <iomgr/iomgr_timer.hpp>
@@ -61,27 +61,27 @@ public:
     ReplicationManager(ReplicationManager const&) = delete;
     ReplicationManager& operator=(ReplicationManager const&) = delete;
 
-    folly::coro::Task< void > start();
-    folly::coro::Task< void > stop();
+    Async< void > start();
+    Async< void > stop();
 
     // -------- Public Task<>-driven API (proposer-style operations) --------
 
-    folly::coro::Task< ReplResult< shared< ReplicaSet > > > create_replica_set(GroupId group_id,
-                                                                               std::set< ReplicaId > const& members);
+    Async< ReplResult< shared< ReplicaSet > > > create_replica_set(GroupId group_id,
+                                                                   std::set< ReplicaId > const& members);
 
     /// Schedule a replica set for destruction. Resolves once the destroy is accepted; actual resource reclaim
     /// happens lazily in the reaper.
-    folly::coro::Task< ReplError > remove_replica_set(GroupId group_id);
+    Async< ReplError > remove_replica_set(GroupId group_id);
 
     /// Replace one member of a group with another. Two-phase: (1) flip member_out to learner + add member_in;
     /// (2) remove member_out.
-    folly::coro::Task< ReplResult<> > replace_member(GroupId group_id, ReplicaMemberInfo const& member_out,
-                                                     ReplicaMemberInfo const& member_in, uint32_t commit_quorum = 0,
-                                                     uint64_t trace_id = 0) const;
+    Async< ReplResult<> > replace_member(GroupId group_id, ReplicaMemberInfo const& member_out,
+                                         ReplicaMemberInfo const& member_in, uint32_t commit_quorum = 0,
+                                         uint64_t trace_id = 0) const;
 
-    folly::coro::Task< ReplResult<> > flip_learner_flag(GroupId group_id, ReplicaMemberInfo const& member, bool target,
-                                                        uint32_t commit_quorum, bool wait_and_verify = true,
-                                                        uint64_t trace_id = 0) const;
+    Async< ReplResult<> > flip_learner_flag(GroupId group_id, ReplicaMemberInfo const& member, bool target,
+                                            uint32_t commit_quorum, bool wait_and_verify = true,
+                                            uint64_t trace_id = 0) const;
 
     // -------- Synchronous accessors --------
 
@@ -101,8 +101,7 @@ public:
     /// Construct a new ReplicaSet for an unknown group_id by asking the application via
     /// ReplApplication::create_replica_set_listener.  Returns nullptr if the application rejects the group,
     /// or if joining the raft group fails.  Resolves after the new replica's raft_server is up.
-    folly::coro::Task< nuraft::ptr< nuraft::raft_server > >
-    create_replica_set_for_group(nuraft::group_id_t const& gid);
+    Async< nuraft::ptr< nuraft::raft_server > > create_replica_set_for_group(nuraft::group_id_t const& gid);
 
     /// Folly transport — used by per-group ReplicaSet's join_group to build the nuraft::context.
     shared< replication::FollyRpcClientFactory > rpc_client_factory() const { return rpc_client_factory_; }
@@ -206,7 +205,7 @@ public:
     ~ReplCPHandler() override = default;
 
     void on_switchover_cp(CP* cur_cp, CP* new_cp) override;
-    folly::coro::Task< bool > cp_flush(CP* cp) override;
+    Async< bool > cp_flush(CP* cp) override;
     void cp_cleanup(CP* cp) override;
     int cp_progress_percent() override;
 };

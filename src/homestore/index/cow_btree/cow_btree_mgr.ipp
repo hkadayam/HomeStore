@@ -9,6 +9,7 @@
 #pragma once
 
 #include <algorithm>
+#include "common/async.h"
 #include <cstring>
 
 #include "homestore/index/cow_btree/cow_btree.h"
@@ -23,8 +24,8 @@ namespace homestore {
 /// COWBtree::create() (which fills in stream IDs and persists), then wraps the resulting UnderlyingBtree in a
 /// Btree<K,V>. Empty root_node_id triggers Btree<K,V>'s fresh-boot path which calls create_root_node().
 template < typename K, typename V >
-folly::coro::Task< shared< Btree< K, V > > >
-COWBtreeManager::create_cow_btree(BtreeConfig const& cfg, shared< BlobDev > blob_dev, sisl::Blob const& user_sb) {
+Async< shared< Btree< K, V > > > COWBtreeManager::create_cow_btree(BtreeConfig const& cfg, shared< BlobDev > blob_dev,
+                                                                   sisl::Blob const& user_sb) {
     auto const ordinal = ordinal_reserver_.reserve();
 
     auto const sb_size = sizeof(COWBtreeSuperBlock) + user_sb.size();
@@ -51,8 +52,8 @@ COWBtreeManager::create_cow_btree(BtreeConfig const& cfg, shared< BlobDev > blob
 /// the manager's MetaClient, hands off to COWBtree::load() (opens streams from sb.*_stream_id and runs recovery), then
 /// wraps in a Btree<K,V> seeded with the persisted root.
 template < typename K, typename V >
-folly::coro::Task< shared< Btree< K, V > > >
-COWBtreeManager::load_cow_btree(BtreeConfig const& cfg, shared< BlobDev > blob_dev, COWBtreeSuperBlock const& sb) {
+Async< shared< Btree< K, V > > > COWBtreeManager::load_cow_btree(BtreeConfig const& cfg, shared< BlobDev > blob_dev,
+                                                                 COWBtreeSuperBlock const& sb) {
     auto it = std::find_if(pending_btrees_.begin(), pending_btrees_.end(),
                            [&](PersistedBtreeInfo const& info) { return info.sb.ordinal == sb.ordinal; });
     HS_REL_ASSERT(it != pending_btrees_.end(), "load_cow_btree: no persisted MetaBlk for ordinal={}", sb.ordinal);

@@ -25,7 +25,7 @@
 #include <utility>
 #include <vector>
 
-#include <folly/coro/Task.h>
+#include "common/async.h"
 #include "sisl/fds/buffer.h"
 #include "sisl/fds/stream_tracker.h"
 
@@ -43,7 +43,7 @@ class MetaClient;
 // strictly greater than max_log_id, so they replay normally even when they land on the same lsn the rollback
 // invalidated. Handles sparse / out-of-order non-append-mode writes without needing multiple logid sub-ranges.
 struct rollback_record {
-    lsn_t   above_lsn{0};
+    lsn_t above_lsn{0};
     logid_t max_log_id{0};
 };
 
@@ -129,10 +129,10 @@ public:
 
     // ── Factories (called by LogStoreManager) ────────────────────────────────
 
-    static folly::coro::Task< shared< LogStore > > create(logstore_id_t sid, shared< MetaClient > meta_client,
-                                                          shared< LogStream > stream, bool append_mode);
+    static Async< shared< LogStore > > create(logstore_id_t sid, shared< MetaClient > meta_client,
+                                              shared< LogStream > stream, bool append_mode);
 
-    static folly::coro::Task< shared< LogStore > > load(shared< LogStream > stream, MetaBlkWrapper&& mb);
+    static Async< shared< LogStore > > load(shared< LogStream > stream, MetaBlkWrapper&& mb);
 
     // ── Open / state ─────────────────────────────────────────────────────────
 
@@ -151,7 +151,7 @@ public:
     lsn_t quick_append(const LogBlob& data);
 
     /// quick_append + co_await flush_upto(lsn).
-    folly::coro::Task< lsn_t > append_and_flush(const LogBlob& data);
+    Async< lsn_t > append_and_flush(const LogBlob& data);
 
     // ── Non-append-mode API (asserts !append_mode_) ──────────────────────────
 
@@ -159,7 +159,7 @@ public:
     void quick_write(lsn_t lsn, const LogBlob& data);
 
     /// quick_write + co_await flush_upto(lsn).
-    folly::coro::Task< void > write_and_flush(lsn_t lsn, const LogBlob& data);
+    Async< void > write_and_flush(lsn_t lsn, const LogBlob& data);
 
     /// Insert an empty record at lsn (used to plug holes in non-append mode so truncate can advance over them).
     void fill_gap(lsn_t lsn);
@@ -169,21 +169,21 @@ public:
     /// Read the data bytes for `lsn`.  Internally awaits flush_upto(lsn) so records_ is populated, then resolves
     /// the dev_key and reads via the underlying LogStream.  Returns an empty IoBufView if lsn is outside
     /// [head_lsn, next_lsn).
-    folly::coro::Task< sisl::IoBufView > read(lsn_t lsn);
+    Async< sisl::IoBufView > read(lsn_t lsn);
 
     /// Drains pending records (via stream_->flush()) until tail_lsn_ >= upto_lsn or bounded retry exhausted.
-    folly::coro::Task< void > flush();
+    Async< void > flush();
 
     /// Advance head_lsn to upto_lsn+1.  Evicts records [<= upto_lsn] from records_, captures the trunc_key for
     /// the manager's cross-store min aggregation, persists the new sb.  in_memory_only=true skips the manager
     /// notification (used when the manager itself is driving truncate).
-    folly::coro::Task< void > truncate(lsn_t upto_lsn, bool in_memory_only = false);
+    Async< void > truncate(lsn_t upto_lsn, bool in_memory_only = false);
 
     /// Drains in-flight via stream_->flush(), then under stream_->flush_lock(): captures the lsn-tail boundary
     /// (above_lsn=to_lsn) and the max log_id at the time of rollback, appends to rollback_records_, rolls
     /// records_ back, rewinds tail_lsn_, persists sb.  Returns false if to_lsn out of range.  Works for sparse
     /// non-append-mode stores — no requirement that to_lsn+1 be an active slot.
-    folly::coro::Task< bool > rollback(lsn_t to_lsn);
+    Async< bool > rollback(lsn_t to_lsn);
 
     // ── Callbacks from LogStream ─────────────────────────────────────────────
 
@@ -215,8 +215,8 @@ public:
     /// MetaClient::remove_meta_blk.  Not for general use.
     const MetaBlk& sb_blk() const { return meta_blk_.meta_blk(); }
 
-    LogStore(shared< LogStream > stream, MetaBlkWrapper&& mb, logstore_id_t sid, bool is_append_mode,
-             lsn_t head_lsn, std::vector< rollback_record > rollback_records);
+    LogStore(shared< LogStream > stream, MetaBlkWrapper&& mb, logstore_id_t sid, bool is_append_mode, lsn_t head_lsn,
+             std::vector< rollback_record > rollback_records);
 
 private:
     /// True if (lsn, log_id) was invalidated by any persisted rollback — i.e. lsn lies above some rollback's
@@ -225,7 +225,7 @@ private:
     bool in_rollback_range(lsn_t lsn, logid_t log_id) const;
 
     /// Serialise current state into the sb mblk.  Caller holds stream_->flush_lock().
-    folly::coro::Task< void > persist_sb();
+    Async< void > persist_sb();
 
     logstore_id_t store_id_{0};
     shared< LogStream > stream_;
@@ -243,7 +243,6 @@ private:
     // Mutated only by rollback() under stream_->flush_lock(); read by on_log_found during single-threaded
     // recovery (which runs before any rollback can fire).  No additional synchronisation needed.
     std::vector< rollback_record > rollback_records_;
-
 };
 
 } // namespace homestore

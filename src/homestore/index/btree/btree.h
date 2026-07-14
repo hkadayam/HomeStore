@@ -16,6 +16,7 @@
 #pragma once
 
 #include <atomic>
+#include "common/async.h"
 #include <array>
 
 #include "homestore/index/btree/btree_base.h"

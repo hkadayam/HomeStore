@@ -14,7 +14,7 @@
 #pragma once
 
 #include <gtest/gtest.h>
-#include <folly/coro/Task.h>
+#include "common/async.h"
 #include "iomanager/iomanager.h"
 
 // gtest's ASSERT_* macros use `return;` which is a compile error inside coroutines.
@@ -22,30 +22,33 @@
 #define CO_ASSERT_TRUE(cond)                                                                                           \
     do {                                                                                                               \
         EXPECT_TRUE(cond);                                                                                             \
-        if (!(cond)) co_return;                                                                                        \
+        if (!(cond))                                                                                                   \
+            co_return;                                                                                                 \
     } while (0)
 #define CO_ASSERT_FALSE(cond)                                                                                          \
     do {                                                                                                               \
         EXPECT_FALSE(cond);                                                                                            \
-        if ((cond)) co_return;                                                                                         \
+        if ((cond))                                                                                                    \
+            co_return;                                                                                                 \
     } while (0)
 #define CO_ASSERT_EQ(a, b)                                                                                             \
     do {                                                                                                               \
         EXPECT_EQ(a, b);                                                                                               \
-        if ((a) != (b)) co_return;                                                                                     \
+        if ((a) != (b))                                                                                                \
+            co_return;                                                                                                 \
     } while (0)
 #define CO_ASSERT_NE(a, b)                                                                                             \
     do {                                                                                                               \
         EXPECT_NE(a, b);                                                                                               \
-        if ((a) == (b)) co_return;                                                                                     \
+        if ((a) == (b))                                                                                                \
+            co_return;                                                                                                 \
     } while (0)
 
 // Wraps a coroutine body in spawn_and_block so gtest can run it as a regular TEST_F.
 #define CORO_TEST_F(fixture, name)                                                                                     \
-    folly::coro::Task< void > fixture##_##name##_coro(fixture& self);                                                  \
+    Async< void > fixture##_##name##_coro(fixture& self);                                                              \
     TEST_F(fixture, name) {                                                                                            \
-        iomgr().spawn_and_block(                                                                                       \
-            iomanager::ReactorTarget::any(),                                                                           \
-            [this]() -> folly::coro::Task< void > { co_await fixture##_##name##_coro(*this); }());                     \
+        iomgr().spawn_and_block(iomanager::ReactorTarget::any(),                                                       \
+                                [this]() -> Async< void > { co_await fixture##_##name##_coro(*this); }());             \
     }                                                                                                                  \
-    folly::coro::Task< void > fixture##_##name##_coro([[maybe_unused]] fixture& self)
+    Async< void > fixture##_##name##_coro([[maybe_unused]] fixture& self)

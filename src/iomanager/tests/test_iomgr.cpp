@@ -1,4 +1,5 @@
 #include <atomic>
+#include "common/async.h"
 #include <chrono>
 #include <numeric>
 #include <vector>
@@ -14,10 +15,10 @@ using namespace iomanager;
 using namespace std::chrono_literals;
 
 SISL_OPTION_GROUP(test_iomgr,
-    (num_reactors, "", "num_reactors", "number of reactor threads",
-     ::cxxopts::value<uint32_t>()->default_value("4"), "number"),
-    (num_iters, "", "num_iters", "iterations for timer/msg tests",
-     ::cxxopts::value<uint32_t>()->default_value("5"), "number"))
+                  (num_reactors, "", "num_reactors", "number of reactor threads",
+                   ::cxxopts::value< uint32_t >()->default_value("4"), "number"),
+                  (num_iters, "", "num_iters", "iterations for timer/msg tests",
+                   ::cxxopts::value< uint32_t >()->default_value("5"), "number"))
 
 static uint32_t g_num_reactors{4};
 static uint32_t g_num_iters{5};
@@ -34,25 +35,21 @@ TEST_F(IOMgrTest, NumReactors) {
 TEST_F(IOMgrTest, SpawnAndBlockRunsOnCorrectReactor) {
     for (size_t i = 0; i < iomgr().num_reactors(); ++i) {
         size_t observed = iomgr().spawn_and_block(
-            ReactorTarget::reactor(i),
-            [i]() -> folly::coro::Task<size_t> {
-                co_return iomgr().current_reactor_id();
-            }());
+            ReactorTarget::reactor(i), [i]() -> Async< size_t > { co_return iomgr().current_reactor_id(); }());
         EXPECT_EQ(observed, i) << "reactor " << i << " reported wrong id";
     }
 }
 
 TEST_F(IOMgrTest, CurrentReactorIdIsMaxOnNonReactorThread) {
-    EXPECT_EQ(iomgr().current_reactor_id(), std::numeric_limits<size_t>::max());
+    EXPECT_EQ(iomgr().current_reactor_id(), std::numeric_limits< size_t >::max());
 }
 
 TEST_F(IOMgrTest, SpawnDetachedFiresAndForgets) {
     folly::Baton<> done;
-    iomgr().spawn_detached(ReactorTarget::any(),
-        [&done]() -> folly::coro::Task<void> {
-            done.post();
-            co_return;
-        });
+    iomgr().spawn_detached(ReactorTarget::any(), [&done]() -> Async< void > {
+        done.post();
+        co_return;
+    });
     done.wait();
 }
 
@@ -65,10 +62,9 @@ TEST_F(IOMgrTest, SingleShotSleepAccuracy) {
     // Sleep 50 ms on each reactor and verify elapsed time is in range.
     for (size_t i = 0; i < iomgr().num_reactors(); ++i) {
         auto start = std::chrono::steady_clock::now();
-        iomgr().spawn_and_block(ReactorTarget::reactor(i),
-                                iomgr().sleep(50ms));
+        iomgr().spawn_and_block(ReactorTarget::reactor(i), iomgr().sleep(50ms));
         auto elapsed = std::chrono::steady_clock::now() - start;
-        EXPECT_GE(elapsed, 40ms)  << "sleep fired too early on reactor " << i;
+        EXPECT_GE(elapsed, 40ms) << "sleep fired too early on reactor " << i;
         EXPECT_LT(elapsed, 500ms) << "sleep took too long on reactor " << i;
     }
 }
@@ -79,17 +75,15 @@ TEST_F(IOMgrTest, SingleShotSleepAccuracy) {
 TEST_F(IOMgrTest, RecurringTimerRunsNTimesOnEachReactor) {
     // Each reactor runs a sleep loop g_num_iters times.
     // We collect the per-reactor counts and verify they all hit g_num_iters.
-    auto counts = iomgr().spawn_and_block(
-        ReactorTarget::reactor(0),
-        iomgr().spawn_waitable_all(
-            [](size_t /*reactor_id*/) -> folly::coro::Task<uint32_t> {
-                uint32_t count = 0;
-                for (uint32_t i = 0; i < g_num_iters; ++i) {
-                    co_await iomgr().sleep(5ms);
-                    ++count;
-                }
-                co_return count;
-            }));
+    auto counts = iomgr().spawn_and_block(ReactorTarget::reactor(0),
+                                          iomgr().spawn_waitable_all([](size_t /*reactor_id*/) -> Async< uint32_t > {
+                                              uint32_t count = 0;
+                                              for (uint32_t i = 0; i < g_num_iters; ++i) {
+                                                  co_await iomgr().sleep(5ms);
+                                                  ++count;
+                                              }
+                                              co_return count;
+                                          }));
 
     ASSERT_EQ(counts.size(), iomgr().num_reactors());
     for (size_t i = 0; i < counts.size(); ++i) {
@@ -101,18 +95,17 @@ TEST_F(IOMgrTest, RecurringTimerRunsNTimesOnEachReactor) {
 // New: atomic stop flag checked inside the coroutine loop — no handle needed.
 
 TEST_F(IOMgrTest, CancellableRecurringTimer) {
-    std::atomic<bool> stop{false};
-    std::atomic<uint32_t> fire_count{0};
+    std::atomic< bool > stop{false};
+    std::atomic< uint32_t > fire_count{0};
     folly::Baton<> done;
 
-    iomgr().spawn_detached(ReactorTarget::reactor(0),
-        [&stop, &fire_count, &done]() -> folly::coro::Task<void> {
-            while (!stop.load(std::memory_order_acquire)) {
-                co_await iomgr().sleep(10ms);
-                ++fire_count;
-            }
-            done.post();
-        });
+    iomgr().spawn_detached(ReactorTarget::reactor(0), [&stop, &fire_count, &done]() -> Async< void > {
+        while (!stop.load(std::memory_order_acquire)) {
+            co_await iomgr().sleep(10ms);
+            ++fire_count;
+        }
+        done.post();
+    });
 
     // Let a few ticks fire, then cancel.
     std::this_thread::sleep_for(55ms);
@@ -134,25 +127,23 @@ TEST_F(IOMgrTest, CancellableRecurringTimer) {
 // completes, so b_ran would still be 0 when A checks it.
 
 TEST_F(IOMgrTest, YieldAllowsOtherTaskToRun) {
-    std::atomic<int> b_ran{0};
+    std::atomic< int > b_ran{0};
     folly::Baton<> done;
 
     // Task A: yield 10 times, then check that B already ran.
-    iomgr().spawn_detached(ReactorTarget::reactor(0),
-        [&b_ran, &done]() -> folly::coro::Task<void> {
-            for (int i = 0; i < 10; ++i) {
-                co_await iomgr().yield_now();
-            }
-            EXPECT_GT(b_ran.load(), 0) << "B never ran during A's yields";
-            done.post();
-        });
+    iomgr().spawn_detached(ReactorTarget::reactor(0), [&b_ran, &done]() -> Async< void > {
+        for (int i = 0; i < 10; ++i) {
+            co_await iomgr().yield_now();
+        }
+        EXPECT_GT(b_ran.load(), 0) << "B never ran during A's yields";
+        done.post();
+    });
 
     // Task B: increment counter and return immediately.
-    iomgr().spawn_detached(ReactorTarget::reactor(0),
-        [&b_ran]() -> folly::coro::Task<void> {
-            b_ran.fetch_add(1);
-            co_return;
-        });
+    iomgr().spawn_detached(ReactorTarget::reactor(0), [&b_ran]() -> Async< void > {
+        b_ran.fetch_add(1);
+        co_return;
+    });
 
     done.wait();
 }
@@ -163,16 +154,14 @@ TEST_F(IOMgrTest, YieldAllowsOtherTaskToRun) {
 // New: spawn_and_block(reactor(0), spawn_waitable_all(fn))
 
 TEST_F(IOMgrTest, SyncBroadcastToAllReactors) {
-    std::atomic<uint32_t> rcvd{0};
+    std::atomic< uint32_t > rcvd{0};
 
     // Sequentially visits every reactor and increments the counter.
-    iomgr().spawn_and_block(
-        ReactorTarget::reactor(0),
-        iomgr().spawn_waitable_all(
-            [&rcvd](size_t /*reactor_id*/) -> folly::coro::Task<void> {
-                rcvd.fetch_add(1, std::memory_order_relaxed);
-                co_return;
-            }));
+    iomgr().spawn_and_block(ReactorTarget::reactor(0),
+                            iomgr().spawn_waitable_all([&rcvd](size_t /*reactor_id*/) -> Async< void > {
+                                rcvd.fetch_add(1, std::memory_order_relaxed);
+                                co_return;
+                            }));
 
     EXPECT_EQ(rcvd.load(), iomgr().num_reactors());
 }
@@ -182,17 +171,16 @@ TEST_F(IOMgrTest, SyncBroadcastToAllReactors) {
 
 TEST_F(IOMgrTest, AsyncBroadcastToAllReactors) {
     const size_t N = iomgr().num_reactors();
-    std::atomic<size_t> rcvd{0};
+    std::atomic< size_t > rcvd{0};
     folly::Baton<> all_done;
 
     for (size_t i = 0; i < N; ++i) {
-        iomgr().spawn_detached(ReactorTarget::reactor(i),
-            [&rcvd, &all_done, N]() -> folly::coro::Task<void> {
-                if (rcvd.fetch_add(1, std::memory_order_acq_rel) + 1 == N) {
-                    all_done.post();
-                }
-                co_return;
-            });
+        iomgr().spawn_detached(ReactorTarget::reactor(i), [&rcvd, &all_done, N]() -> Async< void > {
+            if (rcvd.fetch_add(1, std::memory_order_acq_rel) + 1 == N) {
+                all_done.post();
+            }
+            co_return;
+        });
     }
 
     all_done.wait();
@@ -203,17 +191,17 @@ TEST_F(IOMgrTest, AsyncBroadcastToAllReactors) {
 // New: each "client" calls spawn_and_block; the reactor-side task increments rcvd.
 
 TEST_F(IOMgrTest, SyncUnicastFromMultipleCallers) {
-    std::atomic<uint64_t> sent{0};
-    std::atomic<uint64_t> rcvd{0};
+    std::atomic< uint64_t > sent{0};
+    std::atomic< uint64_t > rcvd{0};
 
-    auto sink_task = [&rcvd]() -> folly::coro::Task<void> {
+    auto sink_task = [&rcvd]() -> Async< void > {
         rcvd.fetch_add(1, std::memory_order_relaxed);
         co_return;
     };
 
     const uint32_t nclients = 4;
-    const uint32_t iters    = g_num_iters;
-    std::vector<std::thread> clients;
+    const uint32_t iters = g_num_iters;
+    std::vector< std::thread > clients;
     clients.reserve(nclients);
 
     for (uint32_t c = 0; c < nclients; ++c) {
@@ -227,7 +215,8 @@ TEST_F(IOMgrTest, SyncUnicastFromMultipleCallers) {
         });
     }
 
-    for (auto& t : clients) t.join();
+    for (auto& t : clients)
+        t.join();
     EXPECT_EQ(sent.load(), rcvd.load());
 }
 
@@ -236,24 +225,21 @@ TEST_F(IOMgrTest, SyncUnicastFromMultipleCallers) {
 
 TEST_F(IOMgrTest, AsyncRelayBroadcast) {
     const size_t N = iomgr().num_reactors();
-    std::atomic<size_t> rcvd{0};
+    std::atomic< size_t > rcvd{0};
     folly::Baton<> all_done;
 
-    iomgr().spawn_and_block(
-        ReactorTarget::any(),
-        [N, &rcvd, &all_done]() -> folly::coro::Task<void> {
-            // From inside a reactor coroutine, fan-out to all reactors.
-            for (size_t i = 0; i < N; ++i) {
-                iomgr().spawn_detached(ReactorTarget::reactor(i),
-                    [&rcvd, &all_done, N]() -> folly::coro::Task<void> {
-                        if (rcvd.fetch_add(1, std::memory_order_acq_rel) + 1 == N) {
-                            all_done.post();
-                        }
-                        co_return;
-                    });
-            }
-            co_return;
-        }());
+    iomgr().spawn_and_block(ReactorTarget::any(), [N, &rcvd, &all_done]() -> Async< void > {
+        // From inside a reactor coroutine, fan-out to all reactors.
+        for (size_t i = 0; i < N; ++i) {
+            iomgr().spawn_detached(ReactorTarget::reactor(i), [&rcvd, &all_done, N]() -> Async< void > {
+                if (rcvd.fetch_add(1, std::memory_order_acq_rel) + 1 == N) {
+                    all_done.post();
+                }
+                co_return;
+            });
+        }
+        co_return;
+    }());
 
     all_done.wait();
     EXPECT_EQ(rcvd.load(), N);
@@ -264,10 +250,7 @@ TEST_F(IOMgrTest, AsyncRelayBroadcast) {
 TEST_F(IOMgrTest, SpawnWaitableAllVisitsEveryReactor) {
     auto results = iomgr().spawn_and_block(
         ReactorTarget::reactor(0),
-        iomgr().spawn_waitable_all(
-            [](size_t /*i*/) -> folly::coro::Task<size_t> {
-                co_return iomgr().current_reactor_id();
-            }));
+        iomgr().spawn_waitable_all([](size_t /*i*/) -> Async< size_t > { co_return iomgr().current_reactor_id(); }));
 
     ASSERT_EQ(results.size(), iomgr().num_reactors());
     for (size_t i = 0; i < results.size(); ++i) {
@@ -277,8 +260,8 @@ TEST_F(IOMgrTest, SpawnWaitableAllVisitsEveryReactor) {
 
 int main(int argc, char* argv[]) {
     SISL_OPTIONS_LOAD(argc, argv);
-    g_num_reactors = SISL_OPTIONS["num_reactors"].as<uint32_t>();
-    g_num_iters    = SISL_OPTIONS["num_iters"].as<uint32_t>();
+    g_num_reactors = SISL_OPTIONS["num_reactors"].as< uint32_t >();
+    g_num_iters = SISL_OPTIONS["num_iters"].as< uint32_t >();
     sisl::logging::SetLogger("test_iomgr");
     ::testing::InitGoogleTest(&argc, argv);
     init_iomgr(g_num_reactors);

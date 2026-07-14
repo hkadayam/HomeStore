@@ -22,7 +22,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <folly/coro/Task.h>
+#include "common/async.h"
 #include "sisl/fds/bitset.h"
 
 #include "homestore/device/device_decl.h"  // HSDevType, IOFlag, DevInfo
@@ -62,12 +62,12 @@ struct DeviceManagerState {
 // Async methods that perform I/O are folly coroutines (Task<>).
 class DeviceManager : public std::enable_shared_from_this< DeviceManager > {
 public:
-    static shared< DeviceManager > create(std::vector< DevInfo >&& devs, IOFlag data_open_flags, IOFlag fast_open_flags);
+    static shared< DeviceManager > create(std::vector< DevInfo >&& devs, IOFlag data_open_flags,
+                                          IOFlag fast_open_flags);
 
     /// Convenience: create + format_devices + commit_formatting in one call.
-    static folly::coro::Task< shared< DeviceManager > > create_and_format(std::vector< DevInfo >&& devs,
-                                                                          IOFlag data_open_flags,
-                                                                          IOFlag fast_open_flags);
+    static Async< shared< DeviceManager > > create_and_format(std::vector< DevInfo >&& devs, IOFlag data_open_flags,
+                                                              IOFlag fast_open_flags);
 
     ~DeviceManager() = default;
     DeviceManager(const DeviceManager&) = delete;
@@ -78,16 +78,16 @@ public:
     bool is_boot_in_degraded_mode() const;
 
     // ── Device lifecycle ──────────────────────────────────────────────────────
-    folly::coro::Task< void > format_devices();
-    folly::coro::Task< void > commit_formatting();
-    folly::coro::Task< void > load_devices();
-    folly::coro::Task< void > close_devices();
+    Async< void > format_devices();
+    Async< void > commit_formatting();
+    Async< void > load_devices();
+    Async< void > close_devices();
 
     // ── VirtualDev management ─────────────────────────────────────────────────
-    folly::coro::Task< shared< VirtualDev > > create_vdev(VDevParameters&& params);
+    Async< shared< VirtualDev > > create_vdev(VDevParameters&& params);
 
     /// Destroys the vdev on disk, removes it from the registry, frees its slot, and persists the bitmap.
-    folly::coro::Task< void > destroy_vdev(cshared< VirtualDev >& vdev);
+    Async< void > destroy_vdev(cshared< VirtualDev >& vdev);
 
     // ── PhysicalDev accessors (thread-safe, lock-protected) ───────────────────
     shared< PhysicalDev > get_pdev(uint32_t pdev_id) const;
@@ -113,11 +113,11 @@ private:
     DeviceManager(std::vector< DevInfo >&& devs, IOFlag data_open_flags, IOFlag fast_open_flags);
 
     // ── Private async helpers ─────────────────────────────────────────────────
-    folly::coro::Task< void > load_vdevs();
-    folly::coro::Task< void > cleanup_stale_slot_vdevs(const std::vector< uint32_t >& stale_slot_ids);
-    folly::coro::Task< void > write_vdev_slot_bitmap();
+    Async< void > load_vdevs();
+    Async< void > cleanup_stale_slot_vdevs(const std::vector< uint32_t >& stale_slot_ids);
+    Async< void > write_vdev_slot_bitmap();
 
-    static folly::coro::Task< VDevInfo > read_vdev_info(cshared< PhysicalDev >& pdev, uint32_t vdev_id);
+    static Async< VDevInfo > read_vdev_info(cshared< PhysicalDev >& pdev, uint32_t vdev_id);
 
     /// Returns (start_slot, end_slot) pairs of consecutive set-bit runs in bm.
     static std::vector< std::pair< uint32_t, uint32_t > > find_consecutive_ranges(const sisl::Bitset& bm);

@@ -23,7 +23,7 @@
 #include <string_view>
 #include <type_traits>
 
-#include <folly/coro/Task.h>
+#include "common/async.h"
 #include <nlohmann/json.hpp>
 #include "sisl/fds/buffer.h"
 
@@ -84,7 +84,7 @@ public:
     ///   written until write() is called.
     /// - On recovery (existing data found): the recovered IoBufShared is used directly; the T it contains is accessible
     ///   immediately.
-    static folly::coro::Task< ModuleMetaBlk< T > > open(std::string name, std::optional< size_t > size = std::nullopt) {
+    static Async< ModuleMetaBlk< T > > open(std::string name, std::optional< size_t > size = std::nullopt) {
         if (name.empty()) {
             name = "meta_blk_" + std::to_string(g_module_counter.fetch_add(1, std::memory_order_relaxed));
         }
@@ -119,13 +119,13 @@ public:
     // ── Persistence ───────────────────────────────────────────────────────────
 
     /// Persist the current contents of T to disk.
-    folly::coro::Task< void > write() {
+    Async< void > write() {
         co_await client_.write_meta_blk(meta_blk_, buffer_);
         is_persisted_ = true;
     }
 
     /// Remove this module's metadata from disk. After destroy() the object must not be used for further writes.
-    folly::coro::Task< void > destroy() {
+    Async< void > destroy() {
         if (is_persisted_) {
             co_await client_.remove_meta_blk(meta_blk_);
             is_persisted_ = false;
@@ -164,13 +164,12 @@ private:
 
 private:
     // ── Private factory helpers ───────────────────────────────────────────────
-    static folly::coro::Task< ModuleMetaBlk< T > > load_existing(MetaClient client, std::string name,
-                                                                 size_t /*buf_sz*/) {
+    static Async< ModuleMetaBlk< T > > load_existing(MetaClient client, std::string name, size_t /*buf_sz*/) {
         ModuleMetaBlk< T > m;
         bool found = false;
 
         co_await client.for_each_recovered_block(
-            [&m, &found](const MetaBlk& blk, const sisl::IoBufView& data) -> folly::coro::Task< void > {
+            [&m, &found](const MetaBlk& blk, const sisl::IoBufView& data) -> Async< void > {
                 if (!found) {
                     if (data.size() < sizeof(T)) {
                         throw std::runtime_error{"ModuleMetaBlk::load_existing: recovered data too small"};
@@ -192,7 +191,7 @@ private:
         co_return m;
     }
 
-    static folly::coro::Task< ModuleMetaBlk< T > > create_new(MetaClient client, std::string name, size_t buf_sz) {
+    static Async< ModuleMetaBlk< T > > create_new(MetaClient client, std::string name, size_t buf_sz) {
         ModuleMetaBlk< T > m;
         m.buffer_ = sisl::make_io_buf_shared(to_u32(buf_sz));
 
@@ -234,7 +233,7 @@ public:
     /// - On first call (no existing data): json document is empty; the block is allocated but NOT written until write()
     ///   is called.
     /// - On recovery: the on-disk msgpack payload is deserialised into the json document.
-    static folly::coro::Task< JsonMetaBlk > open(std::string name) {
+    static Async< JsonMetaBlk > open(std::string name) {
         if (name.empty()) {
             name = "meta_blk_" + std::to_string(g_module_counter.fetch_add(1, std::memory_order_relaxed));
         }
@@ -260,7 +259,7 @@ public:
     // ── Persistence ───────────────────────────────────────────────────────────
 
     /// Serialise the current json document to msgpack and persist it.
-    folly::coro::Task< void > write() {
+    Async< void > write() {
         const auto packed = nlohmann::json::to_msgpack(json_);
         const auto sz = packed.size();
         sisl::IoBufShared buf = sisl::make_io_buf_shared(to_u32(sz));
@@ -270,7 +269,7 @@ public:
     }
 
     /// Remove this module's metadata from disk. After destroy() the object must not be used for further writes.
-    folly::coro::Task< void > destroy() {
+    Async< void > destroy() {
         if (is_persisted_) {
             co_await client_.remove_meta_blk(meta_blk_);
             is_persisted_ = false;
@@ -296,12 +295,12 @@ private:
     std::string name_;
     bool is_persisted_{false};
 
-    static folly::coro::Task< JsonMetaBlk > load_existing(MetaClient client, std::string name) {
+    static Async< JsonMetaBlk > load_existing(MetaClient client, std::string name) {
         JsonMetaBlk m;
         bool found = false;
 
         co_await client.for_each_recovered_block(
-            [&m, &found](const MetaBlk& blk, const sisl::IoBufView& data) -> folly::coro::Task< void > {
+            [&m, &found](const MetaBlk& blk, const sisl::IoBufView& data) -> Async< void > {
                 if (!found) {
                     try {
                         std::string_view const sv{c_charptr_cast(data.bytes()), data.size()};
@@ -326,7 +325,7 @@ private:
         co_return m;
     }
 
-    static folly::coro::Task< JsonMetaBlk > create_new(MetaClient client, std::string name) {
+    static Async< JsonMetaBlk > create_new(MetaClient client, std::string name) {
         JsonMetaBlk m;
         m.json_ = nlohmann::json{};
         m.meta_blk_ = co_await client.create_meta_blk(name, std::nullopt);

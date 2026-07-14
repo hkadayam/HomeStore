@@ -5,7 +5,7 @@
 #include <climits>
 #include <stdexcept>
 
-#include <folly/coro/Sleep.h>
+#include "common/async.h"
 #include <folly/init/Init.h>
 #include <folly/io/async/EventBaseManager.h>
 
@@ -132,11 +132,11 @@ folly::EventBase* IOManager::resolve_target(ReactorTarget target) const {
 // Non-template dispatch methods
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > IOManager::yield_now() {
+Async< void > IOManager::yield_now() {
     co_await folly::coro::co_reschedule_on_current_executor;
 }
 
-folly::coro::Task< void > IOManager::sleep(std::chrono::milliseconds dur) {
+Async< void > IOManager::sleep(std::chrono::milliseconds dur) {
     co_await folly::coro::sleep(dur);
 }
 

@@ -23,12 +23,11 @@
 #include <unordered_map>
 #include <vector>
 
-#include <folly/coro/Mutex.h>
-#include <folly/coro/Task.h>
+#include "common/async.h"
 
-#include "homestore/base/blk.h"               // BlkId, BlkAllocStatus, blk_count_t, blk_alloc_hints
+#include "homestore/base/blk.h"            // BlkId, BlkAllocStatus, blk_count_t, blk_alloc_hints
 #include "homestore/base/homestore_decl.h" // shared<>, unique<>
-#include "homestore/blob/stream_base.h"              // StreamBase, CPSessionBase, cp_id_t, CPManager::max_concurent_cps
+#include "homestore/blob/stream_base.h"    // StreamBase, CPSessionBase, cp_id_t, CPManager::max_concurent_cps
 
 namespace homestore {
 
@@ -45,8 +44,8 @@ class VirtualDev;
 // blocks.  After finalize() the WriteUnit is read-only.
 // ─────────────────────────────────────────────────────────────────────────────
 struct WriteUnit {
-    BlkId alloc_blkid;            // full pre-allocated range
-    uint32_t used_nblks{0};       // blocks actually written
+    BlkId alloc_blkid;                     // full pre-allocated range
+    uint32_t used_nblks{0};                // blocks actually written
     std::vector< sisl::IoBufShared > bufs; // pending buffers in write order (shared ownership)
 
     explicit WriteUnit(BlkId bid) : alloc_blkid{bid} {}
@@ -99,16 +98,14 @@ class AppendBlkStream : public StreamBase {
 public:
     // ── Factories ─────────────────────────────────────────────────────────────
 
-    static folly::coro::Task< shared< AppendBlkStream > > create(uint64_t stream_id, MetaClient& meta_client,
-                                                                 const std::string& dev_name,
-                                                                 const shared< VirtualDev >& vdev, uint64_t chunk_size,
-                                                                 uint32_t blk_size = 0);
+    static Async< shared< AppendBlkStream > > create(uint64_t stream_id, MetaClient& meta_client,
+                                                     const std::string& dev_name, const shared< VirtualDev >& vdev,
+                                                     uint64_t chunk_size, uint32_t blk_size = 0);
 
     using ChunkMblkMap = std::unordered_map< uint32_t, std::pair< MetaBlk, sisl::IoBufView > >;
-    static folly::coro::Task< shared< AppendBlkStream > > load(uint64_t stream_id, MetaClient& meta_client,
-                                                               const std::string& dev_name,
-                                                               const shared< VirtualDev >& vdev, uint32_t blk_size,
-                                                               ChunkMblkMap&& mblks);
+    static Async< shared< AppendBlkStream > > load(uint64_t stream_id, MetaClient& meta_client,
+                                                   const std::string& dev_name, const shared< VirtualDev >& vdev,
+                                                   uint32_t blk_size, ChunkMblkMap&& mblks);
 
     AppendBlkStream(const AppendBlkStream&) = delete;
     AppendBlkStream& operator=(const AppendBlkStream&) = delete;
@@ -125,16 +122,16 @@ public:
 
     /// Async append: allocates a new WriteUnit (possibly expanding the stream), installs it, and appends buf.
     /// No disk I/O — caller must call flush() separately to write filled WriteUnits to disk.
-    folly::coro::Task< BlkId > append(CP* cp, uint16_t segment_id, sisl::IoBufShared&& buf);
+    Async< BlkId > append(CP* cp, uint16_t segment_id, sisl::IoBufShared&& buf);
 
     /// Grab all filled WriteUnits and write them to disk (writev + commit + free excess).
     /// Caller can fire on an executor and collectAll later to overlap I/O with CPU work.
-    folly::coro::Task< void > flush(CP* cp);
+    Async< void > flush(CP* cp);
 
     /// Invalidate (free) a previously-appended block.  Marks owning chunk dirty.
     void invalidate(CP* cp, const BlkId& bid);
 
-    folly::coro::Task< std::error_code > read(sisl::IoBuf& buf, const BlkId& bid);
+    Async< std::error_code > read(sisl::IoBuf& buf, const BlkId& bid);
 
     // ── CP hooks ──────────────────────────────────────────────────────────────
 
@@ -142,7 +139,7 @@ public:
     void on_cp_switchover(CP* cur_cp, CP* new_cp);
 
     /// Finalize all remaining WriteUnits for this CP, issue writev, write dirty bitmaps.
-    folly::coro::Task< bool > cp_flush(CP* cp);
+    Async< bool > cp_flush(CP* cp);
 
     /// Returns true if any chunks were dirtied during the given CP epoch.
     bool is_dirty(cp_id_t cp_id) { return cp_session(cp_id).has_dirty_chunks(); }
@@ -163,15 +160,15 @@ private:
     std::vector< unique< WriteUnit > > grab_write_units(CPSession& session);
 
     /// Flush a batch of WriteUnits to disk: writev used portions, commit used blocks, free excess.
-    folly::coro::Task< void > flush_write_units(const std::vector< unique< WriteUnit > >& units);
+    Async< void > flush_write_units(const std::vector< unique< WriteUnit > >& units);
 
     /// Try to alloc nblks; expand by one chunk and retry once on failure.
-    folly::coro::Task< BlkId > alloc_or_expand(blk_count_t nblks, const blk_alloc_hints& hints);
+    Async< BlkId > alloc_or_expand(blk_count_t nblks, const blk_alloc_hints& hints);
 
     CPSession& cp_session(cp_id_t cp_id) { return cp_session_[cp_id % CPManager::max_concurent_cps]; }
 
 private:
-    std::mutex mu_;                // protects do_append / grab_write_units (session mutation)
+    std::mutex mu_;               // protects do_append / grab_write_units (session mutation)
     folly::coro::Mutex flush_mu_; // serialises async path (flush + alloc + append) and cp_flush
     CPSession cp_session_[CPManager::max_concurent_cps];
 

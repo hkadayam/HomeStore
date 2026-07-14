@@ -19,6 +19,7 @@
 // No restart/recovery here — that goes in a separate test once recovery is wired up.
 //
 #include <filesystem>
+#include "common/async.h"
 #include <fstream>
 #include <random>
 #include <map>
@@ -130,7 +131,7 @@ static std::vector< DevInfo > make_dev_infos() {
     return infos;
 }
 
-static folly::coro::Task< shared< BlobDev > > bootstrap_stack() {
+static Async< shared< BlobDev > > bootstrap_stack() {
     auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
     co_await MetaBlkManager::create(META_VDEV_SIZE);
 
@@ -152,7 +153,7 @@ static folly::coro::Task< shared< BlobDev > > bootstrap_stack() {
     co_return co_await blob_dev_mgr().create_blob_dev("cow_io_bd"s, std::move(params));
 }
 
-static folly::coro::Task< void > shutdown_stack() {
+static Async< void > shutdown_stack() {
     co_await cp_mgr().shutdown();
     blob_dev_mgr().shutdown();
     cow_btree_mgr().shutdown();
@@ -213,13 +214,12 @@ struct BtreeTest : public BtreeTestHelper< TestType >, public ::testing::Test {
 };
 
 // TODO Enable PrefixIntervalBtreeTest later once the variant-node port lands.
-using BtreeTypes =
-    testing::Types< FixedLenBtreeTest, VarKeySizeBtreeTest, VarValueSizeBtreeTest, VarObjSizeBtreeTest >;
+using BtreeTypes = testing::Types< FixedLenBtreeTest, VarKeySizeBtreeTest, VarValueSizeBtreeTest, VarObjSizeBtreeTest >;
 TYPED_TEST_SUITE(BtreeTest, BtreeTypes);
 
 TYPED_TEST(BtreeTest, SequentialInsert) {
     auto* self = this;
-    iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [self]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [self]() -> Async< void > {
         const auto num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
         const auto entries_iter1 = num_entries / 2;
         LOGINFO("Step 1: forward sequential insert for {} entries", entries_iter1);
@@ -256,7 +256,7 @@ TYPED_TEST(BtreeTest, SequentialInsert) {
 
 TYPED_TEST(BtreeTest, SequentialRemove) {
     auto* self = this;
-    iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [self]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [self]() -> Async< void > {
         const auto num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
         LOGINFO("Step 1: forward sequential insert for {} entries", num_entries);
         for (uint32_t i = 0; i < num_entries; ++i) {
@@ -289,7 +289,7 @@ TYPED_TEST(BtreeTest, SequentialRemove) {
 
 TYPED_TEST(BtreeTest, RandomInsert) {
     auto* self = this;
-    iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [self]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [self]() -> Async< void > {
         const auto num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
         std::vector< uint32_t > vec(num_entries);
         std::iota(vec.begin(), vec.end(), 0);
@@ -305,7 +305,7 @@ TYPED_TEST(BtreeTest, RandomInsert) {
 
 TYPED_TEST(BtreeTest, RangeUpdate) {
     auto* self = this;
-    iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [self]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [self]() -> Async< void > {
         const auto num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
         LOGINFO("Step 1: forward sequential insert for {} entries", num_entries);
         for (uint32_t i = 0; i < num_entries; ++i) {
@@ -325,7 +325,7 @@ TYPED_TEST(BtreeTest, RangeUpdate) {
 
 TYPED_TEST(BtreeTest, SimpleRemoveRange) {
     auto* self = this;
-    iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [self]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [self]() -> Async< void > {
         const auto num_entries = 20u;
         LOGINFO("Step 1: forward sequential insert for {} entries", num_entries);
         for (uint32_t i = 0; i < num_entries; ++i) {
@@ -345,7 +345,7 @@ TYPED_TEST(BtreeTest, SimpleRemoveRange) {
 
 TYPED_TEST(BtreeTest, RandomRemove) {
     auto* self = this;
-    iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [self]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [self]() -> Async< void > {
         const auto num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
 
         LOGINFO("Step 1: forward sequential insert for {} entries", num_entries);
@@ -368,7 +368,7 @@ TYPED_TEST(BtreeTest, RandomRemove) {
 
 TYPED_TEST(BtreeTest, RandomRemoveRange) {
     auto* self = this;
-    iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [self]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [self]() -> Async< void > {
         const auto num_entries = SISL_OPTIONS["num_entries"].as< uint32_t >();
         const auto num_iters = SISL_OPTIONS["num_iters"].as< uint32_t >();
 

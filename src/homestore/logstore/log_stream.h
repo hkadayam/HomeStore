@@ -22,8 +22,7 @@
 #include <optional>
 #include <type_traits>
 
-#include <folly/coro/Mutex.h>
-#include <folly/coro/Task.h>
+#include "common/async.h"
 #include "sisl/fds/buffer.h"
 #include "sisl/fds/stream_tracker.h"
 #include "sisl/fds/utils.h" // Clock
@@ -169,23 +168,22 @@ static_assert(std::is_trivially_copyable_v< LogRecord >, "StreamTracker requires
 // ─────────────────────────────────────────────────────────────────────────────
 class LogStream : public AppendByteStream, public std::enable_shared_from_this< LogStream > {
 public:
-    static folly::coro::Task< shared< LogStream > > create(uint64_t stream_id, MetaClient& meta_client,
-                                                           const std::string& dev_name,
-                                                           const shared< VirtualDev >& vdev, uint64_t chunk_size);
+    static Async< shared< LogStream > > create(uint64_t stream_id, MetaClient& meta_client, const std::string& dev_name,
+                                               const shared< VirtualDev >& vdev, uint64_t chunk_size);
 
     /// Load from a persisted LogStream sb MetaBlk + payload.  Reconstructs head_offset, chunk_size, and the chunk
     /// list — but does NOT walk the CRC chain.  Manager calls recover() separately, after every LogStore has been
     /// opened, so on_log_found dispatch finds its target.
-    static folly::coro::Task< shared< LogStream > > load(uint64_t stream_id, MetaClient& meta_client,
-                                                         const std::string& dev_name, const shared< VirtualDev >& vdev,
-                                                         MetaBlk&& sb, sisl::IoBufView sb_payload);
+    static Async< shared< LogStream > > load(uint64_t stream_id, MetaClient& meta_client, const std::string& dev_name,
+                                             const shared< VirtualDev >& vdev, MetaBlk&& sb,
+                                             sisl::IoBufView sb_payload);
 
     /// Walk the on-disk LogGroup chain forward from head_offset, validating magic + CRC chain at each step.  For
     /// every recovered record, looks up its owning store via `lookup` and (if non-null) dispatches
     /// store->on_log_found(lsn, log_id, stream_offset, data_view).  Sets tail_offset_, last_crc_, log_id_, and
     /// last_flush_idx_ to the post-recovery state.  Stops at the first invalid group; tail_offset_ lands at the
     /// boundary between durable and missing data.  Called by LogStoreManager::recover().
-    folly::coro::Task< void > recover(lookup_store_fn lookup);
+    Async< void > recover(lookup_store_fn lookup);
 
     LogStream(const LogStream&) = delete;
     LogStream& operator=(const LogStream&) = delete;
@@ -202,19 +200,19 @@ public:
     /// Drain the tracker into 1+ LogGroups (loop while more contiguous-active records appear, capped at
     /// max_flush_loops), emplace each group into the parent buffer with CRC chaining, then call
     /// AppendByteStream::flush() once to push to disk.  Serialised by an internal coro mutex.
-    folly::coro::Task< void > flush();
+    Async< void > flush();
 
     /// Read the data bytes of the record identified by `key`.  Reads the log_record_header at
     /// key.record_stream_offset, validates `log_id` matches, then returns the data slice.  Returns an empty buffer
     /// on stale key or read error.
-    folly::coro::Task< sisl::IoBufView > read(const stream_key& key);
+    Async< sisl::IoBufView > read(const stream_key& key);
 
     /// Advance the stream's head to key.group_stream_offset (must be a LogGroup boundary — only stream_keys handed
     /// out by on_write_completion / on_log_found satisfy this) and persist the sb.  Releases any chunks fully before
     /// the new head.  Inherited semantics: head==tail keeps one chunk as anchor and resets positions to 0.
     /// When the truncate collapses the stream to empty, bumps chain_seed_ and re-persists the sb so any stale
     /// on-disk groups left in the anchor chunk fail recovery's first-group prev_crc check on next restart.
-    folly::coro::Task< void > truncate(const stream_key& key);
+    Async< void > truncate(const stream_key& key);
 
     /// Spawns the recurring time-based auto-flush timer on any reactor.  Cancelled via stop() — uses folly's
     /// CancellationSource + Baton pattern (mirrors CPManager::start_timer).  Called from the create() / load()
@@ -224,7 +222,7 @@ public:
     /// Cancels the flush timer and awaits its exit baton.  LogStoreManager::shutdown calls this before
     /// resetting the shared_ptr.  Safe to call multiple times (subsequent calls no-op since the source is
     /// already cancelled).
-    folly::coro::Task< void > stop();
+    Async< void > stop();
 
     /// MetaBlk-name component used by StreamBase::init_chunk_mblk and BlobDevManager parsing.
     std::string_view stream_type_name() const override { return "logstream"; }
@@ -244,7 +242,7 @@ protected:
     /// LogStream rediscovers tail via CRC walk on recovery, so per-flush sb persistence is unnecessary.
     /// Chunk-list changes still persist via the inherited init/remove_chunk_mblk overrides; explicit truncate
     /// persists the sb directly.
-    folly::coro::Task< void > persist_flush_metadata() override;
+    Async< void > persist_flush_metadata() override;
 
 private:
     LogStream(uint64_t stream_id, MetaClient& meta_client, std::string dev_name, const shared< VirtualDev >& vdev,
@@ -259,7 +257,7 @@ private:
     /// we don't know the chain across the gap).  Returns the offset of the found group, or std::nullopt if no
     /// valid group is found in the lookahead window (legitimate tail) or the config is 0 (legacy behavior).
     /// Caller (recover()) treats Some(off) as a fatal corruption signal and throws.
-    folly::coro::Task< std::optional< uint64_t > > probe_for_torn_write(uint64_t bad_off);
+    Async< std::optional< uint64_t > > probe_for_torn_write(uint64_t bad_off);
 
     /// Inline capacity for the per-flush small_vector of emplaced groups.  The actual cap is
     /// HS_DYNAMIC_CONFIG(logstore.max_flush_loops) (hotswap, default 4) — pick the inline capacity high enough

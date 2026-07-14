@@ -12,6 +12,7 @@
  * under the License.
  ***************************************************************************/
 #include <algorithm>
+#include "common/async.h"
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -60,7 +61,7 @@ public:
     void TearDown() override {
         // Uncache any device fds left over (e.g. from standalone read_first_block calls) before deleting files,
         // otherwise the next test's SetUp recreates the path but open_and_cache_dev returns a stale fd.
-        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> Async< void > {
             for (auto& p : dev_paths_) {
                 co_await close_and_uncache_dev(p);
             }

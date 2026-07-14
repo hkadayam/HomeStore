@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "common/async.h"
 #include <memory>
 #include <shared_mutex>
 #include <string>

@@ -15,6 +15,7 @@
  ***************************************************************************/
 
 #include <cassert>
+#include "common/async.h"
 #include <chrono>
 #include <fcntl.h>
 #include <iostream>
@@ -36,7 +37,7 @@ std::mutex s_dev_cache_mtx;
 std::unordered_map< std::string, shared< IoDevice > > s_dev_cache;
 } // namespace
 
-folly::coro::Task< shared< IoDevice > > open_and_cache_dev(const std::string& devname, int oflags) {
+Async< shared< IoDevice > > open_and_cache_dev(const std::string& devname, int oflags) {
     {
         std::lock_guard lg{s_dev_cache_mtx};
         auto it = s_dev_cache.find(devname);
@@ -56,7 +57,7 @@ folly::coro::Task< shared< IoDevice > > open_and_cache_dev(const std::string& de
     co_return it->second;
 }
 
-folly::coro::Task< void > close_and_uncache_dev(const std::string& devname) {
+Async< void > close_and_uncache_dev(const std::string& devname) {
     std::lock_guard lg{s_dev_cache_mtx};
     s_dev_cache.erase(devname);
     // IoDevice destructor closes the fd when the last shared_ptr drops.
@@ -83,7 +84,7 @@ PDevInfoHeader PhysicalDev::create_pdev_info(const DevInfo& dinfo, uint32_t pdev
     return hdr;
 }
 
-folly::coro::Task< FirstBlock > PhysicalDev::read_first_block(const std::string& devname, int oflags) {
+Async< FirstBlock > PhysicalDev::read_first_block(const std::string& devname, int oflags) {
     auto iodev = co_await open_and_cache_dev(devname, oflags);
 
     DriveInterface di{};
@@ -98,7 +99,7 @@ folly::coro::Task< FirstBlock > PhysicalDev::read_first_block(const std::string&
     co_return fb;
 }
 
-folly::coro::Task< void > PhysicalDev::write_first_block(const FirstBlockHeader& fbhdr) {
+Async< void > PhysicalDev::write_first_block(const FirstBlockHeader& fbhdr) {
     FirstBlock fb{};
     fb.magic = FirstBlock::HOMESTORE_MAGIC;
     fb.formatting_done = 0x0; // Not yet complete — commit_formatting() sets this to 1
@@ -117,7 +118,7 @@ folly::coro::Task< void > PhysicalDev::write_first_block(const FirstBlockHeader&
     co_await write_super_block(buf, HSSuperBlk::first_block_offset());
 }
 
-folly::coro::Task< void > PhysicalDev::commit_formatting() {
+Async< void > PhysicalDev::commit_formatting() {
     IoBuf buf{FirstBlock::s_io_fb_size};
     auto ec = co_await read_super_block(buf, HSSuperBlk::first_block_offset());
     if (ec) {
@@ -133,14 +134,13 @@ folly::coro::Task< void > PhysicalDev::commit_formatting() {
     co_await write_super_block(buf, HSSuperBlk::first_block_offset());
 }
 
-folly::coro::Task< uint64_t > PhysicalDev::get_dev_size(const std::string& devname) {
+Async< uint64_t > PhysicalDev::get_dev_size(const std::string& devname) {
     auto iodev = co_await open_and_cache_dev(devname, O_RDWR | O_CREAT);
     co_return co_await DriveInterface::get_size(*iodev);
 }
 
 // ── Factory: construct (private) ─────────────────────────────────────────────
-folly::coro::Task< shared< PhysicalDev > > PhysicalDev::construct(const DevInfo& dinfo, int oflags,
-                                                                  const PDevInfoHeader& pinfo) {
+Async< shared< PhysicalDev > > PhysicalDev::construct(const DevInfo& dinfo, int oflags, const PDevInfoHeader& pinfo) {
     auto pdev = std::make_shared< PhysicalDev >();
 
     pdev->drive_iface_ = std::make_shared< DriveInterface >();
@@ -176,8 +176,8 @@ folly::coro::Task< shared< PhysicalDev > > PhysicalDev::construct(const DevInfo&
 
 // ── Factory: create ───────────────────────────────────────────────────────────
 
-folly::coro::Task< shared< PhysicalDev > > PhysicalDev::create(const DevInfo& dinfo, int oflags, uint32_t pdev_id,
-                                                               const FirstBlockHeader& fbhdr) {
+Async< shared< PhysicalDev > > PhysicalDev::create(const DevInfo& dinfo, int oflags, uint32_t pdev_id,
+                                                   const FirstBlockHeader& fbhdr) {
     auto pinfo = create_pdev_info(dinfo, pdev_id);
     pinfo.system_uuid = fbhdr.system_uuid;
     auto pdev = co_await construct(dinfo, oflags, pinfo);
@@ -188,8 +188,7 @@ folly::coro::Task< shared< PhysicalDev > > PhysicalDev::create(const DevInfo& di
 
 // ── Factory: load ─────────────────────────────────────────────────────────────
 
-folly::coro::Task< shared< PhysicalDev > > PhysicalDev::load(const DevInfo& dinfo, int oflags,
-                                                             const FirstBlockHeader& fbhdr) {
+Async< shared< PhysicalDev > > PhysicalDev::load(const DevInfo& dinfo, int oflags, const FirstBlockHeader& fbhdr) {
     const auto fb = co_await read_first_block(dinfo.dev_name, oflags);
     if (!fb.is_valid()) {
         LOGCRITICAL("load() is_valid failed: magic={:#x} formatting_done={} product='{}' expected='{}'", fb.magic,
@@ -213,7 +212,7 @@ folly::coro::Task< shared< PhysicalDev > > PhysicalDev::load(const DevInfo& dinf
 
 // ── Super block ───────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > PhysicalDev::write_super_block(const IoBuf& buf, uint64_t offset) {
+Async< void > PhysicalDev::write_super_block(const IoBuf& buf, uint64_t offset) {
     auto ec = co_await drive_iface_->write(*iodev_, buf, offset);
     if (ec) {
         throw std::system_error(ec, "write_super_block failed on " + devname_);
@@ -227,11 +226,11 @@ folly::coro::Task< void > PhysicalDev::write_super_block(const IoBuf& buf, uint6
     }
 }
 
-folly::coro::Task< std::error_code > PhysicalDev::read_super_block(IoBuf& buf, uint64_t offset) {
+Async< std::error_code > PhysicalDev::read_super_block(IoBuf& buf, uint64_t offset) {
     co_return co_await drive_iface_->read(*iodev_, buf, offset);
 }
 
-folly::coro::Task< void > PhysicalDev::close_device() {
+Async< void > PhysicalDev::close_device() {
     // Release this pdev's owning refs to its chunks.  Chunks hold shared<PhysicalDev> back at us, so without this
     // the mutual ownership keeps both sides alive forever (PhysicalDev → chunk_provisioner_.chunks → Chunk → pdev_
     // → PhysicalDev).  After this clear, only VirtualDev's shared<Chunk> entries remain; those are released when
@@ -246,36 +245,36 @@ folly::coro::Task< void > PhysicalDev::close_device() {
 
 // ── Data IO ───────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > PhysicalDev::write(const IoBuf& buf, uint64_t offset) {
+Async< void > PhysicalDev::write(const IoBuf& buf, uint64_t offset) {
     auto ec = co_await drive_iface_->write(*iodev_, buf, offset);
     if (ec) {
         throw std::system_error(ec, "write failed on " + devname_);
     }
 }
 
-folly::coro::Task< std::error_code > PhysicalDev::read(IoBuf& buf, uint64_t offset) {
+Async< std::error_code > PhysicalDev::read(IoBuf& buf, uint64_t offset) {
     co_return co_await drive_iface_->read(*iodev_, buf, offset);
 }
 
-folly::coro::Task< void > PhysicalDev::writev(sisl::SgList const& sg, uint64_t offset) {
+Async< void > PhysicalDev::writev(sisl::SgList const& sg, uint64_t offset) {
     auto ec = co_await drive_iface_->writev(*iodev_, sg, offset);
     if (ec) {
         throw std::system_error(ec, "writev failed on " + devname_);
     }
 }
 
-folly::coro::Task< std::error_code > PhysicalDev::readv(sisl::SgList const& sg, uint64_t offset) {
+Async< std::error_code > PhysicalDev::readv(sisl::SgList const& sg, uint64_t offset) {
     co_return co_await drive_iface_->readv(*iodev_, sg, offset);
 }
 
-folly::coro::Task< void > PhysicalDev::write_zero(uint64_t size, uint64_t offset) {
+Async< void > PhysicalDev::write_zero(uint64_t size, uint64_t offset) {
     auto ec = co_await drive_iface_->write_zero(*iodev_, size, offset);
     if (ec) {
         throw std::system_error(ec, "write_zero failed on " + devname_);
     }
 }
 
-folly::coro::Task< void > PhysicalDev::fsync() {
+Async< void > PhysicalDev::fsync() {
     auto ec = co_await drive_iface_->fsync(*iodev_);
     if (ec) {
         throw std::system_error(ec, "fsync failed on " + devname_);
@@ -284,7 +283,7 @@ folly::coro::Task< void > PhysicalDev::fsync() {
 
 // ── Chunk management ─────────────────────────────────────────────────────────
 
-folly::coro::Task< void > PhysicalDev::format_chunks() {
+Async< void > PhysicalDev::format_chunks() {
     const uint32_t max_chunks = max_chunks_in_pdev();
     sisl::Bitset bitset{std::max(1u, max_chunks), /* align */ 0};
 
@@ -296,8 +295,8 @@ folly::coro::Task< void > PhysicalDev::format_chunks() {
     chunk_provisioner_.chunk_info_slots = std::make_unique< sisl::Bitset >(std::move(bitset));
 }
 
-folly::coro::Task< shared< Chunk > > PhysicalDev::create_chunk(uint32_t vdev_id, uint64_t size, uint64_t vdev_order,
-                                                               const uint8_t* user_private_data, size_t up_size) {
+Async< shared< Chunk > > PhysicalDev::create_chunk(uint32_t vdev_id, uint64_t size, uint64_t vdev_order,
+                                                   const uint8_t* user_private_data, size_t up_size) {
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     auto& prov = chunk_provisioner_;
 
@@ -333,8 +332,8 @@ folly::coro::Task< shared< Chunk > > PhysicalDev::create_chunk(uint32_t vdev_id,
     co_return chunk;
 }
 
-folly::coro::Task< std::vector< shared< Chunk > > >
-PhysicalDev::create_chunks(uint32_t vdev_id, uint32_t num_chunks, uint64_t size, uint64_t start_vdev_order) {
+Async< std::vector< shared< Chunk > > > PhysicalDev::create_chunks(uint32_t vdev_id, uint32_t num_chunks, uint64_t size,
+                                                                   uint64_t start_vdev_order) {
     std::vector< shared< Chunk > > ret_chunks;
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     auto& prov = chunk_provisioner_;
@@ -392,7 +391,7 @@ PhysicalDev::create_chunks(uint32_t vdev_id, uint32_t num_chunks, uint64_t size,
     co_return ret_chunks;
 }
 
-folly::coro::Task< std::unordered_map< uint32_t, std::vector< shared< Chunk > > > > PhysicalDev::load_chunks() {
+Async< std::unordered_map< uint32_t, std::vector< shared< Chunk > > > > PhysicalDev::load_chunks() {
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     auto& prov = chunk_provisioner_;
 
@@ -453,7 +452,7 @@ folly::coro::Task< std::unordered_map< uint32_t, std::vector< shared< Chunk > > 
     co_return chunks_by_vdev;
 }
 
-folly::coro::Task< void > PhysicalDev::remove_chunk(cshared< Chunk >& chunk) {
+Async< void > PhysicalDev::remove_chunk(cshared< Chunk >& chunk) {
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     auto& prov = chunk_provisioner_;
 
@@ -476,7 +475,7 @@ folly::coro::Task< void > PhysicalDev::remove_chunk(cshared< Chunk >& chunk) {
     co_return;
 }
 
-folly::coro::Task< void > PhysicalDev::remove_chunks(const std::vector< shared< Chunk > >& chunks) {
+Async< void > PhysicalDev::remove_chunks(const std::vector< shared< Chunk > >& chunks) {
     if (chunks.empty()) {
         co_return;
     }
@@ -502,7 +501,7 @@ folly::coro::Task< void > PhysicalDev::remove_chunks(const std::vector< shared< 
     co_return;
 }
 
-folly::coro::Task< void > PhysicalDev::remove_chunks_for_vdev(uint32_t vdev_id) {
+Async< void > PhysicalDev::remove_chunks_for_vdev(uint32_t vdev_id) {
     // Collect chunks for this vdev without holding the lock.
     std::vector< shared< Chunk > > to_remove;
     {
@@ -518,7 +517,7 @@ folly::coro::Task< void > PhysicalDev::remove_chunks_for_vdev(uint32_t vdev_id) 
     }
 }
 
-folly::coro::Task< void > PhysicalDev::deactivate_chunk(cshared< Chunk >& chunk) {
+Async< void > PhysicalDev::deactivate_chunk(cshared< Chunk >& chunk) {
     ChunkInfo cinfo = chunk->info();
     cinfo.set_free();
     cinfo.compute_checksum();
@@ -532,7 +531,7 @@ folly::coro::Task< void > PhysicalDev::deactivate_chunk(cshared< Chunk >& chunk)
     co_return;
 }
 
-folly::coro::Task< void > PhysicalDev::reactivate_chunk(cshared< Chunk >& chunk, uint64_t new_vdev_order) {
+Async< void > PhysicalDev::reactivate_chunk(cshared< Chunk >& chunk, uint64_t new_vdev_order) {
     ChunkInfo cinfo = chunk->info();
     cinfo.set_allocated();
     cinfo.chunk_vdev_order = new_vdev_order;
@@ -549,7 +548,7 @@ folly::coro::Task< void > PhysicalDev::reactivate_chunk(cshared< Chunk >& chunk,
 
 // ── Chunk accessors ───────────────────────────────────────────────────────────
 
-folly::coro::Task< std::vector< shared< Chunk > > > PhysicalDev::get_all_chunks() {
+Async< std::vector< shared< Chunk > > > PhysicalDev::get_all_chunks() {
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     std::vector< shared< Chunk > > result;
     result.reserve(chunk_provisioner_.chunks.size());
@@ -559,13 +558,13 @@ folly::coro::Task< std::vector< shared< Chunk > > > PhysicalDev::get_all_chunks(
     co_return result;
 }
 
-folly::coro::Task< shared< Chunk > > PhysicalDev::get_chunk(uint32_t chunk_id) {
+Async< shared< Chunk > > PhysicalDev::get_chunk(uint32_t chunk_id) {
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     auto it = chunk_provisioner_.chunks.find(chunk_id);
     co_return (it != chunk_provisioner_.chunks.end()) ? it->second : nullptr;
 }
 
-folly::coro::Task< std::vector< shared< Chunk > > > PhysicalDev::get_chunks_for_vdev(uint32_t vdev_id) {
+Async< std::vector< shared< Chunk > > > PhysicalDev::get_chunks_for_vdev(uint32_t vdev_id) {
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     std::vector< shared< Chunk > > result;
     for (const auto& [_, c] : chunk_provisioner_.chunks) {
@@ -576,7 +575,7 @@ folly::coro::Task< std::vector< shared< Chunk > > > PhysicalDev::get_chunks_for_
     co_return result;
 }
 
-folly::coro::Task< size_t > PhysicalDev::get_chunk_count() {
+Async< size_t > PhysicalDev::get_chunk_count() {
     auto lock = co_await chunk_mutex_.co_scoped_lock();
     co_return chunk_provisioner_.chunks.size();
 }

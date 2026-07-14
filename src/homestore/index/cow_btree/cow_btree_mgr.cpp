@@ -1,4 +1,4 @@
-#include <folly/coro/Collect.h>
+#include "common/async.h"
 
 #include "sisl/flip/flip.h"
 
@@ -19,7 +19,7 @@ static constexpr char COW_BTREE_MGR_META_CLIENT_NAME[] = "cow_btree_mgr";
 
 // ──────────────────────────────────────────────── Lifecycle ──────────────────────────────────────────────────────────
 
-folly::coro::Task< void > COWBtreeManager::create() {
+Async< void > COWBtreeManager::create() {
     auto mgr = shared< COWBtreeManager >(new COWBtreeManager());
     mgr->meta_client_ =
         std::make_shared< MetaClient >(co_await meta_mgr().register_client(COW_BTREE_MGR_META_CLIENT_NAME));
@@ -27,7 +27,7 @@ folly::coro::Task< void > COWBtreeManager::create() {
     co_return;
 }
 
-folly::coro::Task< void > COWBtreeManager::load() {
+Async< void > COWBtreeManager::load() {
     auto mgr = shared< COWBtreeManager >(new COWBtreeManager());
     mgr->meta_client_ =
         std::make_shared< MetaClient >(co_await meta_mgr().register_client(COW_BTREE_MGR_META_CLIENT_NAME));
@@ -35,17 +35,16 @@ folly::coro::Task< void > COWBtreeManager::load() {
     // Walk every persisted MetaBlk under our client.  Each block holds one COWBtree's superblock (followed by an
     // optional user_sb).  Stash them in pending_btrees_ so the upper layer can iterate via list_persisted_btrees()
     // and call load_cow_btree<K,V>() for each one with the right K/V types.
-    co_await mgr->meta_client_->for_each_recovered_block(
-        [&mgr](MetaBlk const& blk, sisl::IoBufView data) -> folly::coro::Task< void > {
-            HS_REL_ASSERT_GE(data.size(), sizeof(COWBtreeSuperBlock), "COWBtree metablk too small: {} bytes",
-                             data.size());
-            PersistedBtreeInfo info;
-            std::memcpy(&info.sb, data.bytes(), sizeof(COWBtreeSuperBlock));
-            info.mblk = blk;
-            mgr->ordinal_reserver_.reserve(info.sb.ordinal);
-            mgr->pending_btrees_.push_back(std::move(info));
-            co_return;
-        });
+    co_await mgr->meta_client_->for_each_recovered_block([&mgr](MetaBlk const& blk,
+                                                                sisl::IoBufView data) -> Async< void > {
+        HS_REL_ASSERT_GE(data.size(), sizeof(COWBtreeSuperBlock), "COWBtree metablk too small: {} bytes", data.size());
+        PersistedBtreeInfo info;
+        std::memcpy(&info.sb, data.bytes(), sizeof(COWBtreeSuperBlock));
+        info.mblk = blk;
+        mgr->ordinal_reserver_.reserve(info.sb.ordinal);
+        mgr->pending_btrees_.push_back(std::move(info));
+        co_return;
+    });
 
     Managers::init_cow_btree_mgr(std::move(mgr));
     co_return;
@@ -108,7 +107,7 @@ void COWBtreeManager::track(cshared< BtreeBase >& bt) {
     tracked_btrees_.push_back(bt);
 }
 
-folly::coro::Task< void > COWBtreeManager::destroy_cow_btree(cshared< BtreeBase >& base) {
+Async< void > COWBtreeManager::destroy_cow_btree(cshared< BtreeBase >& base) {
     auto* cow_bt = COWBtree::cast_to(base.get());
     auto const ordinal = cow_bt->ordinal();
 
@@ -118,8 +117,7 @@ folly::coro::Task< void > COWBtreeManager::destroy_cow_btree(cshared< BtreeBase 
 
     {
         std::lock_guard lk(tracking_mtx_);
-        tracked_btrees_.erase(std::remove(tracked_btrees_.begin(), tracked_btrees_.end(), base),
-                              tracked_btrees_.end());
+        tracked_btrees_.erase(std::remove(tracked_btrees_.begin(), tracked_btrees_.end(), base), tracked_btrees_.end());
     }
 
     ordinal_reserver_.unreserve(ordinal);
@@ -152,7 +150,7 @@ bool COWBtreeManager::should_force_full_flush() const {
 void COWBtreeManager::CPCallbacksImpl::on_switchover_cp(CP* cur_cp, CP* new_cp) {
 }
 
-folly::coro::Task< bool > COWBtreeManager::CPCallbacksImpl::cp_flush(CP* cp) {
+Async< bool > COWBtreeManager::CPCallbacksImpl::cp_flush(CP* cp) {
     std::vector< shared< BtreeBase > > btrees;
     {
         std::lock_guard lk(mgr_.tracking_mtx_);
@@ -167,7 +165,7 @@ folly::coro::Task< bool > COWBtreeManager::CPCallbacksImpl::cp_flush(CP* cp) {
     // Flush all btrees in parallel.  Each COWBtree::cp_flush() internally batches dirty nodes into stream WriteUnits
     // and issues IO as each unit fills — so even heavily-skewed btrees (one with 100K dirty nodes, another with 10)
     // stream out writes incrementally rather than blocking until the end.
-    std::vector< folly::coro::Task< void > > tasks;
+    std::vector< Async< void > > tasks;
     tasks.reserve(btrees.size());
     for (auto const& bt : btrees) {
         tasks.push_back(COWBtree::cast_to(bt.get())->cp_flush(cp, suggest_incremental));

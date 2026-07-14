@@ -15,6 +15,7 @@
  ***************************************************************************/
 
 #include <cassert>
+#include "common/async.h"
 #include <cstdlib>
 #include <stdexcept>
 
@@ -34,20 +35,18 @@ using sisl::IoBuf;
 // ─────────────────────────────────────────────────────────────────────────────
 //                              Factory and Constructor
 // ─────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< shared< RawBlkStream > > RawBlkStream::create(uint64_t stream_id, MetaClient& meta_client,
-                                                                 const std::string& dev_name,
-                                                                 const shared< VirtualDev >& vdev, uint64_t chunk_size,
-                                                                 uint32_t blk_size) {
+Async< shared< RawBlkStream > > RawBlkStream::create(uint64_t stream_id, MetaClient& meta_client,
+                                                     const std::string& dev_name, const shared< VirtualDev >& vdev,
+                                                     uint64_t chunk_size, uint32_t blk_size) {
     auto stream = shared< RawBlkStream >{
         new RawBlkStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_size, blk_size}};
     co_await stream->expand_to(0);
     co_return stream;
 }
 
-folly::coro::Task< shared< RawBlkStream > > RawBlkStream::load(uint64_t stream_id, MetaClient& meta_client,
-                                                               const std::string& dev_name,
-                                                               const shared< VirtualDev >& vdev, uint32_t blk_size,
-                                                               ChunkMblkMap&& mblks) {
+Async< shared< RawBlkStream > > RawBlkStream::load(uint64_t stream_id, MetaClient& meta_client,
+                                                   const std::string& dev_name, const shared< VirtualDev >& vdev,
+                                                   uint32_t blk_size, ChunkMblkMap&& mblks) {
     // Load each chunk's block allocator from the recovered bitmap before the constructor consumes the map.
     for (auto& [cid, entry] : mblks) {
         vdev->load_blk_allocator(cid, entry.second.extract());
@@ -118,20 +117,20 @@ BlkAllocStatus RawBlkStream::commit_blks(CP* cp, BlkIds const& bids) {
     return BlkAllocStatus::SUCCESS;
 }
 
-folly::coro::Task< void > RawBlkStream::invalidate_blk(CP* cp, const BlkId& bid) {
+Async< void > RawBlkStream::invalidate_blk(CP* cp, const BlkId& bid) {
     // Wait for any in-flight reads on this block to complete before freeing.
     co_await blk_read_tracker_.wait_on(bid);
     vdev().free_blk(bid);
     cp_session(cp->id()).mark_chunk_dirty(bid.chunk_num());
 }
 
-folly::coro::Task< void > RawBlkStream::invalidate_blks(CP* cp, BlkIds const& bids) {
+Async< void > RawBlkStream::invalidate_blks(CP* cp, BlkIds const& bids) {
     for (auto const& bid : bids) {
         co_await invalidate_blk(cp, bid);
     }
 }
 
-folly::coro::Task< void > RawBlkStream::expand() {
+Async< void > RawBlkStream::expand() {
     co_await expand_to(num_chunks());
 }
 
@@ -139,7 +138,7 @@ folly::coro::Task< void > RawBlkStream::expand() {
 // I/O
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > RawBlkStream::write(const BlkId& bid, const IoBuf& buf, bool buffered) {
+Async< void > RawBlkStream::write(const BlkId& bid, const IoBuf& buf, bool buffered) {
     if (buffered) {
         // TODO: Impl buffered write path — read() must return buffered data for overlapping BlkIds, which requires a
         // concurrent hashmap keyed by BlkId rather than a simple vector.
@@ -149,11 +148,11 @@ folly::coro::Task< void > RawBlkStream::write(const BlkId& bid, const IoBuf& buf
     co_await vdev().write(buf, bid);
 }
 
-folly::coro::Task< void > RawBlkStream::writev(sisl::SgList const& sg, const BlkId& bid) {
+Async< void > RawBlkStream::writev(sisl::SgList const& sg, const BlkId& bid) {
     co_await vdev().writev(sg, bid);
 }
 
-folly::coro::Task< void > RawBlkStream::write_multi(BlkIds const& bids, sisl::IoBuf const& buf, bool buffered) {
+Async< void > RawBlkStream::write_multi(BlkIds const& bids, sisl::IoBuf const& buf, bool buffered) {
     HS_REL_ASSERT(!buffered, "buffered multi-BlkId write not yet implemented");
     auto const blk_size = block_size();
     uint32_t off = 0;
@@ -166,7 +165,7 @@ folly::coro::Task< void > RawBlkStream::write_multi(BlkIds const& bids, sisl::Io
     co_return;
 }
 
-folly::coro::Task< void > RawBlkStream::writev_multi(BlkIds const& bids, sisl::SgList const& sg, bool buffered) {
+Async< void > RawBlkStream::writev_multi(BlkIds const& bids, sisl::SgList const& sg, bool buffered) {
     HS_REL_ASSERT(!buffered, "buffered multi-BlkId writev not yet implemented");
     auto const blk_size = block_size();
 
@@ -204,21 +203,21 @@ folly::coro::Task< void > RawBlkStream::writev_multi(BlkIds const& bids, sisl::S
     co_return;
 }
 
-folly::coro::Task< std::error_code > RawBlkStream::read(IoBuf& buf, const BlkId& bid) {
+Async< std::error_code > RawBlkStream::read(IoBuf& buf, const BlkId& bid) {
     blk_read_tracker_.insert(bid);
     auto ec = co_await vdev().read(buf, bid);
     blk_read_tracker_.remove(bid);
     co_return ec;
 }
 
-folly::coro::Task< std::error_code > RawBlkStream::readv(sisl::SgList const& sg, const BlkId& bid) {
+Async< std::error_code > RawBlkStream::readv(sisl::SgList const& sg, const BlkId& bid) {
     blk_read_tracker_.insert(bid);
     auto ec = co_await vdev().readv(sg, bid);
     blk_read_tracker_.remove(bid);
     co_return ec;
 }
 
-folly::coro::Task< std::error_code > RawBlkStream::read_multi(BlkIds const& bids, sisl::IoBuf& buf) {
+Async< std::error_code > RawBlkStream::read_multi(BlkIds const& bids, sisl::IoBuf& buf) {
     auto const blk_size = block_size();
     uint32_t off = 0;
     for (auto const& b : bids) {
@@ -235,7 +234,7 @@ folly::coro::Task< std::error_code > RawBlkStream::read_multi(BlkIds const& bids
     co_return std::error_code{};
 }
 
-folly::coro::Task< void > RawBlkStream::fsync() {
+Async< void > RawBlkStream::fsync() {
     co_await vdev().fsync();
 }
 
@@ -243,13 +242,13 @@ folly::coro::Task< void > RawBlkStream::fsync() {
 // CP hooks
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > RawBlkStream::buffered_write_flush() {
+Async< void > RawBlkStream::buffered_write_flush() {
     // TODO: Buffered writes are not implemented yet (because it also needs to make sure they are readable), so its
     // flush is marked unimplemented
     co_return;
 }
 
-folly::coro::Task< bool > RawBlkStream::cp_flush(CP* cp) {
+Async< bool > RawBlkStream::cp_flush(CP* cp) {
     co_await buffered_write_flush();
 
     auto dirty = cp_session(cp->id()).gather_dirty_chunks();

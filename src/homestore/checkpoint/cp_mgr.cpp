@@ -14,6 +14,7 @@
  *
  *********************************************************************************/
 #include <folly/io/async/EventBaseManager.h>
+#include "common/async.h"
 #include <folly/io/async/Request.h>
 #include "sisl/fds/rcu.h"
 
@@ -44,7 +45,9 @@ using sisl::IoBufOwn;
 static thread_local CPManager::ThreadStackInfo* t_cp_info_{nullptr};
 
 std::stack< CP* >& CPManager::thread_stack() {
-    if (t_cp_info_ && t_cp_info_->mgr == this) { return t_cp_info_->stk; }
+    if (t_cp_info_ && t_cp_info_->mgr == this) {
+        return t_cp_info_->stk;
+    }
 
     // Slow path: first touch from this thread for this manager (or previous manager was destroyed).
     auto info = std::make_unique< ThreadStackInfo >();
@@ -75,7 +78,7 @@ CPManager::~CPManager() {
     HS_REL_ASSERT(!cur_cp_, "CPManager is tiering down without calling shutdown");
 }
 
-folly::coro::Task< void > CPManager::start(bool first_time_boot) {
+Async< void > CPManager::start(bool first_time_boot) {
     sb_ = co_await ModuleMetaBlk< CPManagerSuperBlock >::open("CPSuperBlock");
     create_first_cp();
     if (first_time_boot) {
@@ -87,11 +90,10 @@ folly::coro::Task< void > CPManager::start(bool first_time_boot) {
 void CPManager::start_timer() {
     const auto interval = std::chrono::microseconds(HS_DYNAMIC_CONFIG(generic.cp_timer_us));
     LOGINFO("cp timer is set to {} usec", interval.count());
-    cp_timer_.start(ReactorTarget::any(), interval, iomanager::TimerKind::Recurring,
-                    [this]() -> folly::coro::Task< void > {
-                        trigger_cp_flush(false, CPTriggerReason::Timer);
-                        co_return;
-                    });
+    cp_timer_.start(ReactorTarget::any(), interval, iomanager::TimerKind::Recurring, [this]() -> Async< void > {
+        trigger_cp_flush(false, CPTriggerReason::Timer);
+        co_return;
+    });
 }
 
 void CPManager::create_first_cp() {
@@ -100,7 +102,7 @@ void CPManager::create_first_cp() {
     cur_cp_->cp_id_ = sb_->m_last_flushed_cp + 1;
 }
 
-folly::coro::Task< void > CPManager::shutdown() {
+Async< void > CPManager::shutdown() {
     // Request cancellation of the periodic timer (non-blocking). The timer coroutine will exit on its own.
     folly::SemiFuture< bool > wd_done = folly::SemiFuture< bool >::makeEmpty();
     cp_timer_.request_stop();
@@ -119,17 +121,18 @@ folly::coro::Task< void > CPManager::shutdown() {
     // #ifdef _PRERELEASE
     //     if (!hs()->crash_simulator().is_in_crashing_phase()) {
     // #endif
-        LOGINFO("Trigger cp flush at CP shutdown");
-        auto success =
-            co_await do_trigger_cp_flush(/*force=*/true, /*flush_on_shutdown=*/true, CPTriggerReason::Timer);
-        HS_REL_ASSERT_EQ(success, true, "CP Flush failed");
-        LOGINFO("Trigger cp done");
+    LOGINFO("Trigger cp flush at CP shutdown");
+    auto success = co_await do_trigger_cp_flush(/*force=*/true, /*flush_on_shutdown=*/true, CPTriggerReason::Timer);
+    HS_REL_ASSERT_EQ(success, true, "CP Flush failed");
+    LOGINFO("Trigger cp done");
     // #ifdef _PRERELEASE
     //     }
     // #endif
 
     // Wait for watchdog and timer coroutines to exit before tearing down state.
-    if (wd_done.valid()) { co_await std::move(wd_done); }
+    if (wd_done.valid()) {
+        co_await std::move(wd_done);
+    }
     co_await cp_timer_.stop();
 
     // Don't reset wd_cp_ here: the co_await awaiter above still holds a Future
@@ -265,7 +268,7 @@ void CPManager::cp_start_flush(CP* cp) {
     CP_PERIODIC_LOG(INFO, cp->id(), "Starting CP flush");
     cp->cp_status_ = cp_status_t::cp_flushing;
 
-    spawn_detached(ReactorTarget::any(), [this, cp]() -> folly::coro::Task< void > {
+    spawn_detached(ReactorTarget::any(), [this, cp]() -> Async< void > {
         // Flush all consumers one at a time; sequential ordering is intentional.
         // Snapshot callbacks under shared lock, then release before co_await.
         std::vector< shared< CPCallbacks > > cbs;
@@ -355,7 +358,9 @@ CPGuard::CPGuard(CPManager* mgr) {
 CPGuard::~CPGuard() {
     if (pushed_ && cp_) {
         auto& stk = cp_->cp_mgr_->thread_stack();
-        if (!stk.empty()) { stk.pop(); }
+        if (!stk.empty()) {
+            stk.pop();
+        }
     }
     if (cp_) {
         cp_->cp_mgr_->cp_io_exit(cp_);

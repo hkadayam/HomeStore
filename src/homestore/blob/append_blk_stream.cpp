@@ -15,6 +15,7 @@
  ***************************************************************************/
 
 #include <stdexcept>
+#include "common/async.h"
 #include <string>
 
 #include "homestore/checkpoint/cp.h"     // CP, cp_id_t
@@ -40,20 +41,19 @@ AppendBlkStream::AppendBlkStream(uint64_t stream_id, MetaClient& meta_client, st
         StreamBase{stream_id, vdev, meta_client, std::move(dev_name), chunk_size, blk_size, std::move(mblks)} {
 }
 
-folly::coro::Task< shared< AppendBlkStream > > AppendBlkStream::create(uint64_t stream_id, MetaClient& meta_client,
-                                                                       const std::string& dev_name,
-                                                                       const shared< VirtualDev >& vdev,
-                                                                       uint64_t chunk_size, uint32_t blk_size) {
+Async< shared< AppendBlkStream > > AppendBlkStream::create(uint64_t stream_id, MetaClient& meta_client,
+                                                           const std::string& dev_name,
+                                                           const shared< VirtualDev >& vdev, uint64_t chunk_size,
+                                                           uint32_t blk_size) {
     auto stream = shared< AppendBlkStream >{
         new AppendBlkStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_size, blk_size}};
     co_await stream->expand_to(0);
     co_return stream;
 }
 
-folly::coro::Task< shared< AppendBlkStream > > AppendBlkStream::load(uint64_t stream_id, MetaClient& meta_client,
-                                                                     const std::string& dev_name,
-                                                                     const shared< VirtualDev >& vdev,
-                                                                     uint32_t blk_size, ChunkMblkMap&& mblks) {
+Async< shared< AppendBlkStream > > AppendBlkStream::load(uint64_t stream_id, MetaClient& meta_client,
+                                                         const std::string& dev_name, const shared< VirtualDev >& vdev,
+                                                         uint32_t blk_size, ChunkMblkMap&& mblks) {
     // Load each chunk's block allocator from the recovered bitmap before the constructor consumes the map.
     for (auto& [cid, entry] : mblks) {
         vdev->load_blk_allocator(cid, entry.second.extract());
@@ -69,7 +69,7 @@ folly::coro::Task< shared< AppendBlkStream > > AppendBlkStream::load(uint64_t st
 // Allocation of Blocks
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< BlkId > AppendBlkStream::alloc_or_expand(blk_count_t nblks, const blk_alloc_hints& hints) {
+Async< BlkId > AppendBlkStream::alloc_or_expand(blk_count_t nblks, const blk_alloc_hints& hints) {
     BlkId bid;
     blk_alloc_hints h = hints;
 
@@ -132,7 +132,7 @@ std::vector< unique< WriteUnit > > AppendBlkStream::grab_write_units(CPSession& 
     return std::move(session.all_units);
 }
 
-folly::coro::Task< void > AppendBlkStream::flush_write_units(const std::vector< unique< WriteUnit > >& units) {
+Async< void > AppendBlkStream::flush_write_units(const std::vector< unique< WriteUnit > >& units) {
     for (auto& wu : units) {
         if (wu->bufs.empty()) {
             // Unused WriteUnit — free the entire allocation.
@@ -174,7 +174,7 @@ std::optional< BlkId > AppendBlkStream::quick_append(CP* cp, uint16_t segment_id
     return do_quick_append(cp_session(cp->id()), segment_id, /*new_wu=*/nullptr, buf);
 }
 
-folly::coro::Task< BlkId > AppendBlkStream::append(CP* cp, uint16_t segment_id, sisl::IoBufShared&& buf) {
+Async< BlkId > AppendBlkStream::append(CP* cp, uint16_t segment_id, sisl::IoBufShared&& buf) {
     if (segment_id >= CPSession::MAX_SEGMENTS) {
         throw std::invalid_argument{"AppendBlkStream: segment_id out of range"};
     }
@@ -199,7 +199,7 @@ folly::coro::Task< BlkId > AppendBlkStream::append(CP* cp, uint16_t segment_id, 
     co_return *result;
 }
 
-folly::coro::Task< void > AppendBlkStream::flush(CP* cp) {
+Async< void > AppendBlkStream::flush(CP* cp) {
     auto flush_lock = co_await flush_mu_.co_scoped_lock();
     co_await flush_write_units(grab_write_units(cp_session(cp->id())));
 }
@@ -209,14 +209,14 @@ void AppendBlkStream::invalidate(CP* cp, const BlkId& bid) {
     cp_session(cp->id()).mark_chunk_dirty(bid.chunk_num());
 }
 
-folly::coro::Task< std::error_code > AppendBlkStream::read(IoBuf& buf, const BlkId& bid) {
+Async< std::error_code > AppendBlkStream::read(IoBuf& buf, const BlkId& bid) {
     co_return co_await vdev().read(buf, bid);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CP hooks
 // ─────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< bool > AppendBlkStream::cp_flush(CP* cp) {
+Async< bool > AppendBlkStream::cp_flush(CP* cp) {
     auto flush_lock = co_await flush_mu_.co_scoped_lock();
     CPSession& session = cp_session(cp->id());
 

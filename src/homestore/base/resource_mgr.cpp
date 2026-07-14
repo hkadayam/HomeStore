@@ -14,6 +14,7 @@
  *
  *********************************************************************************/
 #include "resource_mgr.h"
+#include "common/async.h"
 
 #include <unistd.h>
 #ifdef __APPLE__
@@ -56,8 +57,8 @@ void ResourceMgr::start(std::vector< DevInfo > const& devs, std::optional< uint6
         (d.dev_type == HSDevType::Fast ? fast_capacity : data_capacity) += d.dev_size;
     }
 
-    const uint64_t resolved_mem_cap = mem_cap.value_or(
-        (total_system_memory() * HS_DYNAMIC_CONFIG(resource_limits.sys_mem_use_percent)) / 100);
+    const uint64_t resolved_mem_cap =
+        mem_cap.value_or((total_system_memory() * HS_DYNAMIC_CONFIG(resource_limits.sys_mem_use_percent)) / 100);
     const uint64_t cache_size = (resolved_mem_cap * HS_DYNAMIC_CONFIG(resource_limits.cache_size_percent)) / 100;
 
     LOGINFO("ResourceMgr starting: fast_capacity={} data_capacity={} mem_cap={} (caller_provided={}) cache_size={}",
@@ -81,10 +82,8 @@ void ResourceMgr::stop() {
 }
 
 ResourceMgr::ResourceMgr(uint64_t fast_capacity, uint64_t data_capacity, uint64_t mem_cap, uint64_t cache_size) :
-        fast_capacity_{fast_capacity},
-        data_capacity_{data_capacity},
-        mem_cap_{mem_cap},
-        cache_size_{cache_size} {}
+        fast_capacity_{fast_capacity}, data_capacity_{data_capacity}, mem_cap_{mem_cap}, cache_size_{cache_size} {
+}
 
 ResourceMgr::~ResourceMgr() = default;
 
@@ -109,7 +108,7 @@ uint64_t ResourceMgr::mem_free_bytes() const {
 
 // ────────────────────────────────────────────────── Poll loop ────────────────────────────────────────────────────────
 
-folly::coro::Task< void > ResourceMgr::poll_tick() {
+Async< void > ResourceMgr::poll_tick() {
     // TODO: implement rule bodies once the per-manager getters land:
     //   • check_btree_dirty()    — cow_btree_mgr().total_dirty_bytes() vs mem-derived limit
     //   • check_log_size()       — log_store_mgr().total_log_bytes() vs disk-free-derived limit

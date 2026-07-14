@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "common/async.h"
 #include <cstdint>
 #include <memory>
 
@@ -139,8 +140,7 @@ public:
 private:
     // Once a full WireFrame request is in, look up the raft_server by group_id, dispatch its process_req
     // coro task, schedule the response write-back on this same socket when the task completes.
-    folly::coro::Task< void > dispatch_request(nuraft::group_id_t gid, uint64_t req_id,
-                                               nuraft::ptr< nuraft::buffer > body);
+    Async< void > dispatch_request(nuraft::group_id_t gid, uint64_t req_id, nuraft::ptr< nuraft::buffer > body);
 
     // Build a response wire frame (header echoing req_id with is_response flag set, plus encoded resp_msg
     // payload) and writeChain it on this socket with MSG_ZEROCOPY.  Called from any thread — uses

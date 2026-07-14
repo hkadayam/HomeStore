@@ -21,7 +21,7 @@
 #include <variant>
 #include <vector>
 
-#include <folly/coro/Task.h>
+#include "common/async.h"
 
 #include "common/defs.h"                   // shared<>, unique<>
 #include "homestore/base/homestore_decl.h" // DevInfo, IOFlag, HSDevType
@@ -96,14 +96,14 @@ public:
 
     /// Boot the system.  Returns true on first-time boot (caller MUST follow up with
     /// format_and_start(FormatOpts)); false if recovery completed and HomeStore is fully up.
-    folly::coro::Task< bool > start(InputParams input);
+    Async< bool > start(InputParams input);
 
     /// First-time-boot only.  Formats devices, creates each manager's vdev, brings managers up,
     /// commits formatting.  Do NOT call on subsequent mounts — start() handles those itself.
-    folly::coro::Task< void > format_and_start(FormatOpts opts);
+    Async< void > format_and_start(FormatOpts opts);
 
     /// Tear down all managers in reverse start order.  Idempotent.
-    folly::coro::Task< void > shutdown();
+    Async< void > shutdown();
 
     bool is_first_time_boot() const;
     bool is_initialized() const { return init_done_.load(std::memory_order_acquire); }

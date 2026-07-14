@@ -7,7 +7,7 @@
 #include <utility>
 #include <vector>
 
-#include <folly/coro/Task.h>
+#include "common/async.h"
 #include <folly/io/async/EventBase.h>
 #include <sisl/fds/buffer.h>
 
@@ -60,10 +60,10 @@ public:
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     /// Open a file or block device. `oflags`: e.g. O_RDWR | O_DIRECT.
-    static folly::coro::Task< std::shared_ptr< IoDevice > > open_dev(std::string devname, int oflags);
+    static Async< std::shared_ptr< IoDevice > > open_dev(std::string devname, int oflags);
 
     /// Returns device/file size in bytes.
-    static folly::coro::Task< uint64_t > get_size(const IoDevice& dev);
+    static Async< uint64_t > get_size(const IoDevice& dev);
 
     /// No-op kept for API symmetry; ownership is released by dropping the ptr.
     void close_dev(std::shared_ptr< IoDevice >) noexcept {}
@@ -72,31 +72,30 @@ public:
 
     /// Positioned read into buf — polymorphic via the IoBuf abstract base.  Caller must keep buf alive
     /// through the await (guaranteed when caller co_awaits).
-    folly::coro::Task< std::error_code > read(const IoDevice& dev, IoBuf& buf, uint64_t offset);
+    Async< std::error_code > read(const IoDevice& dev, IoBuf& buf, uint64_t offset);
 
     /// Scatter read into `sg.bufs` — polymorphic IoBuf pointer list.  Each element's underlying bytes are
     /// filled in place; lifetime is the caller's responsibility per element.
-    folly::coro::Task< std::error_code > readv(const IoDevice& dev, sisl::SgList const& sg, uint64_t offset);
+    Async< std::error_code > readv(const IoDevice& dev, sisl::SgList const& sg, uint64_t offset);
 
     // ── Write ─────────────────────────────────────────────────────────────────
 
     /// Positioned write — polymorphic via the IoBuf abstract base.  Same lifetime contract as read.
-    folly::coro::Task< std::error_code > write(const IoDevice& dev, const IoBuf& buf, uint64_t offset);
+    Async< std::error_code > write(const IoDevice& dev, const IoBuf& buf, uint64_t offset);
 
     /// Gather write — `sg.bufs` is the read-only polymorphic IoBuf pointer list; caller retains ownership.
-    folly::coro::Task< std::error_code > writev(const IoDevice& dev, sisl::SgList const& sg, uint64_t offset);
+    Async< std::error_code > writev(const IoDevice& dev, sisl::SgList const& sg, uint64_t offset);
 
     // ── Misc ──────────────────────────────────────────────────────────────────
 
     /// Zero [offset, offset+size).  Uses BLKZEROOUT on block devices (Linux).
-    folly::coro::Task< std::error_code > write_zero(const IoDevice& dev, uint64_t size, uint64_t offset);
+    Async< std::error_code > write_zero(const IoDevice& dev, uint64_t size, uint64_t offset);
 
     /// fdatasync(2) — flush kernel buffers to backing storage.
-    folly::coro::Task< std::error_code > fsync(const IoDevice& dev);
+    Async< std::error_code > fsync(const IoDevice& dev);
 
 private:
-    folly::coro::Task< std::error_code > do_writev(const IoDevice& dev, std::vector< struct iovec >&& iovs,
-                                                    uint64_t offset);
+    Async< std::error_code > do_writev(const IoDevice& dev, std::vector< struct iovec >&& iovs, uint64_t offset);
 };
 
 } // namespace iomanager

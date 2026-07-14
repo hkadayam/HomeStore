@@ -15,6 +15,7 @@
  ***************************************************************************/
 
 #include <algorithm>
+#include "common/async.h"
 #include <cassert>
 #include <cstring>
 #include <random>
@@ -53,8 +54,8 @@ VirtualDev::VirtualDev(VDevInfo info, std::vector< shared< PhysicalDev > > pdevs
     store_state(std::move(initial));
 }
 
-folly::coro::Task< unique< VirtualDev > > VirtualDev::create(VDevParameters&& params, uint32_t vdev_id,
-                                                             const std::vector< shared< PhysicalDev > >& pdevs) {
+Async< unique< VirtualDev > > VirtualDev::create(VDevParameters&& params, uint32_t vdev_id,
+                                                 const std::vector< shared< PhysicalDev > >& pdevs) {
     if (pdevs.empty()) {
         throw std::invalid_argument("No pdevs available; cannot create vdev " + params.vdev_name);
     }
@@ -140,7 +141,7 @@ unique< VirtualDev > VirtualDev::load(VDevInfo vinfo, std::vector< shared< Physi
 // ──────────────────────────────────────────────────────────────────────────────
 // Public APIs: Device Resizing section with chunks
 // ──────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< shared< Chunk > > VirtualDev::expand(uint64_t chunk_size) {
+Async< shared< Chunk > > VirtualDev::expand(uint64_t chunk_size) {
     shared< Chunk > chunk = nullptr;
     uint64_t vdev_order;
     {
@@ -177,7 +178,7 @@ folly::coro::Task< shared< Chunk > > VirtualDev::expand(uint64_t chunk_size) {
     co_return chunk;
 }
 
-folly::coro::Task< uint32_t > VirtualDev::shrink(ChunkToShrink which, uint32_t specific_chunk_id) {
+Async< uint32_t > VirtualDev::shrink(ChunkToShrink which, uint32_t specific_chunk_id) {
     shared< Chunk > chunk;
     {
         std::lock_guard lk{chunk_mgmt_mutex_};
@@ -213,7 +214,7 @@ folly::coro::Task< uint32_t > VirtualDev::shrink(ChunkToShrink which, uint32_t s
     co_return chunk_id;
 }
 
-folly::coro::Task< void > VirtualDev::destroy() {
+Async< void > VirtualDev::destroy() {
     std::lock_guard lk{chunk_mgmt_mutex_};
     LOGINFO("Destroying VirtualDev '{}' (id={})", name_, vdev_id_);
 
@@ -238,31 +239,31 @@ folly::coro::Task< void > VirtualDev::destroy() {
 // ──────────────────────────────────────────────────────────────────────────────
 // Public APIs: I/Os
 // ──────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< void > VirtualDev::write(sisl::IoBuf const& buf, const BlkId& bid) {
+Async< void > VirtualDev::write(sisl::IoBuf const& buf, const BlkId& bid) {
     auto [dev_offset, chunk] = to_dev_offset(bid);
     VDEV_LOG(DEBUG, name_, "write: blk_num={} nblks={} chunk={} dev_offset={} buf_size={}", bid.blk_num(),
              bid.blk_count(), bid.chunk_num(), dev_offset, buf.size());
     co_await chunk->physical_dev()->write(buf, dev_offset);
 }
 
-folly::coro::Task< std::error_code > VirtualDev::read(sisl::IoBuf& buf, const BlkId& bid) {
+Async< std::error_code > VirtualDev::read(sisl::IoBuf& buf, const BlkId& bid) {
     auto [dev_offset, chunk] = to_dev_offset(bid);
     VDEV_LOG(DEBUG, name_, "read: blk_num={} nblks={} chunk={} dev_offset={} buf_size={}", bid.blk_num(),
              bid.blk_count(), bid.chunk_num(), dev_offset, buf.size());
     co_return co_await chunk->physical_dev()->read(buf, dev_offset);
 }
 
-folly::coro::Task< void > VirtualDev::writev(sisl::SgList const& sg, const BlkId& bid) {
+Async< void > VirtualDev::writev(sisl::SgList const& sg, const BlkId& bid) {
     auto [dev_offset, chunk] = to_dev_offset(bid);
     co_await chunk->physical_dev()->writev(sg, dev_offset);
 }
 
-folly::coro::Task< std::error_code > VirtualDev::readv(sisl::SgList const& sg, const BlkId& bid) {
+Async< std::error_code > VirtualDev::readv(sisl::SgList const& sg, const BlkId& bid) {
     auto [dev_offset, chunk] = to_dev_offset(bid);
     co_return co_await chunk->physical_dev()->readv(sg, dev_offset);
 }
 
-folly::coro::Task< void > VirtualDev::format() {
+Async< void > VirtualDev::format() {
     auto state = load_state();
     for (auto& [chunk_id, chunk] : state->all_chunks) {
         co_await chunk->physical_dev()->write_zero(chunk->info().chunk_size, chunk->start_offset());
@@ -270,7 +271,7 @@ folly::coro::Task< void > VirtualDev::format() {
     LOGINFO("VirtualDev '{}' formatted", name_);
 }
 
-folly::coro::Task< void > VirtualDev::fsync() {
+Async< void > VirtualDev::fsync() {
     auto state = load_state();
     std::unordered_set< uint32_t > seen;
     for (auto& [_, chunk] : state->all_chunks) {
@@ -575,7 +576,7 @@ void VirtualDev::enable_chunk_pooling(size_t pool_limit) {
     LOGINFO("VirtualDev '{}': enabled chunk pooling limit={}", name_, pool_limit);
 }
 
-folly::coro::Task< std::pair< shared< Chunk >, bool > > VirtualDev::get_or_create_nth_chunk(size_t n) {
+Async< std::pair< shared< Chunk >, bool > > VirtualDev::get_or_create_nth_chunk(size_t n) {
     shared< Chunk > existing;
     size_t current_count;
     {
@@ -657,7 +658,7 @@ void VirtualDev::adjust_vdev_info() {
     LOGINFO("Adjusted VDev '{}' stats: size={} num_chunks={}", name_, total_size, total_count);
 }
 
-folly::coro::Task< void > VirtualDev::write_vdev_info() {
+Async< void > VirtualDev::write_vdev_info() {
     // Recompute checksum then mirror the VDevInfo record to every pdev for redundancy.
     VDevInfo vinfo;
     {

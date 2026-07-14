@@ -15,6 +15,7 @@
  ***************************************************************************/
 
 #include <algorithm>
+#include "common/async.h"
 #include <optional>
 #include <utility>
 
@@ -62,7 +63,7 @@ StreamBase::StreamBase(uint64_t stream_id, const shared< VirtualDev >& vdev, Met
     chunks_.make_and_exchange(std::move(sorted));
 }
 
-folly::coro::Task< void > StreamBase::destroy() {
+Async< void > StreamBase::destroy() {
     auto lock = co_await expand_mutex_.co_scoped_lock();
 
     std::vector< shared< Chunk > > old_list;
@@ -84,7 +85,7 @@ folly::coro::Task< void > StreamBase::destroy() {
 //  Expansion and Truncation
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > StreamBase::expand_to(size_t n) {
+Async< void > StreamBase::expand_to(size_t n) {
     auto lock = co_await expand_mutex_.co_scoped_lock();
 
     // Snapshot current list — release the RCU guard before any co_await.
@@ -117,7 +118,7 @@ folly::coro::Task< void > StreamBase::expand_to(size_t n) {
     }
 }
 
-folly::coro::Task< void > StreamBase::init_chunk_mblk(const shared< Chunk >& chunk) {
+Async< void > StreamBase::init_chunk_mblk(const shared< Chunk >& chunk) {
     const uint32_t cid = chunk->chunk_id();
     auto name = fmt::format("{}_{}_{}_{}_{}", dev_name_, stream_type_name(), stream_id_, cid, blk_size_);
     auto blk = co_await meta_client_.create_meta_blk(name, std::nullopt);
@@ -126,12 +127,13 @@ folly::coro::Task< void > StreamBase::init_chunk_mblk(const shared< Chunk >& chu
     chunk_mblks_.emplace(cid, std::move(blk));
 }
 
-folly::coro::Task< void > StreamBase::remove_chunk_mblk(uint32_t chunk_id) {
+Async< void > StreamBase::remove_chunk_mblk(uint32_t chunk_id) {
     MetaBlk blk;
     {
         auto lock = co_await mblk_mutex_.co_scoped_lock();
         auto it = chunk_mblks_.find(chunk_id);
-        if (it == chunk_mblks_.end()) co_return;
+        if (it == chunk_mblks_.end())
+            co_return;
         blk = std::move(it->second);
         chunk_mblks_.erase(it);
     }
@@ -144,7 +146,7 @@ void StreamBase::install_chunks(std::vector< shared< Chunk > > chunks) {
     chunks_.make_and_exchange(std::move(chunks));
 }
 
-folly::coro::Task< void > StreamBase::truncate_before(size_t nchunks) {
+Async< void > StreamBase::truncate_before(size_t nchunks) {
     auto lock = co_await expand_mutex_.co_scoped_lock();
 
     std::vector< shared< Chunk > > old_list;

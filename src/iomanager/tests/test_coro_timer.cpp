@@ -18,7 +18,7 @@
 #include <thread>
 
 #include <gtest/gtest.h>
-#include <folly/coro/Task.h>
+#include "common/async.h"
 #include <folly/synchronization/Baton.h>
 
 #include <sisl/logging/logging.h>
@@ -30,13 +30,12 @@ using namespace iomanager;
 using namespace std::chrono_literals;
 
 SISL_OPTION_GROUP(test_coro_timer,
-    (num_reactors, "", "num_reactors", "number of reactor threads",
-     ::cxxopts::value< uint32_t >()->default_value("4"), "number"))
+                  (num_reactors, "", "num_reactors", "number of reactor threads",
+                   ::cxxopts::value< uint32_t >()->default_value("4"), "number"))
 
 static uint32_t g_num_reactors{4};
 
 class CoroTimerTest : public ::testing::Test {};
-
 
 // ── Recurring ─────────────────────────────────────────────────────────────────
 
@@ -44,11 +43,10 @@ TEST_F(CoroTimerTest, RecurringFiresMultipleTimes) {
     CoroTimer timer;
     std::atomic< uint32_t > tick_count{0};
 
-    timer.start(ReactorTarget::any(), 10ms, TimerKind::Recurring,
-                [&tick_count]() -> folly::coro::Task< void > {
-                    tick_count.fetch_add(1, std::memory_order_relaxed);
-                    co_return;
-                });
+    timer.start(ReactorTarget::any(), 10ms, TimerKind::Recurring, [&tick_count]() -> Async< void > {
+        tick_count.fetch_add(1, std::memory_order_relaxed);
+        co_return;
+    });
 
     std::this_thread::sleep_for(55ms);
     iomgr().spawn_and_block(ReactorTarget::reactor(0), timer.stop());
@@ -63,11 +61,10 @@ TEST_F(CoroTimerTest, RecurringStopsPromptly) {
     CoroTimer timer;
     std::atomic< uint32_t > tick_count{0};
 
-    timer.start(ReactorTarget::any(), 5ms, TimerKind::Recurring,
-                [&tick_count]() -> folly::coro::Task< void > {
-                    tick_count.fetch_add(1, std::memory_order_relaxed);
-                    co_return;
-                });
+    timer.start(ReactorTarget::any(), 5ms, TimerKind::Recurring, [&tick_count]() -> Async< void > {
+        tick_count.fetch_add(1, std::memory_order_relaxed);
+        co_return;
+    });
 
     std::this_thread::sleep_for(20ms);
     iomgr().spawn_and_block(ReactorTarget::reactor(0), timer.stop());
@@ -84,12 +81,11 @@ TEST_F(CoroTimerTest, OneShotFiresExactlyOnce) {
     std::atomic< uint32_t > tick_count{0};
     folly::Baton<> tick_done;
 
-    timer.start(ReactorTarget::any(), 10ms, TimerKind::OneShot,
-                [&tick_count, &tick_done]() -> folly::coro::Task< void > {
-                    tick_count.fetch_add(1, std::memory_order_relaxed);
-                    tick_done.post();
-                    co_return;
-                });
+    timer.start(ReactorTarget::any(), 10ms, TimerKind::OneShot, [&tick_count, &tick_done]() -> Async< void > {
+        tick_count.fetch_add(1, std::memory_order_relaxed);
+        tick_done.post();
+        co_return;
+    });
 
     tick_done.wait();
     std::this_thread::sleep_for(50ms); // Plenty of time for any spurious additional ticks.
@@ -109,7 +105,7 @@ TEST_F(CoroTimerTest, OneShotRearmsFromInsideTick) {
 
     std::function< void() > arm = [&]() {
         timer.start(ReactorTarget::any(), 1ms, TimerKind::OneShot,
-                    [&tick_count, &arm, &all_done, target]() -> folly::coro::Task< void > {
+                    [&tick_count, &arm, &all_done, target]() -> Async< void > {
                         auto n = tick_count.fetch_add(1, std::memory_order_relaxed) + 1;
                         if (n < target) {
                             arm(); // re-arm from INSIDE tick — exercises the auto-reset hot path
@@ -131,11 +127,10 @@ TEST_F(CoroTimerTest, OneShotCancelledBeforeTick) {
     CoroTimer timer;
     std::atomic< uint32_t > tick_count{0};
 
-    timer.start(ReactorTarget::any(), 200ms, TimerKind::OneShot,
-                [&tick_count]() -> folly::coro::Task< void > {
-                    tick_count.fetch_add(1, std::memory_order_relaxed);
-                    co_return;
-                });
+    timer.start(ReactorTarget::any(), 200ms, TimerKind::OneShot, [&tick_count]() -> Async< void > {
+        tick_count.fetch_add(1, std::memory_order_relaxed);
+        co_return;
+    });
 
     // Cancel well before the 200ms interval elapses.
     std::this_thread::sleep_for(20ms);
@@ -151,11 +146,10 @@ TEST_F(CoroTimerTest, RestartAfterStop) {
     std::atomic< uint32_t > tick_count{0};
 
     auto run_burst = [&]() {
-        timer.start(ReactorTarget::any(), 10ms, TimerKind::Recurring,
-                    [&tick_count]() -> folly::coro::Task< void > {
-                        tick_count.fetch_add(1, std::memory_order_relaxed);
-                        co_return;
-                    });
+        timer.start(ReactorTarget::any(), 10ms, TimerKind::Recurring, [&tick_count]() -> Async< void > {
+            tick_count.fetch_add(1, std::memory_order_relaxed);
+            co_return;
+        });
         std::this_thread::sleep_for(35ms);
         iomgr().spawn_and_block(ReactorTarget::reactor(0), timer.stop());
     };
@@ -174,23 +168,21 @@ TEST_F(CoroTimerTest, RestartAfterOneShotNaturalCompletion) {
     std::atomic< uint32_t > tick_count{0};
 
     folly::Baton<> tick_a;
-    timer.start(ReactorTarget::any(), 5ms, TimerKind::OneShot,
-                [&tick_count, &tick_a]() -> folly::coro::Task< void > {
-                    tick_count.fetch_add(1, std::memory_order_relaxed);
-                    tick_a.post();
-                    co_return;
-                });
+    timer.start(ReactorTarget::any(), 5ms, TimerKind::OneShot, [&tick_count, &tick_a]() -> Async< void > {
+        tick_count.fetch_add(1, std::memory_order_relaxed);
+        tick_a.post();
+        co_return;
+    });
     tick_a.wait();
     EXPECT_EQ(tick_count.load(), 1u);
 
     // Re-start without explicit stop — auto-reset path.
     folly::Baton<> tick_b;
-    timer.start(ReactorTarget::any(), 5ms, TimerKind::OneShot,
-                [&tick_count, &tick_b]() -> folly::coro::Task< void > {
-                    tick_count.fetch_add(1, std::memory_order_relaxed);
-                    tick_b.post();
-                    co_return;
-                });
+    timer.start(ReactorTarget::any(), 5ms, TimerKind::OneShot, [&tick_count, &tick_b]() -> Async< void > {
+        tick_count.fetch_add(1, std::memory_order_relaxed);
+        tick_b.post();
+        co_return;
+    });
     tick_b.wait();
     EXPECT_EQ(tick_count.load(), 2u);
 
@@ -203,11 +195,10 @@ TEST_F(CoroTimerTest, RequestStopThenStopPattern) {
     CoroTimer timer;
     std::atomic< uint32_t > tick_count{0};
 
-    timer.start(ReactorTarget::any(), 10ms, TimerKind::Recurring,
-                [&tick_count]() -> folly::coro::Task< void > {
-                    tick_count.fetch_add(1, std::memory_order_relaxed);
-                    co_return;
-                });
+    timer.start(ReactorTarget::any(), 10ms, TimerKind::Recurring, [&tick_count]() -> Async< void > {
+        tick_count.fetch_add(1, std::memory_order_relaxed);
+        co_return;
+    });
 
     std::this_thread::sleep_for(25ms);
     timer.request_stop(); // non-blocking; cancellation requested
@@ -238,8 +229,7 @@ TEST_F(CoroTimerTest, IsStartedReflectsLifecycle) {
     CoroTimer timer;
     EXPECT_FALSE(timer.is_started());
 
-    timer.start(ReactorTarget::any(), 100ms, TimerKind::Recurring,
-                []() -> folly::coro::Task< void > { co_return; });
+    timer.start(ReactorTarget::any(), 100ms, TimerKind::Recurring, []() -> Async< void > { co_return; });
     EXPECT_TRUE(timer.is_started());
 
     iomgr().spawn_and_block(ReactorTarget::reactor(0), timer.stop());
@@ -252,11 +242,10 @@ TEST_F(CoroTimerTest, TickCanAwait) {
     CoroTimer timer;
     std::atomic< uint32_t > tick_count{0};
 
-    timer.start(ReactorTarget::any(), 10ms, TimerKind::Recurring,
-                [&tick_count]() -> folly::coro::Task< void > {
-                    co_await iomgr().sleep(2ms);
-                    tick_count.fetch_add(1, std::memory_order_relaxed);
-                });
+    timer.start(ReactorTarget::any(), 10ms, TimerKind::Recurring, [&tick_count]() -> Async< void > {
+        co_await iomgr().sleep(2ms);
+        tick_count.fetch_add(1, std::memory_order_relaxed);
+    });
 
     std::this_thread::sleep_for(60ms);
     iomgr().spawn_and_block(ReactorTarget::reactor(0), timer.stop());
@@ -273,11 +262,10 @@ TEST_F(CoroTimerTest, MultipleTimersConcurrent) {
     std::array< std::atomic< uint32_t >, N > counts{};
 
     for (int i = 0; i < N; ++i) {
-        timers[i].start(ReactorTarget::any(), 10ms, TimerKind::Recurring,
-                        [&counts, i]() -> folly::coro::Task< void > {
-                            counts[i].fetch_add(1, std::memory_order_relaxed);
-                            co_return;
-                        });
+        timers[i].start(ReactorTarget::any(), 10ms, TimerKind::Recurring, [&counts, i]() -> Async< void > {
+            counts[i].fetch_add(1, std::memory_order_relaxed);
+            co_return;
+        });
     }
 
     std::this_thread::sleep_for(50ms);

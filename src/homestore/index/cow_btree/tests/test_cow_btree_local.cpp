@@ -13,6 +13,7 @@
 // across stack restarts.
 //
 #include <atomic>
+#include "common/async.h"
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -91,7 +92,7 @@ static std::vector< DevInfo > make_dev_infos() {
 
 // ──────────────────────────────────────────── Stack bootstrap / teardown ─────────────────────────────────────────────
 // first_time_boot=true: format devices, create fresh managers.  false: open existing devices, recover all managers.
-static folly::coro::Task< shared< BlobDev > > bootstrap_stack(bool first_time_boot) {
+static Async< shared< BlobDev > > bootstrap_stack(bool first_time_boot) {
     shared< DeviceManager > dm;
     if (first_time_boot) {
         dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
@@ -134,7 +135,7 @@ static folly::coro::Task< shared< BlobDev > > bootstrap_stack(bool first_time_bo
     }
 }
 
-static folly::coro::Task< void > shutdown_stack() {
+static Async< void > shutdown_stack() {
     co_await cp_mgr().shutdown();
     blob_dev_mgr().shutdown();
     cow_btree_mgr().shutdown();
@@ -199,7 +200,7 @@ public:
         bnodeid_t id{empty_bnodeid};
         std::vector< std::pair< uint64_t, uint32_t > > pairs;
         auto* self = this;
-        iomgr().spawn_and_block(ReactorTarget::any(), [self, kvs_per_node, &id, &pairs]() -> folly::coro::Task< void > {
+        iomgr().spawn_and_block(ReactorTarget::any(), [self, kvs_per_node, &id, &pairs]() -> Async< void > {
             auto* cow = COWBtree::cast_to(self->bt_.get());
             auto node = cow->create_node(/*is_leaf=*/true);
             self->fill_node(node, kvs_per_node, pairs);
@@ -219,7 +220,7 @@ public:
         ASSERT_LT(slot_idx, shadow_[id].size());
         auto const new_val_raw = next_value();
         auto* self = this;
-        iomgr().spawn_and_block(ReactorTarget::any(), [self, id, slot_idx, new_val_raw]() -> folly::coro::Task< void > {
+        iomgr().spawn_and_block(ReactorTarget::any(), [self, id, slot_idx, new_val_raw]() -> Async< void > {
             auto* cow = COWBtree::cast_to(self->bt_.get());
             auto result = co_await cow->read_node(id, LockType::Write);
             HS_REL_ASSERT(result.hasValue(), "read_node failed for id={}", id);
@@ -239,7 +240,7 @@ public:
     void remove(bnodeid_t id) {
         ASSERT_TRUE(shadow_.count(id)) << "remove on unknown node " << id;
         auto* self = this;
-        iomgr().spawn_and_block(ReactorTarget::any(), [self, id]() -> folly::coro::Task< void > {
+        iomgr().spawn_and_block(ReactorTarget::any(), [self, id]() -> Async< void > {
             auto* cow = COWBtree::cast_to(self->bt_.get());
             auto result = co_await cow->read_node(id, LockType::Write);
             HS_REL_ASSERT(result.hasValue(), "read_node for remove id={}", id);
@@ -266,36 +267,35 @@ public:
             std::string detail;
         };
         std::vector< Mismatch > mismatches;
-        iomgr().spawn_and_block(
-            ReactorTarget::any(), [self, ids = std::move(ids), &mismatches]() -> folly::coro::Task< void > {
-                auto* cow = COWBtree::cast_to(self->bt_.get());
-                for (auto id : ids) {
-                    auto result = co_await cow->read_node(id, LockType::Read);
-                    if (!result.hasValue()) {
-                        mismatches.push_back({id, "read_node failed"});
-                        continue;
-                    }
-                    auto& node = result.value();
-                    auto* leaf = static_cast< LeafNode const* >(node.operator->());
-                    auto const& expected = self->shadow_.at(id);
-                    if (leaf->total_entries() != expected.size()) {
-                        mismatches.push_back(
-                            {id, fmt::format("entry count: got {} want {}", leaf->total_entries(), expected.size())});
-                        continue;
-                    }
-                    for (uint32_t i = 0; i < expected.size(); ++i) {
-                        K key = leaf->template get_nth_key< K >(i, /*copy=*/false);
-                        V val;
-                        leaf->get_nth_value(i, &val, /*copy=*/false);
-                        if (key.key() != expected[i].first || val.value() != expected[i].second) {
-                            mismatches.push_back({id,
-                                                  fmt::format("slot {}: got ({},{}) want ({},{})", i, key.key(),
-                                                              val.value(), expected[i].first, expected[i].second)});
-                        }
+        iomgr().spawn_and_block(ReactorTarget::any(), [self, ids = std::move(ids), &mismatches]() -> Async< void > {
+            auto* cow = COWBtree::cast_to(self->bt_.get());
+            for (auto id : ids) {
+                auto result = co_await cow->read_node(id, LockType::Read);
+                if (!result.hasValue()) {
+                    mismatches.push_back({id, "read_node failed"});
+                    continue;
+                }
+                auto& node = result.value();
+                auto* leaf = static_cast< LeafNode const* >(node.operator->());
+                auto const& expected = self->shadow_.at(id);
+                if (leaf->total_entries() != expected.size()) {
+                    mismatches.push_back(
+                        {id, fmt::format("entry count: got {} want {}", leaf->total_entries(), expected.size())});
+                    continue;
+                }
+                for (uint32_t i = 0; i < expected.size(); ++i) {
+                    K key = leaf->template get_nth_key< K >(i, /*copy=*/false);
+                    V val;
+                    leaf->get_nth_value(i, &val, /*copy=*/false);
+                    if (key.key() != expected[i].first || val.value() != expected[i].second) {
+                        mismatches.push_back({id,
+                                              fmt::format("slot {}: got ({},{}) want ({},{})", i, key.key(),
+                                                          val.value(), expected[i].first, expected[i].second)});
                     }
                 }
-                co_return;
-            }());
+            }
+            co_return;
+        }());
 
         for (auto const& m : mismatches) {
             ADD_FAILURE() << "node " << m.id << ": " << m.detail;
@@ -354,7 +354,7 @@ private:
             freq.kind.Set(pf);
             flip::FlipClient::instance().inject_noreturn_flip("force_full_map_flush", {}, freq);
         }
-        iomgr().spawn_and_block(ReactorTarget::any(), []() -> folly::coro::Task< void > {
+        iomgr().spawn_and_block(ReactorTarget::any(), []() -> Async< void > {
             auto fut = cp_mgr().trigger_cp_flush(/*force=*/true, CPTriggerReason::UserDriven);
             co_await std::move(fut).via(co_await folly::coro::co_current_executor);
             co_return;

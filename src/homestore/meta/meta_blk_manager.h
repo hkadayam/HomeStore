@@ -20,11 +20,10 @@
 #include <unordered_map>
 #include <vector>
 
-#include <folly/coro/Mutex.h>
-#include <folly/coro/Task.h>
+#include "common/async.h"
 
-#include "homestore/base/blk.h"              // BlkId
-#include "common/defs.h" // shared<>, unique<>, cshared<>
+#include "homestore/base/blk.h" // BlkId
+#include "common/defs.h"        // shared<>, unique<>, cshared<>
 
 #include "homestore/meta/meta_client.h"      // MetaClient
 #include "homestore/meta/meta_client_info.h" // MetaClientInfo, MAX_META_CLIENTS
@@ -87,10 +86,10 @@ public:
 
     /// Format a brand-new meta vdev and install this manager into Managers.  The vdev is created with one chunk of
     /// `chunk_size` bytes and grows in `chunk_size` increments via VirtualDev::expand() as more space is needed.
-    static folly::coro::Task< void > create(uint64_t chunk_size);
+    static Async< void > create(uint64_t chunk_size);
 
     /// Load an existing meta vdev and install this manager into Managers.
-    static folly::coro::Task< void > load();
+    static Async< void > load();
 
     // ── Client registration ───────────────────────────────────────────────────
 
@@ -98,11 +97,11 @@ public:
     ///
     /// If a matching entry was recovered from disk (i.e. the system restarted), the existing MetaClient (with its full
     /// block chain) is returned. Otherwise a fresh MetaClient is created and its slot is written to disk.
-    folly::coro::Task< MetaClient > register_client(std::string name);
+    Async< MetaClient > register_client(std::string name);
 
     /// Free the client's slot so it can be reused.  The caller is responsible for removing any MetaBlks before
     /// deregistering.
-    folly::coro::Task< void > deregister_client(const MetaClient& client);
+    Async< void > deregister_client(const MetaClient& client);
 
     // ── Non-copyable, non-movable ─────────────────────────────────────────────
     MetaBlkManager(const MetaBlkManager&) = delete;
@@ -114,7 +113,7 @@ private:
     MetaBlkManager() = default;
 
     // ── Private helpers ───────────────────────────────────────────────────────
-    folly::coro::Task< void > load_client_info_from_disk();
+    Async< void > load_client_info_from_disk();
     folly::coro::Mutex mgmt_mutex_;
 
     /// Find the first free slot, mark it allocated, return its index. Throws std::runtime_error if all slots are

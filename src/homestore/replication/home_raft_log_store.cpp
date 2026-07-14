@@ -14,6 +14,7 @@
  *********************************************************************************/
 
 #include "home_raft_log_store.h"
+#include "common/async.h"
 
 #include <cstring>
 #include <stdexcept>
@@ -122,8 +123,8 @@ static constexpr logstore_seq_num_t to_store_lsn(raft_lsn_t raft_lsn) {
 // Static factories
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< unique< HomeRaftLogStore > > HomeRaftLogStore::create(superblk< ReplicaSetSuperBlk >& sb,
-                                                                         shared< RawBlkStream > blob_stream) {
+Async< unique< HomeRaftLogStore > > HomeRaftLogStore::create(superblk< ReplicaSetSuperBlk >& sb,
+                                                             shared< RawBlkStream > blob_stream) {
     auto log_store = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
     sb->raft_log_store_id = log_store->store_id();
 
@@ -140,11 +141,11 @@ folly::coro::Task< unique< HomeRaftLogStore > > HomeRaftLogStore::create(superbl
     co_return self;
 }
 
-folly::coro::Task< unique< HomeRaftLogStore > > HomeRaftLogStore::load(superblk< ReplicaSetSuperBlk >& sb,
-                                                                       shared< RawBlkStream > blob_stream) {
+Async< unique< HomeRaftLogStore > > HomeRaftLogStore::load(superblk< ReplicaSetSuperBlk >& sb,
+                                                           shared< RawBlkStream > blob_stream) {
     HS_REL_ASSERT_NE(sb->raft_log_store_id, UINT32_MAX, "load() called with no persisted raft_log_store_id");
 
-    // Replay handler is a no-op here — fetch_entry_sync materializes entries lazily, and the recovery walk
+    // Replay handler is a no-op here — fetch_entry materializes entries lazily, and the recovery walk
     // happens internally inside LogStoreManager::recover() which Managers wired up before ReplicaSet load.
     auto log_store = log_store_mgr().open_log_store(sb->raft_log_store_id, [](lsn_t, sisl::IoBufView const&) {});
     if (!log_store) {
@@ -183,7 +184,7 @@ HomeRaftLogStore::HomeRaftLogStore(shared< LogStore > log_store, unique< Indirec
     dummy_log_entry_ = nuraft::cs_new< nuraft::log_entry >(0, nuraft::buffer::alloc(0), nuraft::log_val_type::app_log);
 }
 
-folly::coro::Task< void > HomeRaftLogStore::destroy() {
+Async< void > HomeRaftLogStore::destroy() {
     REPL_STORE_LOG(DEBUG, "Logstore is being physically destroyed");
     if (indirect_) {
         co_await indirect_->destroy();
@@ -208,13 +209,13 @@ ulong HomeRaftLogStore::start_index() const {
     return std::max< ulong >(1, to_ulong(log_store_->head_lsn() + 1));
 }
 
-RaftLogEntryPtr HomeRaftLogStore::last_entry() const {
+Async< RaftLogEntryPtr > HomeRaftLogStore::last_entry() const {
     store_lsn_t max_seq = log_store_->tail_lsn();
     if (max_seq < 0) {
-        return dummy_log_entry_;
+        co_return dummy_log_entry_;
     }
     ulong lsn = to_ulong(max_seq + 1);
-    return fetch_entry_sync(lsn);
+    co_return co_await fetch_entry(lsn);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -240,7 +241,7 @@ LogBlob HomeRaftLogStore::to_log_blob(RaftLogEntryPtr& entry) {
     return LogBlob{sisl::IoBufSpan{coalesced->data_begin(), to_u32(coalesced->size()), /*is_aligned=*/false}};
 }
 
-ulong HomeRaftLogStore::append(RaftLogEntryPtr& entry) {
+Async< ulong > HomeRaftLogStore::append(RaftLogEntryPtr& entry) {
     REPL_STORE_LOG(TRACE, "append entry term={}, log_val_type={} size={}", entry->get_term(),
                    static_cast< uint32_t >(entry->get_val_type()), entry->total_size());
 
@@ -254,7 +255,7 @@ ulong HomeRaftLogStore::append(RaftLogEntryPtr& entry) {
     BlkIds bids;
     bool const is_indirect = indirect_ && entry->total_size() >= kLargeValueThreshold;
     if (is_indirect) {
-        std::tie(lb, bids) = indirect_->write(entry);
+        std::tie(lb, bids) = co_await indirect_->write(entry);
     } else {
         lb = to_log_blob(entry);
     }
@@ -271,16 +272,16 @@ ulong HomeRaftLogStore::append(RaftLogEntryPtr& entry) {
         std::unique_lock lk(cache_mtx_);
         entry_cache_[position_in_cache] = std::make_pair(lsn, entry);
     }
-    return lsn;
+    co_return lsn;
 }
 
-void HomeRaftLogStore::write_at(ulong index, RaftLogEntryPtr& entry) {
+Async< void > HomeRaftLogStore::write_at(ulong index, RaftLogEntryPtr& entry) {
     // Roll back the main log past index-1 first so concurrent deferred_free sees the post-rollback tail
     // and classifies a stale referenced_lsn correctly (immediate free).  Then roll back indirect_'s own
     // state (uncommitted_blkids_ release, deferred_free drain).
-    iomanager::blocking_wait(log_store_->rollback(to_store_lsn(index) - 1));
+    co_await log_store_->rollback(to_store_lsn(index) - 1);
     if (indirect_) {
-        iomanager::blocking_wait(indirect_->rollback(static_cast< raft_lsn_t >(index) - 1));
+        co_await indirect_->rollback(static_cast< raft_lsn_t >(index) - 1);
     }
 
     // we need to reset the durable lsn, because its ok to set to lower number as it will be updated on next flush
@@ -291,7 +292,7 @@ void HomeRaftLogStore::write_at(ulong index, RaftLogEntryPtr& entry) {
     BlkIds bids;
     bool const is_indirect = indirect_ && entry->total_size() >= kLargeValueThreshold;
     if (is_indirect) {
-        std::tie(lb, bids) = indirect_->write(entry);
+        std::tie(lb, bids) = co_await indirect_->write(entry);
     } else {
         lb = to_log_blob(entry);
     }
@@ -328,37 +329,41 @@ void HomeRaftLogStore::end_of_append_batch(ulong start, ulong cnt) {
     // detached coroutine awaits the LogStore's actual flush (which may also kick on LogStream's size /
     // timer auto-flush in parallel); once persisted, we update last_durable_lsn_ and notify the raft_server
     // so its durability_signal_ wakes any handle_append_entries coroutines waiting on this lsn.
-    iomanager::spawn_detached(iomanager::ReactorTarget::any(),
-                              [this, end_repl_lsn, end_store_lsn]() -> folly::coro::Task< void > {
-                                  co_await log_store_->flush();
-                                  last_durable_lsn_.store(end_store_lsn, std::memory_order_release);
-                                  if (raft_server_) {
-                                      raft_server_->notify_durable(end_repl_lsn);
-                                  }
-                              });
+    iomanager::spawn_detached(iomanager::ReactorTarget::any(), [this, end_repl_lsn, end_store_lsn]() -> Async< void > {
+        co_await log_store_->flush();
+        last_durable_lsn_.store(end_store_lsn, std::memory_order_release);
+        if (raft_server_) {
+            raft_server_->notify_durable(end_repl_lsn);
+        }
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 // Reads — cache then blockingWait on the new LogStore's async read
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-RaftLogEntryPtr HomeRaftLogStore::fetch_entry_sync(ulong index, bool need_value) const {
+std::optional< RaftLogEntryPtr > HomeRaftLogStore::cache_lookup(ulong index) const {
     auto position_in_cache = index % entry_cache_.size();
-    {
-        std::shared_lock lk(cache_mtx_);
-        auto nle = entry_cache_[position_in_cache];
-        if (nle.first == index) {
-            return nle.second;
-        }
+    std::shared_lock lk(cache_mtx_);
+    auto const& nle = entry_cache_[position_in_cache];
+    if (nle.first == index) {
+        return nle.second;
     }
-    // Cache miss — block on the underlying LogStore read. Transport routes slow callers (snapshot, sync_log)
-    // onto the slow_executor where blocking is safe; hot callers (election, append_resp uncommitted-window
-    // walk) only ever touch lsns within the cache window so they never reach this branch.
-    auto byte_view = iomanager::blocking_wait(log_store_->read(to_store_lsn(index)));
+    return std::nullopt;
+}
+
+Async< RaftLogEntryPtr > HomeRaftLogStore::fetch_entry(ulong index, bool need_value) const {
+    if (auto cached = cache_lookup(index)) {
+        co_return *cached;
+    }
+    // Cache miss — co_await the underlying LogStore read. Hot callers (election, append_resp uncommitted-window
+    // walk) only ever touch lsns within the cache window so they never reach this branch; cold callers
+    // (snapshot, sync_log) suspend here instead of blocking their reactor.
+    auto byte_view = co_await log_store_->read(to_store_lsn(index));
     if (byte_view.size() == 0) {
-        REPL_STORE_LOG(ERROR, "fetch_entry_sync({}) out_of_range start={} end={}", index, start_index(),
+        REPL_STORE_LOG(ERROR, "fetch_entry({}) out_of_range start={} end={}", index, start_index(),
                        to_ulong(log_store_->flushed_upto() + 1));
-        return dummy_log_entry_;
+        co_return dummy_log_entry_;
     }
 
     // Zero-copy: wrap the disk bytes as a nuraft::buffer via take_ownership; the deleter captures the
@@ -382,53 +387,57 @@ RaftLogEntryPtr HomeRaftLogStore::fetch_entry_sync(ulong index, bool need_value)
         auto const* hdr = r_cast< ReplLogHeader const* >(base + nuraft::log_entry::kHdrSize);
         if (hdr->code == to_u8(JournalType::HS_DATA_INDIRECT)) {
             entry->set_private_buf(std::move(raft_buf));
-            iomanager::blocking_wait(indirect_->reconstruct(*entry));
+            co_await indirect_->reconstruct(*entry);
         }
     }
-    return entry;
+    co_return entry;
 }
 
-RaftLogEntryPtr HomeRaftLogStore::entry_at(ulong index) {
-    return fetch_entry_sync(index);
+Async< RaftLogEntryPtr > HomeRaftLogStore::entry_at(ulong index) {
+    co_return co_await fetch_entry(index);
 }
 
-ulong HomeRaftLogStore::term_at(ulong index) {
-    auto position_in_cache = index % entry_cache_.size();
-    {
-        std::shared_lock lk(cache_mtx_);
-        auto nle = entry_cache_[position_in_cache];
-        if (nle.first == index) {
-            return nle.second->get_term();
-        }
+std::optional< RaftLogEntryPtr > HomeRaftLogStore::try_entry_at(ulong index) {
+    return cache_lookup(index);
+}
+
+Async< ulong > HomeRaftLogStore::term_at(ulong index) {
+    auto entry = co_await fetch_entry(index, /*need_value=*/false);
+    co_return entry->get_term();
+}
+
+std::optional< ulong > HomeRaftLogStore::try_term_at(ulong index) {
+    if (auto cached = cache_lookup(index)) {
+        return (*cached)->get_term();
     }
-    return fetch_entry_sync(index, /*need_value=*/false)->get_term();
+    return std::nullopt;
 }
 
-nuraft::ptr< std::vector< RaftLogEntryPtr > > HomeRaftLogStore::log_entries(ulong start, ulong end) {
+Async< nuraft::ptr< std::vector< RaftLogEntryPtr > > > HomeRaftLogStore::log_entries(ulong start, ulong end) {
     auto out_vec = std::make_shared< std::vector< RaftLogEntryPtr > >();
     out_vec->reserve(end - start);
     for (ulong i = start; i < end; ++i) {
-        out_vec->emplace_back(fetch_entry_sync(i));
+        out_vec->emplace_back(co_await fetch_entry(i));
     }
     REPL_STORE_LOG(TRACE, "Num log entries start={} end={} num_entries={}", start, end, out_vec->size());
-    return out_vec;
+    co_return out_vec;
 }
 
-nuraft::ptr< std::vector< RaftLogEntryPtr > > HomeRaftLogStore::log_entries_ext(ulong start, ulong end,
-                                                                                int64_t batch_size_hint_in_bytes) {
+Async< nuraft::ptr< std::vector< RaftLogEntryPtr > > >
+HomeRaftLogStore::log_entries_ext(ulong start, ulong end, int64_t batch_size_hint_in_bytes) {
     if (batch_size_hint_in_bytes < 0) {
         // Follower-busy signal — ship zero entries (NOT nullptr, which nuraft treats as retrieval failure).
-        return std::make_shared< std::vector< RaftLogEntryPtr > >();
+        co_return std::make_shared< std::vector< RaftLogEntryPtr > >();
     } else if (batch_size_hint_in_bytes == 0) {
         // No limit — unbounded fetch.
-        return log_entries(start, end);
+        co_return co_await log_entries(start, end);
     } else {
         auto out_vec = std::make_shared< std::vector< RaftLogEntryPtr > >();
         auto const hint = to_u64(batch_size_hint_in_bytes);
         out_vec->reserve(end - start);
         uint64_t accumulated = 0;
         for (ulong i = start; i < end; ++i) {
-            auto entry = fetch_entry_sync(i);
+            auto entry = co_await fetch_entry(i);
             accumulated += entry->total_size();
             out_vec->emplace_back(std::move(entry));
             if (accumulated >= hint) {
@@ -437,7 +446,7 @@ nuraft::ptr< std::vector< RaftLogEntryPtr > > HomeRaftLogStore::log_entries_ext(
         }
         REPL_STORE_LOG(TRACE, "log_entries_ext start={} end={} hint={} returned={} bytes={}", start, end, hint,
                        out_vec->size(), accumulated);
-        return out_vec;
+        co_return out_vec;
     }
 }
 
@@ -445,7 +454,7 @@ nuraft::ptr< std::vector< RaftLogEntryPtr > > HomeRaftLogStore::log_entries_ext(
 // Pack / apply_pack
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-RaftBufferPtr HomeRaftLogStore::pack(ulong index, int32_t cnt) {
+Async< RaftBufferPtr > HomeRaftLogStore::pack(ulong index, int32_t cnt) {
     static constexpr size_t estimated_record_size = 128;
     size_t estimated_size = cnt * estimated_record_size + sizeof(uint32_t);
 
@@ -459,7 +468,7 @@ RaftBufferPtr HomeRaftLogStore::pack(ulong index, int32_t cnt) {
     out_buf->put(cnt);
 
     for (int32_t i = 0; i < cnt; ++i) {
-        auto entry = fetch_entry_sync(index + i);
+        auto entry = co_await fetch_entry(index + i);
         auto serialized = entry->serialize();
         size_t const total_entry_size = serialized->size() + sizeof(uint32_t);
         size_t avail_size = out_buf->size() - out_buf->pos();
@@ -472,10 +481,10 @@ RaftBufferPtr HomeRaftLogStore::pack(ulong index, int32_t cnt) {
                        avail_size);
         out_buf->put(serialized->data_begin(), serialized->size());
     }
-    return out_buf;
+    co_return out_buf;
 }
 
-void HomeRaftLogStore::apply_pack(ulong index, nuraft::buffer& pack) {
+Async< void > HomeRaftLogStore::apply_pack(ulong index, nuraft::buffer& pack) {
     pack.pos(0);
     auto num_entries = pack.get_int();
 
@@ -483,9 +492,9 @@ void HomeRaftLogStore::apply_pack(ulong index, nuraft::buffer& pack) {
     if (index < slot) {
         // We are asked to apply/insert data behind next slot, so we must rollback before index and then append.
         // Main log first so concurrent deferred_free sees the post-rollback tail; then indirect_'s state.
-        iomanager::blocking_wait(log_store_->rollback(to_store_lsn(index) - 1));
+        co_await log_store_->rollback(to_store_lsn(index) - 1);
         if (indirect_) {
-            iomanager::blocking_wait(indirect_->rollback(static_cast< raft_lsn_t >(index) - 1));
+            co_await indirect_->rollback(static_cast< raft_lsn_t >(index) - 1);
         }
     } else if (index > slot) {
         // We are asked to apply/insert data after next slot, so we need to fill in with dummy entries upto the slot
@@ -495,7 +504,7 @@ void HomeRaftLogStore::apply_pack(ulong index, nuraft::buffer& pack) {
                        "with dummy data to make it functional, however, this could result in inconsistent data",
                        index, to_store_lsn(slot));
         while (index++ < slot) {
-            append(dummy_log_entry_);
+            co_await append(dummy_log_entry_);
         }
     }
 
@@ -509,7 +518,7 @@ void HomeRaftLogStore::apply_pack(ulong index, nuraft::buffer& pack) {
         auto copy_buf = nuraft::buffer::alloc(entry_len);
         std::memcpy(copy_buf->data_begin(), entry, entry_len);
         auto nle = nuraft::log_entry::from_serialized(std::move(copy_buf));
-        this->append(nle);
+        co_await this->append(nle);
         REPL_STORE_LOG(TRACE, "unpacking nth_entry={} of size={}, lsn={}", i + 1, entry_len, slot + i);
     }
     this->end_of_append_batch(slot, num_entries);
@@ -519,7 +528,7 @@ void HomeRaftLogStore::apply_pack(ulong index, nuraft::buffer& pack) {
 // Compact / flush / durable
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-bool HomeRaftLogStore::compact(ulong compact_lsn) {
+Async< bool > HomeRaftLogStore::compact(ulong compact_lsn) {
     auto cur_max_lsn = log_store_->tail_lsn();
     if (cur_max_lsn < to_store_lsn(compact_lsn)) {
         // if compact_lsn is beyond the current max_lsn, it indicates a hole from cur_max_lsn to compact_lsn.
@@ -531,16 +540,16 @@ bool HomeRaftLogStore::compact(ulong compact_lsn) {
     // compact_lsn as already-gone (immediate free) instead of pushing into deferred_free_blkids_ that we are
     // about to drain.  indirect_->compact then drains deferred_free_blkids_ ≤ compact_lsn and runs the
     // free_blks_journal_ truncate under the mutex.
-    iomanager::blocking_wait(log_store_->truncate(to_store_lsn(compact_lsn)));
+    co_await log_store_->truncate(to_store_lsn(compact_lsn));
     if (indirect_) {
-        iomanager::blocking_wait(indirect_->compact(static_cast< raft_lsn_t >(compact_lsn)));
+        co_await indirect_->compact(static_cast< raft_lsn_t >(compact_lsn));
     }
-    return true;
+    co_return true;
 }
 
-bool HomeRaftLogStore::flush() {
-    iomanager::blocking_wait(log_store_->flush());
-    return true;
+Async< bool > HomeRaftLogStore::flush() {
+    co_await log_store_->flush();
+    co_return true;
 }
 
 ulong HomeRaftLogStore::last_durable_index() {
@@ -549,7 +558,7 @@ ulong HomeRaftLogStore::last_durable_index() {
     return to_ulong(durable + 1);
 }
 
-folly::coro::Task< void > HomeRaftLogStore::purge_all_logs() {
+Async< void > HomeRaftLogStore::purge_all_logs() {
     auto last_lsn = log_store_->tail_lsn();
     REPL_STORE_LOG(INFO, "Purging all logs in the log store, last_lsn={}", last_lsn);
     co_await log_store_->truncate(last_lsn);
@@ -563,7 +572,7 @@ void HomeRaftLogStore::set_last_durable_lsn(raft_lsn_t lsn) {
 // Large-value extensions
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > HomeRaftLogStore::deferred_free(BlkId blkid, raft_lsn_t referenced_lsn) {
+Async< void > HomeRaftLogStore::deferred_free(BlkId blkid, raft_lsn_t referenced_lsn) {
     if (!indirect_) {
         // optimization off; caller shouldn't be holding a BlkId in the first place.
         co_return;
@@ -608,7 +617,7 @@ HomeRaftLogStore::IndirectBlkHandler::IndirectBlkHandler(shared< RawBlkStream > 
     }
 }
 
-std::pair< LogBlob, BlkIds > HomeRaftLogStore::IndirectBlkHandler::write(RaftLogEntryPtr& entry) {
+Async< std::pair< LogBlob, BlkIds > > HomeRaftLogStore::IndirectBlkHandler::write(RaftLogEntryPtr& entry) {
     // Peek the ReplLogHdr fixed prefix so we know value_size + user_header_size before any allocation.
     ReplLogHeader hdr;
     copy_entry_slice(*entry, to_u32(nuraft::log_entry::kHdrSize),
@@ -641,8 +650,9 @@ std::pair< LogBlob, BlkIds > HomeRaftLogStore::IndirectBlkHandler::write(RaftLog
 
     // 5. Zero-copy SgList over entry's value-bytes chain — get_entry_value() returns the relevant nuraft
     //    buffers + first-buf offset; each becomes an IoBufSpan aliasing the underlying bytes.  The chain's
-    //    shared_ptrs keep the nuraft buffers alive through the blockingWait.  writev_multi routes bytes per
-    //    BlkId, and DriveInterface tail-pads the trailing BlkId to LBA-multiple internally.
+    //    shared_ptrs (held on the coroutine frame) keep the nuraft buffers alive across the co_await.
+    //    writev_multi routes bytes per BlkId, and DriveInterface tail-pads the trailing BlkId to LBA-multiple
+    //    internally.
     auto [value_bufs, first_offset] = get_entry_value(*entry, header_size);
     std::vector< sisl::IoBufSpan > spans;
     spans.reserve(value_bufs.size());
@@ -653,7 +663,7 @@ std::pair< LogBlob, BlkIds > HomeRaftLogStore::IndirectBlkHandler::write(RaftLog
         spans.emplace_back(value_bufs[i]->data_begin() + off, sz, /*is_aligned=*/false);
         sg.bufs.push_back(&spans.back());
     }
-    iomanager::blocking_wait(blob_stream_->writev_multi(bids, sg, /*buffered=*/false));
+    co_await blob_stream_->writev_multi(bids, sg, /*buffered=*/false);
 
     // 6. Park indirect_entry_buf on the entry as private_buf so its bytes stay alive across the in-flight
     //    LogStream flush.  The entry's wire-side bufs_ chain is left untouched so the entry replicates
@@ -661,10 +671,10 @@ std::pair< LogBlob, BlkIds > HomeRaftLogStore::IndirectBlkHandler::write(RaftLog
     entry->set_private_buf(indirect_entry_buf);
     LogBlob lb{sisl::IoBufSpan{indirect_entry_buf->data_begin(), to_u32(header_size + encoded.size()),
                                /*is_aligned=*/false}};
-    return {std::move(lb), std::move(bids)};
+    co_return std::pair< LogBlob, BlkIds >{std::move(lb), std::move(bids)};
 }
 
-folly::coro::Task< void > HomeRaftLogStore::IndirectBlkHandler::reconstruct(nuraft::log_entry& entry) {
+Async< void > HomeRaftLogStore::IndirectBlkHandler::reconstruct(nuraft::log_entry& entry) {
     // entry is in from_serialized state — bufs_[0] is the whole on-disk record
     // [9B nuraft | ReplLogHdr(INDIRECT) | user_header | BlkIds trailer].  Build two-buf chain:
     //   bufs_[0] = shrunk copy of the on-disk prefix [9B | ReplLogHdr(flipped to INLINE) | user_header]
@@ -708,7 +718,7 @@ folly::coro::Task< void > HomeRaftLogStore::IndirectBlkHandler::reconstruct(nura
     co_return;
 }
 
-folly::coro::Task< bool > HomeRaftLogStore::IndirectBlkHandler::deferred_free(BlkId blkid, raft_lsn_t referenced_lsn) {
+Async< bool > HomeRaftLogStore::IndirectBlkHandler::deferred_free(BlkId blkid, raft_lsn_t referenced_lsn) {
     bool defer = false;
     {
         std::lock_guard lk{indirect_mtx_};
@@ -763,7 +773,7 @@ BlkIds HomeRaftLogStore::IndirectBlkHandler::on_commit(raft_lsn_t lsn) {
     return bids;
 }
 
-folly::coro::Task< void > HomeRaftLogStore::IndirectBlkHandler::rollback(raft_lsn_t to_lsn) {
+Async< void > HomeRaftLogStore::IndirectBlkHandler::rollback(raft_lsn_t to_lsn) {
     // Two BlkId sets to invalidate for entries in (to_lsn, tail]:
     //   (a) uncommitted_blkids_[lsn] — BlkIds allocated for entries that never raft-committed.
     //   (b) deferred_free_blkids_[lsn] — app deferred-free intents tagged to those lsns.
@@ -798,7 +808,7 @@ folly::coro::Task< void > HomeRaftLogStore::IndirectBlkHandler::rollback(raft_ls
     co_return;
 }
 
-folly::coro::Task< void > HomeRaftLogStore::IndirectBlkHandler::compact(raft_lsn_t upto_lsn) {
+Async< void > HomeRaftLogStore::IndirectBlkHandler::compact(raft_lsn_t upto_lsn) {
     // Mirrors rollback's two-phase pattern: under the mutex collect BlkIds for entries ≤ upto_lsn and
     // truncate the journal; outside the mutex invalidate asynchronously.
     BlkIds to_free;
@@ -818,11 +828,11 @@ folly::coro::Task< void > HomeRaftLogStore::IndirectBlkHandler::compact(raft_lsn
     co_return;
 }
 
-folly::coro::Task< void > HomeRaftLogStore::IndirectBlkHandler::cp_flush() {
+Async< void > HomeRaftLogStore::IndirectBlkHandler::cp_flush() {
     co_await free_blks_journal_->flush();
 }
 
-folly::coro::Task< void > HomeRaftLogStore::IndirectBlkHandler::destroy() {
+Async< void > HomeRaftLogStore::IndirectBlkHandler::destroy() {
     // Drain everything we still own — both uncommitted (entries we wrote but were never raft-committed)
     // and deferred-free intents the app hadn't reaped yet — into a single list, then hand to blob_stream_
     // as one bulk invalidate.  RawBlkStream is agnostic to our committed/uncommitted distinction; the

@@ -13,6 +13,7 @@
  *
  ***************************************************************************/
 #include <cstdint>
+#include "common/async.h"
 #include <stdexcept>
 #include <utility>
 
@@ -76,7 +77,7 @@ uint64_t HomeStore::resolve_mem_cap(AppMemSize const& mem) {
         mem);
 }
 
-folly::coro::Task< bool > HomeStore::start(InputParams input) {
+Async< bool > HomeStore::start(InputParams input) {
     if (input.devices.empty()) {
         throw std::invalid_argument("HomeStore::start: device list is empty");
     }
@@ -132,7 +133,7 @@ folly::coro::Task< bool > HomeStore::start(InputParams input) {
     co_return false;
 }
 
-folly::coro::Task< void > HomeStore::format_and_start(FormatOpts opts) {
+Async< void > HomeStore::format_and_start(FormatOpts opts) {
     HS_REL_ASSERT(device_mgr().is_first_time_boot(),
                   "format_and_start called when device is not in first-time-boot state");
 
@@ -162,7 +163,7 @@ folly::coro::Task< void > HomeStore::format_and_start(FormatOpts opts) {
     LOGINFO("HomeStore: first-time boot formatting complete");
 }
 
-folly::coro::Task< void > HomeStore::shutdown() {
+Async< void > HomeStore::shutdown() {
     if (!init_done_.exchange(false, std::memory_order_acq_rel)) {
         LOGWARN("HomeStore::shutdown called before init complete (or twice)");
         co_return;

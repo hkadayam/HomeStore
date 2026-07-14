@@ -23,9 +23,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include <folly/coro/Task.h>
+#include "common/async.h"
 
-#include "homestore/base/blk.h"                 // BlkId, blk_count_t, chunk_num_t
+#include "homestore/base/blk.h"            // BlkId, blk_count_t, chunk_num_t
 #include "homestore/base/homestore_decl.h" // shared<>, unique<>
 #include "sisl/fds/buffer.h"               // sisl::Blob, sisl::BufBuilder
 
@@ -95,7 +95,7 @@ public:
     public:
         // Returns up to max_bytes from the cursor's current position, plus a `valid` byte count (= view.size()).
         // The returned IoBufView's bytes() points exactly at the cursor position — block alignment is hidden inside.
-        folly::coro::Task< std::pair< sisl::IoBufView, uint32_t > > next(size_t max_bytes);
+        Async< std::pair< sisl::IoBufView, uint32_t > > next(size_t max_bytes);
 
         bool has_more() const { return pos_ < end_; }
         uint64_t position() const { return pos_; }
@@ -111,17 +111,15 @@ public:
 
     // ── Factories ─────────────────────────────────────────────────────────────
 
-    static folly::coro::Task< shared< AppendByteStream > > create(uint64_t stream_id, MetaClient& meta_client,
-                                                                  const std::string& dev_name,
-                                                                  const shared< VirtualDev >& vdev, uint64_t chunk_size,
-                                                                  bool concurrent_safe = true);
+    static Async< shared< AppendByteStream > > create(uint64_t stream_id, MetaClient& meta_client,
+                                                      const std::string& dev_name, const shared< VirtualDev >& vdev,
+                                                      uint64_t chunk_size, bool concurrent_safe = true);
 
     /// Load from a previously persisted stream sb MetaBlk and its decoded payload.
-    static folly::coro::Task< shared< AppendByteStream > > load(uint64_t stream_id, MetaClient& meta_client,
-                                                                const std::string& dev_name,
-                                                                const shared< VirtualDev >& vdev, MetaBlk&& sb,
-                                                                sisl::IoBufView sb_payload,
-                                                                bool concurrent_safe = true);
+    static Async< shared< AppendByteStream > > load(uint64_t stream_id, MetaClient& meta_client,
+                                                    const std::string& dev_name, const shared< VirtualDev >& vdev,
+                                                    MetaBlk&& sb, sisl::IoBufView sb_payload,
+                                                    bool concurrent_safe = true);
 
     /// Name of the per-stream sb MetaBlk: "<dev>_appendbyte_sb_<stream_id>".
     static std::string sb_mblk_name(const std::string& dev, uint64_t stream_id);
@@ -155,7 +153,7 @@ public:
     /// Read len bytes starting at byte_offset.  Returns a IoBufView whose bytes() points exactly at byte_offset
     /// (the underlying read is block-aligned, but that's hidden — the slice handles the in-block offset for the
     /// caller).  size() == len.
-    folly::coro::Task< std::pair< std::error_code, sisl::IoBufView > > read(uint64_t byte_offset, size_t len);
+    Async< std::pair< std::error_code, sisl::IoBufView > > read(uint64_t byte_offset, size_t len);
 
     ReadCursor open_cursor(uint64_t start_offset = 0) const;
     ReadCursor open_cursor(uint64_t start_offset, uint64_t end_offset) const;
@@ -164,12 +162,12 @@ public:
     /// upto_offset back to the vdev (which may pool them).  If the stream is logically empty after the advance
     /// (head == tail), all remaining chunks are also released and positions are reset to 0 — this is the
     /// "fresh-start" mode used by reusable streams (e.g. cow_btree's incr_map).
-    folly::coro::Task< void > truncate(uint64_t upto_offset);
+    Async< void > truncate(uint64_t upto_offset);
 
     // ── Flush ─────────────────────────────────────────────────────────────────
 
     /// Swap the buffer, expand chunks as needed, write to disk, update MetaBlks.
-    folly::coro::Task< bool > flush();
+    Async< bool > flush();
 
     // ── Accessors ─────────────────────────────────────────────────────────────
     uint64_t tail_offset() const { return tail_offset_; }
@@ -183,16 +181,16 @@ protected:
     /// Per-flush durability hook.  Default: persist the stream sb (head_offset, tail_offset, chunk_ids[]) into the
     /// stream's single sb MetaBlk.  Subclasses can override to skip per-flush persistence (e.g. LogStream deduces
     /// tail on recovery and persists only on truncate / chunk-list changes).
-    virtual folly::coro::Task< void > persist_flush_metadata();
+    virtual Async< void > persist_flush_metadata();
 
     /// Write the current {head, tail, chunk_ids[]} state into the stream sb MetaBlk.  Called from flush() (via
     /// persist_flush_metadata), from truncate(), and whenever chunk membership changes (chunk add/remove overrides).
-    folly::coro::Task< void > persist_stream_sb();
+    Async< void > persist_stream_sb();
 
     /// Overrides: AppendByteStream maintains a single per-stream MetaBlk carrying the chunk list, so chunks
     /// themselves don't get per-chunk MetaBlks.  Each override updates the stream sb after the chunk-list change.
-    folly::coro::Task< void > init_chunk_mblk(const shared< Chunk >& chunk) override;
-    folly::coro::Task< void > remove_chunk_mblk(uint32_t chunk_id) override;
+    Async< void > init_chunk_mblk(const shared< Chunk >& chunk) override;
+    Async< void > remove_chunk_mblk(uint32_t chunk_id) override;
 
     AppendByteStream(uint64_t stream_id, MetaClient& meta_client, std::string dev_name,
                      const shared< VirtualDev >& vdev, uint64_t chunk_size, bool concurrent_safe);
@@ -201,10 +199,9 @@ protected:
     /// clobbering on-disk bytes.  When `tail` is not block-aligned, reads back the partial-tail block from disk
     /// and seeds flush_buf_ with its valid bytes.  Used by load() with the sb-recovered tail and by LogStream's
     /// post-CRC-walk recover with the chain-discovered tail.
-    folly::coro::Task< void > resume_writes_at(uint64_t tail);
+    Async< void > resume_writes_at(uint64_t tail);
 
 private:
-
     /// Core append logic (no locking).  Memcpys into the flush buffer; if the buffer is empty, start_offset is set
     /// to the current tail.  Any partial-tail-block bytes carried over from the prior flush are already sitting in
     /// flush_buf_ (injected by the prior flush() or load()).
@@ -223,8 +220,8 @@ private:
     }
 
     /// Internal read helper.
-    folly::coro::Task< std::pair< std::error_code, sisl::IoBufOwn > > read_blocks(chunk_num_t cid, uint32_t blk_num,
-                                                                                  blk_count_t nblks);
+    Async< std::pair< std::error_code, sisl::IoBufOwn > > read_blocks(chunk_num_t cid, uint32_t blk_num,
+                                                                      blk_count_t nblks);
 
     /// Resolve the chunk_id for the n-th chunk (by vdev_order) in this stream.  Takes a brief RCU read guard.
     chunk_num_t lookup_chunk_id(size_t nth_chunk);
@@ -245,8 +242,8 @@ protected:
     uint64_t tail_offset_{0};
     uint64_t head_offset_{0};           // head of the logical byte stream; advances on truncate
     uint64_t offset_in_first_chunk_{0}; // offset within the first chunk where head starts
-    MetaBlk sb_mblk_;                   // the stream's single sb MetaBlk, created at stream construction (or recovered at load)
-    uint32_t chain_seed_{0};            // see AppendByteStreamSb::chain_seed — written/read by persist_stream_sb / load
+    MetaBlk sb_mblk_;        // the stream's single sb MetaBlk, created at stream construction (or recovered at load)
+    uint32_t chain_seed_{0}; // see AppendByteStreamSb::chain_seed — written/read by persist_stream_sb / load
 
 private:
     bool concurrent_safe_;

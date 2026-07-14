@@ -25,8 +25,7 @@
 #include <filesystem>
 #include <boost/algorithm/string.hpp>
 
-#include <folly/coro/Task.h>
-#include <folly/coro/BlockingWait.h>
+#include "common/async.h"
 
 #include "sisl/options/options.h"
 #include "sisl/logging/logging.h"
@@ -42,22 +41,26 @@ static constexpr uint32_t g_node_size{4096};
 #define BTH_ASSERT_TRUE(cond)                                                                                          \
     do {                                                                                                               \
         EXPECT_TRUE(cond);                                                                                             \
-        if (!(cond)) CO_RETURN;                                                                                        \
+        if (!(cond))                                                                                                   \
+            CO_RETURN;                                                                                                 \
     } while (0)
 #define BTH_ASSERT_FALSE(cond)                                                                                         \
     do {                                                                                                               \
         EXPECT_FALSE(cond);                                                                                            \
-        if ((cond)) CO_RETURN;                                                                                         \
+        if ((cond))                                                                                                    \
+            CO_RETURN;                                                                                                 \
     } while (0)
 #define BTH_ASSERT_EQ(a, b)                                                                                            \
     do {                                                                                                               \
         EXPECT_EQ(a, b);                                                                                               \
-        if (!((a) == (b))) CO_RETURN;                                                                                  \
+        if (!((a) == (b)))                                                                                             \
+            CO_RETURN;                                                                                                 \
     } while (0)
 #define BTH_ASSERT_NE(a, b)                                                                                            \
     do {                                                                                                               \
         EXPECT_NE(a, b);                                                                                               \
-        if (!((a) != (b))) CO_RETURN;                                                                                  \
+        if (!((a) != (b)))                                                                                             \
+            CO_RETURN;                                                                                                 \
     } while (0)
 
 // Tight co_await loops over fully-cached btree ops never suspend back to the executor, so the actor frames keep
@@ -67,7 +70,8 @@ static constexpr uint32_t g_node_size{4096};
 #define BTH_YIELD_PERIODIC()                                                                                           \
     do {                                                                                                               \
         thread_local uint32_t _bth_yield_counter{0};                                                                   \
-        if ((++_bth_yield_counter & 0x7f) == 0) co_await iomgr().yield_now();                                          \
+        if ((++_bth_yield_counter & 0x7f) == 0)                                                                        \
+            co_await iomgr().yield_now();                                                                              \
     } while (0)
 #else
 #define BTH_YIELD_PERIODIC() ((void)0)
@@ -180,21 +184,20 @@ public:
             const auto start_range = i * chunk_size;
             const auto end_range = start_range + ((i == n_workers - 1) ? last_chunk_size : chunk_size) - 1;
             // One coroutine per reactor; CO_AWAIT'd put() works in both sync and async btree modes.
-            iomgr().spawn_detached(
-                iomanager::ReactorTarget::reactor(i),
-                [this, start_range, end_range, &test_count, preload_size]() -> folly::coro::Task< void > {
-                    for (uint32_t k = start_range; k < end_range; k++) {
-                        CO_AWAIT put(k, BtreePutType::INSERT);
-                        track_progress(preload_size, "Preload");
-                    }
-                    {
-                        std::unique_lock lg(test_done_mtx_);
-                        if (test_count.fetch_sub(1) == 1) {
-                            test_done_cv_.notify_one();
-                        }
-                    }
-                    co_return;
-                });
+            iomgr().spawn_detached(iomanager::ReactorTarget::reactor(i),
+                                   [this, start_range, end_range, &test_count, preload_size]() -> Async< void > {
+                                       for (uint32_t k = start_range; k < end_range; k++) {
+                                           CO_AWAIT put(k, BtreePutType::INSERT);
+                                           track_progress(preload_size, "Preload");
+                                       }
+                                       {
+                                           std::unique_lock lg(test_done_mtx_);
+                                           if (test_count.fetch_sub(1) == 1) {
+                                               test_done_cv_.notify_one();
+                                           }
+                                       }
+                                       co_return;
+                                   });
         }
 
         {
@@ -607,7 +610,7 @@ public:
         for (size_t worker_id = 0; worker_id < num_workers_; ++worker_id) {
             auto num_ios_this_worker = num_ios_per_worker + (worker_id < extra_ios ? 1 : 0);
             iomgr().spawn_detached(iomanager::ReactorTarget::reactor(worker_id),
-                                   [this, &test_count, op_list, num_ios_this_worker]() -> folly::coro::Task< void > {
+                                   [this, &test_count, op_list, num_ios_this_worker]() -> Async< void > {
                                        // Seed from the process-wide g_re so --seed reproduces this worker's op
                                        // sequence.
                                        std::default_random_engine re{g_re()};

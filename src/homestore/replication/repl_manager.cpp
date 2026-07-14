@@ -14,6 +14,7 @@
  *********************************************************************************/
 
 #include "homestore/replication/repl_manager.h"
+#include "common/async.h"
 
 #include <fmt/format.h>
 #include <boost/uuid/uuid_io.hpp>
@@ -43,15 +44,15 @@ ReplicationManager::ReplicationManager(shared< ReplApplication > repl_app) : rep
 
 ReplicationManager::~ReplicationManager() = default;
 
-folly::coro::Task< void > ReplicationManager::start() {
+Async< void > ReplicationManager::start() {
     my_uuid_ = repl_app_->get_my_repl_id();
 
     auto [bind_host, bind_port] = repl_app_->lookup_peer(my_uuid_, GroupId{});
     LOGINFOMOD(replication, "ReplicationManager starting; my_uuid={} bind={}:{}", boost::uuids::to_string(my_uuid_),
                bind_host, bind_port);
 
-    slow_executor_ = std::make_unique< folly::CPUThreadPoolExecutor >(
-        2, std::make_shared< folly::NamedThreadFactory >("repl_slow"));
+    slow_executor_ =
+        std::make_unique< folly::CPUThreadPoolExecutor >(2, std::make_shared< folly::NamedThreadFactory >("repl_slow"));
 
     rpc_client_factory_ = std::make_shared< replication::FollyRpcClientFactory >(slow_executor_.get());
     rpc_listener_ =
@@ -65,14 +66,14 @@ folly::coro::Task< void > ReplicationManager::start() {
         co_await hs()->meta_blk_mgr().register_client(std::string{kReplDevRaftConfigMetaName}));
 
     co_await rs_meta_client_->for_each_recovered_block(
-        [this](MetaBlk const& blk, sisl::IoBufView data) -> folly::coro::Task< void > {
+        [this](MetaBlk const& blk, sisl::IoBufView data) -> Async< void > {
             (void)blk;
             load_replica_set(data);
             co_return;
         });
 
     co_await rs_raft_cfg_meta_client_->for_each_recovered_block(
-        [this](MetaBlk const& blk, sisl::IoBufView data) -> folly::coro::Task< void > {
+        [this](MetaBlk const& blk, sisl::IoBufView data) -> Async< void > {
             (void)blk;
             (void)raft_group_config_found(data);
             co_return;
@@ -87,7 +88,7 @@ folly::coro::Task< void > ReplicationManager::start() {
     co_return;
 }
 
-folly::coro::Task< void > ReplicationManager::stop() {
+Async< void > ReplicationManager::stop() {
     if (rpc_listener_) {
         rpc_listener_->shutdown();
         rpc_listener_.reset();
@@ -135,7 +136,7 @@ nuraft::ptr< nuraft::raft_server > ReplicationManager::lookup_raft_server(nuraft
     return rs.value()->raft_server();
 }
 
-folly::coro::Task< nuraft::ptr< nuraft::raft_server > >
+Async< nuraft::ptr< nuraft::raft_server > >
 ReplicationManager::create_replica_set_for_group(nuraft::group_id_t const& gid) {
     GroupId group_id;
     std::memcpy(group_id.data, gid.data(), gid.size());
@@ -170,8 +171,7 @@ ReplicationManager::create_replica_set_for_group(nuraft::group_id_t const& gid) 
 
     rs->attach_listener(std::move(listener));
     if (!rs->join_group()) {
-        LOGERRORMOD(replication, "join_group failed for newly-created group_id={}",
-                    boost::uuids::to_string(group_id));
+        LOGERRORMOD(replication, "join_group failed for newly-created group_id={}", boost::uuids::to_string(group_id));
         co_return nullptr;
     }
 
@@ -193,22 +193,21 @@ void ReplicationManager::add_replica_set(GroupId group_id, shared< ReplicaSet > 
     replica_sets_.emplace(group_id, std::move(rs));
 }
 
-folly::coro::Task< ReplResult< shared< ReplicaSet > > >
+Async< ReplResult< shared< ReplicaSet > > >
 ReplicationManager::create_replica_set(GroupId group_id, std::set< ReplicaId > const& members) {
     (void)group_id;
     (void)members;
     co_return folly::makeUnexpected(ReplError::NOT_IMPLEMENTED);
 }
 
-folly::coro::Task< ReplError > ReplicationManager::remove_replica_set(GroupId group_id) {
+Async< ReplError > ReplicationManager::remove_replica_set(GroupId group_id) {
     (void)group_id;
     co_return ReplError::NOT_IMPLEMENTED;
 }
 
-folly::coro::Task< ReplResult<> > ReplicationManager::replace_member(GroupId group_id,
-                                                                     ReplicaMemberInfo const& member_out,
-                                                                     ReplicaMemberInfo const& member_in,
-                                                                     uint32_t commit_quorum, uint64_t trace_id) const {
+Async< ReplResult<> > ReplicationManager::replace_member(GroupId group_id, ReplicaMemberInfo const& member_out,
+                                                         ReplicaMemberInfo const& member_in, uint32_t commit_quorum,
+                                                         uint64_t trace_id) const {
     (void)group_id;
     (void)member_out;
     (void)member_in;
@@ -217,10 +216,9 @@ folly::coro::Task< ReplResult<> > ReplicationManager::replace_member(GroupId gro
     co_return folly::makeUnexpected(ReplError::NOT_IMPLEMENTED);
 }
 
-folly::coro::Task< ReplResult<> > ReplicationManager::flip_learner_flag(GroupId group_id,
-                                                                        ReplicaMemberInfo const& member, bool target,
-                                                                        uint32_t commit_quorum, bool wait_and_verify,
-                                                                        uint64_t trace_id) const {
+Async< ReplResult<> > ReplicationManager::flip_learner_flag(GroupId group_id, ReplicaMemberInfo const& member,
+                                                            bool target, uint32_t commit_quorum, bool wait_and_verify,
+                                                            uint64_t trace_id) const {
     (void)group_id;
     (void)member;
     (void)target;
@@ -295,7 +293,7 @@ int32_t ReplicationManager::compute_raft_follower_priority() {
 void ReplicationManagerCPHandler::on_switchover_cp(CP* /*cur_cp*/, CP* /*new_cp*/) {
 }
 
-folly::coro::Task< bool > ReplicationManagerCPHandler::cp_flush(CP* /*cp*/) {
+Async< bool > ReplicationManagerCPHandler::cp_flush(CP* /*cp*/) {
     co_return true;
 }
 

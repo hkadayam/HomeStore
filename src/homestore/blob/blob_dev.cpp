@@ -15,6 +15,7 @@
  ***************************************************************************/
 
 #include <algorithm>
+#include "common/async.h"
 #include <charconv>
 #include <stdexcept>
 #include <string>
@@ -56,7 +57,7 @@ VirtualDev& BlobDev::vdev() const {
 
 template < typename T >
 static std::vector< shared< T > > collect_streams(const folly::SharedMutex& mtx,
-                                                   const std::map< uint64_t, shared< T > >& m) {
+                                                  const std::map< uint64_t, shared< T > >& m) {
     std::shared_lock lk{mtx};
     std::vector< shared< T > > out;
     out.reserve(m.size());
@@ -79,8 +80,8 @@ std::vector< shared< AppendByteStream > > BlobDev::append_byte_streams() const {
 }
 
 template < typename StreamT >
-static shared< StreamT > find_stream(folly::SharedMutex& mtx,
-                                     std::map< uint64_t, shared< StreamT > > const& map, uint64_t stream_id) {
+static shared< StreamT > find_stream(folly::SharedMutex& mtx, std::map< uint64_t, shared< StreamT > > const& map,
+                                     uint64_t stream_id) {
     std::shared_lock holder(mtx);
     auto it = map.find(stream_id);
     return (it != map.end()) ? it->second : nullptr;
@@ -141,24 +142,34 @@ std::optional< BlobDev::ParsedChunkMblk > BlobDev::parse_chunk_mblk_name(const s
         std::string_view rest = name.substr(prefix.size());
 
         auto sep1 = rest.find('_');
-        if (sep1 == std::string_view::npos) { continue; }
+        if (sep1 == std::string_view::npos) {
+            continue;
+        }
 
         uint64_t stream_id{};
         auto res1 = std::from_chars(rest.data(), rest.data() + sep1, stream_id);
-        if (res1.ec != std::errc{}) { continue; }
+        if (res1.ec != std::errc{}) {
+            continue;
+        }
 
         std::string_view after_sid = rest.substr(sep1 + 1);
         auto sep2 = after_sid.find('_');
-        if (sep2 == std::string_view::npos) { continue; }
+        if (sep2 == std::string_view::npos) {
+            continue;
+        }
 
         uint32_t chunk_id{};
         auto res2 = std::from_chars(after_sid.data(), after_sid.data() + sep2, chunk_id);
-        if (res2.ec != std::errc{}) { continue; }
+        if (res2.ec != std::errc{}) {
+            continue;
+        }
 
         std::string_view bs_part = after_sid.substr(sep2 + 1);
         uint32_t blk_size{};
         auto res3 = std::from_chars(bs_part.data(), bs_part.data() + bs_part.size(), blk_size);
-        if (res3.ec != std::errc{}) { continue; }
+        if (res3.ec != std::errc{}) {
+            continue;
+        }
 
         return ParsedChunkMblk{type, stream_id, chunk_id, blk_size};
     }
@@ -169,7 +180,7 @@ std::optional< BlobDev::ParsedChunkMblk > BlobDev::parse_chunk_mblk_name(const s
 // CP lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > BlobDev::cp_flush(CP* cp) {
+Async< void > BlobDev::cp_flush(CP* cp) {
     // Collect streams under shared lock, then flush outside the lock.
     auto rbs = raw_blk_streams();
     auto abs = append_blk_streams();
@@ -190,7 +201,7 @@ folly::coro::Task< void > BlobDev::cp_flush(CP* cp) {
 // Stream creation
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< shared< RawBlkStream > > BlobDev::create_raw_blk_stream(uint64_t chunk_size, uint32_t blk_size) {
+Async< shared< RawBlkStream > > BlobDev::create_raw_blk_stream(uint64_t chunk_size, uint32_t blk_size) {
     auto sid = next_stream_id();
     auto stream = co_await RawBlkStream::create(sid, meta_client_, dev_name_, vdev_, chunk_size, blk_size);
     {
@@ -200,7 +211,7 @@ folly::coro::Task< shared< RawBlkStream > > BlobDev::create_raw_blk_stream(uint6
     co_return stream;
 }
 
-folly::coro::Task< shared< AppendBlkStream > > BlobDev::create_append_blk_stream(uint64_t chunk_size, uint32_t blk_size) {
+Async< shared< AppendBlkStream > > BlobDev::create_append_blk_stream(uint64_t chunk_size, uint32_t blk_size) {
     auto sid = next_stream_id();
     auto stream = co_await AppendBlkStream::create(sid, meta_client_, dev_name_, vdev_, chunk_size, blk_size);
     {
@@ -210,8 +221,7 @@ folly::coro::Task< shared< AppendBlkStream > > BlobDev::create_append_blk_stream
     co_return stream;
 }
 
-folly::coro::Task< shared< AppendByteStream > > BlobDev::create_append_byte_stream(uint64_t chunk_size,
-                                                                                    bool concurrent_safe) {
+Async< shared< AppendByteStream > > BlobDev::create_append_byte_stream(uint64_t chunk_size, bool concurrent_safe) {
     auto sid = next_stream_id();
     auto stream = co_await AppendByteStream::create(sid, meta_client_, dev_name_, vdev_, chunk_size, concurrent_safe);
     {
@@ -225,13 +235,12 @@ folly::coro::Task< shared< AppendByteStream > > BlobDev::create_append_byte_stre
 // Recovery load
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > BlobDev::load(StreamMblkMap&& raw_blk, StreamMblkMap&& append_blk,
-                                        AppendByteSbMap&& append_byte) {
+Async< void > BlobDev::load(StreamMblkMap&& raw_blk, StreamMblkMap&& append_blk, AppendByteSbMap&& append_byte) {
     uint64_t max_sid = 0;
 
     for (auto& [sid, info] : raw_blk) {
-        raw_blk_streams_[sid] =
-            co_await RawBlkStream::load(sid, meta_client_, dev_name_, vdev_, info.blk_size, std::move(info.chunk_mblks));
+        raw_blk_streams_[sid] = co_await RawBlkStream::load(sid, meta_client_, dev_name_, vdev_, info.blk_size,
+                                                            std::move(info.chunk_mblks));
         max_sid = std::max(max_sid, sid);
     }
     for (auto& [sid, info] : append_blk) {
@@ -257,7 +266,7 @@ folly::coro::Task< void > BlobDev::load(StreamMblkMap&& raw_blk, StreamMblkMap&&
 // reconcile_chunks
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > BlobDev::reconcile_chunks() {
+Async< void > BlobDev::reconcile_chunks() {
     // Build the set of chunk_ids claimed by all loaded streams.
     std::unordered_set< uint32_t > claimed;
     auto collect = [&](const StreamBase* stream) {

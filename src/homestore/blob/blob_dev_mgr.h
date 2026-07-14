@@ -23,10 +23,10 @@
 #include <unordered_map>
 #include <vector>
 
-#include <folly/coro/Task.h>
+#include "common/async.h"
 
 #include "homestore/base/homestore_decl.h" // shared<>, unique<>
-#include "homestore/checkpoint/cp_mgr.h" // CPCallbacks
+#include "homestore/checkpoint/cp_mgr.h"   // CPCallbacks
 
 namespace homestore {
 
@@ -52,10 +52,10 @@ public:
     // ---------------------------------- Lifecycle ───────────────────────────────
 
     /// First-time boot: create a fresh manager, register the single MetaClient, and install into Managers.
-    static folly::coro::Task< void > create();
+    static Async< void > create();
 
     /// Recovery boot: scan all recovered MetaBlks, reconstruct BlobDevs, and install into Managers.
-    static folly::coro::Task< void > load();
+    static Async< void > load();
 
     BlobDevManager(const BlobDevManager&) = delete;
     BlobDevManager& operator=(const BlobDevManager&) = delete;
@@ -69,14 +69,14 @@ public:
     // -----------------------------Device Management ───────────────────────────────
 
     /// Create a new BlobDev backed by a new VirtualDev.
-    folly::coro::Task< shared< BlobDev > > create_blob_dev(std::string&& dev_name, VDevParameters&& params);
+    Async< shared< BlobDev > > create_blob_dev(std::string&& dev_name, VDevParameters&& params);
 
     /// Look up an existing BlobDev by name.  Returns nullptr if not found.
     shared< BlobDev > get_blob_dev(const std::string& dev_name) const;
 
     // ── CPCallbacks (one registration for the entire blob subsystem) ──────────
     void on_switchover_cp(CP* cur_cp, CP* new_cp) override;
-    folly::coro::Task< bool > cp_flush(CP* cp) override;
+    Async< bool > cp_flush(CP* cp) override;
     void cp_cleanup(CP* cp) override;
     int cp_progress_percent() override;
 

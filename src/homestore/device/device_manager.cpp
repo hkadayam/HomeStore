@@ -15,6 +15,7 @@
  ***************************************************************************/
 
 #include <algorithm>
+#include "common/async.h"
 #include <cassert>
 #include <cstring>
 #include <stdexcept>
@@ -70,8 +71,8 @@ shared< DeviceManager > DeviceManager::create(std::vector< DevInfo >&& devs, IOF
     return mgr;
 }
 
-folly::coro::Task< shared< DeviceManager > >
-DeviceManager::create_and_format(std::vector< DevInfo >&& devs, IOFlag data_open_flags, IOFlag fast_open_flags) {
+Async< shared< DeviceManager > > DeviceManager::create_and_format(std::vector< DevInfo >&& devs, IOFlag data_open_flags,
+                                                                  IOFlag fast_open_flags) {
     auto mgr = create(std::move(devs), data_open_flags, fast_open_flags);
     co_await mgr->format_devices();
     co_await mgr->commit_formatting();
@@ -92,7 +93,7 @@ bool DeviceManager::is_boot_in_degraded_mode() const {
 
 // ── Device lifecycle ──────────────────────────────────────────────────────────
 
-folly::coro::Task< void > DeviceManager::format_devices() {
+Async< void > DeviceManager::format_devices() {
     {
         std::lock_guard lg{state_mutex_};
         auto& hdr = state_.first_blk_hdr;
@@ -130,7 +131,7 @@ folly::coro::Task< void > DeviceManager::format_devices() {
     co_await write_vdev_slot_bitmap();
 }
 
-folly::coro::Task< void > DeviceManager::commit_formatting() {
+Async< void > DeviceManager::commit_formatting() {
     std::vector< shared< PhysicalDev > > pdevs;
     {
         std::lock_guard lg{state_mutex_};
@@ -144,7 +145,7 @@ folly::coro::Task< void > DeviceManager::commit_formatting() {
     LOGINFO("HomeStore formatting committed on all {} physical devices", pdevs.size());
 }
 
-folly::coro::Task< void > DeviceManager::load_devices() {
+Async< void > DeviceManager::load_devices() {
     // Read the first block from the first device to recover the system header (uuid, num_pdevs, etc.).
     {
         const auto& first_dev = dev_infos_.front();
@@ -184,7 +185,7 @@ folly::coro::Task< void > DeviceManager::load_devices() {
     co_await load_vdevs();
 }
 
-folly::coro::Task< void > DeviceManager::close_devices() {
+Async< void > DeviceManager::close_devices() {
     // Stop the sweep service before tearing down devices: the ticker thread holds weak_ptrs into per-allocator
     // SegmentManagers, and dereferencing them after PhysicalDev/Chunk teardown is a use-after-free.
     blkalloc::shutdown_sweep_service();
@@ -203,7 +204,7 @@ folly::coro::Task< void > DeviceManager::close_devices() {
 
 // ── VirtualDev management ─────────────────────────────────────────────────────
 
-folly::coro::Task< shared< VirtualDev > > DeviceManager::create_vdev(VDevParameters&& params) {
+Async< shared< VirtualDev > > DeviceManager::create_vdev(VDevParameters&& params) {
     auto pdevs = get_pdevs_by_dev_type(params.dev_type);
     if (pdevs.empty()) {
         throw std::runtime_error(fmt::format("No physical devices of type {} available", enum_name(params.dev_type)));
@@ -229,7 +230,7 @@ folly::coro::Task< shared< VirtualDev > > DeviceManager::create_vdev(VDevParamet
     co_return vdev;
 }
 
-folly::coro::Task< void > DeviceManager::destroy_vdev(cshared< VirtualDev >& vdev) {
+Async< void > DeviceManager::destroy_vdev(cshared< VirtualDev >& vdev) {
     co_await vdev->destroy();
     const uint32_t vdev_id = vdev->vdev_id();
     {
@@ -348,7 +349,7 @@ void DeviceManager::free_vdev_id(uint32_t vdev_id) {
 
 // ── Private async helpers ─────────────────────────────────────────────────────
 
-folly::coro::Task< void > DeviceManager::load_vdevs() {
+Async< void > DeviceManager::load_vdevs() {
     // Collect all pdevs and load chunks from each, merging into a vdev_id → chunks map.
     std::vector< shared< PhysicalDev > > all_pdevs;
     {
@@ -408,7 +409,7 @@ folly::coro::Task< void > DeviceManager::load_vdevs() {
     }
 
     auto read_vinfo_from = [](const shared< PhysicalDev >& pdev,
-                              uint32_t vdev_id) -> folly::coro::Task< std::optional< VDevInfo > > {
+                              uint32_t vdev_id) -> Async< std::optional< VDevInfo > > {
         const uint64_t off = VDevInfo::vdev_info_offset(vdev_id);
         IoBufOwn buf{to_u32(VDevInfo::SIZE)};
         if (auto ec = co_await pdev->read_super_block(buf, off); ec) {
@@ -498,7 +499,7 @@ folly::coro::Task< void > DeviceManager::load_vdevs() {
     LOGINFO("Loaded {} virtual device(s)", state_.all_vdevs.size());
 }
 
-folly::coro::Task< void > DeviceManager::cleanup_stale_slot_vdevs(const std::vector< uint32_t >& stale_slot_ids) {
+Async< void > DeviceManager::cleanup_stale_slot_vdevs(const std::vector< uint32_t >& stale_slot_ids) {
     std::vector< shared< PhysicalDev > > all_pdevs;
     {
         std::lock_guard lg{state_mutex_};
@@ -520,7 +521,7 @@ folly::coro::Task< void > DeviceManager::cleanup_stale_slot_vdevs(const std::vec
     }
 }
 
-folly::coro::Task< void > DeviceManager::write_vdev_slot_bitmap() {
+Async< void > DeviceManager::write_vdev_slot_bitmap() {
     const uint64_t offset = HSSuperBlk::vdev_sb_offset();
 
     sisl::IoBufShared ba;
@@ -543,7 +544,7 @@ folly::coro::Task< void > DeviceManager::write_vdev_slot_bitmap() {
 }
 
 // static
-folly::coro::Task< VDevInfo > DeviceManager::read_vdev_info(cshared< PhysicalDev >& pdev, uint32_t vdev_id) {
+Async< VDevInfo > DeviceManager::read_vdev_info(cshared< PhysicalDev >& pdev, uint32_t vdev_id) {
     const uint64_t offset = VDevInfo::vdev_info_offset(vdev_id);
     IoBufOwn buf{VDevInfo::SIZE};
     if (auto ec = co_await pdev->read_super_block(buf, offset); ec) {

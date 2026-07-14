@@ -1,4 +1,5 @@
 #include "drive_interface.h"
+#include "common/async.h"
 #include "iomanager.h"
 #include "common/defs.h"
 
@@ -84,7 +85,7 @@ static std::error_code to_ec(int res) {
 
 // ── Public API — Linux ────────────────────────────────────────────────────────
 
-folly::coro::Task< std::shared_ptr< IoDevice > > DriveInterface::open_dev(std::string devname, int oflags) {
+Async< std::shared_ptr< IoDevice > > DriveInterface::open_dev(std::string devname, int oflags) {
     int fd = ::open(devname.c_str(), oflags, 0666);
     if (fd < 0)
         throw std::system_error(errno, std::generic_category(), "open: " + devname);
@@ -93,7 +94,7 @@ folly::coro::Task< std::shared_ptr< IoDevice > > DriveInterface::open_dev(std::s
     co_return std::make_shared< IoDevice >(fd, std::move(devname), S_ISBLK(st.st_mode));
 }
 
-folly::coro::Task< uint64_t > DriveInterface::get_size(const IoDevice& dev) {
+Async< uint64_t > DriveInterface::get_size(const IoDevice& dev) {
     if (dev.is_block_device) {
         uint64_t sz = 0;
         if (::ioctl(dev.fd, BLKGETSIZE64, &sz) < 0)
@@ -105,7 +106,7 @@ folly::coro::Task< uint64_t > DriveInterface::get_size(const IoDevice& dev) {
     co_return to_u64(st.st_size);
 }
 
-folly::coro::Task< std::error_code > DriveInterface::read(const IoDevice& dev, IoBuf& buf, uint64_t offset) {
+Async< std::error_code > DriveInterface::read(const IoDevice& dev, IoBuf& buf, uint64_t offset) {
     if (!t_dr) {
         co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), read(dev, buf, offset));
     }
@@ -134,7 +135,7 @@ folly::coro::Task< std::error_code > DriveInterface::read(const IoDevice& dev, I
     co_return ec;
 }
 
-folly::coro::Task< std::error_code > DriveInterface::write(const IoDevice& dev, const IoBuf& buf, uint64_t offset) {
+Async< std::error_code > DriveInterface::write(const IoDevice& dev, const IoBuf& buf, uint64_t offset) {
     if (!t_dr) {
         co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), write(dev, buf, offset));
     }
@@ -159,8 +160,7 @@ folly::coro::Task< std::error_code > DriveInterface::write(const IoDevice& dev, 
     co_return ec;
 }
 
-folly::coro::Task< std::error_code > DriveInterface::readv(const IoDevice& dev, sisl::SgList const& sg,
-                                                            uint64_t offset) {
+Async< std::error_code > DriveInterface::readv(const IoDevice& dev, sisl::SgList const& sg, uint64_t offset) {
     if (!t_dr) {
         co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), readv(dev, sg, offset));
     }
@@ -193,7 +193,9 @@ folly::coro::Task< std::error_code > DriveInterface::readv(const IoDevice& dev, 
     // O_DIRECT requires block-multiple total bytes.  If the SgList's total isn't 512-multiple, append a
     // pad iov reading into a throwaway aligned temp — bytes are discarded (no copy_back entry).
     if (auto const rem = total % 512; rem != 0) {
-        if (aligned_temps.empty()) { aligned_temps.reserve(1); }
+        if (aligned_temps.empty()) {
+            aligned_temps.reserve(1);
+        }
         aligned_temps.emplace_back(to_u32(512 - rem), 512);
         iovs.push_back({aligned_temps.back().bytes(), 512 - rem});
     }
@@ -208,8 +210,8 @@ folly::coro::Task< std::error_code > DriveInterface::readv(const IoDevice& dev, 
     co_return ec;
 }
 
-folly::coro::Task< std::error_code > DriveInterface::do_writev(const IoDevice& dev, std::vector< struct iovec >&& iovs,
-                                                               uint64_t offset) {
+Async< std::error_code > DriveInterface::do_writev(const IoDevice& dev, std::vector< struct iovec >&& iovs,
+                                                   uint64_t offset) {
     if (!t_dr) {
         co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), do_writev(dev, std::move(iovs), offset));
     }
@@ -220,8 +222,7 @@ folly::coro::Task< std::error_code > DriveInterface::do_writev(const IoDevice& d
     co_return to_ec(co_await std::move(sf).via(t_dr->eb));
 }
 
-folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev, sisl::SgList const& sg,
-                                                              uint64_t offset) {
+Async< std::error_code > DriveInterface::writev(const IoDevice& dev, sisl::SgList const& sg, uint64_t offset) {
     // Per-element alignment check.  Aligned sources pass through with no copy.  Unaligned sources get a
     // same-indexed aligned temp (memcpy'd from the source); the iovec slot points at the temp.  Temps live
     // until do_writev's await completes.  aligned_temps stays zero-alloc until the first unaligned entry
@@ -247,7 +248,9 @@ folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev,
     // zero-filled pad iov so the kernel sees a valid IO size.  Pad bytes land on disk but are unread —
     // the on-disk record's value_size tells the reader how much to consume.
     if (auto const rem = total % 512; rem != 0) {
-        if (aligned_temps.empty()) { aligned_temps.reserve(1); }
+        if (aligned_temps.empty()) {
+            aligned_temps.reserve(1);
+        }
         aligned_temps.emplace_back(to_u32(512 - rem), 512);
         std::memset(aligned_temps.back().bytes(), 0, 512 - rem);
         iovs.push_back({aligned_temps.back().bytes(), 512 - rem});
@@ -256,7 +259,7 @@ folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev,
     co_return co_await do_writev(dev, std::move(iovs), offset);
 }
 
-folly::coro::Task< std::error_code > DriveInterface::fsync(const IoDevice& dev) {
+Async< std::error_code > DriveInterface::fsync(const IoDevice& dev) {
     if (!t_dr) {
         co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), fsync(dev));
     }
@@ -266,7 +269,7 @@ folly::coro::Task< std::error_code > DriveInterface::fsync(const IoDevice& dev) 
     co_return to_ec(co_await std::move(sf).via(t_dr->eb));
 }
 
-folly::coro::Task< std::error_code > DriveInterface::write_zero(const IoDevice& dev, uint64_t size, uint64_t offset) {
+Async< std::error_code > DriveInterface::write_zero(const IoDevice& dev, uint64_t size, uint64_t offset) {
     if (!t_dr) {
         co_return co_await iomgr().spawn_waitable(ReactorTarget::any(), write_zero(dev, size, offset));
     }
@@ -297,7 +300,7 @@ folly::coro::Task< std::error_code > DriveInterface::write_zero(const IoDevice& 
 void drive_interface_init_reactor(folly::EventBase*) {
 }
 
-folly::coro::Task< std::shared_ptr< IoDevice > > DriveInterface::open_dev(std::string devname, int oflags) {
+Async< std::shared_ptr< IoDevice > > DriveInterface::open_dev(std::string devname, int oflags) {
     int fd = ::open(devname.c_str(), oflags, 0666);
     if (fd < 0)
         throw std::system_error(errno, std::generic_category(), "open: " + devname);
@@ -306,37 +309,36 @@ folly::coro::Task< std::shared_ptr< IoDevice > > DriveInterface::open_dev(std::s
     co_return std::make_shared< IoDevice >(fd, std::move(devname), false);
 }
 
-folly::coro::Task< uint64_t > DriveInterface::get_size(const IoDevice& dev) {
+Async< uint64_t > DriveInterface::get_size(const IoDevice& dev) {
     struct stat st {};
     ::fstat(dev.fd, &st);
     co_return static_cast< uint64_t >(st.st_size);
 }
 
-folly::coro::Task< std::error_code > DriveInterface::read(const IoDevice& dev, IoBuf& buf, uint64_t offset) {
+Async< std::error_code > DriveInterface::read(const IoDevice& dev, IoBuf& buf, uint64_t offset) {
     int fd = dev.fd;
     void* ptr = buf.bytes();
     size_t sz = buf.size();
-    co_return co_await folly::coro::co_invoke([fd, ptr, sz, offset]() -> folly::coro::Task< std::error_code > {
+    co_return co_await folly::coro::co_invoke([fd, ptr, sz, offset]() -> Async< std::error_code > {
         ssize_t n = ::pread(fd, ptr, sz, (off_t)offset);
         co_return (n < 0) ? std::error_code(errno, std::generic_category()) : std::error_code{};
     }).scheduleOn(folly::getGlobalCPUExecutor().get());
 }
 
-folly::coro::Task< std::error_code > DriveInterface::write(const IoDevice& dev, const IoBuf& buf, uint64_t offset) {
+Async< std::error_code > DriveInterface::write(const IoDevice& dev, const IoBuf& buf, uint64_t offset) {
     int fd = dev.fd;
     const void* ptr = buf.cbytes();
     size_t sz = buf.size();
-    co_return co_await folly::coro::co_invoke([fd, ptr, sz, offset]() -> folly::coro::Task< std::error_code > {
+    co_return co_await folly::coro::co_invoke([fd, ptr, sz, offset]() -> Async< std::error_code > {
         ssize_t n = ::pwrite(fd, ptr, sz, (off_t)offset);
         co_return (n < 0) ? std::error_code(errno, std::generic_category()) : std::error_code{};
     }).scheduleOn(folly::getGlobalCPUExecutor().get());
 }
 
-folly::coro::Task< std::error_code > DriveInterface::readv(const IoDevice& dev, sisl::SgList const& sg,
-                                                            uint64_t offset) {
+Async< std::error_code > DriveInterface::readv(const IoDevice& dev, sisl::SgList const& sg, uint64_t offset) {
     int fd = dev.fd;
     auto const* bufs_ptr = &sg.bufs;
-    co_return co_await folly::coro::co_invoke([fd, bufs_ptr, offset]() mutable -> folly::coro::Task< std::error_code > {
+    co_return co_await folly::coro::co_invoke([fd, bufs_ptr, offset]() mutable -> Async< std::error_code > {
         for (auto* b : *bufs_ptr) {
             ssize_t n = ::pread(fd, b->bytes(), b->size(), (off_t)offset);
             if (n < 0) {
@@ -348,11 +350,11 @@ folly::coro::Task< std::error_code > DriveInterface::readv(const IoDevice& dev, 
     }).scheduleOn(folly::getGlobalCPUExecutor().get());
 }
 
-folly::coro::Task< std::error_code > DriveInterface::do_writev(const IoDevice& dev, std::vector< struct iovec >&& iovs,
-                                                               uint64_t offset) {
+Async< std::error_code > DriveInterface::do_writev(const IoDevice& dev, std::vector< struct iovec >&& iovs,
+                                                   uint64_t offset) {
     int fd = dev.fd;
     co_return co_await folly::coro::co_invoke([fd, iovs = std::move(iovs),
-                                               offset]() mutable -> folly::coro::Task< std::error_code > {
+                                               offset]() mutable -> Async< std::error_code > {
         for (auto& iov : iovs) {
             ssize_t n = ::pwrite(fd, iov.iov_base, iov.iov_len, (off_t)offset);
             if (n < 0) {
@@ -364,8 +366,7 @@ folly::coro::Task< std::error_code > DriveInterface::do_writev(const IoDevice& d
     }).scheduleOn(folly::getGlobalCPUExecutor().get());
 }
 
-folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev, sisl::SgList const& sg,
-                                                              uint64_t offset) {
+Async< std::error_code > DriveInterface::writev(const IoDevice& dev, sisl::SgList const& sg, uint64_t offset) {
     std::vector< struct iovec > iovs;
     iovs.reserve(sg.bufs.size());
     for (auto const* b : sg.bufs) {
@@ -374,9 +375,9 @@ folly::coro::Task< std::error_code > DriveInterface::writev(const IoDevice& dev,
     co_return co_await do_writev(dev, std::move(iovs), offset);
 }
 
-folly::coro::Task< std::error_code > DriveInterface::fsync(const IoDevice& dev) {
+Async< std::error_code > DriveInterface::fsync(const IoDevice& dev) {
     int fd = dev.fd;
-    co_return co_await folly::coro::co_invoke([fd]() -> folly::coro::Task< std::error_code > {
+    co_return co_await folly::coro::co_invoke([fd]() -> Async< std::error_code > {
 #ifdef __APPLE__
         // macOS lacks fdatasync; F_FULLFSYNC flushes write-back cache too
         int rc = ::fcntl(fd, F_FULLFSYNC);
@@ -387,9 +388,9 @@ folly::coro::Task< std::error_code > DriveInterface::fsync(const IoDevice& dev) 
     }).scheduleOn(folly::getGlobalCPUExecutor().get());
 }
 
-folly::coro::Task< std::error_code > DriveInterface::write_zero(const IoDevice& dev, uint64_t size, uint64_t offset) {
+Async< std::error_code > DriveInterface::write_zero(const IoDevice& dev, uint64_t size, uint64_t offset) {
     int fd = dev.fd;
-    co_return co_await folly::coro::co_invoke([fd, size, offset]() -> folly::coro::Task< std::error_code > {
+    co_return co_await folly::coro::co_invoke([fd, size, offset]() -> Async< std::error_code > {
         static constexpr size_t kChunk = 1u << 20; // 1 MiB
         IoBuf zbuf{static_cast< uint32_t >(std::min(size, (uint64_t)kChunk))};
         std::memset(zbuf.bytes(), 0, zbuf.size());

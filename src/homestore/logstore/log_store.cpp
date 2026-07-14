@@ -21,7 +21,7 @@
 #include <stdexcept>
 
 #include <fmt/format.h>
-#include <folly/coro/Sleep.h>
+#include "common/async.h"
 
 #include "homestore/base/homestore_assert.h"
 #include "homestore/base/homestore_config.h" // HS_DYNAMIC_CONFIG
@@ -50,8 +50,8 @@ LogStore::LogStore(shared< LogStream > stream, MetaBlkWrapper&& mb, logstore_id_
         rollback_records_{std::move(rollback_records)} {
 }
 
-folly::coro::Task< shared< LogStore > > LogStore::create(logstore_id_t sid, shared< MetaClient > meta_client,
-                                                         shared< LogStream > stream, bool is_append_mode) {
+Async< shared< LogStore > > LogStore::create(logstore_id_t sid, shared< MetaClient > meta_client,
+                                             shared< LogStream > stream, bool is_append_mode) {
     LOGINFO("Creating LogStore sid={} append_mode={} on stream_id={}", sid, is_append_mode, stream->stream_id());
     auto mb = co_await MetaBlkWrapper::create(std::move(meta_client), fmt::format("LogStore_{}", sid),
                                               std::optional< size_t >{sizeof(LogStoreSb)});
@@ -66,7 +66,7 @@ folly::coro::Task< shared< LogStore > > LogStore::create(logstore_id_t sid, shar
                                            /*head_lsn=*/0, std::vector< rollback_record >{});
 }
 
-folly::coro::Task< shared< LogStore > > LogStore::load(shared< LogStream > stream, MetaBlkWrapper&& mb) {
+Async< shared< LogStore > > LogStore::load(shared< LogStream > stream, MetaBlkWrapper&& mb) {
     sisl::IoBufView sb_payload = co_await mb.read();
     if (sb_payload.size() < sizeof(LogStoreSb)) {
         throw std::runtime_error(fmt::format("LogStore::load: sb payload too small ({} bytes)", sb_payload.size()));
@@ -103,7 +103,7 @@ lsn_t LogStore::quick_append(const LogBlob& data) {
     return lsn;
 }
 
-folly::coro::Task< lsn_t > LogStore::append_and_flush(const LogBlob& data) {
+Async< lsn_t > LogStore::append_and_flush(const LogBlob& data) {
     const lsn_t lsn = quick_append(data);
 
     // Wait for a brief time to allow coalescing multiple writes.
@@ -132,7 +132,7 @@ void LogStore::quick_write(lsn_t lsn, const LogBlob& data) {
     stream_->append(this, lsn, data);
 }
 
-folly::coro::Task< void > LogStore::write_and_flush(lsn_t lsn, const LogBlob& data) {
+Async< void > LogStore::write_and_flush(lsn_t lsn, const LogBlob& data) {
     quick_write(lsn, data);
 
     // Wait for a brief time to allow coalescing multiple writes.
@@ -162,7 +162,7 @@ void LogStore::fill_gap(lsn_t lsn) {
 // Read / flush / truncate / rollback
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< sisl::IoBufView > LogStore::read(lsn_t lsn) {
+Async< sisl::IoBufView > LogStore::read(lsn_t lsn) {
     auto exp = records_.try_at(lsn);
     if (!exp) {
         if (exp.error() == sisl::StreamTrackerError::OutOfRange) {
@@ -179,11 +179,11 @@ folly::coro::Task< sisl::IoBufView > LogStore::read(lsn_t lsn) {
     co_return co_await stream_->read(stream_key{rec.log_id, rec.record_stream_offset, 0});
 }
 
-folly::coro::Task< void > LogStore::flush() {
+Async< void > LogStore::flush() {
     co_await stream_->flush();
 }
 
-folly::coro::Task< void > LogStore::truncate(lsn_t upto_lsn, bool in_memory_only) {
+Async< void > LogStore::truncate(lsn_t upto_lsn, bool in_memory_only) {
     auto lock = co_await stream_->flush_lock().co_scoped_lock();
     const lsn_t s = head_lsn_.load(std::memory_order_acquire);
     if (upto_lsn < s) {
@@ -205,7 +205,7 @@ folly::coro::Task< void > LogStore::truncate(lsn_t upto_lsn, bool in_memory_only
     }
 }
 
-folly::coro::Task< bool > LogStore::rollback(lsn_t to_lsn) {
+Async< bool > LogStore::rollback(lsn_t to_lsn) {
     THIS_LOGSTORE_LOG(INFO, "rollback request to_lsn={} current tail_lsn={} head_lsn={}", to_lsn,
                       tail_lsn_.load(std::memory_order_relaxed), head_lsn_.load(std::memory_order_relaxed));
     // Drain in-flight via stream flush, then under flush_lock snapshot the max log_id.  Each rollback persists
@@ -314,7 +314,7 @@ bool LogStore::in_rollback_range(lsn_t lsn, logid_t log_id) const {
     return false;
 }
 
-folly::coro::Task< void > LogStore::persist_sb() {
+Async< void > LogStore::persist_sb() {
     const uint32_t n = to_u32(rollback_records_.size());
     const size_t sz = LogStoreSb::size_for(n);
 

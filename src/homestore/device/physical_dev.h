@@ -23,23 +23,22 @@
 #include <unordered_set>
 #include <vector>
 
-#include <folly/coro/Mutex.h>
-#include <folly/coro/Task.h>
+#include "common/async.h"
 
 #include "sisl/fds/bitset.h"
 
-#include "homestore/device/device_decl.h"          // HSDevType, IOFlag, DevInfo
-#include "homestore/device/hs_super_blk.h"         // PDevInfoHeader, FirstBlock, HSSuperBlk
-#include "iomanager/drive_interface.h" // iomanager::DriveInterface, iomanager::IoDevice
-#include "homestore/device/chunk.h"                // ChunkInfo, ChunkInterval, ChunkIntervalSet, Chunk
+#include "homestore/device/device_decl.h"  // HSDevType, IOFlag, DevInfo
+#include "homestore/device/hs_super_blk.h" // PDevInfoHeader, FirstBlock, HSSuperBlk
+#include "iomanager/drive_interface.h"     // iomanager::DriveInterface, iomanager::IoDevice
+#include "homestore/device/chunk.h"        // ChunkInfo, ChunkInterval, ChunkIntervalSet, Chunk
 
 namespace homestore {
 
 // ── Global device cache ───────────────────────────────────────────────────────
 // The cache avoids reopening the same device when both a format pass and a load
 // pass reference the same underlying file/block device.
-folly::coro::Task< shared< iomanager::IoDevice > > open_and_cache_dev(const std::string& devname, int oflags);
-folly::coro::Task< void > close_and_uncache_dev(const std::string& devname);
+Async< shared< iomanager::IoDevice > > open_and_cache_dev(const std::string& devname, int oflags);
+Async< void > close_and_uncache_dev(const std::string& devname);
 
 // ── ChunkProvisioner ──────────────────────────────────────────────────────────
 // All mutable chunk-related state is grouped here and protected by
@@ -72,92 +71,90 @@ public:
 
     /// First-time format: creates PDevInfoHeader from dinfo, writes the FirstBlock (with formatting_done=0) to disk,
     /// opens the device, and initialises the on-disk chunk bitmap.
-    static folly::coro::Task< shared< PhysicalDev > > create(const DevInfo& dinfo, int oflags, uint32_t pdev_id,
-                                                             const FirstBlockHeader& fbhdr);
+    static Async< shared< PhysicalDev > > create(const DevInfo& dinfo, int oflags, uint32_t pdev_id,
+                                                 const FirstBlockHeader& fbhdr);
 
     /// Recovery: reads the FirstBlock from disk, validates it against the provided fbhdr (e.g. system_uuid match),
     /// opens the device, and replays chunk metadata.
-    static folly::coro::Task< shared< PhysicalDev > > load(const DevInfo& dinfo, int oflags,
-                                                           const FirstBlockHeader& fbhdr);
+    static Async< shared< PhysicalDev > > load(const DevInfo& dinfo, int oflags, const FirstBlockHeader& fbhdr);
 
     /// Build a PDevInfoHeader for a device (used by DeviceManager too).
     /// Builds a PDevInfoHeader from device info and pdev_id.
     static PDevInfoHeader create_pdev_info(const DevInfo& dinfo, uint32_t pdev_id);
 
     /// Read the first block from a device without constructing a PhysicalDev.
-    static folly::coro::Task< FirstBlock > read_first_block(const std::string& devname, int oflags);
+    static Async< FirstBlock > read_first_block(const std::string& devname, int oflags);
 
     /// Return the total device/file size in bytes.
-    static folly::coro::Task< uint64_t > get_dev_size(const std::string& devname);
+    static Async< uint64_t > get_dev_size(const std::string& devname);
 
     // ── Super block ───────────────────────────────────────────────────────────
 
     /// Write buf to offset (and optionally mirrored to the footer).
-    folly::coro::Task< void > write_super_block(const sisl::IoBuf& buf, uint64_t offset);
+    Async< void > write_super_block(const sisl::IoBuf& buf, uint64_t offset);
 
     /// Read into buf. Caller retains ownership; returns error_code.
-    folly::coro::Task< std::error_code > read_super_block(sisl::IoBuf& buf, uint64_t offset);
+    Async< std::error_code > read_super_block(sisl::IoBuf& buf, uint64_t offset);
 
     /// Mark formatting as complete: reads FirstBlock back, sets formatting_done=1, recomputes checksum, writes back.
-    folly::coro::Task< void > commit_formatting();
+    Async< void > commit_formatting();
 
-    folly::coro::Task< void > close_device();
+    Async< void > close_device();
 
     // ── Data IO ───────────────────────────────────────────────────────────────
     // All async IO methods
 
     /// Single-buf write/read — any concrete IoBuf subclass via virtual dispatch.
-    folly::coro::Task< void > write(const sisl::IoBuf& buf, uint64_t offset);
-    folly::coro::Task< std::error_code > read(sisl::IoBuf& buf, uint64_t offset);
+    Async< void > write(const sisl::IoBuf& buf, uint64_t offset);
+    Async< std::error_code > read(sisl::IoBuf& buf, uint64_t offset);
 
     /// Scatter-gather I/O — `sg.bufs` is a polymorphic IoBuf pointer list.  Caller guarantees the
     /// pointed-to IoBufs outlive the await.
-    folly::coro::Task< void > writev(sisl::SgList const& sg, uint64_t offset);
-    folly::coro::Task< std::error_code > readv(sisl::SgList const& sg, uint64_t offset);
+    Async< void > writev(sisl::SgList const& sg, uint64_t offset);
+    Async< std::error_code > readv(sisl::SgList const& sg, uint64_t offset);
 
-    folly::coro::Task< void > write_zero(uint64_t size, uint64_t offset);
-    folly::coro::Task< void > fsync();
+    Async< void > write_zero(uint64_t size, uint64_t offset);
+    Async< void > fsync();
 
     // ── Chunk management ─────────────────────────────────────────────────────
 
     /// Initialise the on-disk chunk slot bitmap (first-time format).
-    folly::coro::Task< void > format_chunks();
+    Async< void > format_chunks();
 
     /// Allocate one chunk slot; chunk_id = pdev_id * HS_MAX_CHUNKS + slot_number.
-    folly::coro::Task< shared< Chunk > > create_chunk(uint32_t vdev_id, uint64_t size, uint64_t vdev_order,
-                                                      const uint8_t* user_private = nullptr,
-                                                      size_t user_private_size = 0);
+    Async< shared< Chunk > > create_chunk(uint32_t vdev_id, uint64_t size, uint64_t vdev_order,
+                                          const uint8_t* user_private = nullptr, size_t user_private_size = 0);
 
     /// Allocate num_chunks slots in batch; vdev_orders start at start_vdev_order.
-    folly::coro::Task< std::vector< shared< Chunk > > > create_chunks(uint32_t vdev_id, uint32_t num_chunks,
-                                                                      uint64_t size, uint64_t start_vdev_order = 0);
+    Async< std::vector< shared< Chunk > > > create_chunks(uint32_t vdev_id, uint32_t num_chunks, uint64_t size,
+                                                          uint64_t start_vdev_order = 0);
 
     /// Load all chunks from disk. Returns vdev_id → [chunks] for recovery.
-    folly::coro::Task< std::unordered_map< uint32_t, std::vector< shared< Chunk > > > > load_chunks();
+    Async< std::unordered_map< uint32_t, std::vector< shared< Chunk > > > > load_chunks();
 
     /// Remove a single chunk (frees slot, persists bitmap).
-    folly::coro::Task< void > remove_chunk(cshared< Chunk >& chunk);
+    Async< void > remove_chunk(cshared< Chunk >& chunk);
 
     /// Remove a batch; batches the final bitmap write for efficiency.
-    folly::coro::Task< void > remove_chunks(const std::vector< shared< Chunk > >& chunks);
+    Async< void > remove_chunks(const std::vector< shared< Chunk > >& chunks);
 
     /// Convenience: remove all chunks belonging to vdev_id.
-    folly::coro::Task< void > remove_chunks_for_vdev(uint32_t vdev_id);
+    Async< void > remove_chunks_for_vdev(uint32_t vdev_id);
 
     /// Mark chunk as unallocated (chunk_allocated = 0) for pool reuse.
     /// Persists updated ChunkInfo; calls chunk->update_info().
-    folly::coro::Task< void > deactivate_chunk(cshared< Chunk >& chunk);
+    Async< void > deactivate_chunk(cshared< Chunk >& chunk);
 
     /// Mark chunk as allocated with a new vdev_order (from pool reuse).
     /// Persists updated ChunkInfo; calls chunk->update_info().
-    folly::coro::Task< void > reactivate_chunk(cshared< Chunk >& chunk, uint64_t new_vdev_order);
+    Async< void > reactivate_chunk(cshared< Chunk >& chunk, uint64_t new_vdev_order);
 
     // ── Chunk accessors ───────────────────────────────────────────────────────
 
-    folly::coro::Task< std::vector< shared< Chunk > > > get_all_chunks();
-    folly::coro::Task< shared< Chunk > > get_chunk(uint32_t chunk_id);
-    folly::coro::Task< std::vector< shared< Chunk > > > get_chunks_for_vdev(uint32_t vdev_id);
-    folly::coro::Task< size_t > get_chunk_count();
+    Async< std::vector< shared< Chunk > > > get_all_chunks();
+    Async< shared< Chunk > > get_chunk(uint32_t chunk_id);
+    Async< std::vector< shared< Chunk > > > get_chunks_for_vdev(uint32_t vdev_id);
+    Async< size_t > get_chunk_count();
 
     // ── Parameter getters (sync — immutable after construction) ──────────────
     uint32_t pdev_id() const { return pdev_info_.pdev_id; }
@@ -177,11 +174,10 @@ private:
 
     /// Common low-level init: opens device, measures size, populates fields.
     /// Returns a heap-allocated PhysicalDev wrapped in shared_ptr.
-    static folly::coro::Task< shared< PhysicalDev > > construct(const DevInfo& dinfo, int oflags,
-                                                                const PDevInfoHeader& pinfo);
+    static Async< shared< PhysicalDev > > construct(const DevInfo& dinfo, int oflags, const PDevInfoHeader& pinfo);
 
     /// Write the FirstBlock to disk at offset 0. Called during create() with formatting_done=0.
-    folly::coro::Task< void > write_first_block(const FirstBlockHeader& fbhdr);
+    Async< void > write_first_block(const FirstBlockHeader& fbhdr);
 
     // ── Locked helpers (called with chunk_mutex_ held) ────────────────────────
 

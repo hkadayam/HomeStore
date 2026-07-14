@@ -16,10 +16,11 @@
 #pragma once
 
 #include <cstdint>
+#include "common/async.h"
 #include <optional>
 #include <vector>
 
-#include "common/defs.h" // shared<>
+#include "common/defs.h"                   // shared<>
 #include "homestore/base/homestore_decl.h" // DevInfo, HSDevType
 #include "iomanager/coro_timer.h"
 #include "homestore/base/resource_event.h"
@@ -67,7 +68,7 @@ private:
     ResourceMgr(uint64_t fast_capacity, uint64_t data_capacity, uint64_t mem_cap, uint64_t cache_size);
 
     /// Periodic rule evaluation — runs on poll_timer_'s EB thread.
-    folly::coro::Task< void > poll_tick();
+    Async< void > poll_tick();
 
     /// ResourceEvent subscriber — invoked synchronously from EventManager::publish() on the publisher's thread.
     /// Heavy follow-up work is dispatched via spawn_detached.

@@ -15,6 +15,7 @@
  ***************************************************************************/
 
 #include <cstring>
+#include "common/async.h"
 #include <stdexcept>
 
 #include "common/defs.h"
@@ -30,7 +31,7 @@ using sisl::IoBufOwn;
 // ──────────────────────────────────────────────────────────────────────────────
 // create
 // ──────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< void > MetaBlkManager::create(uint64_t chunk_size) {
+Async< void > MetaBlkManager::create(uint64_t chunk_size) {
     VDevParameters params;
     params.vdev_name = "meta_vdev";
     params.blk_size = 512;
@@ -78,7 +79,7 @@ folly::coro::Task< void > MetaBlkManager::create(uint64_t chunk_size) {
 // ──────────────────────────────────────────────────────────────────────────────
 // load
 // ──────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< void > MetaBlkManager::load() {
+Async< void > MetaBlkManager::load() {
     shared< VirtualDev > vdev = device_mgr().get_vdev("meta_vdev");
 
     // Meta vdev is non-persistent: construct fresh block allocators so alloc/commit work after reload.
@@ -105,7 +106,7 @@ folly::coro::Task< void > MetaBlkManager::load() {
 // ──────────────────────────────────────────────────────────────────────────────
 // register_client
 // ──────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< MetaClient > MetaBlkManager::register_client(std::string name) {
+Async< MetaClient > MetaBlkManager::register_client(std::string name) {
     // Determine client_id and whether this is a recovery case.
     // Lock is released before the (potentially slow) client create/load.
     uint8_t client_id{};
@@ -137,7 +138,7 @@ folly::coro::Task< MetaClient > MetaBlkManager::register_client(std::string name
 // ──────────────────────────────────────────────────────────────────────────────
 // deregister_client
 // ──────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< void > MetaBlkManager::deregister_client(const MetaClient& client) {
+Async< void > MetaBlkManager::deregister_client(const MetaClient& client) {
     const uint8_t cid = co_await client.client_id();
 
     {
@@ -162,18 +163,22 @@ folly::coro::Task< void > MetaBlkManager::deregister_client(const MetaClient& cl
 // ──────────────────────────────────────────────────────────────────────────────
 // load_client_info_from_disk  (private)
 // ──────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< void > MetaBlkManager::load_client_info_from_disk() {
+Async< void > MetaBlkManager::load_client_info_from_disk() {
     const size_t total_sz = MetaBlkSuperHeader::SIZE + MAX_META_CLIENTS * MetaClientInfo::SIZE;
 
     META_LOG(DEBUG, "load_client_info_from_disk: reading {} bytes from blk_num={}", total_sz,
              client_info_bid_.blk_num());
     IoBufOwn buf{to_u32(total_sz)};
     auto err = co_await meta_vdev_->read(buf, client_info_bid_);
-    if (err) { throw std::runtime_error{"MetaBlkManager: failed to read client info area"}; }
+    if (err) {
+        throw std::runtime_error{"MetaBlkManager: failed to read client info area"};
+    }
 
     // Validate super-header.
     const auto& super = *reinterpret_cast< const MetaBlkSuperHeader* >(buf.bytes());
-    if (!super.is_valid()) { throw std::runtime_error{"MetaBlkManager: invalid super-header magic/version"}; }
+    if (!super.is_valid()) {
+        throw std::runtime_error{"MetaBlkManager: invalid super-header magic/version"};
+    }
     META_LOG(DEBUG, "load_client_info_from_disk: super-header valid, scanning {} client slots", MAX_META_CLIENTS);
 
     // Scan all client slots.

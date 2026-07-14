@@ -12,7 +12,7 @@
 #include <vector>
 
 #include <boost/uuid/uuid_io.hpp>
-#include <folly/coro/Task.h>
+#include "common/async.h"
 #include <folly/futures/Future.h>
 #include <folly/futures/Promise.h>
 
@@ -276,20 +276,18 @@ public:
     /// callback will get the Blkids where the value is written. If its small or optimization is off, then it gets
     /// inlined with header. Appln co_await this call will get done only after entire replication is committed or
     /// failed.
-    folly::coro::Task< ReplResult<> > write(sisl::IoBuf const& user_header, sisl::IoBufView value, TraceId tid = 0);
+    Async< ReplResult<> > write(sisl::IoBuf const& user_header, sisl::IoBufView value, TraceId tid = 0);
 
     // ── Membership / leadership ──────────────────────────────────────────────────────────────────────────────
 
-    folly::coro::Task< ReplResult<> > become_leader();
-    folly::coro::Task< ReplResult<> > start_replace_member(ReplicaMemberInfo const& member_out,
-                                                           ReplicaMemberInfo const& member_in,
-                                                           uint32_t commit_quorum = 0, TraceId tid = 0);
-    folly::coro::Task< ReplResult<> > complete_replace_member(ReplicaMemberInfo const& member_out,
-                                                              ReplicaMemberInfo const& member_in,
-                                                              uint32_t commit_quorum = 0, TraceId tid = 0);
-    folly::coro::Task< ReplResult<> > flip_learner_flag(ReplicaMemberInfo const& member, bool target,
-                                                        uint32_t commit_quorum, bool wait_and_verify = true,
-                                                        TraceId tid = 0);
+    Async< ReplResult<> > become_leader();
+    Async< ReplResult<> > start_replace_member(ReplicaMemberInfo const& member_out, ReplicaMemberInfo const& member_in,
+                                               uint32_t commit_quorum = 0, TraceId tid = 0);
+    Async< ReplResult<> > complete_replace_member(ReplicaMemberInfo const& member_out,
+                                                  ReplicaMemberInfo const& member_in, uint32_t commit_quorum = 0,
+                                                  TraceId tid = 0);
+    Async< ReplResult<> > flip_learner_flag(ReplicaMemberInfo const& member, bool target, uint32_t commit_quorum,
+                                            bool wait_and_verify = true, TraceId tid = 0);
 
     ReplError do_add_member(ReplicaMemberInfo const& member, TraceId tid = 0);
     ReplError do_remove_member(ReplicaMemberInfo const& member, TraceId tid = 0);
@@ -358,9 +356,8 @@ public:
 
     // ── nuraft::state_machine overrides ─────────────────────────────────────────────────────────────────────
 
-    folly::coro::Task< RaftBufferPtr > commit_ext_chained(ulong log_idx,
-                                                          std::vector< RaftBufferPtr > const& bufs) override;
-    folly::coro::Task< RaftBufferPtr > commit_ext(ext_op_params const& params) override;
+    Async< RaftBufferPtr > commit_ext_chained(ulong log_idx, std::vector< RaftBufferPtr > const& bufs) override;
+    Async< RaftBufferPtr > commit_ext(ext_op_params const& params) override;
     RaftBufferPtr pre_commit_ext(ext_op_params const& params) override;
     void rollback_ext(ext_op_params const& params) override;
     void commit_config(ulong log_idx, nuraft::ptr< nuraft::cluster_config >& new_conf) override;

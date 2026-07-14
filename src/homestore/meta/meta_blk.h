@@ -21,14 +21,14 @@
 #include <string>
 #include <string_view>
 
-#include <folly/coro/Task.h>
+#include "common/async.h"
 
 #include "homestore/base/blk.h"              // BlkId, BlkAllocStatus, blk_alloc_hints
 #include "homestore/base/crc.h"              // crc32_ieee
-#include "common/defs.h"                // shared<>, unique<>, to_u32
-#include "homestore/base/homestore_assert.h"    // HS_SUBMOD_LOG
+#include "common/defs.h"                     // shared<>, unique<>, to_u32
+#include "homestore/base/homestore_assert.h" // HS_SUBMOD_LOG
 
-#include "sisl/fds/buffer.h"            // IoBufShared, make_io_buf_shared
+#include "sisl/fds/buffer.h" // IoBufShared, make_io_buf_shared
 
 namespace homestore {
 
@@ -68,8 +68,9 @@ struct MetaBlkHeader {
         // Silent truncation here is a debugging nightmare — multiple metablks end up sharing the same on-disk
         // name, parse_mblk_name fails on every one of them, and recovery surfaces zero metablks with no obvious
         // cause.  Trip in debug builds so callers find this immediately.
-        HS_DBG_ASSERT_LT(name_sv.size(), sizeof(MetaBlkHeader::name), "MetaBlk name '{}' is too long ({} bytes); max {}",
-                         name_sv, name_sv.size(), sizeof(MetaBlkHeader::name) - 1);
+        HS_DBG_ASSERT_LT(name_sv.size(), sizeof(MetaBlkHeader::name),
+                         "MetaBlk name '{}' is too long ({} bytes); max {}", name_sv, name_sv.size(),
+                         sizeof(MetaBlkHeader::name) - 1);
         MetaBlkHeader h;
         h.magic = META_BLK_HEADER_MAGIC;
         h.data_size = 0;
@@ -110,10 +111,10 @@ static_assert(sizeof(MetaBlkHeader) == META_BLK_HEADER_SIZE,
 // ──────────────────────────────────────────────────────────────────────────────
 class MetaBlk {
 public:
-    BlkId blkid{};              // Block ID on the vdev
-    BlkId prev_bid{};           // Previous block in chain (in-memory only)
-    sisl::IoBufShared buffer;     // Exactly one block: header (64 B) + inline data (shared ownership)
-    bool is_fresh{true};        // true until first write into the client's chain
+    BlkId blkid{};            // Block ID on the vdev
+    BlkId prev_bid{};         // Previous block in chain (in-memory only)
+    sisl::IoBufShared buffer; // Exactly one block: header (64 B) + inline data (shared ownership)
+    bool is_fresh{true};      // true until first write into the client's chain
 
     // ── Factory ──────────────────────────────────────────────────────────────
     static MetaBlk create(BlkId blkid, uint32_t blk_sz, std::string_view name) {
@@ -155,14 +156,14 @@ public:
 
     /// Write payload to disk. Stores inline if it fits in one block, allocates overflow blocks otherwise. Updates
     /// data_size/data_crc in the header, writes the block, then frees any previous overflow block.
-    folly::coro::Task< void > write_data(const sisl::IoBufShared& data, VirtualDev& vdev);
+    Async< void > write_data(const sisl::IoBufShared& data, VirtualDev& vdev);
 
     /// Read the payload. Returns a IoBufView into the cached buffer for inline data (zero copy, zero I/O) or reads
     /// overflow blocks from disk into a new IoBufShared and wraps it in a IoBufView.
-    folly::coro::Task< sisl::IoBufView > read_data(VirtualDev& vdev) const;
+    Async< sisl::IoBufView > read_data(VirtualDev& vdev) const;
 
     /// Free this block (and any overflow blocks) on the vdev.
-    folly::coro::Task< void > free(VirtualDev& vdev);
+    Async< void > free(VirtualDev& vdev);
 
     // ── Copyable (shared_ptr refcount bump), movable ─────────────────────────
     MetaBlk() = default;
@@ -175,7 +176,7 @@ private:
     friend class MetaClient;
 
     /// Update next_bid in the on-disk header and write the cached block back to disk.
-    folly::coro::Task< void > update_next_bid(BlkId next, VirtualDev& vdev);
+    Async< void > update_next_bid(BlkId next, VirtualDev& vdev);
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -187,8 +188,8 @@ private:
 class MetaBlkWrapper {
 public:
     /// Allocate a new MetaBlk through the given client.
-    static folly::coro::Task< MetaBlkWrapper > create(shared< MetaClient > client, std::string_view name,
-                                                      std::optional< size_t > estimated_data_size);
+    static Async< MetaBlkWrapper > create(shared< MetaClient > client, std::string_view name,
+                                          std::optional< size_t > estimated_data_size);
 
     /// Wrap an already-loaded MetaBlk.
     static MetaBlkWrapper load(shared< MetaClient > client, MetaBlk blk) {
@@ -198,8 +199,8 @@ public:
         return w;
     }
 
-    folly::coro::Task< void > write(const uint8_t* data, size_t len);
-    folly::coro::Task< sisl::IoBufView > read();
+    Async< void > write(const uint8_t* data, size_t len);
+    Async< sisl::IoBufView > read();
 
     const MetaBlk& meta_blk() const { return meta_blk_; }
     MetaBlk& meta_blk() { return meta_blk_; }

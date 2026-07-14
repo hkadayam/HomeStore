@@ -14,6 +14,7 @@
  *
  *********************************************************************************/
 #include <array>
+#include "common/async.h"
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -58,7 +59,7 @@ public:
         next_val_.store(0);
     }
 
-    folly::coro::Task< bool > cp_flush(CP* cp) override {
+    Async< bool > cp_flush(CP* cp) override {
         auto count = next_val_.load();
         LOGINFO("CP={} flushing {} values", cp->id(), count);
         // Validate that the count is within bounds.
@@ -120,7 +121,7 @@ public:
     }
 
     // Format devices, create MetaBlkManager, create CPManager, register test consumer.
-    folly::coro::Task< shared< DeviceManager > > format_and_start_cp() {
+    Async< shared< DeviceManager > > format_and_start_cp() {
         auto dm = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
         co_await MetaBlkManager::create(META_VDEV_SIZE);
 
@@ -134,7 +135,7 @@ public:
     }
 
     // Reload devices, load MetaBlkManager, start CPManager (recovery path).
-    folly::coro::Task< shared< DeviceManager > > reload_and_start_cp() {
+    Async< shared< DeviceManager > > reload_and_start_cp() {
         Managers::reset();
         auto dm = DeviceManager::create(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
         co_await dm->load_devices();
@@ -279,48 +280,45 @@ CORO_TEST_F(CPMgrTest, CPIdAdvancesAfterFlush) {
 TEST_F(CPMgrTest, CPIdSurvivesRestart) {
     cp_id_t id_before_restart{};
 
-    iomgr().spawn_and_block(ReactorTarget::any(),
-                            [this, &id_before_restart]() -> folly::coro::Task< void > {
-                                auto dm = co_await format_and_start_cp();
-                                for (int i = 0; i < 3; ++i) {
-                                    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
-                                    EXPECT_TRUE(success);
-                                }
-                                {
-                                    auto guard = cp_mgr().cp_guard();
-                                    id_before_restart = guard->id();
-                                }
-                                co_await cp_mgr().shutdown();
-                                co_await dm->close_devices();
-                                Managers::reset();
-                            }());
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &id_before_restart]() -> Async< void > {
+        auto dm = co_await format_and_start_cp();
+        for (int i = 0; i < 3; ++i) {
+            auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+            EXPECT_TRUE(success);
+        }
+        {
+            auto guard = cp_mgr().cp_guard();
+            id_before_restart = guard->id();
+        }
+        co_await cp_mgr().shutdown();
+        co_await dm->close_devices();
+        Managers::reset();
+    }());
 
     iomanager::stop_iomgr();
     iomanager::init_iomgr(2);
 
-    iomgr().spawn_and_block(ReactorTarget::any(),
-                            [this, id_before_restart]() -> folly::coro::Task< void > {
-                                auto dm = DeviceManager::create(make_dev_infos(), IOFlag::BUFFERED_IO,
-                                                                IOFlag::BUFFERED_IO);
-                                co_await dm->load_devices();
-                                co_await MetaBlkManager::load();
-                                auto cpmgr = CPManager::create();
-                                co_await cpmgr->start(false /* first_time_boot */);
-                                test_cb_ = std::make_shared< TestCPCallbacks >();
-                                cpmgr->register_consumer("test_consumer", test_cb_);
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, id_before_restart]() -> Async< void > {
+        auto dm = DeviceManager::create(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+        co_await dm->load_devices();
+        co_await MetaBlkManager::load();
+        auto cpmgr = CPManager::create();
+        co_await cpmgr->start(false /* first_time_boot */);
+        test_cb_ = std::make_shared< TestCPCallbacks >();
+        cpmgr->register_consumer("test_consumer", test_cb_);
 
-                                cp_id_t id_after_restart{};
-                                {
-                                    auto guard = cp_mgr().cp_guard();
-                                    id_after_restart = guard->id();
-                                }
-                                // After restart, the CP id should be last_flushed + 1, which equals
-                                // id_before_restart (since shutdown does a final flush).
-                                EXPECT_GE(id_after_restart, id_before_restart);
+        cp_id_t id_after_restart{};
+        {
+            auto guard = cp_mgr().cp_guard();
+            id_after_restart = guard->id();
+        }
+        // After restart, the CP id should be last_flushed + 1, which equals
+        // id_before_restart (since shutdown does a final flush).
+        EXPECT_GE(id_after_restart, id_before_restart);
 
-                                co_await cp_mgr().shutdown();
-                                co_await dm->close_devices();
-                            }());
+        co_await cp_mgr().shutdown();
+        co_await dm->close_devices();
+    }());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

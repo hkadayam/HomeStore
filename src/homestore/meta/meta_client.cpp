@@ -15,6 +15,7 @@
  ***************************************************************************/
 
 #include <cassert>
+#include "common/async.h"
 #include <cstring>
 #include <stdexcept>
 
@@ -30,7 +31,7 @@ using sisl::IoBufOwn;
 // ──────────────────────────────────────────────────────────────────────────────
 // Factory methods: create/load
 // ──────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< MetaClient > MetaClient::create(std::string name, uint8_t client_id, shared< VirtualDev > vdev) {
+Async< MetaClient > MetaClient::create(std::string name, uint8_t client_id, shared< VirtualDev > vdev) {
     MetaClientInfo info = MetaClientInfo::make_free();
     info.client_id = client_id;
     info.set_allocated();
@@ -53,7 +54,7 @@ folly::coro::Task< MetaClient > MetaClient::create(std::string name, uint8_t cli
     co_return client;
 }
 
-folly::coro::Task< MetaClient > MetaClient::load(MetaClientInfo info, shared< VirtualDev > vdev) {
+Async< MetaClient > MetaClient::load(MetaClientInfo info, shared< VirtualDev > vdev) {
     const uint8_t client_id = info.client_id;
     BlkId info_bid = calc_info_bid(client_id, *vdev);
 
@@ -72,10 +73,12 @@ folly::coro::Task< MetaClient > MetaClient::load(MetaClientInfo info, shared< Vi
         BlkId first_blk{current_bid.blk_num(), 1, current_bid.chunk_num()};
         auto one_blk = sisl::make_io_buf_shared(blk_sz);
         auto err = co_await vdev->read(*one_blk, first_blk);
-        if (err) break;
+        if (err)
+            break;
 
         const auto& hdr = *reinterpret_cast< const MetaBlkHeader* >(one_blk->cbytes());
-        if (!hdr.is_valid()) break;
+        if (!hdr.is_valid())
+            break;
 
         const BlkId next_bid = hdr.next_bid;
         META_LOG(DEBUG, "load: client_id={} chain blk_num={} name={} data_size={} overflow={} next_valid={}", client_id,
@@ -86,7 +89,9 @@ folly::coro::Task< MetaClient > MetaClient::load(MetaClientInfo info, shared< Vi
 
         // Reserve the header block and any overflow blocks in the allocator so they are not reallocated.
         vdev->commit_blk(current_bid);
-        if (hdr.overflow_bid.is_valid()) { vdev->commit_blk(hdr.overflow_bid); }
+        if (hdr.overflow_bid.is_valid()) {
+            vdev->commit_blk(hdr.overflow_bid);
+        }
 
         meta_blks.emplace(current_bid, MetaBlk::load(current_bid, prev_bid, std::move(one_blk)));
 
@@ -111,17 +116,17 @@ folly::coro::Task< MetaClient > MetaClient::load(MetaClientInfo info, shared< Vi
 // ──────────────────────────────────────────────────────────────────────────────
 // Queries
 // ──────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< uint8_t > MetaClient::client_id() const {
+Async< uint8_t > MetaClient::client_id() const {
     auto lock = co_await state_->mutex.co_scoped_lock();
     co_return state_->info.client_id;
 }
 
-folly::coro::Task< std::string > MetaClient::client_name() const {
+Async< std::string > MetaClient::client_name() const {
     auto lock = co_await state_->mutex.co_scoped_lock();
     co_return state_->info.get_client_name();
 }
 
-folly::coro::Task< size_t > MetaClient::num_meta_blks() const {
+Async< size_t > MetaClient::num_meta_blks() const {
     auto lock = co_await state_->mutex.co_scoped_lock();
     co_return state_->meta_blks.size();
 }
@@ -129,28 +134,31 @@ folly::coro::Task< size_t > MetaClient::num_meta_blks() const {
 // ──────────────────────────────────────────────────────────────────────────────
 // Meta Blk Management Public APIs
 // ──────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< MetaBlk > MetaClient::create_meta_blk(std::string_view name,
-                                                         std::optional< size_t > estimated_data_size) {
+Async< MetaBlk > MetaClient::create_meta_blk(std::string_view name, std::optional< size_t > estimated_data_size) {
     const uint32_t blk_sz = to_u32(meta_vdev_->block_size());
 
     // Allocate one block for the header + inline data.
     blk_alloc_hints hints{};
     BlkId out_bid{};
     BlkAllocStatus st = meta_vdev_->alloc_contiguous_blks(1, hints, out_bid);
-    if (st != BlkAllocStatus::SUCCESS) { throw std::runtime_error{"MetaClient::create_meta_blk: alloc failed"}; }
+    if (st != BlkAllocStatus::SUCCESS) {
+        throw std::runtime_error{"MetaClient::create_meta_blk: alloc failed"};
+    }
 
     co_return MetaBlk::create(out_bid, blk_sz, name);
 }
 
-folly::coro::Task< std::optional< MetaBlk > > MetaClient::get_meta_blk(std::string_view name) {
+Async< std::optional< MetaBlk > > MetaClient::get_meta_blk(std::string_view name) {
     auto lock = co_await state_->mutex.co_scoped_lock();
     for (const auto& [id, blk] : state_->meta_blks) {
-        if (blk.header().get_name() == name) { co_return blk; }
+        if (blk.header().get_name() == name) {
+            co_return blk;
+        }
     }
     co_return std::nullopt;
 }
 
-folly::coro::Task< void > MetaClient::write_meta_blk(MetaBlk& mblk, const sisl::IoBufShared& data) {
+Async< void > MetaClient::write_meta_blk(MetaBlk& mblk, const sisl::IoBufShared& data) {
     // Write data to disk (inline or overflow). Done *before* acquiring state lock so I/O doesn't hold up other callers.
     co_await mblk.write_data(data, *meta_vdev_);
 
@@ -185,7 +193,7 @@ folly::coro::Task< void > MetaClient::write_meta_blk(MetaBlk& mblk, const sisl::
     }
 }
 
-folly::coro::Task< sisl::IoBufView > MetaClient::read_meta_blk(const MetaBlk& mblk) {
+Async< sisl::IoBufView > MetaClient::read_meta_blk(const MetaBlk& mblk) {
     {
         auto lock = co_await state_->mutex.co_scoped_lock();
         if (!state_->meta_blks.count(mblk.blkid)) {
@@ -195,7 +203,7 @@ folly::coro::Task< sisl::IoBufView > MetaClient::read_meta_blk(const MetaBlk& mb
     co_return co_await mblk.read_data(*meta_vdev_);
 }
 
-folly::coro::Task< void > MetaClient::remove_meta_blk(const MetaBlk& mblk) {
+Async< void > MetaClient::remove_meta_blk(const MetaBlk& mblk) {
     auto lock = co_await state_->mutex.co_scoped_lock();
 
     const BlkId key = mblk.blkid;
@@ -218,7 +226,9 @@ folly::coro::Task< void > MetaClient::remove_meta_blk(const MetaBlk& mblk) {
     if (prev_bid.is_valid()) {
         // Not the head — update prev block's next pointer.
         auto pit = state_->meta_blks.find(prev_bid);
-        if (pit != state_->meta_blks.end()) { co_await pit->second.update_next_bid(next_bid, *meta_vdev_); }
+        if (pit != state_->meta_blks.end()) {
+            co_await pit->second.update_next_bid(next_bid, *meta_vdev_);
+        }
 
         if (!next_bid.is_valid()) {
             // Removed block was the tail.
@@ -226,7 +236,9 @@ folly::coro::Task< void > MetaClient::remove_meta_blk(const MetaBlk& mblk) {
         } else {
             // Update next block's prev pointer (in-memory only).
             auto nit = state_->meta_blks.find(next_bid);
-            if (nit != state_->meta_blks.end()) { nit->second.prev_bid = prev_bid; }
+            if (nit != state_->meta_blks.end()) {
+                nit->second.prev_bid = prev_bid;
+            }
         }
     } else {
         // Removing the head block.
@@ -238,7 +250,9 @@ folly::coro::Task< void > MetaClient::remove_meta_blk(const MetaBlk& mblk) {
             // Advance head to next block.
             state_->info.first_blkid = next_bid;
             auto nit = state_->meta_blks.find(next_bid);
-            if (nit != state_->meta_blks.end()) { nit->second.prev_bid = BlkId{}; }
+            if (nit != state_->meta_blks.end()) {
+                nit->second.prev_bid = BlkId{};
+            }
         }
         co_await write_client_info(state_->info);
     }
@@ -267,7 +281,7 @@ BlkId MetaClient::calc_info_bid(uint8_t client_id, const VirtualDev& vdev) {
     return BlkId{blk_num, static_cast< blk_count_t >(info_nblks), chunk_id};
 }
 
-folly::coro::Task< void > MetaClient::write_client_info(const MetaClientInfo& info) {
+Async< void > MetaClient::write_client_info(const MetaClientInfo& info) {
     // Work on a copy so we can refresh the CRC without touching the caller's copy.
     MetaClientInfo updated = info;
     updated.update_crc();

@@ -27,7 +27,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include <folly/coro/Task.h>
+#include "common/async.h"
 #include "sisl/fds/rcu.h"
 
 #include "homestore/base/blk.h" // BlkId, BlkIds, BlkAllocStatus, blk_alloc_hints, blk_count_t
@@ -116,8 +116,8 @@ public:
     VirtualDev(VDevInfo info, std::vector< shared< PhysicalDev > > pdevs);
 
     /// First-time creation: allocates chunks across pdevs and writes superblock metadata.
-    static folly::coro::Task< unique< VirtualDev > > create(VDevParameters&& params, uint32_t vdev_id,
-                                                            const std::vector< shared< PhysicalDev > >& pdevs);
+    static Async< unique< VirtualDev > > create(VDevParameters&& params, uint32_t vdev_id,
+                                                const std::vector< shared< PhysicalDev > >& pdevs);
 
     /// Recovery: constructs VDev from persisted VDevInfo. Caller should then call on_chunk_found() for each chunk
     /// (which atomically rebuilds the selector), then load_blk_allocator().
@@ -125,18 +125,18 @@ public:
 
     /// Destroy the entire vdev and remove all its chunks and remove the vdev info. Upon completion next load
     /// will not have any trace of this vdev.
-    folly::coro::Task< void > destroy();
+    Async< void > destroy();
 
     // ──────────────────────────────────────────────────────────────────────────────
     // Public APIs: Device Resizing section with chunks
     // ──────────────────────────────────────────────────────────────────────────────
     /// Expand: allocate one new chunk. Returns the new chunk.
-    folly::coro::Task< shared< Chunk > > expand(uint64_t chunk_size);
+    Async< shared< Chunk > > expand(uint64_t chunk_size);
 
     /// Shrink: remove a chunk from a vdev.
     /// Pooling enabled → deactivate + park in pool; disabled → permanently remove.
     /// Returns the removed chunk_id.
-    folly::coro::Task< uint32_t > shrink(ChunkToShrink which, uint32_t specific_chunk_id = 0);
+    Async< uint32_t > shrink(ChunkToShrink which, uint32_t specific_chunk_id = 0);
 
     /// Register one chunk with this vdev (recovery or post-create). Forwards to on_chunks_added().
     void on_chunk_added(cshared< Chunk >& chunk, bool newly_created);
@@ -150,23 +150,23 @@ public:
 
     /// Get the nth chunk (0-indexed by vdev_order), creating it if needed.
     /// Returns (chunk, is_newly_created).
-    folly::coro::Task< std::pair< shared< Chunk >, bool > > get_or_create_nth_chunk(size_t n);
+    Async< std::pair< shared< Chunk >, bool > > get_or_create_nth_chunk(size_t n);
 
     // ──────────────────────────────────────────────────────────────────────────────
     // Public APIs: I/Os
     // ──────────────────────────────────────────────────────────────────────────────
     /// Single-buf write/read — buf is any concrete IoBuf subclass (IoBufOwn / IoBufSpan / IoBufView).
     /// Virtual dispatch on buf.bytes()/size()/is_aligned() selects the right behavior.
-    folly::coro::Task< void > write(sisl::IoBuf const& buf, const BlkId& bid);
-    folly::coro::Task< std::error_code > read(sisl::IoBuf& buf, const BlkId& bid);
+    Async< void > write(sisl::IoBuf const& buf, const BlkId& bid);
+    Async< std::error_code > read(sisl::IoBuf& buf, const BlkId& bid);
 
     /// Scatter-gather I/O — `sg.bufs` is a polymorphic IoBuf pointer list.  Each element's is_aligned()
     /// and is_safe() may be asserted at the entry of the call.  Caller guarantees the pointed-to IoBufs
     /// outlive the await.
-    folly::coro::Task< void > writev(sisl::SgList const& sg, const BlkId& bid);
-    folly::coro::Task< std::error_code > readv(sisl::SgList const& sg, const BlkId& bid);
-    folly::coro::Task< void > format();
-    folly::coro::Task< void > fsync();
+    Async< void > writev(sisl::SgList const& sg, const BlkId& bid);
+    Async< std::error_code > readv(sisl::SgList const& sg, const BlkId& bid);
+    Async< void > format();
+    Async< void > fsync();
 
     // ──────────────────────────────────────────────────────────────────────────────
     // Public APIs: Block Allocations
@@ -200,7 +200,7 @@ public:
     void adjust_vdev_info();
 
     /// Write VDevInfo to ALL physical devices (mirrored for redundancy).
-    folly::coro::Task< void > write_vdev_info();
+    Async< void > write_vdev_info();
 
     // ── Block allocators ──────────────────────────────────────────────────────
 

@@ -18,8 +18,7 @@
 #include <chrono>
 #include <utility>
 
-#include <folly/coro/Baton.h>
-#include <folly/coro/Task.h>
+#include "common/async.h"
 #include <folly/io/async/AsyncTimeout.h>
 #include <folly/io/async/EventBase.h>
 #include "sisl/logging/logging.h" // RELEASE_ASSERT
@@ -87,7 +86,7 @@ public:
         // ReactorTarget::any(), which advances the round-robin and would land us on a different reactor than `eb_`).
         // AsyncTimeout::scheduleTimeout/cancelTimeout require being called on the EB they're bound to.
         auto eb = eb_;
-        auto factory = [this, eb, interval, kind, tick = std::move(tick)]() mutable -> folly::coro::Task< void > {
+        auto factory = [this, eb, interval, kind, tick = std::move(tick)]() mutable -> Async< void > {
             auto to = folly::AsyncTimeout::make(*eb, [baton = &wakeup_baton_]() noexcept { baton->post(); });
             do {
                 to->scheduleTimeoutHighRes(interval);
@@ -134,7 +133,7 @@ public:
     /// Coroutine: drains the timer to completion and resets state.  Idempotent.  Hops onto the timer's EB to issue
     /// the cancel synchronously, which both serialises against the timer coroutine's own EB-thread state and
     /// guarantees no fire-and-forget lambda outlives `this` after stop() returns.
-    folly::coro::Task< void > stop() {
+    Async< void > stop() {
         if (!started_) {
             co_return;
         }
@@ -148,7 +147,7 @@ public:
         auto* eb = eb_;
         // Hop to eb_'s thread, set stop flag + post wakeup baton synchronously.  When this co_await resolves, the
         // EB lambda has completed, so there is no queued reference to `this` left in the EB queue.
-        co_await folly::coro::co_invoke([this]() -> folly::coro::Task< void > {
+        co_await folly::coro::co_invoke([this]() -> Async< void > {
             if (started_ && !stop_requested_) {
                 stop_requested_ = true;
                 wakeup_baton_.post();

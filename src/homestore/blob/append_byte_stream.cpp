@@ -15,6 +15,7 @@
  ***************************************************************************/
 
 #include <algorithm>
+#include "common/async.h"
 #include <cstring>
 #include <stdexcept>
 
@@ -49,10 +50,10 @@ std::string AppendByteStream::sb_mblk_name(const std::string& dev, uint64_t stre
 // create / load
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< shared< AppendByteStream > > AppendByteStream::create(uint64_t stream_id, MetaClient& meta_client,
-                                                                         const std::string& dev_name,
-                                                                         const shared< VirtualDev >& vdev,
-                                                                         uint64_t chunk_size, bool concurrent_safe) {
+Async< shared< AppendByteStream > > AppendByteStream::create(uint64_t stream_id, MetaClient& meta_client,
+                                                             const std::string& dev_name,
+                                                             const shared< VirtualDev >& vdev, uint64_t chunk_size,
+                                                             bool concurrent_safe) {
     auto stream = shared< AppendByteStream >{
         new AppendByteStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_size, concurrent_safe}};
 
@@ -65,11 +66,10 @@ folly::coro::Task< shared< AppendByteStream > > AppendByteStream::create(uint64_
     co_return stream;
 }
 
-folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(uint64_t stream_id, MetaClient& meta_client,
-                                                                       const std::string& dev_name,
-                                                                       const shared< VirtualDev >& vdev, MetaBlk&& sb,
-                                                                       sisl::IoBufView sb_payload,
-                                                                       bool concurrent_safe) {
+Async< shared< AppendByteStream > > AppendByteStream::load(uint64_t stream_id, MetaClient& meta_client,
+                                                           const std::string& dev_name,
+                                                           const shared< VirtualDev >& vdev, MetaBlk&& sb,
+                                                           sisl::IoBufView sb_payload, bool concurrent_safe) {
     // Parse {chunk_size, head, tail, chunk_ids} from the stream sb payload.  The sb is always written by create()
     // and persist_stream_sb(), so any stream that was created should have a valid payload here.
     if (sb_payload.size() < sizeof(AppendByteStreamSb)) {
@@ -113,7 +113,7 @@ folly::coro::Task< shared< AppendByteStream > > AppendByteStream::load(uint64_t 
     co_return stream;
 }
 
-folly::coro::Task< void > AppendByteStream::resume_writes_at(uint64_t tail) {
+Async< void > AppendByteStream::resume_writes_at(uint64_t tail) {
     tail_offset_ = tail;
     const uint32_t blk_sz = block_size();
     if (tail == 0 || (tail % blk_sz) == 0) {
@@ -157,7 +157,7 @@ uint64_t AppendByteStream::append(const sisl::Blob& data) {
 // truncate
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > AppendByteStream::truncate(uint64_t upto_offset) {
+Async< void > AppendByteStream::truncate(uint64_t upto_offset) {
     upto_offset = std::min(upto_offset, tail_offset_);
     if (upto_offset <= head_offset_)
         co_return;
@@ -198,8 +198,7 @@ folly::coro::Task< void > AppendByteStream::truncate(uint64_t upto_offset) {
 // read
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< std::pair< std::error_code, sisl::IoBufView > > AppendByteStream::read(uint64_t byte_offset,
-                                                                                         size_t len) {
+Async< std::pair< std::error_code, sisl::IoBufView > > AppendByteStream::read(uint64_t byte_offset, size_t len) {
     if (byte_offset < head_offset_ || byte_offset + len > tail_offset_) {
         co_return {std::make_error_code(std::errc::invalid_argument), sisl::IoBufView{}};
     }
@@ -218,8 +217,8 @@ folly::coro::Task< std::pair< std::error_code, sisl::IoBufView > > AppendByteStr
                sisl::IoBufView{sisl::make_io_buf_shared(std::move(buf)), to_u32(byte_offset % blk_sz), to_u32(len)}};
 }
 
-folly::coro::Task< std::pair< std::error_code, IoBufOwn > >
-AppendByteStream::read_blocks(chunk_num_t cid, uint32_t blk_num, blk_count_t nblks) {
+Async< std::pair< std::error_code, IoBufOwn > > AppendByteStream::read_blocks(chunk_num_t cid, uint32_t blk_num,
+                                                                              blk_count_t nblks) {
     IoBufOwn buf{to_u32(nblks) * block_size(), block_size()};
     const BlkId bid{blk_num, nblks, cid};
     auto ec = co_await vdev().read(buf, bid);
@@ -242,7 +241,7 @@ AppendByteStream::ReadCursor AppendByteStream::open_cursor(uint64_t start_offset
     return ReadCursor{const_cast< AppendByteStream& >(*this), start_offset, end_offset};
 }
 
-folly::coro::Task< std::pair< sisl::IoBufView, uint32_t > > AppendByteStream::ReadCursor::next(size_t max_bytes) {
+Async< std::pair< sisl::IoBufView, uint32_t > > AppendByteStream::ReadCursor::next(size_t max_bytes) {
     if (pos_ >= end_) {
         co_return {sisl::IoBufView{}, 0};
     }
@@ -272,7 +271,7 @@ folly::coro::Task< std::pair< sisl::IoBufView, uint32_t > > AppendByteStream::Re
 // Flush
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< bool > AppendByteStream::flush() {
+Async< bool > AppendByteStream::flush() {
     FlushBuffer old_buf;
     std::vector< sisl::IoBufOwn > bufs;
     uint64_t total = 0;
@@ -366,11 +365,11 @@ folly::coro::Task< bool > AppendByteStream::flush() {
 // Metadata persistence
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > AppendByteStream::persist_flush_metadata() {
+Async< void > AppendByteStream::persist_flush_metadata() {
     co_await persist_stream_sb();
 }
 
-folly::coro::Task< void > AppendByteStream::persist_stream_sb() {
+Async< void > AppendByteStream::persist_stream_sb() {
     // Snapshot the current chunk list (chunk_ids).
     std::vector< uint32_t > cids;
     {
@@ -395,13 +394,13 @@ folly::coro::Task< void > AppendByteStream::persist_stream_sb() {
     co_await meta_client_.write_meta_blk(sb_mblk_, buf);
 }
 
-folly::coro::Task< void > AppendByteStream::init_chunk_mblk(const shared< Chunk >& /*chunk*/) {
+Async< void > AppendByteStream::init_chunk_mblk(const shared< Chunk >& /*chunk*/) {
     // No per-chunk MetaBlk for appendbyte streams; the chunk list lives in the stream sb.  Update it now that the
     // chunk list grew.
     co_await persist_stream_sb();
 }
 
-folly::coro::Task< void > AppendByteStream::remove_chunk_mblk(uint32_t /*chunk_id*/) {
+Async< void > AppendByteStream::remove_chunk_mblk(uint32_t /*chunk_id*/) {
     // No per-chunk MetaBlk to remove; just refresh the stream sb with the new (shrunken) chunk list.
     co_await persist_stream_sb();
 }

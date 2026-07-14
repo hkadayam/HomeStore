@@ -21,11 +21,10 @@
 #include <unordered_map>
 #include <vector>
 
-#include <folly/coro/Mutex.h>
-#include <folly/coro/Task.h>
+#include "common/async.h"
 
-#include "homestore/base/blk.h"              // BlkId
-#include "common/defs.h" // shared<>, unique<>, cshared<>
+#include "homestore/base/blk.h" // BlkId
+#include "common/defs.h"        // shared<>, unique<>, cshared<>
 
 #include "homestore/meta/meta_blk.h"         // MetaBlk
 #include "homestore/meta/meta_client_info.h" // MetaClientInfo
@@ -43,7 +42,7 @@ struct MetaClientState {
     folly::coro::Mutex mutex; // Protects all fields below
     MetaClientInfo info{};
     std::unordered_map< BlkId, MetaBlk > meta_blks;
-    BlkId tail_blkid{};                                // Invalid = chain empty
+    BlkId tail_blkid{}; // Invalid = chain empty
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -59,48 +58,48 @@ public:
     // ── Factories ─────────────────────────────────────────────────────────────
 
     /// Create a brand-new client, persist its MetaClientInfo to disk.
-    static folly::coro::Task< MetaClient > create(std::string name, uint8_t client_id, shared< VirtualDev > vdev);
+    static Async< MetaClient > create(std::string name, uint8_t client_id, shared< VirtualDev > vdev);
 
     /// Load an existing client from a recovered MetaClientInfo.
     /// Traverses the on-disk chain from info.first_blkid and rebuilds meta_blks.
-    static folly::coro::Task< MetaClient > load(MetaClientInfo info, shared< VirtualDev > vdev);
+    static Async< MetaClient > load(MetaClientInfo info, shared< VirtualDev > vdev);
 
     // ── Queries ───────────────────────────────────────────────────────────────
-    folly::coro::Task< uint8_t > client_id() const;
-    folly::coro::Task< std::string > client_name() const;
-    folly::coro::Task< size_t > num_meta_blks() const;
+    Async< uint8_t > client_id() const;
+    Async< std::string > client_name() const;
+    Async< size_t > num_meta_blks() const;
 
     // ── Block management ──────────────────────────────────────────────────────
 
     /// Allocate a fresh MetaBlk (not yet in the chain). Call write_meta_blk() to actually persist and link it.
-    folly::coro::Task< MetaBlk > create_meta_blk(std::string_view name, std::optional< size_t > estimated_data_size);
+    Async< MetaBlk > create_meta_blk(std::string_view name, std::optional< size_t > estimated_data_size);
 
     /// Find a block by name.  Returns std::nullopt if not found.
-    folly::coro::Task< std::optional< MetaBlk > > get_meta_blk(std::string_view name);
+    Async< std::optional< MetaBlk > > get_meta_blk(std::string_view name);
 
     /// Write data to a MetaBlk.
     ///
     /// - New block (is_fresh == true): data written, block appended to the tail, client info updated on disk,
     ///   and is_fresh set to false so subsequent calls overwrite in-place.
     /// - Existing block (is_fresh == false): data is overwritten in-place; no relinking.
-    folly::coro::Task< void > write_meta_blk(MetaBlk& blk, const sisl::IoBufShared& data);
+    Async< void > write_meta_blk(MetaBlk& blk, const sisl::IoBufShared& data);
 
     /// Read the payload from an existing MetaBlk.
-    folly::coro::Task< sisl::IoBufView > read_meta_blk(const MetaBlk& blk);
+    Async< sisl::IoBufView > read_meta_blk(const MetaBlk& blk);
 
     /// Remove a MetaBlk from the chain and free all its blocks on the vdev.
-    folly::coro::Task< void > remove_meta_blk(const MetaBlk& blk);
+    Async< void > remove_meta_blk(const MetaBlk& blk);
 
     // ── Recovery ──────────────────────────────────────────────────────────────
 
     /// Iterate over all recovered blocks lazily, one block at a time.
     ///
-    /// visitor signature: folly::coro::Task<void>(const MetaBlk&, sisl::IoBufView)
+    /// visitor signature: Async<void>(const MetaBlk&, sisl::IoBufView)
     ///
-    /// For inline data the IoBufView is a zero-copy window into the cached block buffer. For overflow data the IoBufView
-    /// wraps a freshly read IoBufShared that is released after the visitor returns.
+    /// For inline data the IoBufView is a zero-copy window into the cached block buffer. For overflow data the
+    /// IoBufView wraps a freshly read IoBufShared that is released after the visitor returns.
     template < typename Visitor >
-    folly::coro::Task< void > for_each_recovered_block(Visitor visitor);
+    Async< void > for_each_recovered_block(Visitor visitor);
 
     // ── Move-only ─────────────────────────────────────────────────────────────
     MetaClient() = default;
@@ -114,7 +113,7 @@ private:
     shared< VirtualDev > meta_vdev_;
     BlkId info_bid_{};
 
-    folly::coro::Task< void > write_client_info(const MetaClientInfo& info);
+    Async< void > write_client_info(const MetaClientInfo& info);
 
     /// Calculate the BlkId of the on-disk slot that holds this client's
     /// MetaClientInfo (derived from client_id and the vdev's block size).
@@ -125,7 +124,7 @@ private:
 // for_each_recovered_block — template body (must be in the header)
 // ──────────────────────────────────────────────────────────────────────────────
 template < typename Visitor >
-folly::coro::Task< void > MetaClient::for_each_recovered_block(Visitor visitor) {
+Async< void > MetaClient::for_each_recovered_block(Visitor visitor) {
     // Snapshot the block IDs under the lock, then release before any I/O.
     std::vector< BlkId > blk_ids;
     {
@@ -144,7 +143,8 @@ folly::coro::Task< void > MetaClient::for_each_recovered_block(Visitor visitor) 
         {
             auto lock = co_await state_->mutex.co_scoped_lock();
             auto it = state_->meta_blks.find(id);
-            if (it == state_->meta_blks.end()) continue; // removed concurrently
+            if (it == state_->meta_blks.end())
+                continue;          // removed concurrently
             blk_copy = it->second; // shared_ptr refcount bump, no memcpy
         }
 

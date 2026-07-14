@@ -29,7 +29,7 @@
 #include <gtest/gtest.h>
 
 #include <fmt/format.h>
-#include <folly/coro/Sleep.h>
+#include "common/async.h"
 #include "sisl/logging/logging.h"
 #include "sisl/options/options.h"
 #include "sisl/fds/buffer.h"
@@ -165,7 +165,7 @@ public:
         return infos;
     }
 
-    folly::coro::Task< void > bootstrap() {
+    Async< void > bootstrap() {
         dm_ = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
         co_await MetaBlkManager::create(META_VDEV_SIZE);
 
@@ -181,7 +181,7 @@ public:
         meta_client_ = std::make_unique< MetaClient >(co_await meta_mgr().register_client("test_log_streams"));
     }
 
-    folly::coro::Task< void > reload() {
+    Async< void > reload() {
         meta_client_.reset();
         vdev_.reset();
         co_await dm_->close_devices();
@@ -195,21 +195,20 @@ public:
         meta_client_ = std::make_unique< MetaClient >(co_await meta_mgr().register_client("test_log_streams"));
     }
 
-    folly::coro::Task< void > shutdown() {
+    Async< void > shutdown() {
         meta_client_.reset();
         vdev_.reset();
         co_await dm_->close_devices();
     }
 
-    folly::coro::Task< shared< LogStream > > create_stream(uint64_t stream_id,
-                                                           uint64_t chunk_size = LOG_STREAM_CHUNK_SIZE) {
+    Async< shared< LogStream > > create_stream(uint64_t stream_id, uint64_t chunk_size = LOG_STREAM_CHUNK_SIZE) {
         co_return co_await LogStream::create(stream_id, *meta_client_, vdev_name_, vdev_, chunk_size);
     }
 
     /// Reload all LogStreams that the test had created.  Walks the test's meta-client recovered blocks, picks the
     /// ones whose name matches the LogStream::sb_mblk_name pattern, and re-instantiates them.  Caller can pass a
     /// lookup function to dispatch on_log_found into shadow stores.
-    folly::coro::Task< std::vector< shared< LogStream > > > load_streams(lookup_store_fn lookup) {
+    Async< std::vector< shared< LogStream > > > load_streams(lookup_store_fn lookup) {
         std::vector< shared< LogStream > > out;
         struct PendingSb {
             uint64_t stream_id;
@@ -220,7 +219,7 @@ public:
         const auto sb_prefix = fmt::format("{}_logstream_sb_", vdev_name_);
 
         co_await meta_client_->for_each_recovered_block(
-            [&pending, &sb_prefix](MetaBlk blk, sisl::IoBufView data) -> folly::coro::Task< void > {
+            [&pending, &sb_prefix](MetaBlk blk, sisl::IoBufView data) -> Async< void > {
                 // MetaBlk::name() returns std::string by value — bind to a string, not a string_view, so it
                 // outlives this statement.
                 std::string name = blk.name();
@@ -297,8 +296,7 @@ public:
     // ── On-disk corruption helper (no flip) ────────────────────────────────────
     // Resolve a stream byte offset to its physical-dev location and write `bytes` there.  Used by the torn-write
     // tests to scribble over the cur_crc field of a chosen log_group_footer on disk.
-    folly::coro::Task< void > poke_stream_bytes(LogStream& s, uint64_t stream_offset, const uint8_t* bytes,
-                                                size_t len) {
+    Async< void > poke_stream_bytes(LogStream& s, uint64_t stream_offset, const uint8_t* bytes, size_t len) {
         const uint64_t chunk_sz = s.chunk_size();
         const auto chunks_acc = s.chunks();
         const auto& chunks = *chunks_acc;

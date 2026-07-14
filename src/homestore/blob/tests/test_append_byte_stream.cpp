@@ -14,6 +14,7 @@
  * Author: Harihara Kadayam <harihara.kadayam@gmail.com>
  ***************************************************************************/
 #include <atomic>
+#include "common/async.h"
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -95,7 +96,7 @@ public:
         return infos;
     }
 
-    folly::coro::Task< void > bootstrap() {
+    Async< void > bootstrap() {
         dm_ = co_await DeviceManager::create_and_format(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
         co_await MetaBlkManager::create(META_VDEV_SIZE);
 
@@ -120,7 +121,7 @@ public:
     // thread because stop_iomgr joins reactor threads — a reactor calling it would self-join.  Two coroutine
     // phases bracket the cycle: one to tear down on the old reactor pool, one to bring up on the new pool.
     void reload_sync() {
-        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> Async< void > {
             blob_dev_.reset();
             co_await cp_mgr().shutdown();
             blob_dev_mgr().shutdown();
@@ -129,7 +130,7 @@ public:
         }());
         iomanager::stop_iomgr();
         iomanager::init_iomgr(2);
-        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+        iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> Async< void > {
             dm_ = DeviceManager::create(make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
             co_await dm_->load_devices();
             co_await MetaBlkManager::load();
@@ -140,7 +141,7 @@ public:
         }());
     }
 
-    folly::coro::Task< void > shutdown() {
+    Async< void > shutdown() {
         blob_dev_.reset();
         co_await cp_mgr().shutdown();
         blob_dev_mgr().shutdown();
@@ -182,7 +183,7 @@ public:
 
     // Read [offset, offset+size) and verify it matches the seed pattern.  AppendByteStream::read() returns a
     // IoBufView pre-sliced to start at byte_offset — index from 0.
-    static folly::coro::Task< bool > verify_at(AppendByteStream& s, uint64_t offset, size_t size, uint64_t seed) {
+    static Async< bool > verify_at(AppendByteStream& s, uint64_t offset, size_t size, uint64_t seed) {
         auto [ec, view] = co_await s.read(offset, size);
         if (ec) {
             co_return false;
@@ -541,7 +542,7 @@ TEST_F(AppendByteStreamTest, RestartRecoverySingleChunk) {
     constexpr size_t N = 16 * 1024;
     uint64_t sid{};
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> Async< void > {
         co_await bootstrap();
         auto stream = co_await blob_dev_->create_append_byte_stream(CHUNK_SIZE);
         sid = stream->stream_id();
@@ -553,7 +554,7 @@ TEST_F(AppendByteStreamTest, RestartRecoverySingleChunk) {
 
     reload_sync();
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, N]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, N]() -> Async< void > {
         auto streams = blob_dev_->append_byte_streams();
         CO_ASSERT_EQ(streams.size(), 1u);
         auto recovered = streams[0];
@@ -576,37 +577,35 @@ TEST_F(AppendByteStreamTest, RestartRecoveryMultiChunk) {
     uint64_t sid{};
     uint64_t off = 0;
 
-    iomgr().spawn_and_block(ReactorTarget::any(),
-                            [this, &sid, &off, &segs]() -> folly::coro::Task< void > {
-                                co_await bootstrap();
-                                auto stream = co_await blob_dev_->create_append_byte_stream(CHUNK_SIZE);
-                                sid = stream->stream_id();
-                                for (uint32_t i = 0; i < kCount; ++i) {
-                                    append_pattern(*stream, kSeg, 0x2B00 + i);
-                                    segs.push_back({off, kSeg, 0x2B00 + i});
-                                    off += kSeg;
-                                }
-                                co_await stream->flush();
-                                auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
-                                CO_ASSERT_TRUE(success);
-                                EXPECT_GE(stream->num_chunks(), 2u);
-                            }());
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid, &off, &segs]() -> Async< void > {
+        co_await bootstrap();
+        auto stream = co_await blob_dev_->create_append_byte_stream(CHUNK_SIZE);
+        sid = stream->stream_id();
+        for (uint32_t i = 0; i < kCount; ++i) {
+            append_pattern(*stream, kSeg, 0x2B00 + i);
+            segs.push_back({off, kSeg, 0x2B00 + i});
+            off += kSeg;
+        }
+        co_await stream->flush();
+        auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+        CO_ASSERT_TRUE(success);
+        EXPECT_GE(stream->num_chunks(), 2u);
+    }());
 
     reload_sync();
 
-    iomgr().spawn_and_block(ReactorTarget::any(),
-                            [this, sid, off, &segs]() -> folly::coro::Task< void > {
-                                auto streams = blob_dev_->append_byte_streams();
-                                CO_ASSERT_EQ(streams.size(), 1u);
-                                auto recovered = streams[0];
-                                EXPECT_EQ(recovered->stream_id(), sid);
-                                EXPECT_EQ(recovered->tail_offset(), off);
-                                for (auto const& s : segs) {
-                                    EXPECT_TRUE(co_await verify_at(*recovered, s.off, s.size, s.seed))
-                                        << "mismatch after restart at off=" << s.off;
-                                }
-                                co_await shutdown();
-                            }());
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, off, &segs]() -> Async< void > {
+        auto streams = blob_dev_->append_byte_streams();
+        CO_ASSERT_EQ(streams.size(), 1u);
+        auto recovered = streams[0];
+        EXPECT_EQ(recovered->stream_id(), sid);
+        EXPECT_EQ(recovered->tail_offset(), off);
+        for (auto const& s : segs) {
+            EXPECT_TRUE(co_await verify_at(*recovered, s.off, s.size, s.seed))
+                << "mismatch after restart at off=" << s.off;
+        }
+        co_await shutdown();
+    }());
 }
 
 TEST_F(AppendByteStreamTest, RestartWithPartialTailBlock) {
@@ -615,7 +614,7 @@ TEST_F(AppendByteStreamTest, RestartWithPartialTailBlock) {
     constexpr size_t M = BLK_SIZE + 7;
     uint64_t sid{};
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> Async< void > {
         co_await bootstrap();
         auto stream = co_await blob_dev_->create_append_byte_stream(CHUNK_SIZE);
         sid = stream->stream_id();
@@ -627,7 +626,7 @@ TEST_F(AppendByteStreamTest, RestartWithPartialTailBlock) {
 
     reload_sync();
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, N, M]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, N, M]() -> Async< void > {
         auto streams = blob_dev_->append_byte_streams();
         CO_ASSERT_EQ(streams.size(), 1u);
         auto recovered = streams[0];
@@ -646,7 +645,7 @@ TEST_F(AppendByteStreamTest, RestartWithPartialTailBlock) {
 TEST_F(AppendByteStreamTest, RestartAfterTruncate) {
     uint64_t sid{};
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid]() -> Async< void > {
         co_await bootstrap();
         auto stream = co_await blob_dev_->create_append_byte_stream(CHUNK_SIZE);
         sid = stream->stream_id();
@@ -659,7 +658,7 @@ TEST_F(AppendByteStreamTest, RestartAfterTruncate) {
 
     reload_sync();
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid]() -> Async< void > {
         auto streams = blob_dev_->append_byte_streams();
         CO_ASSERT_EQ(streams.size(), 1u);
         auto recovered = streams[0];
@@ -670,7 +669,7 @@ TEST_F(AppendByteStreamTest, RestartAfterTruncate) {
 }
 
 TEST_F(AppendByteStreamTest, DoubleRestart) {
-    iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> Async< void > {
         co_await bootstrap();
         auto stream = co_await blob_dev_->create_append_byte_stream(CHUNK_SIZE);
         append_pattern(*stream, 4096, 0x2E01);
@@ -680,7 +679,7 @@ TEST_F(AppendByteStreamTest, DoubleRestart) {
 
     reload_sync();
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> Async< void > {
         auto recovered = blob_dev_->append_byte_streams().at(0);
         EXPECT_EQ(recovered->tail_offset(), 4096u);
         append_pattern(*recovered, 4096, 0x2E02);
@@ -690,7 +689,7 @@ TEST_F(AppendByteStreamTest, DoubleRestart) {
 
     reload_sync();
 
-    iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this]() -> Async< void > {
         auto recovered2 = blob_dev_->append_byte_streams().at(0);
         EXPECT_EQ(recovered2->tail_offset(), 8192u);
         EXPECT_TRUE(co_await verify_at(*recovered2, 0, 4096, 0x2E01));
@@ -712,7 +711,7 @@ TEST_F(AppendByteStreamTest, LifecycleExtended) {
     uint64_t upto_1_6 = 0;
 
     // ── Phase 1: bootstrap → create empty stream → flush + cp_flush → (reload boundary). ────────────────────────
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid, &CS]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid, &CS]() -> Async< void > {
         co_await bootstrap();
         auto stream = co_await blob_dev_->create_append_byte_stream(CHUNK_SIZE);
         CS = stream->chunk_size();
@@ -724,7 +723,7 @@ TEST_F(AppendByteStreamTest, LifecycleExtended) {
     reload_sync();
 
     // ── Phase 2: verify empty after restart → append seed_a + seed_b → cp_flush → (reload boundary). ───────────
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, CS]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, CS]() -> Async< void > {
         auto ss = blob_dev_->append_byte_streams();
         CO_ASSERT_EQ(ss.size(), 1u);
         auto stream = ss[0];
@@ -747,7 +746,7 @@ TEST_F(AppendByteStreamTest, LifecycleExtended) {
     reload_sync();
 
     // ── Phase 3: verify a/b after restart → append seed_c + head-truncate to CS/4 → cp_flush → (reload). ───────
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, CS]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, CS]() -> Async< void > {
         auto ss = blob_dev_->append_byte_streams();
         CO_ASSERT_EQ(ss.size(), 1u);
         auto stream = ss[0];
@@ -769,31 +768,30 @@ TEST_F(AppendByteStreamTest, LifecycleExtended) {
     reload_sync();
 
     // ── Phase 4: verify b/c after restart → head-truncate to 1.6C (releases chunk) → append seed_d → (reload). ─
-    iomgr().spawn_and_block(ReactorTarget::any(),
-                            [this, CS, &upto_1_6]() -> folly::coro::Task< void > {
-                                auto ss = blob_dev_->append_byte_streams();
-                                CO_ASSERT_EQ(ss.size(), 1u);
-                                auto stream = ss[0];
-                                EXPECT_EQ(stream->head_offset(), CS / 4);
-                                EXPECT_EQ(stream->tail_offset(), CS + CS * 3 / 4);
-                                EXPECT_TRUE(co_await verify_at(*stream, CS / 2, CS, seed_b));
-                                EXPECT_TRUE(co_await verify_at(*stream, CS + CS / 2, CS / 4, seed_c));
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, CS, &upto_1_6]() -> Async< void > {
+        auto ss = blob_dev_->append_byte_streams();
+        CO_ASSERT_EQ(ss.size(), 1u);
+        auto stream = ss[0];
+        EXPECT_EQ(stream->head_offset(), CS / 4);
+        EXPECT_EQ(stream->tail_offset(), CS + CS * 3 / 4);
+        EXPECT_TRUE(co_await verify_at(*stream, CS / 2, CS, seed_b));
+        EXPECT_TRUE(co_await verify_at(*stream, CS + CS / 2, CS / 4, seed_c));
 
-                                upto_1_6 = CS + CS * 6 / 10; // 1.6C
-                                co_await stream->truncate(upto_1_6);
-                                EXPECT_EQ(stream->head_offset(), upto_1_6);
+        upto_1_6 = CS + CS * 6 / 10; // 1.6C
+        co_await stream->truncate(upto_1_6);
+        EXPECT_EQ(stream->head_offset(), upto_1_6);
 
-                                append_pattern(*stream, CS / 10, seed_d);
-                                co_await stream->flush();
-                                EXPECT_EQ(stream->tail_offset(), CS + CS * 3 / 4 + CS / 10); // 1.85C
+        append_pattern(*stream, CS / 10, seed_d);
+        co_await stream->flush();
+        EXPECT_EQ(stream->tail_offset(), CS + CS * 3 / 4 + CS / 10); // 1.85C
 
-                                CO_ASSERT_TRUE(co_await cp_mgr().trigger_cp_flush(true /* force */));
-                            }());
+        CO_ASSERT_TRUE(co_await cp_mgr().trigger_cp_flush(true /* force */));
+    }());
 
     reload_sync();
 
     // ── Phase 5: verify d after restart → full-truncate (1 chunk anchor) → (reload). ────────────────────────────
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, CS, upto_1_6]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, CS, upto_1_6]() -> Async< void > {
         auto ss = blob_dev_->append_byte_streams();
         CO_ASSERT_EQ(ss.size(), 1u);
         auto stream = ss[0];
@@ -812,7 +810,7 @@ TEST_F(AppendByteStreamTest, LifecycleExtended) {
     reload_sync();
 
     // ── Phase 6: verify empty + 1 anchor chunk → append seed_e → verify → shutdown. ─────────────────────────────
-    iomgr().spawn_and_block(ReactorTarget::any(), [this, CS]() -> folly::coro::Task< void > {
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, CS]() -> Async< void > {
         auto ss = blob_dev_->append_byte_streams();
         CO_ASSERT_EQ(ss.size(), 1u);
         auto stream = ss[0];

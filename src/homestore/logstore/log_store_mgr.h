@@ -22,7 +22,7 @@
 #include <vector>
 
 #include <folly/SharedMutex.h>
-#include <folly/coro/Task.h>
+#include "common/async.h"
 
 #include "homestore/device/virtual_dev.h"
 
@@ -61,13 +61,13 @@ public:
 
     /// First-boot path: create the VDev (initial_num_chunks of chunk_size each, expand-on-demand thereafter),
     /// the LogStream, and an empty LogStoreManager.  These params are format-time-only and not in dynamic config.
-    static folly::coro::Task< void > create(uint64_t chunk_size, uint32_t initial_num_chunks);
+    static Async< void > create(uint64_t chunk_size, uint32_t initial_num_chunks);
 
     /// Restart path: discover LogStream + LogStores from MetaBlks; does NOT walk the LogStream's CRC chain
     /// (caller must invoke recover() after open_log_store calls so on_log_found dispatch can find handlers).
-    static folly::coro::Task< void > load();
+    static Async< void > load();
 
-    folly::coro::Task< void > shutdown();
+    Async< void > shutdown();
 
     // ── Accessors ────────────────────────────────────────────────────────────
 
@@ -81,7 +81,7 @@ public:
     /// Allocates the next store_id, creates a fresh LogStore on the underlying LogStream, persists its sb.
     /// Returned store is not opened — caller invokes open() (or open_log_store via mgr) to attach the replay
     /// handler.
-    folly::coro::Task< shared< LogStore > > create_log_store(bool append_mode);
+    Async< shared< LogStore > > create_log_store(bool append_mode);
 
     /// Looks up an existing (already-loaded) LogStore by store_id, attaches the replay handler.  Returns
     /// nullptr if no store with that id exists.
@@ -89,14 +89,14 @@ public:
 
     /// Destroy a single LogStore by id — removes its meta_blk so it won't be re-discovered on restart, then
     /// erases it from in-memory state.  Idempotent (warns and returns for unknown ids).
-    folly::coro::Task< void > destroy_log_store(logstore_id_t store_id);
+    Async< void > destroy_log_store(logstore_id_t store_id);
 
     // ── Recovery ─────────────────────────────────────────────────────────────
 
     /// Triggers LogStream::recover with our lookup_store callback.  on_log_found fires per record into the
     /// matching LogStore (skipped if unknown store_id).  After return, LogStores with no replay handler
     /// attached are dropped (sb removed, in-memory state freed).
-    folly::coro::Task< void > recover();
+    Async< void > recover();
 
     // ── Truncation ───────────────────────────────────────────────────────────
 
@@ -104,7 +104,7 @@ public:
     /// calls) to actually reclaim space.  Computes min(min_trunc_stream_offset) across all opened LogStores
     /// and pushes it down via log_stream_->truncate.  Stores without a trunc anchor (empty stores) don't
     /// constrain the min.  No-op if no store has a valid trunc anchor.
-    folly::coro::Task< void > global_truncate();
+    Async< void > global_truncate();
 
 private:
     /// Private ctor.  Use create() / load() factories.
@@ -116,7 +116,7 @@ private:
     LogStore* lookup_store(logstore_id_t store_id) const;
 
     /// Walks log_stores_, drops any without an attached handler.
-    folly::coro::Task< void > drop_unopened_stores();
+    Async< void > drop_unopened_stores();
 
     shared< MetaClient > meta_client_;
     shared< VirtualDev > vdev_;

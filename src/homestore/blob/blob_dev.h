@@ -27,12 +27,12 @@
 #include <vector>
 
 #include <folly/SharedMutex.h>
-#include <folly/coro/Task.h>
+#include "common/async.h"
 
 #include "homestore/base/homestore_decl.h" // shared<>, unique<>
-#include "homestore/checkpoint/cp.h"    // CP
+#include "homestore/checkpoint/cp.h"       // CP
 
-#include "homestore/meta/meta_blk.h"             // MetaBlk
+#include "homestore/meta/meta_blk.h" // MetaBlk
 
 namespace homestore {
 
@@ -99,21 +99,20 @@ public:
     // ── Per-stream create (auto-assigns stream_id) ───────────────────────────
 
     /// Create a fresh stream. Returns the new stream (use stream_id() to get the assigned id).
-    folly::coro::Task< shared< RawBlkStream > > create_raw_blk_stream(uint64_t chunk_size, uint32_t blk_size = 0);
-    folly::coro::Task< shared< AppendBlkStream > > create_append_blk_stream(uint64_t chunk_size, uint32_t blk_size = 0);
-    folly::coro::Task< shared< AppendByteStream > > create_append_byte_stream(uint64_t chunk_size,
-                                                                                bool concurrent_safe = true);
+    Async< shared< RawBlkStream > > create_raw_blk_stream(uint64_t chunk_size, uint32_t blk_size = 0);
+    Async< shared< AppendBlkStream > > create_append_blk_stream(uint64_t chunk_size, uint32_t blk_size = 0);
+    Async< shared< AppendByteStream > > create_append_byte_stream(uint64_t chunk_size, bool concurrent_safe = true);
 
     // ── Recovery load ─────────────────────────────────────────────────────────
 
     /// Load previously-persisted streams from recovered data.
     /// RawBlk and AppendBlk use per-chunk MetaBlks grouped by stream_id (StreamMblkMap).
     /// AppendByte uses a single per-stream sb MetaBlk (AppendByteSbMap).
-    folly::coro::Task< void > load(StreamMblkMap&& raw_blk, StreamMblkMap&& append_blk, AppendByteSbMap&& append_byte);
+    Async< void > load(StreamMblkMap&& raw_blk, StreamMblkMap&& append_blk, AppendByteSbMap&& append_byte);
 
     /// After all streams are loaded, remove any VDev chunks not owned by any stream (orphans left by a crash before
     /// MetaBlk was written).
-    folly::coro::Task< void > reconcile_chunks();
+    Async< void > reconcile_chunks();
 
     // ── Stream accessors (returns a snapshot under shared lock) ────────────
 
@@ -128,7 +127,7 @@ public:
     // ── CP lifecycle ──────────────────────────────────────────────────────────
 
     /// Flush dirty block-allocating streams (RawBlk, AppendBlk) for the given CP.
-    folly::coro::Task< void > cp_flush(CP* cp);
+    Async< void > cp_flush(CP* cp);
 
     // ── Device accessors ──────────────────────────────────────────────────────
     VirtualDev& vdev() const;
@@ -148,7 +147,7 @@ public:
         uint32_t blk_size;
     };
     static std::optional< ParsedChunkMblk > parse_chunk_mblk_name(const std::string_view& dev_name,
-                                                                     const std::string_view& name);
+                                                                  const std::string_view& name);
 
 private:
     uint64_t next_stream_id() { return next_stream_id_.fetch_add(1, std::memory_order_relaxed); }

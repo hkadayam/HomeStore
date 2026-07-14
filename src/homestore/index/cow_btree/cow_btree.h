@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include "common/async.h"
 #include <map>
 #include <memory>
 #include <vector>
@@ -73,7 +74,7 @@ public:
     // the live node's buffer, since the node may receive further mutations after the snapshot.
     struct FlushNodeEntry {
         sisl::CacheHandle< unique< NodeCore > > cache_handle; // pins node in cache until flush completes
-        sisl::IoBufShared flush_buf;                            // zero-copy wrap of COW snapshot
+        sisl::IoBufShared flush_buf;                          // zero-copy wrap of COW snapshot
 
         FlushNodeEntry() = default;
         FlushNodeEntry(sisl::CacheHandle< unique< NodeCore > >&& h, std::shared_ptr< uint8_t > b) :
@@ -94,12 +95,10 @@ public:
     using NodeCache = sisl::Cache< bnodeid_t, unique< NodeCore > >;
     using OverflowCache = sisl::Cache< BlkId, OverflowEntry >;
 
-    static folly::coro::Task< shared< COWBtree > > create(COWBtreeManager& mgr, shared< BlobDev > blob_dev,
-                                                          MetaBlkWrapper&& mblk, shared< NodeCache > node_cache,
-                                                          shared< OverflowCache > overflow_cache);
-    static folly::coro::Task< shared< COWBtree > > load(COWBtreeManager& mgr, shared< BlobDev > blob_dev,
-                                                        MetaBlkWrapper&& mblk, shared< NodeCache > node_cache,
-                                                        shared< OverflowCache > overflow_cache);
+    static Async< shared< COWBtree > > create(COWBtreeManager& mgr, shared< BlobDev > blob_dev, MetaBlkWrapper&& mblk,
+                                              shared< NodeCache > node_cache, shared< OverflowCache > overflow_cache);
+    static Async< shared< COWBtree > > load(COWBtreeManager& mgr, shared< BlobDev > blob_dev, MetaBlkWrapper&& mblk,
+                                            shared< NodeCache > node_cache, shared< OverflowCache > overflow_cache);
 
     virtual ~COWBtree() = default;
 
@@ -135,13 +134,13 @@ public:
     ///   - per-btree MetaBlk holding the COWBtreeSuperBlock
     /// Caller (COWBtreeManager::destroy_cow_btree) is responsible for removing the btree from the tracked list and
     /// unreserving its ordinal.
-    folly::coro::Task< void > destroy();
+    Async< void > destroy();
     uint32_t ordinal() const { return btree_ordinal_; }
 
     // ── CP hooks ─────────────────────────────────────────────────────────────
     // suggest_incremental is the manager's pre-computed advice (cleared when the global incr_map size threshold is
     // crossed). The btree may override based on its own state if needed.
-    folly::coro::Task< void > cp_flush(CP* cp, bool suggest_incremental);
+    Async< void > cp_flush(CP* cp, bool suggest_incremental);
 
     static COWBtree* cast_to(BtreeBase* btree) { return r_cast< COWBtree* >(btree->underlying_btree()); }
     static COWBtree const* cast_to(BtreeBase const* btree) {
@@ -286,10 +285,10 @@ public:
     friend struct CPSession;
 
     template < typename OnNodeFlushed >
-    friend folly::coro::Task< void > flush_dirty_nodes(COWBtree&, CP*, OnNodeFlushed&&);
+    friend Async< void > flush_dirty_nodes(COWBtree&, CP*, OnNodeFlushed&&);
     template < typename OnNodeDeleted >
-    friend folly::coro::Task< void > flush_deleted_nodes(COWBtree&, CP*, OnNodeDeleted&&);
-    friend folly::coro::Task< void > flush_overflow_nodes(COWBtree&, CP*);
+    friend Async< void > flush_deleted_nodes(COWBtree&, CP*, OnNodeDeleted&&);
+    friend Async< void > flush_overflow_nodes(COWBtree&, CP*);
 
     ////////// Helper methods //////////////////////////
     bnodeid_t generate_node_id(bool is_overflow = false);
@@ -301,9 +300,9 @@ public:
     void add_to_remove_overflow_list(const BlkId& blkid);
 
     ////////// CP Helper methods //////////////////////////
-    folly::coro::Task< bool > incr_cp_flush(CP* cp);
-    folly::coro::Task< void > full_cp_flush(CP* cp);
-    folly::coro::Task< void > recover();
+    Async< bool > incr_cp_flush(CP* cp);
+    Async< void > full_cp_flush(CP* cp);
+    Async< void > recover();
     bool is_dirty(cp_id_t cp_id) const;
 
 private:
@@ -332,9 +331,9 @@ private:
 
 private:
     CPSession* cp_session(cp_id_t cp_id);
-    folly::coro::Task< void > recover_full_map(cp_id_t cur_cp_id);
-    folly::coro::Task< uint64_t > recover_one_incr_cp(uint64_t offset, cp_id_t last_full_cp, cp_id_t cur_cp_id);
-    folly::coro::Task< sisl::IoBufView > read_from_incr_stream(uint64_t offset, size_t len);
+    Async< void > recover_full_map(cp_id_t cur_cp_id);
+    Async< uint64_t > recover_one_incr_cp(uint64_t offset, cp_id_t last_full_cp, cp_id_t cur_cp_id);
+    Async< sisl::IoBufView > read_from_incr_stream(uint64_t offset, size_t len);
 
     // ── Incremental map journal format (written to incr_map_stream_) ─────────
     //

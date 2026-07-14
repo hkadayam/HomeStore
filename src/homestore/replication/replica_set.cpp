@@ -14,6 +14,7 @@
  *********************************************************************************/
 
 #include "homestore/replication/replica_set.h"
+#include "common/async.h"
 
 #include <cstring>
 
@@ -247,8 +248,7 @@ void ReplicaSet::detach_listener() {
 // the entry is committed across the quorum (the listener's on_commit has already fired), or with a
 // ReplError if replication couldn't complete (not leader, alloc failure, no quorum, etc).
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
-folly::coro::Task< ReplResult<> > ReplicaSet::write(sisl::IoBuf const& user_header, sisl::IoBufView value,
-                                                    TraceId tid) {
+Async< ReplResult<> > ReplicaSet::write(sisl::IoBuf const& user_header, sisl::IoBufView value, TraceId tid) {
     (void)tid;
 
     auto const uh_size = user_header.size();

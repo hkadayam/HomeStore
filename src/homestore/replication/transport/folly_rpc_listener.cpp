@@ -2,8 +2,7 @@
 #include "nuraft_codec.h"
 #include "wire_frame.h"
 
-#include <folly/coro/Invoke.h>
-#include <folly/coro/Task.h>
+#include "common/async.h"
 #include <folly/io/IOBuf.h>
 #include <folly/io/async/AsyncSocket.h>
 #include <folly/io/async/AsyncServerSocket.h>
@@ -189,8 +188,8 @@ void FollyRpcListener::InboundConnection::readDataAvailable(size_t len) noexcept
     rx_state_ = RxState::Header;
 }
 
-folly::coro::Task< void > FollyRpcListener::InboundConnection::dispatch_request(nuraft::group_id_t gid, uint64_t req_id,
-                                                                                nuraft::ptr< nuraft::buffer > body) {
+Async< void > FollyRpcListener::InboundConnection::dispatch_request(nuraft::group_id_t gid, uint64_t req_id,
+                                                                    nuraft::ptr< nuraft::buffer > body) {
     // Keep `this` alive across the co_await — even if the connection's terminal-state handler runs and
     // unregisters us from the listener registry, the Task continues until process_req completes.
     auto self = shared_from_this();

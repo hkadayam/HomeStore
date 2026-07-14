@@ -12,10 +12,7 @@
 #include <folly/ExceptionWrapper.h>
 #include <folly/ScopeGuard.h>
 #include <folly/Try.h>
-#include <folly/coro/Mutex.h>
-#include <folly/coro/SharedMutex.h>
-#include <folly/coro/Task.h>
-#include <folly/coro/ViaIfAsync.h>
+#include "common/async.h"
 
 namespace homestore {
 
@@ -25,7 +22,7 @@ namespace homestore {
 //
 // Custom Task type so we can attach our own promise.  folly::coro::detail::TaskPromise<T> is `final`, so we cannot
 // derive from it; instead the promise is written from scratch (it does not inherit from TaskPromiseBase because
-// TaskPromiseBase's executor_ field is private and only friend-accessible to folly::coro::Task<T>).  The promise
+// TaskPromiseBase's executor_ field is private and only friend-accessible to Async<T>).  The promise
 // keeps result/continuation/executor itself, and routes nested awaits through stack_check_helper above.
 
 template < typename T >
@@ -69,8 +66,7 @@ public:
     template < typename Awaitable >
     auto await_transform(Awaitable&& a) {
         return folly::coro::co_viaIfAsync(
-            executor_.get_alias(),
-            folly::coro::co_withCancellation(cancel_token_, std::forward< Awaitable >(a)));
+            executor_.get_alias(), folly::coro::co_withCancellation(cancel_token_, std::forward< Awaitable >(a)));
     }
 
     auto await_transform(folly::coro::co_current_executor_t) noexcept {
@@ -132,13 +128,17 @@ public:
 
     BtreeTask(BtreeTask&& o) noexcept : coro_{std::exchange(o.coro_, {})} {}
     BtreeTask& operator=(BtreeTask&& o) noexcept {
-        if (coro_) { coro_.destroy(); }
+        if (coro_) {
+            coro_.destroy();
+        }
         coro_ = std::exchange(o.coro_, {});
         return *this;
     }
 
     ~BtreeTask() {
-        if (coro_) { coro_.destroy(); }
+        if (coro_) {
+            coro_.destroy();
+        }
     }
 
     class Awaiter {
@@ -146,7 +146,9 @@ public:
         explicit Awaiter(handle_t c) noexcept : coro_{c} {}
         Awaiter(Awaiter&& o) noexcept : coro_{std::exchange(o.coro_, {})} {}
         ~Awaiter() {
-            if (coro_) { coro_.destroy(); }
+            if (coro_) {
+                coro_.destroy();
+            }
         }
 
         bool await_ready() noexcept { return false; }
@@ -160,7 +162,9 @@ public:
         }
 
         T await_resume() {
-            SCOPE_EXIT { std::exchange(coro_, {}).destroy(); };
+            SCOPE_EXIT {
+                std::exchange(coro_, {}).destroy();
+            };
             if constexpr (std::is_void_v< T >) {
                 std::move(coro_.promise().result()).value();
             } else {
@@ -209,9 +213,15 @@ using BtreeSharedMutex = folly::coro::SharedMutex;
 // (co_await locks); in sync mode they acquire immediately and return void.  Call sites uniformly do
 // `CO_AWAIT lock_shared_async(m)` — expanding to `co_await m.co_lock_shared()` in async mode, and to a plain
 // `m.lock_shared()` in sync mode.
-inline auto lock_async(BtreeSharedMutex& m) { return m.co_lock(); }
-inline auto lock_shared_async(BtreeSharedMutex& m) { return m.co_lock_shared(); }
-inline auto lock_async(BtreeMutex& m) { return m.co_lock(); }
+inline auto lock_async(BtreeSharedMutex& m) {
+    return m.co_lock();
+}
+inline auto lock_shared_async(BtreeSharedMutex& m) {
+    return m.co_lock_shared();
+}
+inline auto lock_async(BtreeMutex& m) {
+    return m.co_lock();
+}
 } // namespace homestore
 
 #else
@@ -229,9 +239,15 @@ using BtreeSharedMutex = folly::SharedMutex;
 
 // Sync-mode equivalents of the async wrappers.  `CO_AWAIT` is empty in sync mode, so `CO_AWAIT lock_shared_async(m)`
 // collapses to just `lock_shared_async(m);` — which acquires the lock synchronously.
-inline void lock_async(BtreeSharedMutex& m) { m.lock(); }
-inline void lock_shared_async(BtreeSharedMutex& m) { m.lock_shared(); }
-inline void lock_async(BtreeMutex& m) { m.lock(); }
+inline void lock_async(BtreeSharedMutex& m) {
+    m.lock();
+}
+inline void lock_shared_async(BtreeSharedMutex& m) {
+    m.lock_shared();
+}
+inline void lock_async(BtreeMutex& m) {
+    m.lock();
+}
 } // namespace homestore
 
 #endif

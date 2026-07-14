@@ -15,6 +15,7 @@
  ***************************************************************************/
 
 #include "homestore/logstore/log_store_mgr.h"
+#include "common/async.h"
 
 #include <algorithm>
 #include <charconv>
@@ -49,7 +50,7 @@ LogStoreManager::LogStoreManager(shared< MetaClient > meta_client, shared< Virtu
 // create / load / shutdown
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > LogStoreManager::create(uint64_t chunk_size, uint32_t initial_num_chunks) {
+Async< void > LogStoreManager::create(uint64_t chunk_size, uint32_t initial_num_chunks) {
     LOGINFO("LogStoreManager: first boot — creating fresh manager (chunk_size={} initial_num_chunks={})", chunk_size,
             initial_num_chunks);
 
@@ -71,7 +72,7 @@ folly::coro::Task< void > LogStoreManager::create(uint64_t chunk_size, uint32_t 
     LOGINFO("LogStoreManager: ready (chunk_size={} initial_chunks={})", chunk_size, initial_num_chunks);
 }
 
-folly::coro::Task< void > LogStoreManager::load() {
+Async< void > LogStoreManager::load() {
     LOGINFO("LogStoreManager: starting recovery scan");
 
     auto meta_client = std::make_shared< MetaClient >(co_await meta_mgr().register_client("LogStoreManager"));
@@ -84,7 +85,7 @@ folly::coro::Task< void > LogStoreManager::load() {
     logstore_id_t max_store_id = 0;
     bool any_store = false;
 
-    co_await meta_client->for_each_recovered_block([&](MetaBlk blk, sisl::IoBufView data) -> folly::coro::Task< void > {
+    co_await meta_client->for_each_recovered_block([&](MetaBlk blk, sisl::IoBufView data) -> Async< void > {
         const auto& name = blk.name();
         // Per-store sb: "LogStore_<store_id>"
         if (name.size() > kLogStoreSbPrefix.size() &&
@@ -146,7 +147,7 @@ folly::coro::Task< void > LogStoreManager::load() {
     LOGINFO("LogStoreManager: loaded {} log_store(s)", mgr->log_stores_.size());
 }
 
-folly::coro::Task< void > LogStoreManager::shutdown() {
+Async< void > LogStoreManager::shutdown() {
     if (log_stream_) {
         co_await log_stream_->stop();
     }
@@ -183,7 +184,7 @@ std::vector< shared< LogStore > > LogStoreManager::log_stores() const {
 // Store lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< shared< LogStore > > LogStoreManager::create_log_store(bool append_mode) {
+Async< shared< LogStore > > LogStoreManager::create_log_store(bool append_mode) {
     const logstore_id_t sid = next_store_id_.fetch_add(1, std::memory_order_acq_rel);
     auto store = co_await LogStore::create(sid, meta_client_, log_stream_, append_mode);
     {
@@ -214,7 +215,7 @@ LogStore* LogStoreManager::lookup_store(logstore_id_t store_id) const {
     return (it != log_stores_.end()) ? it->second.get() : nullptr;
 }
 
-folly::coro::Task< void > LogStoreManager::recover() {
+Async< void > LogStoreManager::recover() {
     LOGINFO("LogStoreManager: starting recover, {} log_store(s) registered", log_stores_.size());
 
     // Walk the LogStream's CRC chain; per-record on_log_found dispatches into the LogStore via lookup_store.
@@ -226,7 +227,7 @@ folly::coro::Task< void > LogStoreManager::recover() {
     LOGINFO("LogStoreManager: recover complete, {} log_store(s) remain after orphan cleanup", log_stores_.size());
 }
 
-folly::coro::Task< void > LogStoreManager::drop_unopened_stores() {
+Async< void > LogStoreManager::drop_unopened_stores() {
     std::vector< logstore_id_t > to_drop;
     {
         std::shared_lock lk{stores_mutex_};
@@ -243,7 +244,7 @@ folly::coro::Task< void > LogStoreManager::drop_unopened_stores() {
     co_return;
 }
 
-folly::coro::Task< void > LogStoreManager::destroy_log_store(logstore_id_t store_id) {
+Async< void > LogStoreManager::destroy_log_store(logstore_id_t store_id) {
     shared< LogStore > s;
     {
         std::shared_lock lk{stores_mutex_};
@@ -267,7 +268,7 @@ folly::coro::Task< void > LogStoreManager::destroy_log_store(logstore_id_t store
 // Truncation
 // ─────────────────────────────────────────────────────────────────────────────
 
-folly::coro::Task< void > LogStoreManager::global_truncate() {
+Async< void > LogStoreManager::global_truncate() {
     // Min trunc offset across opened stores; std::nullopt-yielding stores (empty stores) don't constrain.
     std::optional< uint64_t > min_off;
     {

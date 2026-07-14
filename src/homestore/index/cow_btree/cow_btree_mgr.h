@@ -8,7 +8,7 @@
 
 #include <boost/uuid/uuid.hpp>
 
-#include <folly/coro/Task.h>
+#include "common/async.h"
 
 #include "sisl/cache/cache.h"
 #include "sisl/cache/two_q_evictor.h"
@@ -67,25 +67,25 @@ public:
     // Called from HomeStore::do_start().  Registers with cp_mgr, reads persisted metablks from meta service, stashes
     // them for the upper layer to iterate.  Registered in Managers as cow_btree_mgr().
     // First-time boot: construct an empty manager, register with cp_mgr, install in Managers.
-    static folly::coro::Task< void > create();
+    static Async< void > create();
 
     // Recovery boot: same as create(), plus read all persisted COWBtree metablks and stash them for the upper layer
     // to iterate via list_persisted_btrees().
-    static folly::coro::Task< void > load();
+    static Async< void > load();
 
     void shutdown();
 
     std::vector< COWBtreeSuperBlock const* > list_persisted_btrees() const;
 
     template < typename K, typename V >
-    folly::coro::Task< shared< Btree< K, V > > > create_cow_btree(BtreeConfig const& cfg, shared< BlobDev > blob_dev,
-                                                                  sisl::Blob const& user_sb = {});
+    Async< shared< Btree< K, V > > > create_cow_btree(BtreeConfig const& cfg, shared< BlobDev > blob_dev,
+                                                      sisl::Blob const& user_sb = {});
 
     template < typename K, typename V >
-    folly::coro::Task< shared< Btree< K, V > > > load_cow_btree(BtreeConfig const& cfg, shared< BlobDev > blob_dev,
-                                                                COWBtreeSuperBlock const& sb);
+    Async< shared< Btree< K, V > > > load_cow_btree(BtreeConfig const& cfg, shared< BlobDev > blob_dev,
+                                                    COWBtreeSuperBlock const& sb);
 
-    folly::coro::Task< void > destroy_cow_btree(cshared< BtreeBase >& base);
+    Async< void > destroy_cow_btree(cshared< BtreeBase >& base);
 
     // ── Incremental map size accounting
     // Tracks total bytes currently held in the incr_map streams across all COWBtree instances.  COWBtree calls
@@ -112,7 +112,7 @@ private:
     public:
         explicit CPCallbacksImpl(COWBtreeManager& mgr) : mgr_{mgr} {}
         void on_switchover_cp(CP* cur_cp, CP* new_cp) override;
-        folly::coro::Task< bool > cp_flush(CP* cp) override;
+        Async< bool > cp_flush(CP* cp) override;
         void cp_cleanup(CP* cp) override;
         int cp_progress_percent() override;
 

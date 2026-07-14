@@ -22,7 +22,7 @@
 #include <chrono>
 
 #include <fmt/format.h>
-#include <folly/coro/Sleep.h>
+#include "common/async.h"
 #include <folly/small_vector.h>
 #include "sisl/fds/utils.h" // Clock, get_elapsed_time_us
 
@@ -62,9 +62,8 @@ std::string LogStream::sb_mblk_name(const std::string& dev, uint64_t stream_id) 
     return fmt::format("{}_logstream_sb_{}", dev, stream_id);
 }
 
-folly::coro::Task< shared< LogStream > > LogStream::create(uint64_t stream_id, MetaClient& meta_client,
-                                                           const std::string& dev_name,
-                                                           const shared< VirtualDev >& vdev, uint64_t chunk_size) {
+Async< shared< LogStream > > LogStream::create(uint64_t stream_id, MetaClient& meta_client, const std::string& dev_name,
+                                               const shared< VirtualDev >& vdev, uint64_t chunk_size) {
     LOGINFOMOD(logstream, "create: sid={} dev={} chunk_size={}", stream_id, dev_name, chunk_size);
     auto stream = shared< LogStream >{new LogStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_size}};
 
@@ -84,9 +83,9 @@ folly::coro::Task< shared< LogStream > > LogStream::create(uint64_t stream_id, M
     co_return stream;
 }
 
-folly::coro::Task< shared< LogStream > > LogStream::load(uint64_t stream_id, MetaClient& meta_client,
-                                                         const std::string& dev_name, const shared< VirtualDev >& vdev,
-                                                         MetaBlk&& sb, sisl::IoBufView sb_payload) {
+Async< shared< LogStream > > LogStream::load(uint64_t stream_id, MetaClient& meta_client, const std::string& dev_name,
+                                             const shared< VirtualDev >& vdev, MetaBlk&& sb,
+                                             sisl::IoBufView sb_payload) {
     if (sb_payload.size() < sizeof(AppendByteStreamSb)) {
         throw std::runtime_error(
             fmt::format("LogStream::load: sb payload too small for stream {} on {}", stream_id, dev_name));
@@ -139,14 +138,13 @@ logid_t LogStream::append(LogStreamClient* client, lsn_t lsn, const LogBlob& dat
     // skip the spawn — flush() decrements the counter on success, naturally re-arming the next crossing.
     const int64_t threshold = to_i64(HS_DYNAMIC_CONFIG(logstore.flush_threshold_size));
     if (prev < threshold && (prev + sz) >= threshold) {
-        iomanager::spawn_detached(
-            iomanager::ReactorTarget::any(),
-            [self = shared_from_this()]() -> folly::coro::Task< void > { co_await self->flush(); });
+        iomanager::spawn_detached(iomanager::ReactorTarget::any(),
+                                  [self = shared_from_this()]() -> Async< void > { co_await self->flush(); });
     }
     return idx;
 }
 
-folly::coro::Task< void > LogStream::flush() {
+Async< void > LogStream::flush() {
     auto lock = co_await flush_mtx_.co_scoped_lock();
 
     // Track each group emplaced this turn so we can construct stream_keys for completion callbacks below without
@@ -208,7 +206,7 @@ folly::coro::Task< void > LogStream::flush() {
 void LogStream::start_flush_timer() {
     flush_timer_.start(iomanager::ReactorTarget::any(),
                        std::chrono::microseconds(HS_DYNAMIC_CONFIG(logstore.flush_timer_frequency_us)),
-                       iomanager::TimerKind::Recurring, [this]() -> folly::coro::Task< void > {
+                       iomanager::TimerKind::Recurring, [this]() -> Async< void > {
                            // Cheap pre-check: skip if no pending bytes.  pending_flush_size_ is decremented by
                            // flush() on success, so >0 means records haven't reached disk yet.
                            if (pending_flush_size_.load(std::memory_order_acquire) <= 0) {
@@ -221,11 +219,11 @@ void LogStream::start_flush_timer() {
                        });
 }
 
-folly::coro::Task< void > LogStream::stop() {
+Async< void > LogStream::stop() {
     co_await flush_timer_.stop();
 }
 
-folly::coro::Task< void > LogStream::truncate(const stream_key& key) {
+Async< void > LogStream::truncate(const stream_key& key) {
     co_await AppendByteStream::truncate(key.group_stream_offset);
 
     // Truncate-all path: AppendByteStream collapses head==tail to (0,0).  Bump chain_seed_ so any stale on-disk
@@ -291,7 +289,7 @@ uint64_t LogStream::build_and_emplace_group(logid_t from_idx, logid_t upto_idx) 
     return group_offset;
 }
 
-folly::coro::Task< sisl::IoBufView > LogStream::read(const stream_key& key) {
+Async< sisl::IoBufView > LogStream::read(const stream_key& key) {
     // Read the record header first.
     auto [ec_h, hdr_buf] = co_await AppendByteStream::read(key.record_stream_offset, sizeof(log_record_header));
     if (ec_h) {
@@ -316,7 +314,7 @@ folly::coro::Task< sisl::IoBufView > LogStream::read(const stream_key& key) {
     co_return data_buf;
 }
 
-folly::coro::Task< void > LogStream::recover(lookup_store_fn lookup) {
+Async< void > LogStream::recover(lookup_store_fn lookup) {
     LSTREAM_LOG(INFO, "recover: walking chain from head_offset={}", head_offset_);
     // Walk forward from head_offset_ as a chain of LogGroups.  For each candidate group: read its header, validate
     // magic and group_size, read the full group, validate prev_crc + cur_crc against the running chain, then dispatch
@@ -451,7 +449,7 @@ folly::coro::Task< void > LogStream::recover(lookup_store_fn lookup) {
     }
 }
 
-folly::coro::Task< std::optional< uint64_t > > LogStream::probe_for_torn_write(uint64_t bad_off) {
+Async< std::optional< uint64_t > > LogStream::probe_for_torn_write(uint64_t bad_off) {
     const uint32_t max_blocks = HS_DYNAMIC_CONFIG(logstore.recovery_max_blks_read_for_additional_check);
     if (max_blocks == 0)
         co_return std::nullopt;
@@ -511,7 +509,7 @@ folly::coro::Task< std::optional< uint64_t > > LogStream::probe_for_torn_write(u
     co_return found_off;
 }
 
-folly::coro::Task< void > LogStream::persist_flush_metadata() {
+Async< void > LogStream::persist_flush_metadata() {
     // No-op: LogStream rediscovers tail at recovery via CRC walk; the sb only needs to be written when chunks
     // change (via inherited init/remove_chunk_mblk overrides) or on truncate.  Skipping per-flush sb writes saves
     // one MetaBlk write per flush on the hot path.

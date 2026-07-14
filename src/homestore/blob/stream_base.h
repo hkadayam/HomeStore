@@ -23,14 +23,13 @@
 #include <utility>
 #include <vector>
 
-#include <folly/coro/Mutex.h>
-#include <folly/coro/Task.h>
+#include "common/async.h"
 #include "sisl/fds/concurrent_insert_set.h"
 #include "sisl/fds/rcu.h"
 
 #include "homestore/base/homestore_decl.h" // shared<>, unique<>
-#include "homestore/checkpoint/cp.h"              // cp_id_t
-#include "homestore/checkpoint/cp_mgr.h"          // CPManager::max_concurent_cps
+#include "homestore/checkpoint/cp.h"       // cp_id_t
+#include "homestore/checkpoint/cp_mgr.h"   // CPManager::max_concurent_cps
 
 #include "homestore/meta/meta_blk.h" // MetaBlk
 
@@ -83,14 +82,14 @@ public:
     // ── Chunk-list mutations (serialised coroutines) ──────────────────────────
 
     /// Ensure at least n+1 chunks exist, expanding via vdev.expand() as needed.
-    folly::coro::Task< void > expand_to(size_t nchunks);
+    Async< void > expand_to(size_t nchunks);
 
     /// Release chunks [0 .. n) from the stream via vdev.shrink(). Remaining chunks keep their relative order; indices
     /// shift down by n.
-    folly::coro::Task< void > truncate_before(size_t nchunks);
+    Async< void > truncate_before(size_t nchunks);
 
     /// Release all chunks via vdev.shrink() and leave the list empty.
-    folly::coro::Task< void > destroy();
+    Async< void > destroy();
 
     // ── Accessors ─────────────────────────────────────────────────────────────
     uint64_t stream_id() const { return stream_id_; }
@@ -143,11 +142,11 @@ protected:
     /// Allocate a MetaBlk for the given chunk and store it in chunk_mblks_. Called automatically by expand_to() for
     /// each newly added chunk.  Subclasses that don't use per-chunk mblks (e.g. AppendByteStream/LogStream which
     /// maintain a single per-stream mblk carrying the chunk list) can override this to update their own mblk.
-    virtual folly::coro::Task< void > init_chunk_mblk(const shared< Chunk >& chunk);
+    virtual Async< void > init_chunk_mblk(const shared< Chunk >& chunk);
 
-    /// Remove the MetaBlk for the given chunk_id (mirror of init_chunk_mblk).  Called automatically by truncate_before()
-    /// and destroy() for every released chunk.  Subclasses can override alongside init_chunk_mblk.
-    virtual folly::coro::Task< void > remove_chunk_mblk(uint32_t chunk_id);
+    /// Remove the MetaBlk for the given chunk_id (mirror of init_chunk_mblk).  Called automatically by
+    /// truncate_before() and destroy() for every released chunk.  Subclasses can override alongside init_chunk_mblk.
+    virtual Async< void > remove_chunk_mblk(uint32_t chunk_id);
 
     /// Install a pre-loaded chunk list on the stream.  Sorts by vdev_order and atomically installs into chunks_.
     /// Used by load paths where chunks are recovered by looking up chunk_ids from the subclass's stream sb rather
@@ -156,13 +155,12 @@ protected:
     void install_chunks(std::vector< shared< Chunk > > chunks);
 
 private:
-
     uint64_t stream_id_;
     shared< VirtualDev > vdev_;
     std::string dev_name_;
     uint64_t chunk_size_;
-    uint32_t blk_size_;         // stream's effective block size (may be a multiple of vdev's block size)
-    uint32_t blk_multiplier_;   // blk_size_ / vdev_->block_size()
+    uint32_t blk_size_;       // stream's effective block size (may be a multiple of vdev's block size)
+    uint32_t blk_multiplier_; // blk_size_ / vdev_->block_size()
 
     // RCU-protected chunk list. Readers take an rcu_reader guard (~2-5 ns). Writers call make_and_exchange() under
     // expand_mutex_ which invokes folly::synchronize_rcu() to wait for any in-flight readers.

@@ -13,20 +13,17 @@
 #include <folly/executors/IOThreadPoolExecutor.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/EventBaseManager.h>
-#include <folly/coro/Task.h>
-#include <folly/coro/BlockingWait.h>
-#include <folly/coro/Sleep.h>
-#include <folly/coro/Invoke.h>
+#include "common/async.h"
 
 #include <sisl/logging/logging.h>
 
 namespace iomanager {
 
-// Extracts T from folly::coro::Task<T>
+// Extracts T from Async<T>
 template < typename Task >
 struct task_value_type_impl;
 template < typename T >
-struct task_value_type_impl< folly::coro::Task< T > > {
+struct task_value_type_impl< Async< T > > {
     using type = T;
 };
 template < typename Fn, typename... Args >
@@ -97,31 +94,29 @@ public:
     // Dispatch task to the target reactor and co_await the result.
     // Call from a coroutine context.
     template < typename T >
-    folly::coro::Task< T > spawn_waitable(ReactorTarget target, folly::coro::Task< T > task);
+    Async< T > spawn_waitable(ReactorTarget target, Async< T > task);
 
     // Dispatch task to the target reactor and BLOCK the current (non-reactor) thread.
     template < typename T >
-    T spawn_and_block(ReactorTarget target, folly::coro::Task< T > task);
+    T spawn_and_block(ReactorTarget target, Async< T > task);
 
     // Run fn(reactor_id) on every reactor sequentially.
-    // fn must return folly::coro::Task<R>. Returns Task<vector<R>> for non-void R,
+    // fn must return Async<R>. Returns Task<vector<R>> for non-void R,
     // or Task<void> for void R.
     template < typename Fn >
-    auto spawn_waitable_all(Fn&& fn)
-        -> folly::coro::Task< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
-                                                  std::vector< task_value_t< Fn, size_t > > > >;
+    auto spawn_waitable_all(Fn&& fn) -> Async< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
+                                                                   std::vector< task_value_t< Fn, size_t > > > >;
 
     // Yield to the current EventBase loop.
-    folly::coro::Task< void > yield_now();
+    Async< void > yield_now();
 
     // Async sleep using the current EventBase timer.
-    folly::coro::Task< void > sleep(std::chrono::milliseconds dur);
+    Async< void > sleep(std::chrono::milliseconds dur);
 
     // Resolves a ReactorTarget to the concrete EventBase* for dispatch.
     folly::EventBase* resolve_target(ReactorTarget target) const;
 
 private:
-
     size_t num_reactors_{0};
     std::unique_ptr< folly::EventBaseManager > ebm_; // owns the per-thread EventBases
     std::shared_ptr< folly::IOThreadPoolExecutor > pool_;
@@ -147,13 +142,13 @@ void IOManager::spawn_detached(ReactorTarget target, F factory) {
 }
 
 template < typename T >
-folly::coro::Task< T > IOManager::spawn_waitable(ReactorTarget target, folly::coro::Task< T > task) {
+Async< T > IOManager::spawn_waitable(ReactorTarget target, Async< T > task) {
     auto* eb = resolve_target(target);
     co_return co_await std::move(task).scheduleOn(eb);
 }
 
 template < typename T >
-T IOManager::spawn_and_block(ReactorTarget target, folly::coro::Task< T > task) {
+T IOManager::spawn_and_block(ReactorTarget target, Async< T > task) {
     auto* eb = resolve_target(target);
     // Use TaskWithExecutor::start(tryCallback) to run the task on the reactor
     // and signal completion via a Baton.  This avoids blockingWait, which can
@@ -174,8 +169,8 @@ T IOManager::spawn_and_block(ReactorTarget target, folly::coro::Task< T > task) 
 
 template < typename Fn >
 auto IOManager::spawn_waitable_all(Fn&& fn)
-    -> folly::coro::Task< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
-                                              std::vector< task_value_t< Fn, size_t > > > > {
+    -> Async< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
+                                  std::vector< task_value_t< Fn, size_t > > > > {
     using R = task_value_t< Fn, size_t >;
     if constexpr (std::is_void_v< R >) {
         for (size_t i = 0; i < num_reactors_; ++i) {
@@ -206,21 +201,20 @@ template < typename F >
 void spawn_detached(ReactorTarget target, F factory);
 
 template < typename T >
-folly::coro::Task< T > spawn_waitable(ReactorTarget target, folly::coro::Task< T > task);
+Async< T > spawn_waitable(ReactorTarget target, Async< T > task);
 
 template < typename T >
-T spawn_and_block(ReactorTarget target, folly::coro::Task< T > task);
+T spawn_and_block(ReactorTarget target, Async< T > task);
 
 template < typename Fn >
-auto spawn_waitable_all(Fn&& fn)
-    -> folly::coro::Task< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
-                                              std::vector< task_value_t< Fn, size_t > > > >;
+auto spawn_waitable_all(Fn&& fn) -> Async< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
+                                                               std::vector< task_value_t< Fn, size_t > > > >;
 
 /// Synchronously drive `task` to completion on the calling thread.  Debug-asserts the caller is NOT on an iomgr
 /// reactor — blocking a reactor deadlocks any work whose continuation routes back to that same reactor.  Use
 /// this everywhere instead of folly::coro::blockingWait so reactor-context misuse is caught at debug time.
 template < typename T >
-T blocking_wait(folly::coro::Task< T >&& task) {
+T blocking_wait(Async< T >&& task) {
     DEBUG_ASSERT(::iomgr().current_reactor_id() >= ::iomgr().num_reactors(),
                  "iomanager::blocking_wait called from reactor — would deadlock");
     return folly::coro::blockingWait(std::move(task));
@@ -244,19 +238,18 @@ void spawn_detached(ReactorTarget target, F factory) {
 }
 
 template < typename T >
-folly::coro::Task< T > spawn_waitable(ReactorTarget target, folly::coro::Task< T > task) {
+Async< T > spawn_waitable(ReactorTarget target, Async< T > task) {
     return ::iomgr().spawn_waitable(target, std::move(task));
 }
 
 template < typename T >
-T spawn_and_block(ReactorTarget target, folly::coro::Task< T > task) {
+T spawn_and_block(ReactorTarget target, Async< T > task) {
     return ::iomgr().spawn_and_block(target, std::move(task));
 }
 
 template < typename Fn >
-auto spawn_waitable_all(Fn&& fn)
-    -> folly::coro::Task< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
-                                              std::vector< task_value_t< Fn, size_t > > > > {
+auto spawn_waitable_all(Fn&& fn) -> Async< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
+                                                               std::vector< task_value_t< Fn, size_t > > > > {
     return ::iomgr().spawn_waitable_all(std::forward< Fn >(fn));
 }
 

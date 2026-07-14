@@ -24,7 +24,7 @@
 #include "sisl/fds/enum.h"
 #include "sisl/fds/utils.h"
 #include <folly/SharedMutex.h>
-#include <folly/coro/Task.h>
+#include "common/async.h"
 #include <folly/futures/Future.h>
 #include <folly/futures/SharedPromise.h>
 #include <folly/io/async/AsyncTimeout.h>
@@ -67,7 +67,7 @@ public:
     /// @brief CPManager calls this once per CP flush, one consumer at a time (sequential). Consumers flush all dirty
     /// data accumulated since the previous CP. Returns true on success.
     /// @param cp CP pointer to flush
-    virtual folly::coro::Task< bool > cp_flush(CP* cp) = 0;
+    virtual Async< bool > cp_flush(CP* cp) = 0;
 
     /// @brief After all consumers flushed the CP, CPManager calls this method to clean up any CP related structures.
     virtual void cp_cleanup(CP* cp) = 0;
@@ -207,7 +207,6 @@ private:
     std::mutex owned_stacks_mtx_;
 
 public:
-
     /// Factory: construct and self-register via Managers::init_cp_mgr(). Call start() separately after recovery.
     static shared< CPManager > create();
 
@@ -216,14 +215,14 @@ public:
 
     /// @brief Start the CPManager, which opens or recovers the CP superblock and creates the first cp session.
     /// @param first_time_boot
-    folly::coro::Task< void > start(bool first_time_boot);
+    Async< void > start(bool first_time_boot);
 
     /// @brief Start the cp timer so that periodic cps are started
     void start_timer();
 
     /// @brief Shutdown the checkpoint manager services. It will trigger a flush, wait for the CP to be flushed
     /// and does a clean shutdown
-    folly::coro::Task< void > shutdown();
+    Async< void > shutdown();
 
     /// @brief Register a CP consumer. The consumer is immediately notified via on_switchover_cp(nullptr, cur_cp)
     /// so it can initialize its internal per-CP state. Each registered consumer receives all future CP lifecycle

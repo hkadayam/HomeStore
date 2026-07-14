@@ -16,6 +16,7 @@
 #pragma once
 
 #include <atomic>
+#include "common/async.h"
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -35,7 +36,9 @@ namespace homestore {
 
 // ── Forward declarations ──────────────────────────────────────────────────────
 class PhysicalDev;
-namespace blkalloc { class BlkAllocator; }
+namespace blkalloc {
+class BlkAllocator;
+}
 
 // ── Interval types ────────────────────────────────────────────────────────────
 using ChunkIntervalSet = boost::icl::split_interval_set< uint64_t >;

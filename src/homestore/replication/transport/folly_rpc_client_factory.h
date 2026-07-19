@@ -44,10 +44,10 @@ namespace homestore::replication {
 //     and the outbound socket is reused.
 class FollyRpcClientFactory : public nuraft::rpc_client_factory {
 public:
-    explicit FollyRpcClientFactory(folly::Executor* slow_executor);
+    explicit FollyRpcClientFactory(folly::Executor* cpu_executor);
     ~FollyRpcClientFactory() override;
 
-    folly::Executor* slow_executor() const { return slow_executor_; }
+    folly::Executor* cpu_executor() const { return cpu_executor_; }
 
     // nuraft::rpc_client_factory API. `endpoint` is "host:port". Hands back a freshly-constructed
     // FollyRpcClient pointing at this factory.
@@ -68,7 +68,7 @@ private:
         std::unordered_map< std::string, unique< PeerOutboundSocket > > by_endpoint;
     };
 
-    folly::Executor* slow_executor_; // non-owning; lifetime managed by ReplicationManager
+    folly::Executor* cpu_executor_; // non-owning; lifetime managed by ReplicationManager
     std::atomic< uint64_t > client_id_seq_{1};
     iomanager::ReactorLocal< PerReactorState > outbound_;
 };

@@ -168,11 +168,11 @@ void FollyRpcListener::InboundConnection::readDataAvailable(size_t len) noexcept
         // msg_type byte. Peeking it here lets routing decide reactor vs slow-executor without paying for full
         // req_msg decode up front.
         uint8_t const msg_type = rx_body_->size() >= 2 ? rx_body_->data_begin()[1] : 0;
-        if (is_slow_rpc(msg_type) && mgr_->slow_executor() != nullptr) {
+        if (is_cpu_intensive_rpc(msg_type) && mgr_->cpu_executor() != nullptr) {
             // Slow path: route to the CPU thread pool so the Task body (which may blocking-wait on log_store
             // reads via HomeRaftLogStore's sync API) does not stall any reactor.
             std::move(dispatch_request(rx_hdr_.group_id, rx_hdr_.req_id, rx_body_))
-                .scheduleOn(folly::Executor::getKeepAliveToken(mgr_->slow_executor()))
+                .scheduleOn(folly::Executor::getKeepAliveToken(mgr_->cpu_executor()))
                 .start();
         } else {
             // Hot path: startInlineUnsafe runs the Task body synchronously on this thread (we're already on
@@ -203,7 +203,7 @@ Async< void > FollyRpcListener::InboundConnection::dispatch_request(nuraft::grou
     if (!srv) {
         // Cold path: first message for an unknown group_id — ask the application if it wants to host this
         // group, and (if so) construct the ReplicaSet.  Async because it does meta-block I/O.
-        srv = co_await mgr_->create_replica_set_for_group(gid);
+        srv = co_await mgr_->create_replica_set_on_demand(gid);
     }
     if (!srv) {
         // This node doesn't host the group — synthesize a SERVER_NOT_FOUND response so the peer's pending

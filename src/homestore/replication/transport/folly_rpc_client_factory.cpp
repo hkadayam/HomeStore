@@ -13,8 +13,8 @@ inline std::string make_key(std::string const& host, uint16_t port) {
 }
 } // namespace
 
-FollyRpcClientFactory::FollyRpcClientFactory(folly::Executor* slow_executor) :
-        slow_executor_(slow_executor), outbound_([]() { return PerReactorState{}; }) {
+FollyRpcClientFactory::FollyRpcClientFactory(folly::Executor* cpu_executor) :
+        cpu_executor_(cpu_executor), outbound_([]() { return PerReactorState{}; }) {
 }
 
 FollyRpcClientFactory::~FollyRpcClientFactory() = default;
@@ -34,7 +34,7 @@ PeerOutboundSocket& FollyRpcClientFactory::get_or_open_outbound(std::string cons
     auto it = state.by_endpoint.find(key);
     if (it == state.by_endpoint.end()) {
         auto* eb = iomanager::iomgr().reactor_for(iomanager::iomgr().current_reactor_id());
-        auto sock = std::make_unique< PeerOutboundSocket >(eb, host, port, slow_executor_);
+        auto sock = std::make_unique< PeerOutboundSocket >(eb, host, port, cpu_executor_);
         it = state.by_endpoint.emplace(std::move(key), std::move(sock)).first;
     }
     return *it->second;

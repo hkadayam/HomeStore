@@ -82,11 +82,11 @@ struct PeerOutboundSocket::TimeoutCallback : public folly::HHWheelTimer::Callbac
 };
 
 PeerOutboundSocket::PeerOutboundSocket(folly::EventBase* eb, std::string host, uint16_t port,
-                                       folly::Executor* slow_executor) :
+                                       folly::Executor* cpu_executor) :
         eb_(eb),
         host_(std::move(host)),
         port_(port),
-        slow_executor_(slow_executor),
+        cpu_executor_(cpu_executor),
         timer_wheel_(folly::HHWheelTimer::newTimer(eb_)) {
     open_connection();
 }
@@ -201,10 +201,10 @@ void PeerOutboundSocket::readDataAvailable(size_t len) noexcept {
                 entry.timeout->cancelTimeout();
             }
             nuraft::ptr< nuraft::rpc_exception > no_err;
-            if (is_slow_rpc(entry.sent_msg_type) && slow_executor_) {
+            if (is_cpu_intensive_rpc(entry.sent_msg_type) && cpu_executor_) {
                 // Hand the handler off so its possibly-blocking work (e.g. snapshot_resp processing that may
                 // pull old log entries) does not stall the outbound reactor.
-                slow_executor_->add([wd = std::move(entry.when_done), resp, no_err]() mutable { wd(resp, no_err); });
+                cpu_executor_->add([wd = std::move(entry.when_done), resp, no_err]() mutable { wd(resp, no_err); });
             } else {
                 entry.when_done(resp, no_err);
             }

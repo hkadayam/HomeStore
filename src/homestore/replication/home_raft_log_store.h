@@ -15,6 +15,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -30,7 +31,6 @@
 #include "homestore/logstore/log_store.h"
 #include "homestore/replication/repl_decls.h"
 #include "homestore/replication/replica_set.h"
-#include "homestore/superblk_handler.hpp"
 
 #if defined __clang__ or defined __GNUC__
 #pragma GCC diagnostic push
@@ -63,15 +63,25 @@ class RawBlkStream;
 // large-value blob write when the entry is indirect, and never block a reactor thread.
 class HomeRaftLogStore : public nuraft::log_store {
 public:
+    // Callback type for the main-log replay walk.  Fires once per replayed entry during LogStoreManager
+    // recovery — ReplicaSet uses it to fold ReplLogHeader.commit_lsn_at_write into commit_upto_lsn_.
+    using OnLogFound = std::function< Async< void >(lsn_t, sisl::IoBufView const&) >;
+
     // First-boot create. Allocates a fresh main log_store; if blob_stream is non-null, also allocates a
-    // free_blks log_store. Records both ids back into `sb` (caller persists via sb.write()).
-    static Async< unique< HomeRaftLogStore > > create(superblk< ReplicaSetSuperBlk >& sb,
-                                                      shared< RawBlkStream > blob_stream);
+    // free_blks log_store. Records both ids back into `sb` (caller persists the SB separately — the caller
+    // owns the underlying MetaBlk; HomeRaftLogStore only mutates the two id fields).  `on_log_found` is
+    // registered on the main log_store for replay callbacks — no replay happens on a fresh create, but
+    // registering here keeps the API uniform with load().  Returns shared<> because nuraft's state_mgr
+    // load_log_store() must hand back a shared_ptr<log_store>, and HomeRaftLogStore inherits log_store.
+    static Async< shared< HomeRaftLogStore > > create(ReplicaSetSuperBlk& sb, shared< RawBlkStream > blob_stream,
+                                                      OnLogFound on_log_found);
 
     // Restart load. Opens existing log_stores from ids in `sb`; throws if sb.free_blks_journal_id is set but
     // blob_stream is null (app removed the optimization across restart but persisted state still needs it).
-    static Async< unique< HomeRaftLogStore > > load(superblk< ReplicaSetSuperBlk >& sb,
-                                                    shared< RawBlkStream > blob_stream);
+    // `on_log_found` is registered on the main log_store and fires per entry during LogStoreManager's
+    // recovery walk.  Only reads from `sb`.
+    static Async< shared< HomeRaftLogStore > > load(ReplicaSetSuperBlk& sb, shared< RawBlkStream > blob_stream,
+                                                    OnLogFound on_log_found);
 
     HomeRaftLogStore(HomeRaftLogStore const&) = delete;
     HomeRaftLogStore& operator=(HomeRaftLogStore const&) = delete;

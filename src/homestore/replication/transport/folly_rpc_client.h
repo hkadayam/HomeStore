@@ -108,7 +108,7 @@ class PeerOutboundSocket : public folly::AsyncSocket::ConnectCallback,
                            public folly::AsyncReader::ReadCallback,
                            public folly::AsyncWriter::WriteCallback {
 public:
-    PeerOutboundSocket(folly::EventBase* eb, std::string host, uint16_t port, folly::Executor* slow_executor);
+    PeerOutboundSocket(folly::EventBase* eb, std::string host, uint16_t port, folly::Executor* cpu_executor);
     ~PeerOutboundSocket() override;
 
     // Called from FollyRpcClient::send() on this reactor. Allocates a req_id, inserts
@@ -159,7 +159,7 @@ private:
     folly::EventBase* eb_;
     std::string host_;
     uint16_t port_;
-    folly::Executor* slow_executor_; // non-owning; for routing slow-RPC response callbacks off this reactor
+    folly::Executor* cpu_executor_; // non-owning; for routing slow-RPC response callbacks off this reactor
     folly::AsyncSocket::UniquePtr sock_;
 
     // Per-EventBase timer wheel that drives every per-request timeout on this socket.  Constructed in the

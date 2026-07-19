@@ -145,7 +145,7 @@ private:
     // Build a response wire frame (header echoing req_id with is_response flag set, plus encoded resp_msg
     // payload) and writeChain it on this socket with MSG_ZEROCOPY.  Called from any thread — uses
     // eb_->isInEventBaseThread() to write directly when on the connection's reactor, or hops via
-    // runInEventBaseThread(...) when off it (slow_executor path, post-await resumption off-eb_, etc.).
+    // runInEventBaseThread(...) when off it (cpu_executor path, post-await resumption off-eb_, etc.).
     void send_response(nuraft::group_id_t const& gid, uint64_t req_id, nuraft::ptr< nuraft::resp_msg > resp);
 
     // Erase this connection from its registry under the registry's mutex.  No-op if the registry weak_ptr

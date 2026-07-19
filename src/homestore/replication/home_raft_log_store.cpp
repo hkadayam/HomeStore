@@ -123,45 +123,49 @@ static constexpr logstore_seq_num_t to_store_lsn(raft_lsn_t raft_lsn) {
 // Static factories
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-Async< unique< HomeRaftLogStore > > HomeRaftLogStore::create(superblk< ReplicaSetSuperBlk >& sb,
-                                                             shared< RawBlkStream > blob_stream) {
+Async< shared< HomeRaftLogStore > > HomeRaftLogStore::create(ReplicaSetSuperBlk& sb, shared< RawBlkStream > blob_stream,
+                                                             OnLogFound /*on_log_found*/) {
+    // Fresh create — no replay will happen on this store this boot, so the callback is unused here.  It's
+    // still part of the signature for API symmetry with load() so callers pass one uniform lambda.  Mutates
+    // sb.raft_log_store_id and sb.free_blks_journal_id; caller persists the SB afterwards.
     auto log_store = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
-    sb->raft_log_store_id = log_store->store_id();
+    sb.raft_log_store_id = log_store->store_id();
 
     unique< IndirectBlkHandler > indirect;
     if (blob_stream) {
         auto fbj = co_await log_store_mgr().create_log_store(/*append_mode=*/false);
-        sb->free_blks_journal_id = fbj->store_id();
+        sb.free_blks_journal_id = fbj->store_id();
         indirect = std::make_unique< IndirectBlkHandler >(std::move(blob_stream), std::move(fbj), log_store.get());
     }
 
-    auto self = unique< HomeRaftLogStore >(new HomeRaftLogStore(std::move(log_store), std::move(indirect)));
+    auto self = shared< HomeRaftLogStore >(new HomeRaftLogStore(std::move(log_store), std::move(indirect)));
     LOGINFOMOD(replication, "Created HomeRaftLogStore raft_store={} free_blks_store={} blob_opt={}",
-               sb->raft_log_store_id, sb->free_blks_journal_id, self->indirect_ ? "on" : "off");
+               sb.raft_log_store_id, sb.free_blks_journal_id, self->indirect_ ? "on" : "off");
     co_return self;
 }
 
-Async< unique< HomeRaftLogStore > > HomeRaftLogStore::load(superblk< ReplicaSetSuperBlk >& sb,
-                                                           shared< RawBlkStream > blob_stream) {
-    HS_REL_ASSERT_NE(sb->raft_log_store_id, UINT32_MAX, "load() called with no persisted raft_log_store_id");
+Async< shared< HomeRaftLogStore > > HomeRaftLogStore::load(ReplicaSetSuperBlk& sb, shared< RawBlkStream > blob_stream,
+                                                           OnLogFound on_log_found) {
+    HS_REL_ASSERT_NE(sb.raft_log_store_id, UINT32_MAX, "load() called with no persisted raft_log_store_id");
 
-    // Replay handler is a no-op here — fetch_entry materializes entries lazily, and the recovery walk
-    // happens internally inside LogStoreManager::recover() which Managers wired up before ReplicaSet load.
-    auto log_store = log_store_mgr().open_log_store(sb->raft_log_store_id, [](lsn_t, sisl::IoBufView const&) {});
+    // Register the caller's replay handler on the main log_store.  LogStoreManager::recover() (driven by the
+    // Manager after all opens are wired) walks persisted entries and dispatches through this callback —
+    // ReplicaSet uses it to fold ReplLogHeader.commit_lsn_at_write into its commit_upto_lsn_ watermark.
+    auto log_store = log_store_mgr().open_log_store(sb.raft_log_store_id, std::move(on_log_found));
     if (!log_store) {
         throw std::runtime_error(
-            fmt::format("HomeRaftLogStore::load: unknown raft_log_store_id={}", sb->raft_log_store_id));
+            fmt::format("HomeRaftLogStore::load: unknown raft_log_store_id={}", sb.raft_log_store_id));
     }
 
     unique< IndirectBlkHandler > indirect;
-    if (sb->free_blks_journal_id != UINT32_MAX) {
+    if (sb.free_blks_journal_id != UINT32_MAX) {
         // sb says optimization was on at create time. If the listener now returns null blob_stream, the
         // persisted free_blks records reference BlkIds we have no way to free — bail rather than corrupt.
         HS_REL_ASSERT(blob_stream != nullptr,
                       "HomeRaftLogStore::load: free_blks_journal persisted but blob_stream "
                       "is null — app removed the large-value optimization across restart");
         indirect =
-            std::make_unique< IndirectBlkHandler >(std::move(blob_stream), sb->free_blks_journal_id, log_store.get());
+            std::make_unique< IndirectBlkHandler >(std::move(blob_stream), sb.free_blks_journal_id, log_store.get());
     } else if (blob_stream) {
         // Symmetric mismatch: app turned the optimization ON across restart but sb doesn't have a free_blks
         // store. Run inline-only for this group; the unused blob_stream just goes out of scope here.
@@ -170,9 +174,9 @@ Async< unique< HomeRaftLogStore > > HomeRaftLogStore::load(superblk< ReplicaSetS
                    "disabling large-value optimization for this group");
     }
 
-    auto self = unique< HomeRaftLogStore >(new HomeRaftLogStore(std::move(log_store), std::move(indirect)));
+    auto self = shared< HomeRaftLogStore >(new HomeRaftLogStore(std::move(log_store), std::move(indirect)));
     LOGINFOMOD(replication, "Loaded HomeRaftLogStore raft_store={} free_blks_store={} blob_opt={}",
-               sb->raft_log_store_id, sb->free_blks_journal_id, self->indirect_ ? "on" : "off");
+               sb.raft_log_store_id, sb.free_blks_journal_id, self->indirect_ ? "on" : "off");
     co_return self;
 }
 

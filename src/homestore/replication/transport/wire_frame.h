@@ -115,35 +115,14 @@ struct WireFrame {
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 // RPC routing classification — used by both the inbound (FollyRpcListener) and outbound (PeerOutboundSocket)
-// dispatch paths. Slow RPCs may pull historical log entries (snapshot install / sync_log / membership) or
-// trigger heavy bookkeeping, and are routed onto a dedicated CPU thread pool where blocking reads from the
-// log_store are acceptable. Everything else (vote/pre_vote/append_entries/client_request/ping/etc.) stays on
-// a reactor thread.
-//
-// Statically materialized as a 32-entry lookup table keyed by raw msg_type value — is_slow_rpc() compiles into
-// one bounds check + one byte load, no branch on the type itself.
-namespace detail {
-inline constexpr auto build_slow_rpc_table() {
-    std::array< bool, 32 > tbl{};
-    tbl[nuraft::add_server_request]        = true;
-    tbl[nuraft::add_server_response]       = true;
-    tbl[nuraft::remove_server_request]     = true;
-    tbl[nuraft::remove_server_response]    = true;
-    tbl[nuraft::sync_log_request]          = true;
-    tbl[nuraft::sync_log_response]         = true;
-    tbl[nuraft::join_cluster_request]      = true;
-    tbl[nuraft::join_cluster_response]     = true;
-    tbl[nuraft::leave_cluster_request]     = true;
-    tbl[nuraft::leave_cluster_response]    = true;
-    tbl[nuraft::install_snapshot_request]  = true;
-    tbl[nuraft::install_snapshot_response] = true;
-    return tbl;
-}
-inline constexpr auto kSlowRpcTable = build_slow_rpc_table();
-} // namespace detail
-
-inline bool is_slow_rpc(uint8_t msg_type) {
-    return msg_type < detail::kSlowRpcTable.size() && detail::kSlowRpcTable[msg_type];
+// dispatch paths.  The historical intent was to route "slow" RPCs (snapshot install / sync_log / membership)
+// off the reactor because they made blocking log_store reads; every path is now coroutine-async so nothing
+// blocks the reactor's event loop.  What CAN still starve the reactor is a genuinely CPU-heavy handler —
+// signature verification, snapshot object hashing, etc.  When such a handler is identified, flip its
+// msg_type to true in the table below.  Today none are flagged; the cpu_executor is scaffolding awaiting
+// real hot spots.
+inline bool is_cpu_intensive_rpc(uint8_t /*msg_type*/) {
+    return false;
 }
 
 } // namespace homestore::replication

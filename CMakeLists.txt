@@ -109,6 +109,9 @@ if (DEFINED REPLICATION )
     set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(DISABLE_SSL 1 CACHE STRING "" FORCE)
+    # HomeStore's replication path (HomeRaftLogStore, ReplicaSet) uses folly::coro::Task<> throughout, so
+    # NuRaft must expose the coroutine-mode API surface. Force it on wherever REPLICATION=ON.
+    set(NURAFT_CORO_MODE ON CACHE BOOL "" FORCE)
     add_subdirectory(extern/NuRaft EXCLUDE_FROM_ALL)
     set(BUILD_TESTING ${_BUILD_TESTING_SAVED} CACHE BOOL "" FORCE)
   endif()

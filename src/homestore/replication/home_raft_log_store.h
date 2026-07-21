@@ -67,6 +67,11 @@ public:
     // recovery — ReplicaSet uses it to fold ReplLogHeader.commit_lsn_at_write into commit_upto_lsn_.
     using OnLogFound = std::function< Async< void >(lsn_t, sisl::IoBufView const&) >;
 
+    // Returns the highest LSN compact is currently authorized to target.  compact() clamps its argument
+    // to this value.  Returning std::numeric_limits<raft_lsn_t>::max() disables the clamp.  Read on every
+    // compact — no caching.
+    using TruncateCeilingFn = std::function< raft_lsn_t() >;
+
     // First-boot create. Allocates a fresh main log_store; if blob_stream is non-null, also allocates a
     // free_blks log_store. Records both ids back into `sb` (caller persists the SB separately — the caller
     // owns the underlying MetaBlk; HomeRaftLogStore only mutates the two id fields).  `on_log_found` is
@@ -74,14 +79,14 @@ public:
     // registering here keeps the API uniform with load().  Returns shared<> because nuraft's state_mgr
     // load_log_store() must hand back a shared_ptr<log_store>, and HomeRaftLogStore inherits log_store.
     static Async< shared< HomeRaftLogStore > > create(ReplicaSetSuperBlk& sb, shared< RawBlkStream > blob_stream,
-                                                      OnLogFound on_log_found);
+                                                      OnLogFound on_log_found, TruncateCeilingFn truncate_ceiling_cb);
 
     // Restart load. Opens existing log_stores from ids in `sb`; throws if sb.free_blks_journal_id is set but
     // blob_stream is null (app removed the optimization across restart but persisted state still needs it).
     // `on_log_found` is registered on the main log_store and fires per entry during LogStoreManager's
     // recovery walk.  Only reads from `sb`.
     static Async< shared< HomeRaftLogStore > > load(ReplicaSetSuperBlk& sb, shared< RawBlkStream > blob_stream,
-                                                    OnLogFound on_log_found);
+                                                    OnLogFound on_log_found, TruncateCeilingFn truncate_ceiling_cb);
 
     HomeRaftLogStore(HomeRaftLogStore const&) = delete;
     HomeRaftLogStore& operator=(HomeRaftLogStore const&) = delete;
@@ -302,7 +307,8 @@ public:
     };
 
 private:
-    HomeRaftLogStore(shared< LogStore > log_store, unique< IndirectBlkHandler > indirect);
+    HomeRaftLogStore(shared< LogStore > log_store, unique< IndirectBlkHandler > indirect,
+                     TruncateCeilingFn truncate_ceiling_cb);
 
     // Cache-then-read entry fetch.  Probes entry_cache_ first (via cache_lookup); on a miss it co_awaits
     // LogStore::read and assembles the entry.  When need_value=false on a cache miss, the indirect reconstruct
@@ -326,6 +332,9 @@ private:
     // invokes indirect_->reconstruct which mutates indirect_'s internal state.  The semantic is "scratch
     // work to materialize the read result" — const at the API boundary, non-const internally.
     mutable unique< IndirectBlkHandler > indirect_; // null iff large-value optimization off
+    // Read on every compact call; result upper-bounds the truncation target.  Returning max() disables
+    // the clamp.  Never null after construction.
+    TruncateCeilingFn truncate_ceiling_cb_;
 
     // Non-owning back-pointer set by ReplicaSet::set_raft_server once raft_server is constructed; ReplicaSet
     // is responsible for nulling it before raft_server destruction so any in-flight detached completions in

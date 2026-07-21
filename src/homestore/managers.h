@@ -27,6 +27,7 @@ class BlobDevManager;
 class COWBtreeManager;
 class ResourceMgr;
 class LogStoreManager;
+class ReplicationManager;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Managers
@@ -49,6 +50,7 @@ public:
     static void init_cow_btree_mgr(shared< COWBtreeManager > mgr) { s_cow_btree_mgr_ = std::move(mgr); }
     static void init_resource_mgr(shared< ResourceMgr > mgr) { s_resource_mgr_ = std::move(mgr); }
     static void init_log_store_mgr(shared< LogStoreManager > mgr) { s_log_store_mgr_ = std::move(mgr); }
+    static void init_repl_mgr(shared< ReplicationManager > mgr) { s_repl_mgr_ = std::move(mgr); }
 
     static void reset_resource_mgr() { s_resource_mgr_.reset(); }
 
@@ -60,6 +62,7 @@ public:
         s_cow_btree_mgr_.reset();
         s_resource_mgr_.reset();
         s_log_store_mgr_.reset();
+        s_repl_mgr_.reset();
     }
 
 private:
@@ -70,6 +73,7 @@ private:
     friend COWBtreeManager& cow_btree_mgr();
     friend ResourceMgr& resource_mgr();
     friend LogStoreManager& log_store_mgr();
+    friend ReplicationManager& repl_mgr();
 
     inline static shared< MetaBlkManager > s_meta_mgr_;
     inline static shared< DeviceManager > s_device_mgr_;
@@ -78,6 +82,7 @@ private:
     inline static shared< COWBtreeManager > s_cow_btree_mgr_;
     inline static shared< ResourceMgr > s_resource_mgr_;
     inline static shared< LogStoreManager > s_log_store_mgr_;
+    inline static shared< ReplicationManager > s_repl_mgr_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -130,6 +135,16 @@ inline LogStoreManager& log_store_mgr() {
         throw std::logic_error{"log_store_mgr() called before init_log_store_mgr()"};
     }
     return *Managers::s_log_store_mgr_;
+}
+
+// Replication is optional — a null s_repl_mgr_ means the application booted without a ReplApplication, so no
+// replication service was created.  Callers that reach here on a non-replicated deployment are a bug.
+inline ReplicationManager& repl_mgr() {
+    if (!Managers::s_repl_mgr_) {
+        throw std::logic_error{"repl_mgr() called before ReplicationManager::create()/load() "
+                               "(replication disabled — no repl_app provided?)"};
+    }
+    return *Managers::s_repl_mgr_;
 }
 
 } // namespace homestore

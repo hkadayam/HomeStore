@@ -31,7 +31,7 @@
 #include "sweep_service.h"
 #include "segment_manager.h"
 #include "homestore/base/homestore_assert.h"
-#include "homestore/base/homestore_config.h"
+#include "homestore/base/hs_runtime_config.h"
 
 namespace homestore {
 namespace blkalloc {
@@ -62,22 +62,22 @@ struct SlabBlkAllocConfig : public BlkAllocConfig {
                        std::string const& name) :
             BlkAllocConfig{blk_size, align_sz, size, persistent, name},
             phys_page_size_{ppage_sz},
-            num_segments_{HS_DYNAMIC_CONFIG(blkallocator.max_segments)} {
+            num_segments_{HS_RUNTIME_CONFIG(blkallocator.max_segments)} {
         const blk_num_t total_cache_blks = static_cast< blk_num_t >(
-            HS_DYNAMIC_CONFIG(blkallocator.free_blk_cache_count_by_vdev_percent) * capacity_ / 100.0);
+            HS_RUNTIME_CONFIG(blkallocator.free_blk_cache_count_by_vdev_percent) * capacity_ / 100.0);
         const blk_num_t num_portions = std::max< blk_num_t >((capacity_ - 1) / blks_per_portion_ + 1, 1u);
-        const float refill_pct = HS_DYNAMIC_CONFIG(blkallocator.slab_refill_threshold_pct);
+        const float refill_pct = HS_RUNTIME_CONFIG(blkallocator.slab_refill_threshold_pct);
 
         // Auto-populate slab distribution from defaults if not configured. Flatbuffers does not allow
         // vector defaults in the schema, so the canonical default lives in
-        // HomeStoreDynamicConfig::default_slab_distribution() and we copy it into the settings factory
+        // HomeStoreRuntimeConfig::default_slab_distribution() and we copy it into the settings factory
         // here on first use.
-        auto const& dist = HS_DYNAMIC_CONFIG(blkallocator.slab_distribution);
+        auto const& dist = HS_RUNTIME_CONFIG(blkallocator.slab_distribution);
         if (dist.empty()) {
             HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
                 auto& slab_pct_dist = s.blkallocator.slab_distribution;
                 if (slab_pct_dist.empty()) {
-                    auto const& defaults = HomeStoreDynamicConfig::default_slab_distribution();
+                    auto const& defaults = HomeStoreRuntimeConfig::default_slab_distribution();
                     slab_pct_dist.insert(slab_pct_dist.begin(), defaults.begin(), defaults.end());
                 }
             });
@@ -85,7 +85,7 @@ struct SlabBlkAllocConfig : public BlkAllocConfig {
         }
 
         slab_idx_t idx{0};
-        for (auto const& pct : HS_DYNAMIC_CONFIG(blkallocator.slab_distribution)) {
+        for (auto const& pct : HS_RUNTIME_CONFIG(blkallocator.slab_distribution)) {
             if (idx >= SlabCache::NUM_SLABS)
                 break;
             auto& sc = slab_cfgs_[idx];

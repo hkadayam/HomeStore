@@ -24,7 +24,7 @@
 #include "common/async.h"
 
 #include "homestore/base/homestore_assert.h"
-#include "homestore/base/homestore_config.h" // HS_DYNAMIC_CONFIG
+#include "homestore/base/hs_runtime_config.h" // HS_RUNTIME_CONFIG
 #include "common/defs.h"
 #include "homestore/meta/meta_client.h"
 
@@ -38,32 +38,36 @@ namespace homestore {
 // Construction / factories
 // ─────────────────────────────────────────────────────────────────────────────
 
-LogStore::LogStore(shared< LogStream > stream, MetaBlkWrapper&& mb, logstore_id_t sid, bool is_append_mode,
-                   lsn_t head_lsn, std::vector< rollback_record > rollback_records) :
+LogStore::LogStore(shared< LogStream > stream, MetaBlkWrapper&& mb, logstore_id_t sid, LogStoreOptions const& options,
+                   lsn_t head_lsn, lsn_t checkpt_lsn, std::vector< rollback_record > rollback_records) :
         store_id_{sid},
         stream_{std::move(stream)},
         meta_blk_{std::move(mb)},
-        append_mode_{is_append_mode},
+        options_{options},
         head_lsn_{head_lsn},
         tail_lsn_{head_lsn - 1},
+        checkpt_lsn_{checkpt_lsn},
+        pending_checkpt_lsn_{checkpt_lsn},
         records_{"LogStore", head_lsn - 1},
         rollback_records_{std::move(rollback_records)} {
 }
 
 Async< shared< LogStore > > LogStore::create(logstore_id_t sid, shared< MetaClient > meta_client,
-                                             shared< LogStream > stream, bool is_append_mode) {
-    LOGINFO("Creating LogStore sid={} append_mode={} on stream_id={}", sid, is_append_mode, stream->stream_id());
+                                             shared< LogStream > stream, LogStoreOptions const& options) {
+    LOGINFO("Creating LogStore sid={} append_mode={} auto_truncate={} preserve_log_count={} on stream_id={}", sid,
+            options.append_mode, options.auto_truncate, options.preserve_log_count, stream->stream_id());
     auto mb = co_await MetaBlkWrapper::create(std::move(meta_client), fmt::format("LogStore_{}", sid),
                                               std::optional< size_t >{sizeof(LogStoreSb)});
     LogStoreSb sb{};
     sb.store_id = sid;
-    sb.append_mode = is_append_mode ? 1 : 0;
+    sb.append_mode = options.append_mode ? 1 : 0;
     sb.head_lsn = 0;
+    sb.checkpt_lsn = -1;
     sb.n_rollback_records = 0;
     co_await mb.write(to_u8ptr(&sb), sizeof(sb));
 
-    co_return std::make_shared< LogStore >(std::move(stream), std::move(mb), sid, is_append_mode,
-                                           /*head_lsn=*/0, std::vector< rollback_record >{});
+    co_return std::make_shared< LogStore >(std::move(stream), std::move(mb), sid, options,
+                                           /*head_lsn=*/0, /*checkpt_lsn=*/-1, std::vector< rollback_record >{});
 }
 
 Async< shared< LogStore > > LogStore::load(shared< LogStream > stream, MetaBlkWrapper&& mb) {
@@ -73,22 +77,34 @@ Async< shared< LogStore > > LogStore::load(shared< LogStream > stream, MetaBlkWr
     }
     const auto* sb = r_cast< const LogStoreSb* >(sb_payload.bytes());
     const logstore_id_t sid = sb->store_id;
-    const bool is_append_mode = (sb->append_mode != 0);
+
+    // Generating auto options, this will be actual user driven options once logstore is opened by the caller.
+    LogStoreOptions options{};
+    options.append_mode = (sb->append_mode != 0);
+
     const lsn_t head_lsn = sb->head_lsn;
+    const lsn_t checkpt_lsn = sb->checkpt_lsn;
     std::vector< rollback_record > records;
     records.reserve(sb->n_rollback_records);
     for (uint32_t i = 0; i < sb->n_rollback_records; ++i) {
         records.push_back(sb->rollback_records()[i]);
     }
-    LOGINFO("Loaded LogStore sid={} append_mode={} head_lsn={} rollback_records={}", sid, is_append_mode, head_lsn,
-            records.size());
-    co_return std::make_shared< LogStore >(std::move(stream), std::move(mb), sid, is_append_mode, head_lsn,
+    LOGINFO("Loaded LogStore sid={} append_mode={} head_lsn={} checkpt_lsn={} rollback_records={}", sid,
+            options.append_mode, head_lsn, checkpt_lsn, records.size());
+    co_return std::make_shared< LogStore >(std::move(stream), std::move(mb), sid, options, head_lsn, checkpt_lsn,
                                            std::move(records));
 }
 
-void LogStore::open(log_replay_cb handler) {
+void LogStore::open(LogStoreOptions const& options, log_replay_cb handler) {
+    // append_mode is durable — was pulled from SB at load() time into options_.  Caller must match; a
+    // mismatch means their reopen would silently mis-interpret every existing record.
+    HS_REL_ASSERT_EQ(options_.append_mode, options.append_mode,
+                     "LogStore::open sid={} append_mode mismatch: existing={} options={}", store_id_,
+                     options_.append_mode, options.append_mode);
+    options_ = options;
     handler_ = std::move(handler);
-    THIS_LOGSTORE_LOG(INFO, "Opened append_mode={} head_lsn={} replay_handler={}", append_mode_,
+    THIS_LOGSTORE_LOG(INFO, "Opened append_mode={} auto_truncate={} preserve_log_count={} head_lsn={} handler={}",
+                      options_.append_mode, options_.auto_truncate, options_.preserve_log_count,
                       head_lsn_.load(std::memory_order_relaxed), handler_ ? "set" : "none");
 }
 
@@ -107,7 +123,7 @@ Async< lsn_t > LogStore::append_and_flush(const LogBlob& data) {
     const lsn_t lsn = quick_append(data);
 
     // Wait for a brief time to allow coalescing multiple writes.
-    co_await folly::coro::sleep(std::chrono::microseconds{HS_DYNAMIC_CONFIG(logstore.flush_coalesce_wait_us)});
+    co_await folly::coro::sleep(std::chrono::microseconds{HS_RUNTIME_CONFIG(logstore.flush_coalesce_wait_us)});
     do {
         if (records_.status(lsn).is_active) {
             co_return lsn;
@@ -127,7 +143,7 @@ Async< lsn_t > LogStore::append_and_flush(const LogBlob& data) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void LogStore::quick_write(lsn_t lsn, const LogBlob& data) {
-    HS_REL_ASSERT(!append_mode_, "quick_write on append-mode LogStore (store_id={})", store_id_);
+    HS_REL_ASSERT(!options_.append_mode, "quick_write on append-mode LogStore (store_id={})", store_id_);
     THIS_LOGSTORE_LOG(TRACE, "quick_write lsn={} size={}", lsn, data.size());
     stream_->append(this, lsn, data);
 }
@@ -136,7 +152,7 @@ Async< void > LogStore::write_and_flush(lsn_t lsn, const LogBlob& data) {
     quick_write(lsn, data);
 
     // Wait for a brief time to allow coalescing multiple writes.
-    co_await folly::coro::sleep(std::chrono::microseconds{HS_DYNAMIC_CONFIG(logstore.flush_coalesce_wait_us)});
+    co_await folly::coro::sleep(std::chrono::microseconds{HS_RUNTIME_CONFIG(logstore.flush_coalesce_wait_us)});
     do {
         if (records_.status(lsn).is_active) {
             co_return;
@@ -148,7 +164,7 @@ Async< void > LogStore::write_and_flush(lsn_t lsn, const LogBlob& data) {
 }
 
 void LogStore::fill_gap(lsn_t lsn) {
-    HS_REL_ASSERT(!append_mode_, "fill_gap on append-mode LogStore (store_id={})", store_id_);
+    HS_REL_ASSERT(!options_.append_mode, "fill_gap on append-mode LogStore (store_id={})", store_id_);
 
     // Empty record with all-zero fields — non-append-mode caller signals "intentional hole at this lsn so
     // flushed_upto() can advance past it."  Bumps tail_lsn_ if this gap is past the current max.
@@ -186,23 +202,48 @@ Async< void > LogStore::flush() {
 Async< void > LogStore::truncate(lsn_t upto_lsn, bool in_memory_only) {
     auto lock = co_await stream_->flush_lock().co_scoped_lock();
     const lsn_t s = head_lsn_.load(std::memory_order_acquire);
-    if (upto_lsn < s) {
-        THIS_LOGSTORE_LOG(DEBUG, "truncate(upto={}) is below head_lsn={}, no-op", upto_lsn, s);
+    const lsn_t t = tail_lsn_.load(std::memory_order_acquire);
+
+    // Clamp the caller's ask.  Two internal ceilings:
+    //   - checkpt_lsn_: never truncate past what a completed CP durably captured.
+    //   - tail_lsn - preserve_log_count: leave at least this many entries at the tail for peer catch-up.
+    //     Signed subtraction — underflows below head_lsn when tail hasn't grown past preserve_log_count,
+    //     naturally becoming a no-op via the head check below.
+    lsn_t const checkpt = checkpt_lsn_.load(std::memory_order_acquire);
+    lsn_t target = std::min({upto_lsn, checkpt, t - s_cast< lsn_t >(options_.preserve_log_count)});
+    if (target < s) {
+        THIS_LOGSTORE_LOG(DEBUG, "truncate(upto={} clamped={}) below head_lsn={}, no-op", upto_lsn, target, s);
         co_return;
     }
-    lsn_t t = tail_lsn_.load(std::memory_order_acquire);
-    if (upto_lsn > t) {
-        upto_lsn = t;
+    if (target > t) {
+        target = t;
     }
-    records_.truncate(upto_lsn);
-    head_lsn_.store(upto_lsn + 1, std::memory_order_release);
-    THIS_LOGSTORE_LOG(INFO, "Truncated upto_lsn={} new head_lsn={} in_memory_only={}", upto_lsn, upto_lsn + 1,
-                      in_memory_only);
+    records_.truncate(target);
+    head_lsn_.store(target + 1, std::memory_order_release);
+    THIS_LOGSTORE_LOG(INFO, "Truncated upto_lsn={} clamped={} new head_lsn={} in_memory_only={}", upto_lsn, target,
+                      target + 1, in_memory_only);
     if (!in_memory_only) {
         co_await persist_sb();
-        // TODO: notify LogStoreManager to recompute cross-store min_trunc_stream_offset and call
-        //       stream_->truncate() if our store was holding back the global head.
     }
+}
+
+void LogStore::on_switchover_cp() {
+    // Capture the current tail_lsn as the pending checkpoint watermark.  The next successful cp_flush_persist
+    // promotes this to checkpt_lsn_ + sb->checkpt_lsn.
+    pending_checkpt_lsn_.store(tail_lsn_.load(std::memory_order_acquire), std::memory_order_release);
+}
+
+Async< void > LogStore::cp_flush_persist() {
+    // Promote the pending watermark captured at switchover, then persist the sb.  No-op if nothing changed
+    // since the last flush.
+    lsn_t const pending = pending_checkpt_lsn_.load(std::memory_order_acquire);
+    if (pending == checkpt_lsn_.load(std::memory_order_acquire)) {
+        co_return;
+    }
+    checkpt_lsn_.store(pending, std::memory_order_release);
+    auto lock = co_await stream_->flush_lock().co_scoped_lock();
+    co_await persist_sb();
+    THIS_LOGSTORE_LOG(TRACE, "cp_flush_persist: checkpt_lsn advanced to {}", pending);
 }
 
 Async< bool > LogStore::rollback(lsn_t to_lsn) {
@@ -255,7 +296,7 @@ void LogStore::on_write_completion(lsn_t lsn, const stream_key& key) {
     // must pin this lsn's trunc anchor to the tail's so a future truncate(this lsn) doesn't drop the tail's group.
     // append-mode bumps tail_lsn_ at quick_append time, so this branch only fires for non-append mode.
     uint64_t trunc_stream_offset{key.group_stream_offset};
-    if (!append_mode_) {
+    if (!options_.append_mode) {
         lsn_t cur_tail = tail_lsn_.load(std::memory_order_acquire);
         if (lsn > cur_tail) {
             // In-order completion: advance tail to this lsn.
@@ -269,14 +310,14 @@ void LogStore::on_write_completion(lsn_t lsn, const stream_key& key) {
                       key.record_stream_offset, trunc_stream_offset);
 }
 
-void LogStore::on_log_found(lsn_t lsn, const stream_key& key, const sisl::IoBufView& data) {
+Async< void > LogStore::on_log_found(lsn_t lsn, const stream_key& key, const sisl::IoBufView& data) {
     if (lsn < head_lsn_.load(std::memory_order_acquire)) {
         THIS_LOGSTORE_LOG(DEBUG, "on_log_found skip lsn={} below head_lsn", lsn);
-        return;
+        co_return;
     }
     if (in_rollback_range(lsn, key.log_id)) {
         THIS_LOGSTORE_LOG(DEBUG, "on_log_found skip lsn={} log_id={} in rollback range", lsn, key.log_id);
-        return;
+        co_return;
     }
     uint64_t trunc_stream_offset{key.group_stream_offset};
     const lsn_t cur_tail = tail_lsn_.load(std::memory_order_acquire);
@@ -289,7 +330,7 @@ void LogStore::on_log_found(lsn_t lsn, const stream_key& key, const sisl::IoBufV
     THIS_LOGSTORE_LOG(TRACE, "on_log_found lsn={} log_id={} record_off={} trunc_off={}", lsn, key.log_id,
                       key.record_stream_offset, trunc_stream_offset);
     if (handler_) {
-        handler_(lsn, data);
+        co_await handler_(lsn, data);
     }
 }
 
@@ -321,8 +362,9 @@ Async< void > LogStore::persist_sb() {
     auto buf = sisl::make_io_buf_shared(to_u32(sz));
     auto* sb = r_cast< LogStoreSb* >(buf->bytes());
     sb->store_id = store_id_;
-    sb->append_mode = append_mode_ ? 1 : 0;
+    sb->append_mode = options_.append_mode ? 1 : 0;
     sb->head_lsn = head_lsn_.load(std::memory_order_acquire);
+    sb->checkpt_lsn = checkpt_lsn_.load(std::memory_order_acquire);
     sb->n_rollback_records = n;
     std::copy(rollback_records_.begin(), rollback_records_.end(), sb->rollback_records());
     co_await meta_blk_.write(buf->cbytes(), sz);

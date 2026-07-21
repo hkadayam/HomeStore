@@ -18,7 +18,7 @@
 #include "sisl/logging/logging.h"
 
 #include "homestore/base/homestore_assert.h"
-#include "homestore/base/homestore_config.h"
+#include "homestore/base/hs_runtime_config.h"
 
 namespace homestore {
 namespace blkalloc {
@@ -202,8 +202,8 @@ void init_sweep_service() {
     std::lock_guard lk{g_service_mtx};
     if (g_service)
         return;
-    const auto num_workers = HS_DYNAMIC_CONFIG(blkallocator.num_slab_sweeper_threads);
-    const auto tick = std::chrono::milliseconds{HS_DYNAMIC_CONFIG(blkallocator.slab_refill_frequency_ms)};
+    const auto num_workers = HS_RUNTIME_CONFIG(blkallocator.num_slab_sweeper_threads);
+    const auto tick = std::chrono::milliseconds{HS_RUNTIME_CONFIG(blkallocator.slab_refill_frequency_ms)};
     g_service = std::make_unique< SweepService >(num_workers, tick);
 }
 

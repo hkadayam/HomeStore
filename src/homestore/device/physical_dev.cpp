@@ -310,7 +310,7 @@ Async< shared< Chunk > > PhysicalDev::create_chunk(uint32_t vdev_id, uint64_t si
     }
     prov.chunk_info_slots->set_bit(cslot);
 
-    const uint32_t chunk_id = to_u32(pdev_id() * HSSuperBlk::MAX_CHUNKS_IN_SYSTEM + cslot);
+    const uint32_t chunk_id = to_u32(pdev_id() * MAX_CHUNKS_IN_SYSTEM + cslot);
 
     ChunkInfo cinfo{};
     populate_chunk_info_locked(prov, cinfo, vdev_id, size, chunk_id, vdev_order, user_private_data, up_size);
@@ -359,7 +359,7 @@ Async< std::vector< shared< Chunk > > > PhysicalDev::create_chunks(uint32_t vdev
         std::vector< shared< Chunk > > batch_chunks;
         for (uint32_t i = 0; i < b.nbits; ++i, ptr += ChunkInfo::SIZE) {
             const uint64_t cslot = b.start_bit + i;
-            const uint32_t chunk_id = to_u32(pdev_id() * HSSuperBlk::MAX_CHUNKS_IN_SYSTEM + cslot);
+            const uint32_t chunk_id = to_u32(pdev_id() * MAX_CHUNKS_IN_SYSTEM + cslot);
             const uint64_t vdev_order = cur_vdev_order++;
 
             ChunkInfo cinfo{};

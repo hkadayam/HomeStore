@@ -20,7 +20,7 @@
 
 #include "homestore/checkpoint/cp_mgr.h"
 #include "homestore/base/homestore_assert.h"
-#include "homestore/base/homestore_config.h"
+#include "homestore/base/hs_runtime_config.h"
 #include "homestore/managers.h"
 // TODO: re-enable once HomeStore singleton and crash_simulator are ported to new iomanager
 // #include "homestore/homestore.h"
@@ -88,7 +88,7 @@ Async< void > CPManager::start(bool first_time_boot) {
 }
 
 void CPManager::start_timer() {
-    const auto interval = std::chrono::microseconds(HS_DYNAMIC_CONFIG(generic.cp_timer_us));
+    const auto interval = std::chrono::microseconds(HS_RUNTIME_CONFIG(generic.cp_timer_us));
     LOGINFO("cp timer is set to {} usec", interval.count());
     cp_timer_.start(ReactorTarget::any(), interval, iomanager::TimerKind::Recurring, [this]() -> Async< void > {
         trigger_cp_flush(false, CPTriggerReason::Timer);
@@ -271,6 +271,21 @@ void CPManager::cp_start_flush(CP* cp) {
     spawn_detached(ReactorTarget::any(), [this, cp]() -> Async< void > {
         // Flush all consumers one at a time; sequential ordering is intentional.
         // Snapshot callbacks under shared lock, then release before co_await.
+        //
+        // TODO(cp-ordering): the current flush order is whatever std::unordered_map iteration returns —
+        // NON-DETERMINISTIC.  This is a correctness bug for consumers whose durability watermark depends on
+        // OTHER consumers having flushed first.  Concrete case: ReplCPHandler persists checkpoint_lsn in its
+        // cp_flush, meaning "the consumer's on_commit results for LSNs <= checkpoint_lsn are durably applied
+        // through this CP".  But the consumer's on_commit writes into IndexCP / BlkAlloc / VDev — so
+        // Replication MUST flush LAST, only after every subsystem the consumer wrote into has already
+        // flushed.  Otherwise a crash between "repl SB persists checkpoint_lsn" and "index flush finishes"
+        // leaves us claiming a durability watermark the underlying data has not actually reached, and
+        // restart's on_log_found will skip re-dispatching commits whose consumer state was lost.
+        //
+        // Fix: let consumers declare an ordering priority at register_consumer() time (e.g. an enum:
+        // Index → BlkAlloc → VDev → ... → Replication), sort cbs by it before the flush loop, and add a
+        // dbg-assert that Replication comes last.  Same ordering probably wanted for on_switchover_cp for
+        // symmetry (checkpoint_lsn should be captured BEFORE anything downstream might race a new write).
         std::vector< shared< CPCallbacks > > cbs;
         {
             std::shared_lock lk(consumers_mtx_);
@@ -401,7 +416,7 @@ CP* CPGuard::get() {
 ////////////////////////////////////////////////////////////////////////////
 
 CPWatchdog::CPWatchdog(CPManager* cp_mgr) :
-        cp_{nullptr}, cp_mgr_{cp_mgr}, timer_sec_{HS_DYNAMIC_CONFIG(generic.cp_watchdog_timer_sec)} {
+        cp_{nullptr}, cp_mgr_{cp_mgr}, timer_sec_{HS_RUNTIME_CONFIG(generic.cp_watchdog_timer_sec)} {
     LOGINFO("CP watchdog timer setting to : {} seconds", timer_sec_);
     wd_eb_ = iomgr().reactor_for(0);
     attachEventBase(wd_eb_);

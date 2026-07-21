@@ -101,11 +101,11 @@ Async< void > DeviceManager::format_devices() {
         hdr.version = FirstBlockHeader::CURRENT_SUPERBLOCK_VERSION;
         std::strncpy(hdr.product_name, FirstBlockHeader::PRODUCT_NAME, FirstBlockHeader::s_product_name_size);
         hdr.num_pdevs = to_u32(dev_infos_.size());
-        hdr.max_vdevs = HSSuperBlk::MAX_VDEVS_IN_SYSTEM;
-        hdr.max_system_chunks = HSSuperBlk::MAX_CHUNKS_IN_SYSTEM;
+        hdr.max_vdevs = MAX_VDEVS_IN_SYSTEM;
+        hdr.max_system_chunks = MAX_CHUNKS_IN_SYSTEM;
         hdr.system_uuid = boost::uuids::random_generator{}();
 
-        state_.vdev_slot_bm = std::make_unique< sisl::Bitset >(HSSuperBlk::MAX_VDEVS_IN_SYSTEM);
+        state_.vdev_slot_bm = std::make_unique< sisl::Bitset >(MAX_VDEVS_IN_SYSTEM);
         state_.first_time_boot = true;
     }
 
@@ -212,7 +212,7 @@ Async< shared< VirtualDev > > DeviceManager::create_vdev(VDevParameters&& params
 
     const auto vdev_id_opt = allocate_vdev_id();
     if (!vdev_id_opt) {
-        throw std::runtime_error(fmt::format("No VDev slots available (max: {})", HSSuperBlk::MAX_VDEVS_IN_SYSTEM));
+        throw std::runtime_error(fmt::format("No VDev slots available (max: {})", MAX_VDEVS_IN_SYSTEM));
     }
     const uint32_t vdev_id = *vdev_id_opt;
 
@@ -559,7 +559,7 @@ Async< VDevInfo > DeviceManager::read_vdev_info(cshared< PhysicalDev >& pdev, ui
 // static
 std::vector< std::pair< uint32_t, uint32_t > > DeviceManager::find_consecutive_ranges(const sisl::Bitset& bm) {
     std::vector< std::pair< uint32_t, uint32_t > > ranges;
-    const uint64_t max_slots = std::min(bm.size(), to_u64(HSSuperBlk::MAX_VDEVS_IN_SYSTEM));
+    const uint64_t max_slots = std::min(bm.size(), to_u64(MAX_VDEVS_IN_SYSTEM));
     uint64_t cur = 0;
 
     while (true) {

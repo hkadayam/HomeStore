@@ -48,10 +48,22 @@ struct rollback_record {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Per-store options.  Passed to LogStoreManager::create_log_store at creation and re-supplied by every
+// open_log_store call on restart.  NOT persisted in the SB — the manager / caller owns durability for
+// options that need to survive restart.
+// ─────────────────────────────────────────────────────────────────────────────
+struct LogStoreOptions {
+    bool append_mode{true};         // append-mode restrictions (only quick_append/append_and_flush allowed)
+    bool auto_truncate{false};      // opt into LogStoreManager's periodic auto-compact iteration
+    uint32_t preserve_log_count{0}; // truncate leaves at least this many entries past the compact point
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Persisted per-store sb (single MetaBlk per LogStore: "<dev>_logstore_sb_<store_id>")
 //
-// Layout: { store_id, append_mode, head_lsn, n_rollback_records, rollback_records[n_rollback_records] }.  The
-// trailing array is variable-size — same trick as AppendByteStreamSb's chunk_ids[].
+// Layout: { store_id, append_mode, head_lsn, checkpt_lsn, n_rollback_records,
+//           rollback_records[n_rollback_records] }.  The trailing array is variable-size — same trick as
+// AppendByteStreamSb's chunk_ids[].
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma pack(1)
 struct LogStoreSb {
@@ -59,6 +71,7 @@ struct LogStoreSb {
     uint8_t append_mode{0};
     uint8_t _reserved[3]{};
     lsn_t head_lsn{0};
+    lsn_t checkpt_lsn{-1}; // Tail lsn captured at CP switchover; -1 = never checkpointed
     uint32_t n_rollback_records{0};
     // followed by rollback_record rollback_records[n_rollback_records]
 
@@ -67,7 +80,7 @@ struct LogStoreSb {
     static size_t size_for(uint32_t n) { return sizeof(LogStoreSb) + n * sizeof(rollback_record); }
 };
 #pragma pack()
-static_assert(sizeof(LogStoreSb) == 20, "LogStoreSb header must be 20 bytes on disk");
+static_assert(sizeof(LogStoreSb) == 28, "LogStoreSb header must be 28 bytes on disk");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // In-memory: LogStoreRecord (StreamTracker entry, indexed by lsn)
@@ -96,7 +109,7 @@ static_assert(std::is_trivially_copyable_v< LogStoreRecord >, "StreamTracker req
 // ─────────────────────────────────────────────────────────────────────────────
 // Replay handler invoked by LogStore::on_log_found for each recovered record once the store is opened.
 // ─────────────────────────────────────────────────────────────────────────────
-using log_replay_cb = std::function< void(lsn_t lsn, const sisl::IoBufView& data) >;
+using log_replay_cb = std::function< Async< void >(lsn_t lsn, const sisl::IoBufView& data) >;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LogStore
@@ -130,7 +143,7 @@ public:
     // ── Factories (called by LogStoreManager) ────────────────────────────────
 
     static Async< shared< LogStore > > create(logstore_id_t sid, shared< MetaClient > meta_client,
-                                              shared< LogStream > stream, bool append_mode);
+                                              shared< LogStream > stream, LogStoreOptions const& options);
 
     static Async< shared< LogStore > > load(shared< LogStream > stream, MetaBlkWrapper&& mb);
 
@@ -138,11 +151,13 @@ public:
 
     /// Attach a replay handler.  Must be called before LogStoreManager::recover() if the client wants per-record
     /// replay callbacks.  Transitions store to opened state.
-    void open(log_replay_cb handler);
+    void open(LogStoreOptions const& options, log_replay_cb handler);
+
+    LogStoreOptions const& options() const { return options_; }
 
     bool is_open() const { return s_cast< bool >(handler_); }
 
-    bool is_append_mode() const { return append_mode_; }
+    bool is_append_mode() const { return options_.append_mode; }
 
     // ── Append-mode API (also valid in non-append mode) ──────────────────────
 
@@ -194,7 +209,7 @@ public:
     /// Same trunc_key derivation as on_write_completion.  Inserts the record with both keys (recovery path
     /// doesn't reserve via create() at append time), advances tail_lsn_ and next_lsn_, fires the replay handler.
     /// Skips records below head_lsn_ or inside any persisted rollback range.
-    void on_log_found(lsn_t lsn, const stream_key& key, const sisl::IoBufView& data) override;
+    Async< void > on_log_found(lsn_t lsn, const stream_key& key, const sisl::IoBufView& data) override;
 
     // ── Accessors ────────────────────────────────────────────────────────────
 
@@ -215,8 +230,19 @@ public:
     /// MetaClient::remove_meta_blk.  Not for general use.
     const MetaBlk& sb_blk() const { return meta_blk_.meta_blk(); }
 
-    LogStore(shared< LogStream > stream, MetaBlkWrapper&& mb, logstore_id_t sid, bool is_append_mode, lsn_t head_lsn,
-             std::vector< rollback_record > rollback_records);
+    /// True if this store opted into LogStoreManager's periodic auto-compact iteration.
+    bool auto_truncate_enabled() const { return options_.auto_truncate; }
+
+    /// CP switchover: capture the current tail_lsn as the pending checkpoint watermark.  Called from
+    /// LogStoreManager's CP handler for every managed store.  Cheap atomic load/store, no I/O.
+    void on_switchover_cp();
+
+    /// CP flush: persist the captured pending checkpoint watermark into sb->checkpt_lsn and advance the
+    /// checkpt_lsn_ atomic.  Called from LogStoreManager's CP handler after all consumers flush.
+    Async< void > cp_flush_persist();
+
+    LogStore(shared< LogStream > stream, MetaBlkWrapper&& mb, logstore_id_t sid, LogStoreOptions const& options,
+             lsn_t head_lsn, lsn_t checkpt_lsn, std::vector< rollback_record > rollback_records);
 
 private:
     /// True if (lsn, log_id) was invalidated by any persisted rollback — i.e. lsn lies above some rollback's
@@ -230,10 +256,12 @@ private:
     logstore_id_t store_id_{0};
     shared< LogStream > stream_;
     MetaBlkWrapper meta_blk_;
-    bool append_mode_{false};
+    LogStoreOptions options_;
 
     std::atomic< lsn_t > head_lsn_{0};
-    std::atomic< lsn_t > tail_lsn_{-1}; // -1 == empty
+    std::atomic< lsn_t > tail_lsn_{-1};            // -1 == empty
+    std::atomic< lsn_t > checkpt_lsn_{-1};         // Highest LSN flushed on CP. Truncate clamps its target to this.
+    std::atomic< lsn_t > pending_checkpt_lsn_{-1}; // Same but transient during running switchover cp callback
     mutable std::atomic< lsn_t > prev_contiguous_lsn_hint_{-1};
 
     log_replay_cb handler_{};

@@ -28,8 +28,7 @@
 #include <libnuraft/callback.hxx>
 
 #include "homestore/blk.h"
-#include "homestore/blkdata_service.hpp"
-#include "homestore/logstore/log_store.hpp"
+#include "homestore/logstore/log_stream.h" // logstore_id_t
 #include "homestore/replication/repl_decls.h"
 #include "homestore/meta/meta_blk.h"
 
@@ -46,7 +45,6 @@ class log_store;
 class raft_server;
 class snapshot;
 class srv_state;
-struct snapshot_obj;
 } // namespace nuraft
 
 namespace homestore {
@@ -66,6 +64,7 @@ VENUM(JournalType, uint8_t,
       HS_CTRL_DESTROY = 2,          // Control message to destroy the replica set.
       HS_CTRL_START_REPLACE = 3,    // Control message to start replacing a member.
       HS_CTRL_COMPLETE_REPLACE = 4, // Control message to complete replacing a member.
+      HS_CTRL_TRUNCATE = 5,         // Advance app-authorized compact ceiling. user_header carries int64_t lsn.
 )
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -107,23 +106,83 @@ ENUM(ReplicaSetStage, uint8_t, INIT, ACTIVE, DESTROYING, DESTROYED, PERMANENT_DE
 // voting-participant assumptions when learner).
 ENUM(ReplicaRole, uint8_t, LEADER, FOLLOWER, LEARNER);
 
-// Generic snapshot-context handle that hides the underlying nuraft::snapshot from the application. Serialize/
-// deserialize lets the application persist and reload a checkpoint's worth of snapshot state.
-class SnapshotContext {
+// Per-group config chosen by whoever brings the group up: user-initiated create passes it as an arg to
+// create_replica_set; peer-initiated on-demand AND restart/reload query listener->replica_set_options()
+// right after listener construction.  Not persisted in the ReplicaSet SB — the listener (i.e., the app) is
+// the single source of truth, responsible for its own persistence if it wants durability across restarts.
+struct ReplicaSetOptions {
+    uint32_t snapshot_distance{0};          // commits between Replication auto-snapshots (0 = manual only)
+    uint32_t preserve_log_count{100000};    // log-entries floor past compact, threaded to LogStoreConfig
+    bool allow_user_driven_truncate{false}; // when true, ReplicaSet::advance_truncate_upto is honored
+};
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// ReplSnapshot / ReplSnapshot::Builder
+//
+// Durable, readable snapshot handle applications derive from to attach their own state (path to persisted
+// snapshot, DB pointer, file handle, whatever).  Every snapshot is uniquely keyed by `lsn` — the raft LSN at
+// which state was captured.  read_next_chunk is always callable and streams the snapshot's contents in
+// chunks; app defines the `obj_id` scheme (byte offset, chunk index, whatever).
+//
+// Builder is a SEPARATE class (not derived from ReplSnapshot).  It's the transient write-accumulator on the
+// follower during baseline resync: build_snapshot returns one, ReplicaSet feeds chunks through
+// write_next_chunk, and after the last chunk it calls finalize() to get the resulting shared<ReplSnapshot>
+// that then flows into apply_snapshot and becomes what last_snapshot() returns afterwards.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+class ReplSnapshot {
 public:
-    SnapshotContext(int64_t lsn) : lsn_(lsn) {}
-    explicit SnapshotContext(nuraft::snapshot& snp);
-    explicit SnapshotContext(sisl::IoBufOwn const& snp_ctx);
-    virtual ~SnapshotContext() = default;
+    class Builder;
 
-    sisl::IoBufOwn serialize();
-    void deserialize(sisl::IoBufOwn const& snp_ctx);
-    nuraft::ptr< nuraft::snapshot > nuraft_snapshot() { return snapshot_; }
-    int64_t get_lsn() const { return lsn_; }
+    explicit ReplSnapshot(lsn_t lsn) : lsn_(lsn) {}
+    virtual ~ReplSnapshot() = default;
 
-private:
-    nuraft::ptr< nuraft::snapshot > snapshot_;
-    int64_t lsn_;
+    /// Read one chunk of the snapshot at cursor `obj_id`.  App returns the bytes as an IoBufView (owning
+    /// a refcount to its backing storage) and sets is_last when done.  Returning an error aborts the
+    /// sync — nuraft discards the transfer and retries from cursor 0 later.
+    virtual AsyncReplResult< sisl::IoBufView > read_chunk(uint64_t& obj_id, bool& is_last) = 0;
+
+    /// Raft LSN this snapshot is anchored at.  Unique per snapshot in the group's history.
+    lsn_t lsn() const { return lsn_; }
+
+protected:
+    friend class ReplicaSet;
+    lsn_t lsn_;
+    /// Wrapped nuraft::snapshot — ReplicaSet fills this in after the listener returns the object.  App
+    /// never touches it directly.
+    RaftSnapshotPtr nuraft_snapshot_;
+};
+
+/// Transient write-side accumulator.  Contains — not is — a ReplSnapshot; finalize() produces the readable
+/// snapshot.  ReplicaSet holds the Builder for the duration of the transfer, releases it after finalize
+/// returns.  App derives to attach whatever build-side state it needs (target file, byte counter, running
+/// hash, etc.).
+class ReplSnapshot::Builder {
+public:
+    explicit Builder(lsn_t lsn) : lsn_(lsn) {}
+    virtual ~Builder() = default;
+
+    /// Accept one chunk at cursor `obj_id`.  App updates obj_id to whatever cursor value it wants the
+    /// leader's next read to see.  No is_first / is_last plumbing — a Builder is freshly constructed via
+    /// build_snapshot at the start of every transfer (so state is always empty on the first call), and
+    /// finalize() signals the end.
+    virtual Async< void > write_chunk(uint64_t& obj_id, sisl::IoBufView const& data) = 0;
+
+    /// Called by ReplicaSet when the in-progress transfer is aborted (nuraft resets and restarts from
+    /// obj_id=0, or the sync times out).  App must undo any partial state it accumulated via write_chunk
+    /// calls — writes to live data need rollback, temp files need cleanup, external systems need revert.
+    /// After abort() returns, the Builder is dropped.  Guaranteed NOT to be called after finalize().
+    virtual void abort() = 0;
+
+    /// Called by ReplicaSet after the last chunk lands.  App constructs and returns its derived
+    /// ReplSnapshot representing the accumulated data.  The Builder is dropped by ReplicaSet after this
+    /// returns; the returned snapshot flows into apply_snapshot and thereafter is what last_snapshot()
+    /// should return.
+    virtual shared< ReplSnapshot > finalize() = 0;
+
+    lsn_t lsn() const { return lsn_; }
+
+protected:
+    lsn_t lsn_;
 };
 
 // UUID string (36 chars) + null terminator + slack.  Task ids are generated at replace_member() start and
@@ -180,13 +239,6 @@ struct ReplicaSetSuperBlk {
     // written means no fresh watermark, so we need this field for the "nothing happened for hours then we
     // crashed" recovery case).
     raft_lsn_t commit_lsn{0};
-
-    // Highest LSN whose on_commit result the consumer has durably flushed as part of a completed CP.  Captured
-    // at cp switchover (see ReplicaSet::on_switchover_cp) and written here by the OLD CP's cp_flush.  On
-    // restart, on_log_found skips re-dispatching commits for lsn <= checkpoint_lsn (consumer already applied
-    // durably) and re-drives dispatch_commit for (checkpoint_lsn, commit_lsn].  Invariant:
-    // checkpoint_lsn <= commit_lsn — the log is always at least as durable as consumer state.
-    raft_lsn_t checkpoint_lsn{0};
 
     // Per-group log_store ids set by HomeRaftLogStore::create. raft_log_store_id is always valid.
     // free_blks_journal_id is set only when the listener provided a non-null blob_stream() at
@@ -267,27 +319,46 @@ public:
     /// still use the start/complete_replace_member pair as well).  `added` and `removed` are disjoint UUID
     /// sets against the previously-committed membership.  ReplicaSet tracks the running committed member set
     /// internally so consumers don't have to.
-    virtual void on_membership_change(std::set< ReplicaId > const& added,
-                                      std::set< ReplicaId > const& removed) = 0;
+    virtual void on_membership_change(std::set< ReplicaId > const& added, std::set< ReplicaId > const& removed) = 0;
 
-    /// Called when nuraft requests a snapshot. The listener creates an application snapshot and returns it via
-    /// the snapshot_context.
-    virtual AsyncReplResult<> create_snapshot(shared< SnapshotContext > context) = 0;
+    /// Leader: capture live state at `lsn` durably.  App must persist consumer state (typically by
+    /// triggering a CP flush themselves) before returning success — the snapshot at lsn is only sound if
+    /// consumer's own durability watermark has caught up.  The returned handle is thereafter readable via
+    /// read_chunk for follower baseline resync.
+    virtual AsyncReplResult< shared< ReplSnapshot > > take_snapshot(lsn_t lsn) = 0;
 
-    /// Called when nuraft completed a baseline resync and is applying the snapshot.
-    virtual bool apply_snapshot(shared< SnapshotContext > context) = 0;
+    /// Follower: allocate an empty Builder to accumulate chunks at `lsn`.  ReplicaSet feeds write_chunk
+    /// calls into it, then either finalize()s (on complete transfer) or abort()s (on nuraft-triggered
+    /// restart of the transfer).
+    virtual AsyncReplResult< shared< ReplSnapshot::Builder > > build_snapshot(lsn_t lsn) = 0;
 
-    /// Return the last application snapshot saved.
-    virtual shared< SnapshotContext > last_snapshot() = 0;
+    /// Follower: mainline the finalized snapshot into live state.  App applies the snapshot to whatever
+    /// data structures it manages.  Durability: ReplicaSet advances SB watermarks + forces a CP flush after
+    /// this returns true, which persists anything under CP management (Index, BlkAllocator, VDev, MetaBlk).
+    /// If the app persists state OUTSIDE CP management (raw journals, external systems), the app must
+    /// ensure its own durability before returning true — a crash between this return and the CP flush
+    /// completing would lose that outside-CP state.  From this point on `snap` is what last_snapshot()
+    /// should return.
+    virtual bool apply_snapshot(shared< ReplSnapshot > snap) = 0;
 
-    /// On the leader side during baseline resync, the leader uses this to fetch resync objects from the application.
-    virtual int read_snapshot_obj(shared< SnapshotContext > context, shared< nuraft::snapshot_obj > snp_obj) = 0;
+    /// Return the current durable snapshot, or null if none exists.  Queried by nuraft at the start of
+    /// every follower's baseline resync so the read cursor has something to open on.
+    virtual shared< ReplSnapshot > last_snapshot() = 0;
 
-    /// On the follower side during baseline resync, the leader's resync objects are handed back to the application.
-    virtual void write_snapshot_obj(shared< SnapshotContext > context, shared< nuraft::snapshot_obj > snp_obj) = 0;
+    /// Repl signals: done with this snapshot from its side.  Fires when the transfer session ends (both
+    /// success and failure paths on the leader, via free_user_snp_ctx) and after every apply_snapshot on
+    /// the follower (whether the app accepted or rejected the snapshot).  App decides whether to drop its
+    /// own refs or keep the object alive for other uses (DB time-travel, backup, etc.).
+    virtual void release_snapshot(shared< ReplSnapshot > snap) = 0;
 
-    /// Free up the user-defined context inside snapshot_obj allocated during read_snapshot_obj.
-    virtual void free_user_snp_ctx(void*& user_snp_ctx) = 0;
+    /// Per-group options.  Queried by ReplicaSet immediately after listener construction on both the
+    /// peer-initiated on-demand path and the restart/reload path — the returned options drive raft_params
+    /// (snapshot_distance), LogStore (preserve_log_count), and truncate gating (allow_user_driven_truncate).
+    /// Not consulted on the user-initiated create path (options passed as an arg to create_replica_set).
+    /// Must be answerable as soon as the listener exists — no I/O or deferred init.  Same group_id across
+    /// replicas must yield the same options; divergent options across replicas break replicated compact.
+    /// App is responsible for its own persistence of options if it wants them stable across restarts.
+    virtual ReplicaSetOptions replica_set_options() = 0;
 
     /// Per-group RawBlkStream for the large-value optimization. Return nullptr to disable — HomeRaftLogStore
     /// will write all entries inline regardless of size, and no free_blks log_store gets created. App is
@@ -315,7 +386,7 @@ class ReplicaSet : public nuraft::state_machine,
                    public nuraft::state_mgr,
                    public std::enable_shared_from_this< ReplicaSet > {
 public:
-    ReplicaSet(ReplicationManager& mgr, MetaBlkWrapper sb_mblk);
+    ReplicaSet(ReplicationManager& mgr, MetaBlkWrapper sb_mblk, ReplicaSetOptions const& options);
     ~ReplicaSet() override;
 
     ReplicaSet(ReplicaSet const&) = delete;
@@ -381,6 +452,13 @@ public:
     /// NOT_LEADER means we are not the leader and the engine could not broadcast either.
     Async< ReplResult<> > set_priority(ReplicaId const& member, int32_t priority, TraceId tid = 0);
 
+    /// Monotonically advance the app-authorized compact ceiling to `lsn`.  Writes a HS_CTRL_TRUNCATE journal
+    /// entry that replicates across the group; on commit each replica updates its `app_truncate_upto_`
+    /// atomic + SB, and subsequent HomeRaftLogStore::compact calls clamp their target to it.  Returns
+    /// BAD_REQUEST if `options_.allow_user_driven_truncate` is false or if `lsn` is not strictly greater
+    /// than the current watermark.  Does not itself trigger compaction — only advances the ceiling.
+    Async< ReplResult< int64_t > > advance_truncate_upto(lsn_t lsn, TraceId tid = 0);
+
     /// Am I the leader of this replication group right now?  Best-effort snapshot — leadership can change
     /// between this call and the next line of consumer code.  Consumers that need to react to a transition
     /// should hook on_change_in_role on the listener instead.
@@ -428,15 +506,18 @@ public:
 
     /////////////////////////////////////// ReplicationManager Interaction ///////////////////////////////////////
 
-    /// Bring the ReplicaSet up.  Called from every entry into this group's life on this node:
-    ///   - consumer-initiated first-time create (manager's create_replica_set happy path)
-    ///   - peer-initiated on-demand create (a replication message arrived for a group we didn't know about)
-    ///   - restart replay (manager walks persisted SBs and reconstructs each ReplicaSet)
-    /// Distinguishes create-vs-load internally from the SB itself; no separate flag is needed.  Sets up the
-    /// log store, hands the consensus engine the state_mgr / state_machine views on `this`, wires the
-    /// role-change callback, and co_awaits the engine's start so callers see a fully-initialized replication
-    /// group on return.
-    Async< bool > start(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raft_cfg_json);
+    /// Phase 1 — reconstruct this ReplicaSet without starting its consensus engine.  Reads the SB, seeds the
+    /// commit/checkpoint watermarks, takes the raft config, and opens the log store with the replay handler
+    /// attached (distinguishes create-vs-load internally from the SB itself; no separate flag).  Does NOT build
+    /// the raft_server — call start_engine() for that.  Used by the manager's restart reconstruction and
+    /// (immediately followed by start_engine()) by the runtime create paths.
+    Async< bool > load(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raft_cfg_json);
+
+    /// Phase 2 — build and start the nuraft consensus engine.  On recovery it must run only after
+    /// LogStoreManager::replay() has restored the log tail / commit index; on a fresh create it runs right after
+    /// load() (nothing to replay).  Hands the engine the state_mgr / state_machine views on `this`, wires the
+    /// role-change callback, and co_awaits start_server.
+    Async< bool > start_engine();
 
     /// Consumer-initiated wind-down — the "start" of a two-phase destroy.  Only the leader can call this
     /// successfully; proposes an HS_CTRL_DESTROY log entry through consensus and resolves once it commits
@@ -460,16 +541,6 @@ public:
     /// and then crashes; without it recovery would rewind to whatever the last write's embedded stamp was.
     Async< void > persist_commit_lsn();
 
-    /// CP switchover hook — the manager's ReplCPHandler fans out to every ReplicaSet as the OLD CP hands off
-    /// to the NEW CP.  Captures the current commit_upto_lsn_ into checkpoint_lsn_; this is the LSN the consumer
-    /// will have durably applied once the OLD CP's flush completes.  Sync — cheap atomic load/store, no I/O.
-    void on_switchover_cp();
-
-    /// CP flush hook — the manager's ReplCPHandler fans out to every ReplicaSet as the OLD CP flushes.  Writes
-    /// checkpoint_lsn_ (captured at switchover) into sb()->checkpoint_lsn and opportunistically bumps
-    /// sb()->commit_lsn to the same value (CP flush is durable, so this SB catch can advance too).
-    Async< void > cp_flush();
-
     // ── ReplicationManager accessor methods ───────────────────────────────────────────────────────────────────
 
     void attach_listener(shared< ReplicaSetListener > listener);
@@ -491,13 +562,13 @@ protected:
     Async< void > commit_config(ulong log_idx, nuraft::ptr< nuraft::cluster_config >& new_conf) override;
     Async< void > rollback_config(ulong log_idx, nuraft::ptr< nuraft::cluster_config >& conf) override;
     ulong last_commit_index() override;
-    void create_snapshot(nuraft::snapshot& s, nuraft::async_result< bool >::handler_type& when_done) override;
-    Async< bool > apply_snapshot(nuraft::snapshot& s) override;
-    nuraft::ptr< nuraft::snapshot > last_snapshot() override;
-    Async< void > save_logical_snp_obj(nuraft::snapshot& s, ulong& obj_id, nuraft::buffer& data, bool is_first_obj,
-                                       bool is_last_obj) override;
-    Async< int > read_logical_snp_obj(nuraft::snapshot& s, void*& user_snp_ctx, ulong obj_id, RaftBufferPtr& data_out,
-                                      bool& is_last_obj) override;
+    void create_snapshot(RaftSnapshotPtr const& s, nuraft::async_result< bool >::handler_type& when_done) override;
+    Async< bool > apply_snapshot(RaftSnapshotPtr const& s) override;
+    RaftSnapshotPtr last_snapshot() override;
+    Async< void > save_logical_snp_obj(RaftSnapshotPtr const& s, ulong& obj_id, RaftBufferPtr const& data,
+                                       bool is_first_obj, bool is_last_obj) override;
+    Async< int > read_logical_snp_obj(RaftSnapshotPtr const& s, void*& user_snp_ctx, ulong obj_id,
+                                      RaftBufferPtr& data_out, bool& is_last_obj) override;
     void free_user_snp_ctx(void*& user_snp_ctx) override;
 
     // ── nuraft::state_mgr overrides ─────────────────────────────────────────────────────────────────────────
@@ -581,11 +652,6 @@ private:
     /// (e.g. destroying state).
     bool should_skip_commit(raft_lsn_t lsn) const { return lsn <= sb()->last_snapshot_lsn; }
 
-    // ── Snapshot (WIP) ────────────────────────────────────────────────────────────────────────────────────────
-    // Held here until the snapshot work resumes — internal helper, never exposed to consumers.
-
-    shared< SnapshotContext > deserialize_snapshot_context(sisl::IoBufOwn& snp_ctx);
-
 private:
     /////////////////////////////////////// Members ///////////////////////////////////////////////////////////
 
@@ -595,6 +661,10 @@ private:
     int32_t raft_server_id_;
     std::string rset_name_;
     std::string identify_str_;
+    // Per-group options.  Set once at ctor time from whichever creation path is active
+    // (user-initiated create passes arg; on-demand / restart query listener->replica_set_options()).
+    // Not persisted in SB — listener is the source of truth across restarts.
+    ReplicaSetOptions options_;
 
     shared< ReplicaSetListener > listener_;
     shared< HomeRaftLogStore > log_store_;
@@ -633,10 +703,11 @@ private:
     std::atomic< raft_lsn_t > commit_upto_lsn_{0};
     raft_lsn_t last_flushed_commit_lsn_{0};
 
-    // Captured by on_switchover_cp from commit_upto_lsn_.  cp_flush writes this into sb()->checkpoint_lsn.
-    // Seeded from sb()->checkpoint_lsn in start() so the very first CP after restart has a sane baseline
-    // even before any switchover fires.
-    std::atomic< raft_lsn_t > checkpoint_lsn_{0};
+    // App-authorized compact ceiling.  Advanced monotonically by dispatch_commit's HS_CTRL_TRUNCATE branch
+    // on every replica; HomeRaftLogStore::compact clamps its target to this value.  Not persisted — on
+    // start() seeded to log_store_->start_index() (the log's first_lsn), which is a safe lower bound
+    // implied by whatever compact has already occurred pre-restart.
+    std::atomic< raft_lsn_t > app_truncate_upto_{0};
 
     // Traffic gate for a freshly elected leader.  raft_event stamps this to raft_server_->get_last_log_idx()
     // on the BecomeLeader transition (i.e. the tail LSN at the moment of promotion — may include entries from
@@ -652,6 +723,12 @@ private:
     // parts of setup live there, not in the ctor.  unique<> so the member can start nullptr in the ctor and
     // move to a real instance in open() without any placeholder registration/deregistration with MetricsFarm.
     unique< ReplicaSetMetrics > metrics_;
+
+    // Snapshot receive-side state.  save_logical_snp_obj allocates the Builder on is_first and feeds
+    // write_next_chunk on every call; state_machine::apply_snapshot(s) later finalizes it and hands the
+    // result to listener->apply_snapshot.  A single follower can only be receiving one snapshot at a time,
+    // so a scalar member suffices.  Accessed only on the raft state-machine driver — no lock.
+    shared< ReplSnapshot::Builder > incoming_snapshot_builder_;
 };
 
 } // namespace homestore

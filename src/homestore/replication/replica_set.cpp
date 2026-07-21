@@ -46,7 +46,7 @@
 #include "sisl/logging/logging.h"
 
 #include "common/homestore_assert.h"
-#include "common/homestore_config.h"
+#include "common/hs_runtime_config.h"
 #include "homestore/homestore.h"
 #include "homestore/replication/repl_manager.h"
 #include "replication/transport/folly_rpc_client_factory.h"
@@ -196,13 +196,14 @@ nuraft::ptr< nuraft::buffer > ReplicaSet::build_log_entry(JournalType type, sisl
 // Construction / destruction
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-ReplicaSet::ReplicaSet(ReplicationManager& mgr, MetaBlkWrapper sb_mblk) :
+ReplicaSet::ReplicaSet(ReplicationManager& mgr, MetaBlkWrapper sb_mblk, ReplicaSetOptions const& options) :
         // Minimal ctor — SB-independent members only.  start() reads sb_mblk_ and populates the rest
         // (sb_buffer_, group_id_, rset_name_, identify_str_, metrics_, commit_upto_lsn_).
         mgr_{mgr},
         my_uuid_{mgr.get_my_repl_id()},
         raft_server_id_{to_server_id(my_uuid_)},
-        sb_mblk_{std::move(sb_mblk)} {
+        sb_mblk_{std::move(sb_mblk)},
+        options_{options} {
     // Single 4-byte sentinel handed back on every pre-commit/commit — nuraft treats the buffer as opaque here.
     success_ptr_ = nuraft::buffer::alloc(sizeof(int));
     success_ptr_->put(0);
@@ -338,6 +339,36 @@ Async< ReplResult<> > ReplicaSet::replace_member(ReplicaMemberInfo const& member
     RS_LOG(INFO, tid, "replace_member: out={} in={} task_id={}", boost::uuids::to_string(member_out.id),
            boost::uuids::to_string(member_in.id), task_id);
     co_return co_await do_replace_member(member_out, member_in, task_id, ReplaceStage::kProposeStart, tid);
+}
+
+Async< ReplResult< int64_t > > ReplicaSet::advance_truncate_upto(lsn_t lsn, TraceId tid) {
+    if (!options_.allow_user_driven_truncate) {
+        RS_LOG(WARN, tid, "advance_truncate_upto rejected — option disabled for this group");
+        co_return folly::makeUnexpected(ReplError::BAD_REQUEST);
+    }
+    if (!raft_server_ || !raft_server_->is_leader()) {
+        RS_LOG(WARN, tid, "advance_truncate_upto rejected — not leader");
+        co_return folly::makeUnexpected(ReplError::NOT_LEADER);
+    }
+    if (lsn <= app_truncate_upto_.load(std::memory_order_acquire)) {
+        RS_LOG(WARN, tid, "advance_truncate_upto rejected — lsn={} <= current watermark={}", lsn,
+               app_truncate_upto_.load(std::memory_order_acquire));
+        co_return folly::makeUnexpected(ReplError::BAD_REQUEST);
+    }
+
+    // Payload = raw int64_t bytes.  dispatch_commit's HS_CTRL_TRUNCATE case reads it out on every replica
+    // and advances app_truncate_upto_ + SB.
+    int64_t const target = lsn;
+    sisl::Blob const payload{to_cu8ptr(&target), to_u32(sizeof(target))};
+    std::vector< nuraft::ptr< nuraft::buffer > > logs;
+    logs.push_back(build_log_entry(JournalType::HS_CTRL_TRUNCATE, payload, /*value_size=*/0));
+    auto const result = co_await raft_server_->append_entries(logs);
+    if (!result.accepted || !result.committed) {
+        RS_LOG(ERROR, tid, "advance_truncate_upto failed accepted={} committed={} code={}", result.accepted,
+               result.committed, to_int(result.code));
+        co_return folly::makeUnexpected(ReplicationManager::to_repl_error(result.code));
+    }
+    co_return target;
 }
 
 Async< ReplResult<> > ReplicaSet::flip_learner_flag(ReplicaMemberInfo const& member, bool target, TraceId tid) {
@@ -478,7 +509,7 @@ Async< std::vector< PeerInfo > > ReplicaSet::get_replication_status() const {
 Async< std::set< ReplicaId > > ReplicaSet::get_active_peers() const {
     std::set< ReplicaId > active;
     auto const my_lsn = commit_upto_lsn_.load();
-    auto const laggy_threshold = HS_DYNAMIC_CONFIG(consensus.laggy_threshold);
+    auto const laggy_threshold = HS_RUNTIME_CONFIG(consensus.laggy_threshold);
     auto peer_status = co_await get_replication_status();
     for (auto const& p : peer_status) {
         if (p.id_ == my_uuid_ || p.id_.is_nil()) {
@@ -495,7 +526,7 @@ Async< std::set< ReplicaId > > ReplicaSet::get_active_peers() const {
 
 /////////////////////////////// ReplicationManager Interaction Section /////////////////////////////////////////
 
-Async< bool > ReplicaSet::start(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raft_cfg_json) {
+Async< bool > ReplicaSet::load(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raft_cfg_json) {
     // Read the SB payload out of sb_mblk_ and populate the identity fields the ctor couldn't touch (it
     // can't co_await).  The returned IoBufView already owns/shares its backing buffer — inline or overflow
     // — so no allocation or copy on our side; we just hold the view.  From here on sb() is valid and
@@ -509,7 +540,6 @@ Async< bool > ReplicaSet::start(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raf
         // Seed the running commit watermark from what was persisted on the last persist_commit_lsn.  Log-store
         // replay below advances it further via on_log_found from each replayed entry's commit_lsn_at_write.
         commit_upto_lsn_.store(sb()->commit_lsn);
-        checkpoint_lsn_.store(sb()->checkpoint_lsn);
         bool const fresh = (sb()->raft_log_store_id == UINT32_MAX);
         RS_LOG(INFO, NO_TRACE_ID, "Starting {} ReplicaSet replica_id={}, raft_server_id={}, commit_lsn_from_sb={}",
                (fresh ? "Fresh" : "Reloaded"), my_replica_id_str(), raft_server_id_, sb()->commit_lsn);
@@ -548,16 +578,15 @@ Async< bool > ReplicaSet::start(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raf
     // off the front and folds commit_lsn_at_write into commit_upto_lsn_ (single-threaded replay so plain
     // load-then-store is enough;)
     auto blob_stream = listener_ ? listener_->blob_stream() : nullptr;
-    // Replay callback for LogStoreManager::recover().  Runs single-threaded per entry, in order, awaited by the
-    // recover walker.  Three responsibilities:
+
+    // Replay callback for LogStoreManager::replay().  Runs single-threaded per entry, in order, awaited by
+    // the recover walker.  For every replayed entry:
     //   1. Fold ReplLogHeader.commit_lsn_at_write back into commit_upto_lsn_ (fine-grained watermark advance).
-    //   2. For entries in (sb.checkpoint_lsn, sb.commit_lsn]: re-drive dispatch_commit so the consumer's
-    //      on_commit fires again for LSNs raft considered durably committed but whose result the consumer had
-    //      not yet flushed as part of a completed CP at crash time.  Consumer must be idempotent — the CP
-    //      switchover/flush timing window means some entries just below checkpoint_lsn may also be replayed,
-    //      matching the upstream contract.
-    //   3. Entries <= sb.checkpoint_lsn are consumer-durable; skip.  Entries > sb.commit_lsn were not durably
-    //      committed pre-crash; nuraft's commit_ext will fire on_commit for them once the raft_server starts.
+    //   2. For entries in (previous_commit, sb.commit_lsn]: re-drive dispatch_commit so the consumer's
+    //      on_commit fires again for LSNs raft considered durably committed pre-crash.  Consumer must be
+    //      idempotent — replay may re-fire on_commit for entries already applied durably in a prior boot.
+    //   3. Entries > sb.commit_lsn were not durably committed pre-crash; nuraft's commit_ext will fire
+    //      on_commit for them once the raft_server starts.
     auto on_log_found_cb = [this](lsn_t entry_lsn, sisl::IoBufView const& bv) -> Async< void > {
         if (bv.size() < sizeof(ReplLogHeader)) {
             co_return;
@@ -566,7 +595,7 @@ Async< bool > ReplicaSet::start(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raf
         if (h->commit_lsn_at_write > commit_upto_lsn_.load(std::memory_order_relaxed)) {
             commit_upto_lsn_.store(h->commit_lsn_at_write, std::memory_order_relaxed);
         }
-        if (entry_lsn <= sb()->checkpoint_lsn || entry_lsn > sb()->commit_lsn) {
+        if (entry_lsn > sb()->commit_lsn) {
             co_return;
         }
         auto* payload = const_cast< uint8_t* >(bv.cbytes()) + sizeof(ReplLogHeader);
@@ -574,13 +603,38 @@ Async< bool > ReplicaSet::start(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raf
         sisl::Blob const value{payload + h->user_header_size_, h->value_size};
         co_await dispatch_commit(entry_lsn, s_cast< JournalType >(h->code), user_header, value);
     };
+    // Compact ceiling callback — returns app_truncate_upto_ when the option is enabled, max() otherwise
+    // (unclamped: HomeRaftLogStore forwards nuraft's ask as-is).
+    HomeRaftLogStore::TruncateCeilingFn truncate_ceiling_cb = [this]() -> raft_lsn_t {
+        return options_.allow_user_driven_truncate ? app_truncate_upto_.load(std::memory_order_acquire)
+                                                  : std::numeric_limits< raft_lsn_t >::max();
+    };
     if (sb()->raft_log_store_id == UINT32_MAX) {
-        log_store_ = co_await HomeRaftLogStore::create(*sb(), std::move(blob_stream), std::move(on_log_found_cb));
+        log_store_ = co_await HomeRaftLogStore::create(*sb(), std::move(blob_stream), std::move(on_log_found_cb),
+                                                       std::move(truncate_ceiling_cb));
         co_await write_sb(); // persist newly-allocated log_store ids
     } else {
-        log_store_ = co_await HomeRaftLogStore::load(*sb(), std::move(blob_stream), std::move(on_log_found_cb));
+        log_store_ = co_await HomeRaftLogStore::load(*sb(), std::move(blob_stream), std::move(on_log_found_cb),
+                                                     std::move(truncate_ceiling_cb));
     }
 
+    // Seed app_truncate_upto_ to the log's current first_lsn.  Any compact that already occurred pre-restart
+    // implies the app authorized compact at least up to log_store_->start_index() - 1, so this is a safe
+    // lower bound that avoids re-clamping HomeRaftLogStore::compact to 0 until the app calls
+    // advance_truncate_upto again.
+    app_truncate_upto_.store(to_i64(log_store_->start_index()));
+
+    // Log store is open and the replay handler is attached; the raft engine is brought up later by
+    // start_engine(), after LogStoreManager::replay() has restored commit_upto_lsn to its pre-crash value.
+    co_return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// start_engine — build and start the nuraft consensus engine.  Must run once the log store is in its final
+// state: on recovery, after LogStoreManager::replay() restored the tail / commit index; on a fresh create,
+// right after load() (nothing to replay).  Either way start_server then observes the correct tail.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Async< bool > ReplicaSet::start_engine() {
     // Pin all this raft_server's coro work to one reactor — hash by group_id so each group sticks to one.
     auto& iom = iomanager::iomgr();
     size_t reactor_id = folly::hash::fnv64_buf(group_id_.data, sizeof(group_id_.data)) % iom.num_reactors();
@@ -591,7 +645,12 @@ Async< bool > ReplicaSet::start(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raf
     nuraft::group_id_t gid{};
     std::memcpy(gid.data(), group_id_.data, sizeof(gid));
 
+    // Snapshot cadence: nuraft auto-fires snapshot_and_compact every N commits (0 disables — only
+    // explicit schedule_snapshot_creation triggers).  Log-entries floor: nuraft's on_snapshot_completed
+    // uses this to compute compact_upto = snap_lsn - reserved.  Both fed from ReplicaSetOptions.
     nuraft::raft_params params;
+    params.with_snapshot_enabled(to_int(options_.snapshot_distance))
+          .with_reserved_log_items(to_int(options_.preserve_log_count));
 
     // ReplicaSet inherits from both state_mgr and state_machine so both slots in the context are `this`.
     auto self = shared_from_this();
@@ -702,31 +761,6 @@ Async< void > ReplicaSet::persist_commit_lsn() {
     RS_LOG(TRACE, NO_TRACE_ID, "persist_commit_lsn — SB.commit_lsn advanced to {}", lsn);
 }
 
-void ReplicaSet::on_switchover_cp() {
-    // Snapshot the current commit watermark for the OLD CP.  Any commits that land during the manager's
-    // per-consumer switchover fan-out (before the RCU pointer swap in CPManager) are still charged to the OLD
-    // CP's flush but not reflected in this captured value — those get re-driven at restart via on_log_found,
-    // relying on the consumer's on_commit being idempotent.  Upstream carries the same trade-off.
-    checkpoint_lsn_.store(commit_upto_lsn_.load(std::memory_order_acquire), std::memory_order_release);
-}
-
-Async< void > ReplicaSet::cp_flush() {
-    if (is_destroyed()) {
-        co_return;
-    }
-    auto const lsn = checkpoint_lsn_.load(std::memory_order_acquire);
-    if (lsn == sb()->checkpoint_lsn) {
-        co_return;
-    }
-    sb()->checkpoint_lsn = lsn;
-    if (lsn > sb()->commit_lsn) {
-        sb()->commit_lsn = lsn;
-        last_flushed_commit_lsn_ = lsn;
-    }
-    co_await write_sb();
-    RS_LOG(TRACE, NO_TRACE_ID, "cp_flush — SB.checkpoint_lsn advanced to {}", lsn);
-}
-
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 // nuraft::state_mgr overrides
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -741,7 +775,7 @@ Async< nuraft::ptr< nuraft::cluster_config > > ReplicaSet::load_config() {
         auto cluster_conf = nuraft::cs_new< nuraft::cluster_config >();
         cluster_conf->get_servers().push_back(nuraft::cs_new< nuraft::srv_config >(
             raft_server_id_, 0, mgr_.lookup_peer_addr(my_uuid_),
-            /*aux=*/my_replica_id_str(), false, HS_DYNAMIC_CONFIG(consensus.default_leader_priority)));
+            /*aux=*/my_replica_id_str(), false, HS_RUNTIME_CONFIG(consensus.default_leader_priority)));
         js["config"] = serialize_cluster_config(*cluster_conf);
     }
     co_return deserialize_cluster_config(js["config"]);
@@ -794,6 +828,219 @@ int32_t ReplicaSet::server_id() {
 
 void ReplicaSet::system_exit(int exit_code) {
     RS_LOG(INFO, NO_TRACE_ID, "System exit signal received exit_code={}", exit_code);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// nuraft::state_machine overrides — snapshot lifecycle
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Marshals ReplSnapshot / ReplSnapshot::Builder to/from the nuraft API surface:
+//   • create_snapshot (leader)    → spawn coro → listener->take_snapshot → advance sb()->last_snapshot_lsn
+//                                    → fire nuraft's when_done handler.
+//   • save_logical_snp_obj (fwr)  → on is_first, abort any stale Builder then build a fresh one via
+//                                    listener->build_snapshot.  Each call: zero-copy IoBufView over
+//                                    nuraft's ptr<buffer>, co_await builder->write_chunk.  is_last_obj
+//                                    ignored — finalize is state_machine::apply_snapshot's job.
+//   • apply_snapshot (follower)   → finalize the cached Builder, hand the resulting ReplSnapshot to
+//                                    listener->apply_snapshot, advance commit_upto_lsn_ / sb()->commit_lsn
+//                                    / sb()->last_snapshot_lsn (max-guarded), write SB, trigger CP flush
+//                                    (Snapshot reason).  Release_snapshot on both success and rejection.
+//   • read_logical_snp_obj (ldr)  → assert s->last_log_idx <= commit_upto (corruption if not); box
+//                                    shared<ReplSnapshot> from listener->last_snapshot() into user_snp_ctx
+//                                    on first call; each call co_awaits snap->read_chunk.
+//   • free_user_snp_ctx           → listener->release_snapshot(*boxed) then delete the box.  Fires from
+//                                    nuraft on both success (peer acked last chunk) and every failure /
+//                                    timeout path — always the end-of-transfer signal on the leader.
+//   • last_snapshot               → return listener->last_snapshot()->nuraft_snapshot_ (or nullptr).
+
+void ReplicaSet::create_snapshot(RaftSnapshotPtr const& s, nuraft::async_result< bool >::handler_type& when_done) {
+    auto const lsn = s_cast< lsn_t >(s->get_last_log_idx());
+    RS_LOG(INFO, NO_TRACE_ID, "create_snapshot lsn={}", lsn);
+
+    iomgr().spawn_detached(
+        iomanager::ReactorTarget::current(), [this, lsn, s, cb = when_done]() mutable -> Async< void > {
+            auto exp = std::shared_ptr< std::exception >();
+            if (!listener_) {
+                if (cb) {
+                    cb(/*ok=*/false, exp);
+                }
+                co_return;
+            }
+
+            auto res = co_await listener_->take_snapshot(lsn);
+            if (res.hasError()) {
+                RS_LOG(ERROR, NO_TRACE_ID, "take_snapshot lsn={} failed", lsn);
+                if (cb) {
+                    cb(/*ok=*/false, exp);
+                }
+                co_return;
+            }
+
+            auto new_snap = res.value();
+            new_snap->nuraft_snapshot_ = s;
+
+            // Advance the snapshot watermark with max-guard.  commit_lsn is owned by persist_commit_lsn's
+            // periodic timer; not written here to avoid racing.
+            sb()->last_snapshot_lsn = std::max(sb()->last_snapshot_lsn, lsn);
+            co_await write_sb();
+
+            if (cb) {
+                cb(/*ok=*/true, exp);
+            }
+        });
+}
+
+Async< bool > ReplicaSet::apply_snapshot(RaftSnapshotPtr const& s) {
+    auto const lsn = s_cast< lsn_t >(s->get_last_log_idx());
+    RS_LOG(INFO, NO_TRACE_ID, "apply_snapshot lsn={}", lsn);
+
+    if (!listener_ || !incoming_snapshot_builder_) {
+        RS_LOG(ERROR, NO_TRACE_ID, "apply_snapshot lsn={} — no cached builder", lsn);
+        co_return false;
+    }
+
+    auto snap = incoming_snapshot_builder_->finalize();
+    incoming_snapshot_builder_.reset();
+    snap->nuraft_snapshot_ = s;
+
+    bool const applied = listener_->apply_snapshot(snap);
+    if (!applied) {
+        RS_LOG(ERROR, NO_TRACE_ID, "apply_snapshot lsn={} — listener rejected", lsn);
+        // Repl has no further use for this snap regardless of apply outcome — signal release so the app
+        // can drop the finalized object it just rejected (or keep it for other purposes).
+        listener_->release_snapshot(snap);
+        co_return false;
+    }
+
+    // Snapshot receipt is a durability event on the follower: commit and snapshot watermarks jump to
+    // `lsn`.  Advance in-memory and SB with max-guards (concurrent commit_ext may have moved ahead),
+    // persist SB, then trigger a CP flush so CP-managed consumer state is durable alongside our SB writes.
+    {
+        auto cur = commit_upto_lsn_.load(std::memory_order_acquire);
+        while (cur < lsn && !commit_upto_lsn_.compare_exchange_weak(cur, lsn, std::memory_order_acq_rel)) {}
+    }
+    if (sb()->commit_lsn < lsn) {
+        sb()->commit_lsn = lsn;
+    }
+    if (sb()->last_snapshot_lsn < lsn) {
+        sb()->last_snapshot_lsn = lsn;
+    }
+    co_await write_sb();
+    co_await hs()->cp_mgr().trigger_cp_flush(/*force=*/true, CPTriggerReason::Snapshot);
+
+    // Signal release: Repl-side use of this snap is done.  App now owns the object's future — it may be
+    // returned from last_snapshot() indefinitely or dropped.
+    listener_->release_snapshot(snap);
+    co_return true;
+}
+
+RaftSnapshotPtr ReplicaSet::last_snapshot() {
+    if (!listener_) {
+        return nullptr;
+    }
+    auto snap = listener_->last_snapshot();
+    return snap ? snap->nuraft_snapshot_ : nullptr;
+}
+
+Async< void > ReplicaSet::save_logical_snp_obj(RaftSnapshotPtr const& s, ulong& obj_id,
+                                               nuraft::ptr< nuraft::buffer > const& data, bool is_first_obj,
+                                               bool is_last_obj) {
+    auto const lsn = s_cast< lsn_t >(s->get_last_log_idx());
+    if (!listener_) {
+        co_return;
+    }
+
+    if (is_first_obj) {
+        // nuraft aborts and restarts a snapshot transfer from is_first=true on any interruption.  If we have a stale
+        // builder from a prior attempt, tell the app to undo whatever partial state it accumulated via write_chunk
+        // BEFORE we drop the ref — otherwise partial writes to live data leak.
+        if (incoming_snapshot_builder_) {
+            incoming_snapshot_builder_->abort();
+            incoming_snapshot_builder_.reset();
+        }
+        auto res = co_await listener_->build_snapshot(lsn);
+        if (res.hasError()) {
+            RS_LOG(ERROR, NO_TRACE_ID, "build_snapshot lsn={} failed", lsn);
+            co_return;
+        }
+        incoming_snapshot_builder_ = res.value();
+    }
+
+    if (!incoming_snapshot_builder_) {
+        RS_LOG(ERROR, NO_TRACE_ID, "save_logical_snp_obj lsn={} obj_id={} — no cached builder", lsn, obj_id);
+        co_return;
+    }
+
+    // Zero-copy the chunk to the app.  The owner shared<uint8_t> holds nuraft's ptr<buffer> alive via a
+    // custom deleter that captures `data`; the resulting IoBufView carries this refcount forward, so the
+    // app can retain the view across its own async I/O and nuraft's buffer stays alive until the last
+    // referencing view drops.
+    sisl::IoBufView view{sisl::make_io_buf_shared(shared< uint8_t >{data->data_begin(), [data](uint8_t*) {}},
+                                                   to_u32(data->size()))};
+    uint64_t cursor = obj_id;
+    co_await incoming_snapshot_builder_->write_chunk(cursor, view);
+    obj_id = cursor;
+
+    // is_last_obj is informational — finalize is deferred to state_machine::apply_snapshot which nuraft
+    // calls right after the is_last_obj save (only if log compact succeeds; otherwise the transfer
+    // aborts and next attempt restarts from is_first=true which triggers our abort path above).
+    (void)is_last_obj;
+    co_return;
+}
+
+Async< int > ReplicaSet::read_logical_snp_obj(RaftSnapshotPtr const& s, void*& user_snp_ctx, ulong obj_id,
+                                              RaftBufferPtr& data_out, bool& is_last_obj) {
+    if (!listener_) {
+        co_return -1;
+    }
+
+    // Reading a snapshot at an LSN above our committed watermark is corruption: nuraft asked us to ship
+    // state we never committed.  Assert rather than mask — silently returning -1 would delay the crash
+    // and leave the bug uncovered.
+    HS_REL_ASSERT_LE(s_cast< lsn_t >(s->get_last_log_idx()), commit_upto_lsn_.load(std::memory_order_acquire),
+                     "read_logical_snp_obj: snapshot lsn > commit_upto");
+
+    shared< ReplSnapshot > snap;
+    if (user_snp_ctx == nullptr) {
+        snap = listener_->last_snapshot();
+        if (!snap) {
+            co_return -1;
+        }
+        // Heap-box the shared_ptr so nuraft's void* slot holds a durable refcount across chunk calls;
+        // free_user_snp_ctx unboxes, calls listener->release_snapshot, then deletes.
+        user_snp_ctx = new shared< ReplSnapshot >(snap);
+    } else {
+        snap = *r_cast< shared< ReplSnapshot >* >(user_snp_ctx);
+    }
+
+    uint64_t cursor = obj_id;
+    is_last_obj = false;
+    auto res = co_await snap->read_chunk(cursor, is_last_obj);
+    if (res.hasError()) {
+        co_return -1;
+    }
+
+    // Zero-copy: nuraft::buffer::take_ownership wraps the IoBufView's memory with a custom deleter that
+    // captures the view by value.  The view's IoBufShared refcount holds the app's backing storage alive
+    // until nuraft drops the ptr<buffer>; at that point the deleter's captured `view` destructs and
+    // releases the refcount.
+    auto view = res.value();
+    data_out = nuraft::buffer::take_ownership(view.bytes(), view.size(),
+                                              [view](nuraft::byte*) mutable { (void)view; });
+    co_return 0;
+}
+
+void ReplicaSet::free_user_snp_ctx(void*& user_snp_ctx) {
+    if (user_snp_ctx) {
+        // nuraft fires this on transfer completion (success + all failure paths — verified via
+        // handle_snapshot_sync.cxx call sites).  Signal release to the app so its per-transfer state
+        // can be dropped, then delete the box.
+        auto* boxed = r_cast< shared< ReplSnapshot >* >(user_snp_ctx);
+        if (listener_) {
+            listener_->release_snapshot(*boxed);
+        }
+        delete boxed;
+        user_snp_ctx = nullptr;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -989,10 +1236,10 @@ Async< void > ReplicaSet::commit_config(ulong log_idx, nuraft::ptr< nuraft::clus
     // rewrite with the same members), skip the callback entirely.
     std::set< ReplicaId > added;
     std::set< ReplicaId > removed;
-    std::set_difference(new_members.begin(), new_members.end(), committed_members_.begin(),
-                        committed_members_.end(), std::inserter(added, added.end()));
-    std::set_difference(committed_members_.begin(), committed_members_.end(), new_members.begin(),
-                        new_members.end(), std::inserter(removed, removed.end()));
+    std::set_difference(new_members.begin(), new_members.end(), committed_members_.begin(), committed_members_.end(),
+                        std::inserter(added, added.end()));
+    std::set_difference(committed_members_.begin(), committed_members_.end(), new_members.begin(), new_members.end(),
+                        std::inserter(removed, removed.end()));
     committed_members_ = std::move(new_members);
     if (listener_ && (!added.empty() || !removed.empty())) {
         listener_->on_membership_change(added, removed);
@@ -1231,7 +1478,7 @@ Async< void > ReplicaSet::dispatch_commit(int64_t lsn, JournalType type, sisl::B
     case JournalType::HS_CTRL_DESTROY:
         // Every replica lands here when the leader's HS_CTRL_DESTROY commits.  start_destroy_local() marks
         // DESTROYED + persists destroy_pending — actual resource teardown deferred to the ReplicationManager's
-        // reaper calling finish_destroy_local() after repl_dev_cleanup_interval_sec.
+        // reaper calling finish_destroy_local() after replica_set_cleanup_interval_sec.
         co_await start_destroy_local();
         break;
     case JournalType::HS_CTRL_START_REPLACE:
@@ -1273,6 +1520,20 @@ Async< void > ReplicaSet::dispatch_commit(int64_t lsn, JournalType type, sisl::B
                 listener_->on_complete_replace_member(out, in, task_id_view);
             }
         }
+        break;
+    }
+    case JournalType::HS_CTRL_TRUNCATE: {
+        // user_header is the packed int64_t target LSN stamped by advance_truncate_upto.  Every replica
+        // lands here with a monotonic max-guard on the atomic.
+        if (user_header.size() != sizeof(int64_t)) {
+            RS_LOG(ERROR, NO_TRACE_ID, "commit lsn={} compact ctrl header size={} != expected {}", lsn,
+                   user_header.size(), sizeof(int64_t));
+            break;
+        }
+        auto const target = *r_cast< int64_t const* >(user_header.cbytes());
+        auto cur = app_truncate_upto_.load(std::memory_order_acquire);
+        while (cur < target && !app_truncate_upto_.compare_exchange_weak(cur, target, std::memory_order_acq_rel)) {}
+        RS_LOG(INFO, NO_TRACE_ID, "HS_CTRL_TRUNCATE commit lsn={} target={}", lsn, target);
         break;
     }
     }

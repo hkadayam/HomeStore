@@ -36,7 +36,7 @@
 
 #include "iomanager/iomanager.h"
 #include "homestore/base/test_defs.h"
-#include "homestore/base/homestore_config.h"
+#include "homestore/base/hs_runtime_config.h"
 
 #include "common/defs.h"
 #include "homestore/device/device_manager.h"
@@ -92,13 +92,16 @@ public:
         completions_.push_back(Record{lsn, key, {}});
     }
 
-    void on_log_found(lsn_t lsn, const stream_key& key, const sisl::IoBufView& data) override {
-        std::lock_guard lk{mtx_};
-        Record r;
-        r.lsn = lsn;
-        r.key = key;
-        r.data.assign(data.bytes(), data.bytes() + data.size());
-        recoveries_.push_back(std::move(r));
+    Async< void > on_log_found(lsn_t lsn, const stream_key& key, const sisl::IoBufView& data) override {
+        {
+            std::lock_guard lk{mtx_};
+            Record r;
+            r.lsn = lsn;
+            r.key = key;
+            r.data.assign(data.bytes(), data.bytes() + data.size());
+            recoveries_.push_back(std::move(r));
+        }
+        co_return;
     }
 
     std::vector< Record > completions() const {

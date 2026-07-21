@@ -23,7 +23,7 @@
 
 #include "sisl/logging/logging.h"
 
-#include "homestore_config.h"
+#include "hs_runtime_config.h"
 #include "homestore/managers.h"
 #include "event_manager.h"
 #include "iomanager/iomanager.h"
@@ -50,19 +50,23 @@ uint64_t ResourceMgr::total_system_memory() {
 #endif
 }
 
-void ResourceMgr::start(std::vector< DevInfo > const& devs, std::optional< uint64_t > mem_cap) {
+void ResourceMgr::start(std::vector< DevInfo > const& devs) {
     uint64_t fast_capacity = 0;
     uint64_t data_capacity = 0;
     for (auto const& d : devs) {
         (d.dev_type == HSDevType::Fast ? fast_capacity : data_capacity) += d.dev_size;
     }
 
+    // Process memory budget: an explicit absolute budget (process_mem_budget_bytes) wins; 0 means derive it as a
+    // fraction (sys_mem_use_percent) of total system RAM.
+    const uint64_t budget_bytes = HS_RUNTIME_CONFIG(resource_limits.process_mem_budget_bytes);
     const uint64_t resolved_mem_cap =
-        mem_cap.value_or((total_system_memory() * HS_DYNAMIC_CONFIG(resource_limits.sys_mem_use_percent)) / 100);
-    const uint64_t cache_size = (resolved_mem_cap * HS_DYNAMIC_CONFIG(resource_limits.cache_size_percent)) / 100;
+        budget_bytes > 0 ? budget_bytes
+                         : (total_system_memory() * HS_RUNTIME_CONFIG(resource_limits.sys_mem_use_percent)) / 100;
+    const uint64_t cache_size = (resolved_mem_cap * HS_RUNTIME_CONFIG(resource_limits.cache_size_percent)) / 100;
 
-    LOGINFO("ResourceMgr starting: fast_capacity={} data_capacity={} mem_cap={} (caller_provided={}) cache_size={}",
-            fast_capacity, data_capacity, resolved_mem_cap, mem_cap.has_value(), cache_size);
+    LOGINFO("ResourceMgr starting: fast_capacity={} data_capacity={} mem_cap={} (absolute={}) cache_size={}",
+            fast_capacity, data_capacity, resolved_mem_cap, budget_bytes > 0, cache_size);
 
     auto mgr = shared< ResourceMgr >{new ResourceMgr{fast_capacity, data_capacity, resolved_mem_cap, cache_size}};
     Managers::init_resource_mgr(mgr);

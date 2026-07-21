@@ -124,16 +124,17 @@ static_assert(sizeof(log_group_footer) == 8, "log_group_footer must be 8 bytes o
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LogStreamClient — the per-store callback surface LogStream knows about.  LogStore implements this; tests can
-// implement a shadow client that records every callback for verification without dragging in LogStore.  Methods
-// are non-coroutine and run inline from inside LogStream::flush() (on_write_completion) or LogStream::recover()
-// (on_log_found); implementations must not block.
+// implement a shadow client that records every callback for verification without dragging in LogStore.
+// on_write_completion runs inline from LogStream::flush() and must not block.  on_log_found is Async<void> so
+// recover() can co_await the client's replay handler (e.g. ReplicaSet dispatches on_commit → Index/BlkStream
+// writes) without a blockingWait shim.
 // ─────────────────────────────────────────────────────────────────────────────
 class LogStreamClient {
 public:
     virtual ~LogStreamClient() = default;
     virtual logstore_id_t store_id() const = 0;
     virtual void on_write_completion(lsn_t lsn, const stream_key& key) = 0;
-    virtual void on_log_found(lsn_t lsn, const stream_key& key, const sisl::IoBufView& data) = 0;
+    virtual Async< void > on_log_found(lsn_t lsn, const stream_key& key, const sisl::IoBufView& data) = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -260,7 +261,7 @@ private:
     Async< std::optional< uint64_t > > probe_for_torn_write(uint64_t bad_off);
 
     /// Inline capacity for the per-flush small_vector of emplaced groups.  The actual cap is
-    /// HS_DYNAMIC_CONFIG(logstore.max_flush_loops) (hotswap, default 4) — pick the inline capacity high enough
+    /// HS_RUNTIME_CONFIG(logstore.max_flush_loops) (hotswap, default 4) — pick the inline capacity high enough
     /// to cover the common case without heap spill; small_vector falls back to heap if the hotswap pushes the
     /// cap higher than this.
     static constexpr int kFlushGroupsInlineCapacity = 8;

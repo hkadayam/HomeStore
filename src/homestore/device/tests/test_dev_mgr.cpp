@@ -26,7 +26,7 @@
 #include "iomanager/iomanager.h"
 #include "homestore/base/test_defs.h"
 
-#include "homestore/base/homestore_config.h"
+#include "homestore/base/hs_runtime_config.h"
 #include "homestore/device/device_manager.h"
 #include "homestore/device/virtual_dev.h"
 
@@ -341,7 +341,7 @@ CORO_TEST_F(DevMgrTest, AllocateAndFreeVdevId) {
 int main(int argc, char* argv[]) {
     SISL_OPTIONS_LOAD(argc, argv);
     sisl::logging::SetLogger("test_dev_mgr");
-    HomeStoreDynamicConfig::init_settings_default();
+    HomeStoreRuntimeConfig::init_settings_default();
     ::testing::InitGoogleTest(&argc, argv);
     iomanager::init_iomgr(2);
     int rc = RUN_ALL_TESTS();

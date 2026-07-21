@@ -46,15 +46,16 @@ namespace homestore {
 class ResourceMgr {
 public:
     /// Construct, install into Managers, compute the cache budget, subscribe to ResourceEvent, and start the poll
-    /// loop.  `devs` is the same vector handed to HomeStore::start (per-tier capacity is summed from it).
-    /// `mem_cap`: when nullopt, falls back to (total_system_memory * resource_limits.sys_mem_use_percent / 100).
-    static void start(std::vector< DevInfo > const& devs, std::optional< uint64_t > mem_cap = std::nullopt);
+    /// loop.  `devs` is the same vector handed to HomeStore::start (per-tier capacity is summed from it).  The
+    /// process memory budget comes from config: resource_limits.process_mem_budget_bytes (absolute), or a
+    /// fraction (sys_mem_use_percent) of total system RAM when that is 0.
+    static void start(std::vector< DevInfo > const& devs);
 
     /// Stop the poll loop, drop event subscriptions, drop the singleton.  Idempotent.
     static void stop();
 
-    /// Total physical RAM on the host, in bytes.  0 if the platform query failed.  Utility for HomeStore::start to
-    /// resolve a ProportionalMem InputParams.mem_size into a concrete byte budget.
+    /// Total physical RAM on the host, in bytes.  0 if the platform query failed.  Used by start() to resolve
+    /// the proportional (sys_mem_use_percent) memory budget when no absolute process_mem_budget_bytes is set.
     static uint64_t total_system_memory();
 
     /// Cache budget in bytes — passed to TwoQEvictor / similar caches at construction.  Fixed at start as

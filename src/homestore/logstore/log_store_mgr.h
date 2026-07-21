@@ -27,6 +27,7 @@
 #include "homestore/device/virtual_dev.h"
 
 #include "homestore/base/homestore_decl.h"
+#include "homestore/checkpoint/cp_mgr.h"
 #include "homestore/logstore/log_store.h"
 #include "homestore/logstore/log_stream.h"
 
@@ -44,7 +45,7 @@ class MetaClient;
 //        restart    → load() re-registers MetaClient, reconstructs the VDev + LogStream, then walks logstore sb
 //                     mblks to reconstruct LogStore instances (NOT opened, no records yet).
 //   2. Client calls open_log_store(sid, handler) for each LogStore it cares about.
-//   3. Client calls recover() — drives LogStream::recover, which dispatches on_log_found to known stores via
+//   3. Client calls replay() — drives LogStream::recover, which dispatches on_log_found to known stores via
 //      lookup_store callback.  After return, unopened stores are dropped (sb removed).
 //   4. Steady state: create_log_store / get_log_store / truncate.
 //
@@ -64,7 +65,7 @@ public:
     static Async< void > create(uint64_t chunk_size, uint32_t initial_num_chunks);
 
     /// Restart path: discover LogStream + LogStores from MetaBlks; does NOT walk the LogStream's CRC chain
-    /// (caller must invoke recover() after open_log_store calls so on_log_found dispatch can find handlers).
+    /// (caller must invoke replay() after open_log_store calls so on_log_found dispatch can find handlers).
     static Async< void > load();
 
     Async< void > shutdown();
@@ -80,12 +81,13 @@ public:
 
     /// Allocates the next store_id, creates a fresh LogStore on the underlying LogStream, persists its sb.
     /// Returned store is not opened — caller invokes open() (or open_log_store via mgr) to attach the replay
-    /// handler.
-    Async< shared< LogStore > > create_log_store(bool append_mode);
+    /// handler.  If options.auto_truncate is set, the manager's auto_truncate iteration includes this store.
+    Async< shared< LogStore > > create_log_store(LogStoreOptions const& options);
 
-    /// Looks up an existing (already-loaded) LogStore by store_id, attaches the replay handler.  Returns
-    /// nullptr if no store with that id exists.
-    shared< LogStore > open_log_store(logstore_id_t store_id, log_replay_cb handler);
+    /// Looks up an existing (already-loaded) LogStore by store_id, installs `options` (updating
+    /// auto_truncate_count_ if the flag changed), and attaches the replay handler.  Returns nullptr if no
+    /// store with that id exists.
+    shared< LogStore > open_log_store(logstore_id_t store_id, LogStoreOptions const& options, log_replay_cb handler);
 
     /// Destroy a single LogStore by id — removes its meta_blk so it won't be re-discovered on restart, then
     /// erases it from in-memory state.  Idempotent (warns and returns for unknown ids).
@@ -95,16 +97,34 @@ public:
 
     /// Triggers LogStream::recover with our lookup_store callback.  on_log_found fires per record into the
     /// matching LogStore (skipped if unknown store_id).  After return, LogStores with no replay handler
-    /// attached are dropped (sb removed, in-memory state freed).
-    Async< void > recover();
+    /// attached are dropped (sb removed, in-memory state freed).  Driven by HomeStore::replay() after all
+    /// consumers have opened their stores — this is where deferred replay actually happens.
+    Async< void > replay();
 
     // ── Truncation ───────────────────────────────────────────────────────────
 
-    /// Cross-store min aggregation, called by the client periodically (or after a batch of LogStore::truncate
-    /// calls) to actually reclaim space.  Computes min(min_trunc_stream_offset) across all opened LogStores
-    /// and pushes it down via log_stream_->truncate.  Stores without a trunc anchor (empty stores) don't
-    /// constrain the min.  No-op if no store has a valid trunc anchor.
-    Async< void > global_truncate();
+    /// For each store with options().auto_truncate set, invokes LogStore::truncate(MAX) so the store
+    /// advances head_lsn to its own clamp (min(checkpt_lsn, tail - preserve_log_count)).  Then aggregates
+    /// min(min_trunc_stream_offset) across all opened LogStores and pushes it down via log_stream_->truncate.
+    /// Stores without a trunc anchor (empty stores) don't constrain the min.  No-op on the stream if no store
+    /// has a valid trunc anchor.
+    Async< void > truncate();
+
+    /// Manager-level CPCallbacks.  Constructed as a shared_ptr in create()/load() and registered with
+    /// cp_mgr().  Fans on_switchover_cp / cp_flush across every managed store.
+    class CPHandler : public CPCallbacks {
+    public:
+        explicit CPHandler(shared< LogStoreManager > mgr) : mgr_{std::move(mgr)} {}
+        ~CPHandler() override = default;
+
+        void on_switchover_cp(CP* cur_cp, CP* new_cp) override;
+        Async< bool > cp_flush(CP* cp) override;
+        void cp_cleanup(CP* cp) override;
+        int cp_progress_percent() override;
+
+    private:
+        std::weak_ptr< LogStoreManager > mgr_;
+    };
 
 private:
     /// Private ctor.  Use create() / load() factories.
@@ -118,6 +138,10 @@ private:
     /// Walks log_stores_, drops any without an attached handler.
     Async< void > drop_unopened_stores();
 
+    /// Recurring iomgr timer: calls truncate() at logstore.auto_truncate_frequency_ms cadence.  Runs on
+    /// ReactorTarget::any() — same IO reactor pool the stream flush/truncate paths use.
+    void start_auto_truncate_timer();
+
     shared< MetaClient > meta_client_;
     shared< VirtualDev > vdev_;
     shared< LogStream > log_stream_;
@@ -125,6 +149,12 @@ private:
     mutable folly::SharedMutex stores_mutex_;
     std::map< logstore_id_t, shared< LogStore > > log_stores_;
     std::atomic< logstore_id_t > next_store_id_{0};
+
+    // Count of log_stores currently opted into auto_truncate. Periodic auto compaction iteration
+    // can short-circuit without walking log_stores_.
+    std::atomic< uint32_t > num_stores_auto_truncate_{0};
+
+    iomanager::CoroTimer auto_truncate_timer_;
 
     static constexpr const char* kVdevName = "logstore_vdev";
 };

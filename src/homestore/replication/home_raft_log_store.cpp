@@ -32,7 +32,6 @@
 #include "homestore/logstore/log_store_mgr.h"
 #include "homestore/managers.h"
 #include "sisl/fds/utils.h"
-#include "storage_engine_buffer.h"
 
 using namespace homestore;
 
@@ -124,34 +123,40 @@ static constexpr logstore_seq_num_t to_store_lsn(raft_lsn_t raft_lsn) {
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 Async< shared< HomeRaftLogStore > > HomeRaftLogStore::create(ReplicaSetSuperBlk& sb, shared< RawBlkStream > blob_stream,
-                                                             OnLogFound /*on_log_found*/) {
+                                                             OnLogFound /*on_log_found*/,
+                                                             TruncateCeilingFn truncate_ceiling_cb) {
     // Fresh create — no replay will happen on this store this boot, so the callback is unused here.  It's
     // still part of the signature for API symmetry with load() so callers pass one uniform lambda.  Mutates
     // sb.raft_log_store_id and sb.free_blks_journal_id; caller persists the SB afterwards.
-    auto log_store = co_await log_store_mgr().create_log_store(/*append_mode=*/true);
+    auto log_store =
+        co_await log_store_mgr().create_log_store(LogStoreOptions{.append_mode = true, .auto_truncate = false});
     sb.raft_log_store_id = log_store->store_id();
 
     unique< IndirectBlkHandler > indirect;
     if (blob_stream) {
-        auto fbj = co_await log_store_mgr().create_log_store(/*append_mode=*/false);
+        auto fbj =
+            co_await log_store_mgr().create_log_store(LogStoreOptions{.append_mode = false, .auto_truncate = false});
         sb.free_blks_journal_id = fbj->store_id();
         indirect = std::make_unique< IndirectBlkHandler >(std::move(blob_stream), std::move(fbj), log_store.get());
     }
 
-    auto self = shared< HomeRaftLogStore >(new HomeRaftLogStore(std::move(log_store), std::move(indirect)));
+    auto self = shared< HomeRaftLogStore >(
+        new HomeRaftLogStore(std::move(log_store), std::move(indirect), std::move(truncate_ceiling_cb)));
     LOGINFOMOD(replication, "Created HomeRaftLogStore raft_store={} free_blks_store={} blob_opt={}",
                sb.raft_log_store_id, sb.free_blks_journal_id, self->indirect_ ? "on" : "off");
     co_return self;
 }
 
 Async< shared< HomeRaftLogStore > > HomeRaftLogStore::load(ReplicaSetSuperBlk& sb, shared< RawBlkStream > blob_stream,
-                                                           OnLogFound on_log_found) {
+                                                           OnLogFound on_log_found,
+                                                           TruncateCeilingFn truncate_ceiling_cb) {
     HS_REL_ASSERT_NE(sb.raft_log_store_id, UINT32_MAX, "load() called with no persisted raft_log_store_id");
 
     // Register the caller's replay handler on the main log_store.  LogStoreManager::recover() (driven by the
     // Manager after all opens are wired) walks persisted entries and dispatches through this callback —
     // ReplicaSet uses it to fold ReplLogHeader.commit_lsn_at_write into its commit_upto_lsn_ watermark.
-    auto log_store = log_store_mgr().open_log_store(sb.raft_log_store_id, std::move(on_log_found));
+    auto log_store = log_store_mgr().open_log_store(
+        sb.raft_log_store_id, LogStoreOptions{.append_mode = true, .auto_truncate = false}, std::move(on_log_found));
     if (!log_store) {
         throw std::runtime_error(
             fmt::format("HomeRaftLogStore::load: unknown raft_log_store_id={}", sb.raft_log_store_id));
@@ -174,15 +179,18 @@ Async< shared< HomeRaftLogStore > > HomeRaftLogStore::load(ReplicaSetSuperBlk& s
                    "disabling large-value optimization for this group");
     }
 
-    auto self = shared< HomeRaftLogStore >(new HomeRaftLogStore(std::move(log_store), std::move(indirect)));
+    auto self = shared< HomeRaftLogStore >(
+        new HomeRaftLogStore(std::move(log_store), std::move(indirect), std::move(truncate_ceiling_cb)));
     LOGINFOMOD(replication, "Loaded HomeRaftLogStore raft_store={} free_blks_store={} blob_opt={}",
                sb.raft_log_store_id, sb.free_blks_journal_id, self->indirect_ ? "on" : "off");
     co_return self;
 }
 
-HomeRaftLogStore::HomeRaftLogStore(shared< LogStore > log_store, unique< IndirectBlkHandler > indirect) :
+HomeRaftLogStore::HomeRaftLogStore(shared< LogStore > log_store, unique< IndirectBlkHandler > indirect,
+                                   TruncateCeilingFn truncate_ceiling_cb) :
         log_store_{std::move(log_store)},
         indirect_{std::move(indirect)},
+        truncate_ceiling_cb_{std::move(truncate_ceiling_cb)},
         // raft_lsn starts from 1, so we set lsn 0 to be dummy
         entry_cache_(100, std::make_pair(0, nullptr)) {
     dummy_log_entry_ = nuraft::cs_new< nuraft::log_entry >(0, nuraft::buffer::alloc(0), nuraft::log_val_type::app_log);
@@ -533,20 +541,28 @@ Async< void > HomeRaftLogStore::apply_pack(ulong index, nuraft::buffer& pack) {
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 Async< bool > HomeRaftLogStore::compact(ulong compact_lsn) {
+    // Clamp caller's ask down to the ceiling the owner authorizes (returns max() when no clamp).  Nuraft
+    // reads log_store_->start_index() dynamically after this returns, so shipping less than the caller
+    // asked for is safe — nuraft picks up the actual truncation point.
+    auto const asked = s_cast< raft_lsn_t >(compact_lsn);
+    auto const ceiling = truncate_ceiling_cb_();
+    auto const target = std::min(asked, ceiling);
+    if (target <= 0) {
+        co_return true;
+    }
+
     auto cur_max_lsn = log_store_->tail_lsn();
-    if (cur_max_lsn < to_store_lsn(compact_lsn)) {
-        // if compact_lsn is beyond the current max_lsn, it indicates a hole from cur_max_lsn to compact_lsn.
-        // we directly compact and truncate up to compact_lsn assuming there are dummy logs.
-        REPL_STORE_LOG(DEBUG, "Compact with log holes from {} to={}", cur_max_lsn + 1, to_store_lsn(compact_lsn));
+    if (cur_max_lsn < to_store_lsn(target)) {
+        REPL_STORE_LOG(DEBUG, "Compact with log holes from {} to={}", cur_max_lsn + 1, to_store_lsn(target));
     }
     // Main log truncate first.  Once main_log_store_->head_lsn() advances, a concurrent deferred_free
     // taking indirect_mtx_ reads the post-truncate head and correctly classifies referenced_lsn ≤
-    // compact_lsn as already-gone (immediate free) instead of pushing into deferred_free_blkids_ that we are
-    // about to drain.  indirect_->compact then drains deferred_free_blkids_ ≤ compact_lsn and runs the
+    // target as already-gone (immediate free) instead of pushing into deferred_free_blkids_ that we are
+    // about to drain.  indirect_->compact then drains deferred_free_blkids_ ≤ target and runs the
     // free_blks_journal_ truncate under the mutex.
-    co_await log_store_->truncate(to_store_lsn(compact_lsn));
+    co_await log_store_->truncate(to_store_lsn(target));
     if (indirect_) {
-        co_await indirect_->compact(static_cast< raft_lsn_t >(compact_lsn));
+        co_await indirect_->compact(target);
     }
     co_return true;
 }
@@ -609,8 +625,9 @@ HomeRaftLogStore::IndirectBlkHandler::IndirectBlkHandler(shared< RawBlkStream > 
     // The on_log_found callback fires asynchronously later when LogStoreManager::recover() walks the
     // journal records.  Capturing `this` is safe — the handler's lifetime extends past recover() because
     // HomeRaftLogStore (which owns this) outlives the LogStoreManager's reference to the callback.
-    free_blks_journal_ =
-        log_store_mgr().open_log_store(free_blks_journal_id, [this](lsn_t store_lsn, sisl::IoBufView const& bv) {
+    free_blks_journal_ = log_store_mgr().open_log_store(
+        free_blks_journal_id, LogStoreOptions{.append_mode = false, .auto_truncate = false},
+        [this](lsn_t store_lsn, sisl::IoBufView const& bv) {
             BlkIds bids;
             bids.deserialize(sisl::Blob{bv.bytes(), to_u32(bv.size())});
             deferred_free_blkids_[to_raft_lsn(static_cast< store_lsn_t >(store_lsn))] = std::move(bids);

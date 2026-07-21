@@ -4,7 +4,7 @@
 
 #include "homestore/index/cow_btree/cow_btree_mgr.h"
 #include "homestore/index/cow_btree/cow_btree.h"
-#include "homestore/base/homestore_config.h" // HS_DYNAMIC_CONFIG
+#include "homestore/base/hs_runtime_config.h" // HS_RUNTIME_CONFIG
 #include "homestore/base/resource_mgr.h"
 #include "homestore/blob/blob_dev.h"
 #include "homestore/blob/blob_dev_mgr.h"
@@ -65,18 +65,18 @@ COWBtreeManager::COWBtreeManager() : cp_callbacks_{std::make_shared< CPCallbacks
     // ResourceMgr owns the global cache budget (mem_cap * resource_limits.cache_size_percent).
     sisl::TwoQEvictor::Config ev_cfg;
     ev_cfg.max_size = resource_mgr().cache_size();
-    ev_cfg.num_partitions = HS_DYNAMIC_CONFIG(cache->num_evictor_partitions);
-    ev_cfg.hot_pct = static_cast< float >(HS_DYNAMIC_CONFIG(cache->hot_size_pct) / 100.0);
-    ev_cfg.high_wm_pct = static_cast< float >(HS_DYNAMIC_CONFIG(cache->high_watermark_pct) / 100.0);
-    ev_cfg.low_wm_pct = static_cast< float >(HS_DYNAMIC_CONFIG(cache->low_watermark_pct) / 100.0);
+    ev_cfg.num_partitions = HS_RUNTIME_CONFIG(cache->num_evictor_partitions);
+    ev_cfg.hot_pct = static_cast< float >(HS_RUNTIME_CONFIG(cache->hot_size_pct) / 100.0);
+    ev_cfg.high_wm_pct = static_cast< float >(HS_RUNTIME_CONFIG(cache->high_watermark_pct) / 100.0);
+    ev_cfg.low_wm_pct = static_cast< float >(HS_RUNTIME_CONFIG(cache->low_watermark_pct) / 100.0);
     evictor_ = std::make_shared< sisl::TwoQEvictor >(ev_cfg);
 
     // Derive num_buckets from total budget assuming ~4KB avg entry; entries_per_hash_bucket is the target ratio.
-    auto const entries_per_bucket = HS_DYNAMIC_CONFIG(cache->entries_per_hash_bucket);
+    auto const entries_per_bucket = HS_RUNTIME_CONFIG(cache->entries_per_hash_bucket);
     constexpr uint64_t avg_entry_size = 4096;
     auto const num_buckets =
         std::max< uint32_t >(1, to_u32(ev_cfg.max_size / avg_entry_size / std::max< uint32_t >(1, entries_per_bucket)));
-    auto const ghost_capacity = HS_DYNAMIC_CONFIG(cache->ghost_capacity_per_partition);
+    auto const ghost_capacity = HS_RUNTIME_CONFIG(cache->ghost_capacity_per_partition);
 
     NodeCache::Config node_cfg;
     node_cfg.num_buckets = num_buckets;
@@ -141,7 +141,7 @@ bool COWBtreeManager::should_force_full_flush() const {
         return false;
     }
 
-    auto const limit_bytes = to_u64(to_double(cap) * HS_DYNAMIC_CONFIG(btree->cow_incr_map_max_size_pct) / 100.0);
+    auto const limit_bytes = to_u64(to_double(cap) * HS_RUNTIME_CONFIG(btree->cow_incr_map_max_size_pct) / 100.0);
     return incr_map_total_bytes_.load(std::memory_order_relaxed) >= limit_bytes;
 }
 

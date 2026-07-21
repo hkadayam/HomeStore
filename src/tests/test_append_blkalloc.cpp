@@ -33,7 +33,7 @@
 #include <iomgr/io_environment.hpp>
 #include "blkalloc/append_blk_allocator.h"
 #include "common/homestore_assert.h"
-#include "common/homestore_config.h"
+#include "common/hs_runtime_config.h"
 #include "test_common/homestore_test_common.h"
 #include "homestore/blkdata_service.hpp"
 

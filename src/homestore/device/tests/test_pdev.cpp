@@ -81,8 +81,8 @@ public:
         std::strncpy(hdr.product_name, FirstBlockHeader::PRODUCT_NAME, FirstBlockHeader::s_product_name_size - 1);
         hdr.product_name[FirstBlockHeader::s_product_name_size - 1] = '\0';
         hdr.num_pdevs = 1;
-        hdr.max_vdevs = HSSuperBlk::MAX_VDEVS_IN_SYSTEM;
-        hdr.max_system_chunks = HSSuperBlk::MAX_CHUNKS_IN_SYSTEM;
+        hdr.max_vdevs = MAX_VDEVS_IN_SYSTEM;
+        hdr.max_system_chunks = MAX_CHUNKS_IN_SYSTEM;
         hdr.system_uuid = boost::uuids::random_generator{}();
         return hdr;
     }

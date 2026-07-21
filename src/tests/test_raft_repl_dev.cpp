@@ -585,7 +585,7 @@ int main(int argc, char* argv[]) {
     //
     HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
         s.consensus.leadership_expiry_ms = -1; // -1 means never expires;
-        s.generic.repl_dev_cleanup_interval_sec = 1;
+        s.consensus.replica_set_cleanup_interval_sec = 1;
 
         // Disable implicit flush and timer.
         s.logstore.flush_threshold_size = 0;
@@ -600,7 +600,7 @@ int main(int argc, char* argv[]) {
             s.consensus.snapshot_freq_distance = SISL_OPTIONS["snapshot_distance"].as< uint32_t >();
         }
         if (SISL_OPTIONS.count("num_raft_logs_resv")) {
-            s.resource_limits.raft_logstore_reserve_threshold = SISL_OPTIONS["num_raft_logs_resv"].as< uint32_t >();
+            s.consensus.raft_logstore_reserve_threshold = SISL_OPTIONS["num_raft_logs_resv"].as< uint32_t >();
         }
         if (SISL_OPTIONS.count("res_mgr_audit_timer_ms")) {
             s.resource_limits.resource_audit_timer_ms = SISL_OPTIONS["res_mgr_audit_timer_ms"].as< uint32_t >();

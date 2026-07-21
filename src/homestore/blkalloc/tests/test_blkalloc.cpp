@@ -40,7 +40,7 @@
 
 #include "homestore/blkalloc/blk_cache.h"
 #include "homestore/base/homestore_assert.h"
-#include "homestore/base/homestore_config.h"
+#include "homestore/base/hs_runtime_config.h"
 #include "homestore/blkalloc/slab_blk_allocator.h"
 
 using namespace homestore;
@@ -121,7 +121,7 @@ struct BlkAllocatorTest {
         assert(m_track_slabs == false);
         m_track_slabs = true;
 
-        const auto& slab_distribution{homestore::HomeStoreDynamicConfig::default_slab_distribution()};
+        const auto& slab_distribution{homestore::HomeStoreRuntimeConfig::default_slab_distribution()};
         m_num_slabs = slab_distribution.size();
         double cum_pct{0.0};
         uint64_t cum{0};
@@ -379,7 +379,7 @@ struct SlabBlkAllocatorTest : public ::testing::Test, BlkAllocatorTest {
     std::unique_ptr< SlabBlkAllocator > m_allocator;
 
     SlabBlkAllocatorTest() : BlkAllocatorTest() {
-        HomeStoreDynamicConfig::init_settings_default();
+        HomeStoreRuntimeConfig::init_settings_default();
         // Bump retry count for CompactAlloc: the test hammers many threads on a small block space, which
         // amplifies the transient slab-empty window from concurrent break_up. Production default of 2 is
         // fine for real workloads.
@@ -829,7 +829,7 @@ int main(int argc, char* argv[]) {
     sisl::logging::SetLogger("test_blkalloc");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%t] %v");
     folly::Init folly_init(&argc, &argv, folly::InitOptions{}.useGFlags(false));
-    HomeStoreDynamicConfig::init_settings_default();
+    HomeStoreRuntimeConfig::init_settings_default();
     init_sweep_service();
     const int result{RUN_ALL_TESTS()};
     shutdown_sweep_service();

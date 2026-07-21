@@ -9,6 +9,7 @@
 #include "replication/raft_state_machine.h"
 #include "replication/replica_set.h"
 #include "homestore/homestore.h"
+#include "homestore/managers.h"
 #include "common/homestore_config.h"
 #include "common/crash_simulator.h"
 
@@ -405,7 +406,7 @@ void RaftStateMachine::save_logical_snp_obj(nuraft::snapshot& s, ulong& obj_id, 
 
     m_rd.m_listener->write_snapshot_obj(snp_ctx, snp_data);
     if (is_last_obj) {
-        hs()->cp_mgr().trigger_cp_flush(true).wait(); // ensure DSN is flushed to disk
+        cp_mgr().trigger_cp_flush(true).wait(); // ensure DSN is flushed to disk
     }
 
     // Update the object offset.
@@ -428,7 +429,7 @@ bool RaftStateMachine::apply_snapshot(nuraft::snapshot& s) {
 
     auto snp_ctx = std::make_shared< nuraft_snapshot_context >(s);
     auto res = m_rd.m_listener->apply_snapshot(snp_ctx);
-    hs()->cp_mgr().trigger_cp_flush(true /* force */).get();
+    cp_mgr().trigger_cp_flush(true /* force */).get();
     return res;
 }
 

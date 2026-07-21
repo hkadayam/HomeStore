@@ -121,7 +121,7 @@ public:
     /// Initialise the on-disk chunk slot bitmap (first-time format).
     Async< void > format_chunks();
 
-    /// Allocate one chunk slot; chunk_id = pdev_id * HS_MAX_CHUNKS + slot_number.
+    /// Allocate one chunk slot; chunk_id = pdev_id * MAX_CHUNKS_IN_SYSTEM + slot_number.
     Async< shared< Chunk > > create_chunk(uint32_t vdev_id, uint64_t size, uint64_t vdev_order,
                                           const uint8_t* user_private = nullptr, size_t user_private_size = 0);
 

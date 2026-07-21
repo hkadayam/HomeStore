@@ -162,7 +162,7 @@ BlkAllocStatus SlabBlkAllocator::alloc(blk_count_t nblks, blk_alloc_hints const&
 
     if (slab_can_satisfy && (cfg_.alloc_mode == AllocMode::CompactAlloc || cfg_.use_slab_cache_)) {
         const auto max_attempts =
-            (cfg_.alloc_mode == AllocMode::CompactAlloc) ? HS_DYNAMIC_CONFIG(blkallocator.max_slab_alloc_attempt) : 1u;
+            (cfg_.alloc_mode == AllocMode::CompactAlloc) ? HS_RUNTIME_CONFIG(blkallocator.max_slab_alloc_attempt) : 1u;
 
         // Excess collects blocks that couldn't be pushed back to slab during break-up / merge-down.
         // For ExpandedAlloc these are freed back to the bitmap below.

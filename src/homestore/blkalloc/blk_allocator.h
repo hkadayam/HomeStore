@@ -22,7 +22,7 @@
 
 #include "homestore/base/homestore_decl.h"
 #include "homestore/base/blk.h"
-#include "homestore/base/homestore_config.h"
+#include "homestore/base/hs_runtime_config.h"
 #include "homestore/base/homestore_assert.h"
 
 namespace homestore {
@@ -61,7 +61,7 @@ public:
             blk_size_{blk_size},
             align_size_{align_size},
             capacity_{static_cast< blk_num_t >(size / blk_size)},
-            blks_per_portion_{std::min(HS_DYNAMIC_CONFIG(blkallocator.num_blks_per_portion), capacity_)},
+            blks_per_portion_{std::min(HS_RUNTIME_CONFIG(blkallocator.num_blks_per_portion), capacity_)},
             persistent_{persistent},
             unique_name_{name} {}
 

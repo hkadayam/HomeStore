@@ -37,7 +37,7 @@
 
 #include "blkalloc/blk_cache.h"
 #include "common/homestore_assert.h"
-#include "common/homestore_config.h"
+#include "common/hs_runtime_config.h"
 #include "blkalloc/slab_blk_allocator.h"
 
  
@@ -109,7 +109,7 @@ struct BlkAllocatorTest {
         double cum_pct{0.0};
         uint64_t cum{0};
         size_t slab_index{0};
-        const auto& slab_distribution{homestore::HomeStoreDynamicConfig::default_slab_distribution()};
+        const auto& slab_distribution{homestore::HomeStoreRuntimeConfig::default_slab_distribution()};
         m_num_slabs = slab_distribution.size();
         for (size_t slab_index{0}; slab_index < slab_distribution.size(); ++slab_index) {
             cum_pct += slab_distribution[slab_index];
@@ -416,7 +416,7 @@ struct CompactBlkAllocatorTest : public ::testing::Test, BlkAllocatorTest {
 struct SlabBlkAllocatorTest : public ::testing::Test, BlkAllocatorTest {
     std::unique_ptr< SlabBlkAllocator > m_allocator;
 
-    SlabBlkAllocatorTest() : BlkAllocatorTest() { HomeStoreDynamicConfig::init_settings_default(); }
+    SlabBlkAllocatorTest() : BlkAllocatorTest() { HomeStoreRuntimeConfig::init_settings_default(); }
     SlabBlkAllocatorTest(const SlabBlkAllocatorTest&) = delete;
     SlabBlkAllocatorTest(SlabBlkAllocatorTest&&) noexcept = delete;
     SlabBlkAllocatorTest& operator=(const SlabBlkAllocatorTest&) = delete;

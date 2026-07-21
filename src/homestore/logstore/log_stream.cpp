@@ -27,7 +27,7 @@
 #include "sisl/fds/utils.h" // Clock, get_elapsed_time_us
 
 #include "homestore/logstore/log_stream.h"
-#include "homestore/base/homestore_config.h" // HS_DYNAMIC_CONFIG
+#include "homestore/base/hs_runtime_config.h" // HS_RUNTIME_CONFIG
 #include "common/defs.h"
 #include "homestore/device/chunk.h"
 #include "homestore/device/virtual_dev.h"
@@ -136,7 +136,7 @@ logid_t LogStream::append(LogStreamClient* client, lsn_t lsn, const LogBlob& dat
     // Size-based auto-flush: only the appender that takes pending_flush_size_ from below threshold to >=
     // threshold spawns the detached flush.  Subsequent appenders that observe an already-above-threshold value
     // skip the spawn — flush() decrements the counter on success, naturally re-arming the next crossing.
-    const int64_t threshold = to_i64(HS_DYNAMIC_CONFIG(logstore.flush_threshold_size));
+    const int64_t threshold = to_i64(HS_RUNTIME_CONFIG(logstore.flush_threshold_size));
     if (prev < threshold && (prev + sz) >= threshold) {
         iomanager::spawn_detached(iomanager::ReactorTarget::any(),
                                   [self = shared_from_this()]() -> Async< void > { co_await self->flush(); });
@@ -149,7 +149,7 @@ Async< void > LogStream::flush() {
 
     // Track each group emplaced this turn so we can construct stream_keys for completion callbacks below without
     // having to refer back into per-record state.  Inline capacity covers the common case; small_vector spills
-    // to heap if HS_DYNAMIC_CONFIG(logstore.max_flush_loops) is hot-swapped above kFlushGroupsInlineCapacity.
+    // to heap if HS_RUNTIME_CONFIG(logstore.max_flush_loops) is hot-swapped above kFlushGroupsInlineCapacity.
     struct EmplacedGroup {
         logid_t from_idx;
         logid_t upto_idx;
@@ -158,7 +158,7 @@ Async< void > LogStream::flush() {
     folly::small_vector< EmplacedGroup, kFlushGroupsInlineCapacity > emplaced;
 
     // Build groups in a loop while contiguous-active records keep arriving (capped at the hotswap config).
-    const auto max_loops = HS_DYNAMIC_CONFIG(logstore.max_flush_loops);
+    const auto max_loops = HS_RUNTIME_CONFIG(logstore.max_flush_loops);
     uint32_t loops = 0;
     while (loops++ < max_loops) {
         const logid_t from = last_flush_idx_ + 1;
@@ -205,7 +205,7 @@ Async< void > LogStream::flush() {
 
 void LogStream::start_flush_timer() {
     flush_timer_.start(iomanager::ReactorTarget::any(),
-                       std::chrono::microseconds(HS_DYNAMIC_CONFIG(logstore.flush_timer_frequency_us)),
+                       std::chrono::microseconds(HS_RUNTIME_CONFIG(logstore.flush_timer_frequency_us)),
                        iomanager::TimerKind::Recurring, [this]() -> Async< void > {
                            // Cheap pre-check: skip if no pending bytes.  pending_flush_size_ is decremented by
                            // flush() on success, so >0 means records haven't reached disk yet.
@@ -213,7 +213,7 @@ void LogStream::start_flush_timer() {
                                co_return;
                            }
                            if (get_elapsed_time_us(last_flush_time_.load(std::memory_order_relaxed)) >=
-                               HS_DYNAMIC_CONFIG(logstore.max_time_between_flush_us)) {
+                               HS_RUNTIME_CONFIG(logstore.max_time_between_flush_us)) {
                                co_await flush();
                            }
                        });
@@ -405,7 +405,8 @@ Async< void > LogStream::recover(lookup_store_fn lookup) {
             if (auto* client = lookup ? lookup(rhdr->store_id) : nullptr) {
                 // Sub-view sharing group_buf's underlying refcount — no copy, group's buffer outlives the view.
                 sisl::IoBufView data_view{group_buf, data_off_in_view, rhdr->size};
-                client->on_log_found(rhdr->store_lsn, stream_key{rhdr->log_id, rec_stream_offset, cursor}, data_view);
+                co_await client->on_log_found(rhdr->store_lsn, stream_key{rhdr->log_id, rec_stream_offset, cursor},
+                                              data_view);
             }
             // else: orphan record — store_id was never opened; manager handles cleanup.
 
@@ -444,13 +445,13 @@ Async< void > LogStream::recover(lookup_store_fn lookup) {
                 "LogStream::recover: torn middle write detected — chain break at stream offset {}, but a valid "
                 "LogGroup exists at offset {} (within {} block lookahead). Refusing to silently truncate; this "
                 "stream needs manual investigation.",
-                cursor, *found, HS_DYNAMIC_CONFIG(logstore.recovery_max_blks_read_for_additional_check)));
+                cursor, *found, HS_RUNTIME_CONFIG(logstore.recovery_max_blks_read_for_additional_check)));
         }
     }
 }
 
 Async< std::optional< uint64_t > > LogStream::probe_for_torn_write(uint64_t bad_off) {
-    const uint32_t max_blocks = HS_DYNAMIC_CONFIG(logstore.recovery_max_blks_read_for_additional_check);
+    const uint32_t max_blocks = HS_RUNTIME_CONFIG(logstore.recovery_max_blks_read_for_additional_check);
     if (max_blocks == 0)
         co_return std::nullopt;
 

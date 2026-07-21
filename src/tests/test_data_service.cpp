@@ -36,7 +36,7 @@
 #include "device/physical_dev.hpp"
 #include "device/virtual_dev.hpp"
 #include "device/chunk.h"
-#include "common/homestore_config.h"
+#include "common/hs_runtime_config.h"
 #include "common/homestore_assert.h"
 #include "blkalloc/blk_allocator.h"
 #include "test_common/bits_generator.h"

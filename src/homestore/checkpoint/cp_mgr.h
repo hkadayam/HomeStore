@@ -153,6 +153,8 @@ VENUM(CPTriggerReason, uint8_t,
       LogStoreFull = 4,          // Log store has gotten really full
       DataFreeBlksExceeded = 5,  // Number of free blks in data service exceeded
       UserDriven = 6,            // User explicitly requested for
+      SystemRestart = 7,         // Bootup or shutdown
+      Snapshot = 8,              // Snapshot being taken
 );
 
 /* It is responsible to trigger the checkpoints when all concurrent IOs are completed.

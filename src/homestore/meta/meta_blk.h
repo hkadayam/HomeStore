@@ -202,6 +202,10 @@ public:
     Async< void > write(const uint8_t* data, size_t len);
     Async< sisl::IoBufView > read();
 
+    /// Unlink this MetaBlk from the client's chain and free its blocks on the vdev.  After destroy() the
+    /// wrapper's meta_blk_ is stale — the caller must not perform further I/O through this wrapper.
+    Async< void > destroy();
+
     const MetaBlk& meta_blk() const { return meta_blk_; }
     MetaBlk& meta_blk() { return meta_blk_; }
     shared< MetaClient > meta_client() const { return client_; }

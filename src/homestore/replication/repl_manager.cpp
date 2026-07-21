@@ -21,13 +21,17 @@
 #include <boost/uuid/string_generator.hpp>
 #include <folly/executors/thread_factory/NamedThreadFactory.h>
 
+#include <libnuraft/async.hxx>
+#include <libnuraft/async_compat.hxx>
 #include <libnuraft/error_code.hxx>
+#include <libnuraft/raft_server.hxx>
 
 #include "sisl/logging/logging.h"
 
 #include "common/homestore_assert.h"
-#include "common/homestore_config.h"
+#include "common/hs_runtime_config.h"
 #include "homestore/homestore.h"
+#include "homestore/managers.h"
 #include "homestore/meta/meta_blk.h"
 #include "homestore/meta/meta_blk_manager.h"
 #include "homestore/meta/meta_client.h"
@@ -48,27 +52,93 @@ ReplicationManager::ReplicationManager(shared< ReplApplication > repl_app) : rep
 
 ReplicationManager::~ReplicationManager() = default;
 
-Async< void > ReplicationManager::start() {
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Static factories + phased bring-up.  Mirrors the manager lifecycle driven by HomeStore:
+//   create() — first-time boot: infra + register CP consumer + go live (listen + timers).  No groups exist;
+//              runtime create_replica_set/on_demand builds and launches each one individually.
+//   load()   — recovery: infra + reconstruct replica sets (ReplicaSet::load, NO engine) + register CP consumer
+//              (after the sets exist, so its initial on_switchover_cp seeds each set's per-CP checkpoint state).
+//   replay() — recovery go-live: launch every reconstructed set's raft engine, then listen + timers.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Async< void > ReplicationManager::create(shared< ReplApplication > repl_app) {
+    auto mgr = std::make_shared< ReplicationManager >(std::move(repl_app));
+    co_await mgr->setup_infra();
+    co_await mgr->start_engine();
+    Managers::init_repl_mgr(mgr);
+    RM_LOG(INFO, NO_TRACE_ID, "Replication service created (first-time boot)");
+}
+
+Async< void > ReplicationManager::load(shared< ReplApplication > repl_app) {
+    auto mgr = std::make_shared< ReplicationManager >(std::move(repl_app));
+    co_await mgr->setup_infra();
+    co_await mgr->reconstruct_replica_sets();
+    Managers::init_repl_mgr(mgr);
+    RM_LOG(INFO, NO_TRACE_ID, "Replication service loaded ({} replica set(s)); awaiting replay()",
+           mgr->replica_sets_.size());
+}
+
+Async< void > ReplicationManager::start_engine() {
+    // Launch every reconstructed set's raft engine, then go live (open inbound traffic + maintenance timers).
+    // First-time boot has no reconstructed sets, so the loop is a no-op and this just goes live; on recovery it
+    // runs after LogStoreManager::replay() has restored each set's commit_upto_lsn (nuraft reads the state
+    // machine's last-committed index at start_server).
+    std::vector< shared< ReplicaSet > > sets;
+    {
+        std::shared_lock lk{rs_mtx_};
+        sets.reserve(replica_sets_.size());
+        for (auto const& [_, rs] : replica_sets_) {
+            if (rs) {
+                sets.push_back(rs);
+            }
+        }
+    }
+    for (auto const& rs : sets) {
+        if (!co_await rs->start_engine()) {
+            RM_LOG(ERROR, NO_TRACE_ID, "raft engine start failed for a reloaded group");
+        }
+    }
+
+    // Go live: open the rpc listener to inbound traffic and start the gc / persist-commit-lsn maintenance loops
+    // (coroutines on any reactor — every SB write inside is co_await-able, so no dedicated reaper thread).
+    nuraft::ptr< nuraft::msg_handler > null_handler;
+    rpc_listener_->listen(null_handler);
+    persist_commit_lsn_timer_.start(
+        iomanager::ReactorTarget::any(),
+        std::chrono::milliseconds{HS_RUNTIME_CONFIG(consensus.flush_durable_commit_interval_ms)},
+        iomanager::TimerKind::Recurring, [this]() -> Async< void > { co_await persist_commit_lsn(); });
+    gc_timer_.start(iomanager::ReactorTarget::any(),
+                    std::chrono::milliseconds{HS_RUNTIME_CONFIG(consensus.gc_scan_interval_ms)},
+                    iomanager::TimerKind::Recurring, [this]() -> Async< void > { co_await gc_replica_sets(); });
+
+    RM_LOG(INFO, NO_TRACE_ID, "Replication service live ({} replica set(s))", sets.size());
+    co_return;
+}
+
+// ── Private bring-up helpers ─────────────────────────────────────────────────────────────────────────────────
+
+Async< void > ReplicationManager::setup_infra() {
     my_uuid_ = repl_app_->get_my_repl_id();
 
     auto [bind_host, bind_port] = repl_app_->lookup_peer(my_uuid_, GroupId{});
-    RM_LOG(INFO, NO_TRACE_ID, "starting; my_uuid={} bind={}:{}", boost::uuids::to_string(my_uuid_), bind_host,
-           bind_port);
+    RM_LOG(INFO, NO_TRACE_ID, "setup; my_uuid={} bind={}:{}", boost::uuids::to_string(my_uuid_), bind_host, bind_port);
 
     cpu_executor_ =
         std::make_unique< folly::CPUThreadPoolExecutor >(2, std::make_shared< folly::NamedThreadFactory >("repl_cpu"));
 
     rpc_client_factory_ = std::make_shared< replication::FollyRpcClientFactory >(cpu_executor_.get());
+    // Construct the listener but do NOT listen() yet — start_engine() opens inbound traffic once engines are up.
     rpc_listener_ =
         std::make_shared< replication::FollyRpcListener >(iomanager::iomgr().reactor_for(0), bind_port, this);
-    nuraft::ptr< nuraft::msg_handler > null_handler;
-    rpc_listener_->listen(null_handler);
 
     rs_meta_client_ =
-        std::make_shared< MetaClient >(co_await hs()->meta_blk_mgr().register_client(std::string{kReplicaSetMetaName}));
-    rs_raft_cfg_meta_client_ = std::make_shared< MetaClient >(
-        co_await hs()->meta_blk_mgr().register_client(std::string{kReplicaRaftConfigMetaName}));
+        std::make_shared< MetaClient >(co_await meta_mgr().register_client(std::string{kReplicaSetMetaName}));
+    rs_raft_cfg_meta_client_ =
+        std::make_shared< MetaClient >(co_await meta_mgr().register_client(std::string{kReplicaRaftConfigMetaName}));
+    co_return;
+}
 
+Async< void > ReplicationManager::reconstruct_replica_sets() {
     // First pass: raft configs.  raft_group_config_found parses group_id off the payload and stashes
     // (mblk, json) into pending_configs_ so the SB walk can look them up.
     co_await rs_raft_cfg_meta_client_->for_each_recovered_block(
@@ -77,7 +147,7 @@ Async< void > ReplicationManager::start() {
         });
 
     // Second pass: SBs.  For each SB, load_replica_set pulls the paired config out of pending_configs_
-    // (or destroys the SB if the config is missing) and drives rs->start().
+    // (or destroys the SB if the config is missing) and drives rs->load() (engine start deferred to replay()).
     co_await rs_meta_client_->for_each_recovered_block(
         [this](MetaBlk const& blk, sisl::IoBufView data) -> Async< void > { co_await load_replica_set(blk, data); });
 
@@ -88,22 +158,7 @@ Async< void > ReplicationManager::start() {
         co_await cfg_pair.first.destroy();
     }
     pending_configs_.clear();
-
-    RM_LOG(INFO, NO_TRACE_ID, "Replica-set replay completed");
-
-    hs()->cp_mgr().register_consumer("Replication", std::make_shared< ReplCPHandler >());
-
-    // Kick off the two recurring maintenance loops.  Both run as coroutines on any reactor — no separate
-    // reaper thread — because every SB write inside is co_await-able.
-    persist_commit_lsn_timer_.start(
-        iomanager::ReactorTarget::any(),
-        std::chrono::milliseconds{HS_DYNAMIC_CONFIG(consensus.flush_durable_commit_interval_ms)},
-        iomanager::TimerKind::Recurring, [this]() -> Async< void > { co_await persist_commit_lsn(); });
-
-    gc_timer_.start(iomanager::ReactorTarget::any(),
-                    std::chrono::milliseconds{HS_DYNAMIC_CONFIG(consensus.gc_scan_interval_ms)},
-                    iomanager::TimerKind::Recurring, [this]() -> Async< void > { co_await gc_replica_sets(); });
-
+    RM_LOG(INFO, NO_TRACE_ID, "Replica-set reconstruction completed");
     co_return;
 }
 
@@ -160,8 +215,9 @@ nuraft::ptr< nuraft::raft_server > ReplicationManager::lookup_raft_server(nuraft
     return rs.value()->raft_server();
 }
 
-Async< ReplResult< shared< ReplicaSet > > >
-ReplicationManager::create_replica_set(GroupId group_id, std::set< ReplicaId > const& members) {
+Async< ReplResult< shared< ReplicaSet > > > ReplicationManager::create_replica_set(GroupId group_id,
+                                                                                   std::set< ReplicaId > const& members,
+                                                                                   ReplicaSetOptions const& options) {
     // Gate under rs_mtx_: if the group already exists, that's an idempotent return.  If a create is
     // in-flight (pending_creates_), a concurrent racer got here first — this call bails with
     // SERVER_ALREADY_EXISTS rather than duplicating the SB / raft_server setup and having to unwind
@@ -207,7 +263,7 @@ ReplicationManager::create_replica_set(GroupId group_id, std::set< ReplicaId > c
     // of falling back to the single-self bootstrap.  Each server's aux holds the UUID string (matches
     // add_member()'s stamping) so downstream int32-srv_id → ReplicaId reverse lookups uniformly work.
     auto servers = nlohmann::json::array();
-    auto const priority = HS_DYNAMIC_CONFIG(consensus.default_leader_priority);
+    auto const priority = HS_RUNTIME_CONFIG(consensus.default_leader_priority);
     for (auto const& member_id : members) {
         servers.push_back(nlohmann::json{{"id", to_server_id(member_id)},
                                          {"dc_id", 0},
@@ -226,9 +282,10 @@ ReplicationManager::create_replica_set(GroupId group_id, std::set< ReplicaId > c
 
     auto raft_cfg_mblk =
         co_await MetaBlkWrapper::create(rs_raft_cfg_meta_client_, fmt::format("cfg_{}", gid_str), /*size=*/{});
-    auto rs = std::make_shared< ReplicaSet >(*this, std::move(sb_mblk));
+    // User-initiated create: options come from the caller arg (not the listener).
+    auto rs = std::make_shared< ReplicaSet >(*this, std::move(sb_mblk), options);
     rs->attach_listener(std::move(listener));
-    if (!co_await rs->start(std::move(raft_cfg_mblk), std::move(raft_cfg_json))) {
+    if (!co_await rs->load(std::move(raft_cfg_mblk), std::move(raft_cfg_json)) || !co_await rs->start_engine()) {
         RM_LOG(ERROR, NO_TRACE_ID, "start failed for created group_id={}", gid_str);
         // Unwind everything rs->start() may have partially built (SB, cfg mblk, log store), then fire
         // on_destroy on the listener that the app allocated for this create.
@@ -276,9 +333,16 @@ ReplicationManager::create_replica_set_on_demand(nuraft::group_id_t const& gid) 
         co_return nullptr;
     }
 
+    // Peer-initiated on-demand: options come from the listener (freshly constructed above).  Same group_id
+    // across replicas must yield the same options — divergent allow_user_driven_truncate across replicas
+    // — that's the app's contract, we don't enforce.
+    auto const options = listener->replica_set_options();
+
     // Allocate a fresh MetaBlk under the shared "ReplicaSet" client for this group's SB.  Build the
     // initial ReplicaSetSuperBlk in a temporary buffer and persist it through sb_mblk.write().  The tmp
-    // dies here; rs->start() will read the SB back into ReplicaSet's own buffer during setup.
+    // dies here; rs->start() will read the SB back into ReplicaSet's own buffer during setup.  Per-group
+    // options are NOT stamped into SB — the listener is the source of truth and gets queried again on
+    // every restart.
     auto sb_mblk =
         co_await MetaBlkWrapper::create(rs_meta_client_, fmt::format("rs_{}", gid_str), sizeof(ReplicaSetSuperBlk));
     {
@@ -295,10 +359,10 @@ ReplicationManager::create_replica_set_on_demand(nuraft::group_id_t const& gid) 
     // path fills in the "config" and "state" keys on first save.
     auto raft_cfg_mblk =
         co_await MetaBlkWrapper::create(rs_raft_cfg_meta_client_, fmt::format("cfg_{}", gid_str), /*size=*/{});
-    auto rs = std::make_shared< ReplicaSet >(*this, std::move(sb_mblk));
+    auto rs = std::make_shared< ReplicaSet >(*this, std::move(sb_mblk), options);
     rs->attach_listener(std::move(listener));
     nlohmann::json raft_cfg_json = {{"group_id", gid_str}};
-    if (!co_await rs->start(std::move(raft_cfg_mblk), std::move(raft_cfg_json))) {
+    if (!co_await rs->load(std::move(raft_cfg_mblk), std::move(raft_cfg_json)) || !co_await rs->start_engine()) {
         RM_LOG(ERROR, NO_TRACE_ID, "start failed for newly-created group_id={}", gid_str);
         co_await rs->finish_destroy_local();
         std::unique_lock lk{rs_mtx_};
@@ -359,10 +423,13 @@ Async< void > ReplicationManager::load_replica_set(MetaBlk const& blk, sisl::IoB
         co_return;
     }
 
-    auto rs = std::make_shared< ReplicaSet >(*this, std::move(sb_mblk));
+    // Restart/reload: options come from the listener (app is authoritative, may change across restarts).
+    auto const options = listener->replica_set_options();
+
+    auto rs = std::make_shared< ReplicaSet >(*this, std::move(sb_mblk), options);
     rs->attach_listener(std::move(listener));
-    if (!co_await rs->start(std::move(raft_cfg_mblk), std::move(raft_cfg_json))) {
-        RM_LOG(ERROR, NO_TRACE_ID, "start failed for reloaded group_id={} — leaving SB + config on disk", gid_str);
+    if (!co_await rs->load(std::move(raft_cfg_mblk), std::move(raft_cfg_json))) {
+        RM_LOG(ERROR, NO_TRACE_ID, "load failed for reloaded group_id={} — leaving SB + config on disk", gid_str);
         co_return;
     }
 
@@ -402,7 +469,7 @@ Async< void > ReplicationManager::raft_group_config_found(MetaBlk const& blk, si
 
 Async< void > ReplicationManager::gc_replica_sets() {
     // Snapshot the reap candidates under the shared lock — never hold the lock across a co_await.
-    auto const grace = std::chrono::seconds{HS_DYNAMIC_CONFIG(consensus.repl_dev_cleanup_interval_sec)};
+    auto const grace = std::chrono::seconds{HS_RUNTIME_CONFIG(consensus.replica_set_cleanup_interval_sec)};
     auto const now = Clock::now();
     std::vector< std::pair< GroupId, shared< ReplicaSet > > > reap_list;
     {
@@ -429,6 +496,34 @@ Async< void > ReplicationManager::gc_replica_sets() {
             replica_sets_.erase(gid);
         }
         repl_app_->destroy_replica_set_listener(gid);
+    }
+    co_return;
+}
+
+Async< void > ReplicationManager::truncate() {
+    std::vector< shared< ReplicaSet > > sets;
+    {
+        std::shared_lock lk{rs_mtx_};
+        sets.reserve(replica_sets_.size());
+        for (auto const& [_, rs] : replica_sets_) {
+            if (rs) {
+                sets.push_back(rs);
+            }
+        }
+    }
+    // Serial: snapshot creation is IO-heavy per group.
+    for (auto const& rs : sets) {
+        auto* srv = rs->raft_server();
+        if (!srv) {
+            continue; // engine not yet started (mid-load, before start_engine)
+        }
+        auto cr = srv->schedule_snapshot_creation();
+        if (!cr) {
+            continue; // nuraft rejected (snapshot inflight or bad server state)
+        }
+        nuraft::Baton baton;
+        cr->when_ready([&baton](uint64_t&, nuraft::ptr< std::exception >&) { baton.post(); });
+        co_await baton.wait();
     }
     co_return;
 }
@@ -486,40 +581,8 @@ ReplError ReplicationManager::to_repl_error(nuraft::cmd_result_code code) {
     }
 }
 
-void ReplCPHandler::on_switchover_cp(CP* /*cur_cp*/, CP* /*new_cp*/) {
-    // Fan out synchronously — each RS just captures an atomic.  Under shared_lock so a concurrent
-    // create/remove can't invalidate iterators.
-    repl_service().iterate_replica_sets([](cshared< ReplicaSet > const& rs) { rs->on_switchover_cp(); });
-}
-
-Async< bool > ReplCPHandler::cp_flush(CP* /*cp*/) {
-    // Snapshot registry under shared_lock, then fan out awaits outside the lock so the SB write doesn't
-    // hold the map lock.  Sequential co_await — CPs are low frequency (default 60s cadence) and per-RS
-    // flush is a single MetaBlk write, so ordering by rs is fine.
-    //
-    // CORRECTNESS DEPENDENCY: this handler MUST run LAST among all CPConsumers, after every subsystem the
-    // consumer's on_commit writes into (Index, BlkAlloc, VDev, etc.) has already flushed.  Persisting
-    // checkpoint_lsn before those flushes complete would claim a durability watermark the data has not
-    // reached — restart's on_log_found would then skip replay for LSNs the consumer state doesn't actually
-    // hold.  See TODO(cp-ordering) in cp_mgr.cpp::cp_start_flush; today the order is whatever
-    // std::unordered_map iteration returns, so the invariant is not yet enforced.
-    std::vector< shared< ReplicaSet > > rsets;
-    repl_service().iterate_replica_sets([&rsets](cshared< ReplicaSet > const& rs) { rsets.push_back(rs); });
-    for (auto const& rs : rsets) {
-        co_await rs->cp_flush();
-    }
-    co_return true;
-}
-
-void ReplCPHandler::cp_cleanup(CP* /*cp*/) {
-}
-
-int ReplCPHandler::cp_progress_percent() {
-    return 100;
-}
-
 ReplicationManager& repl_service() {
-    return hs()->repl_service();
+    return repl_mgr();
 }
 
 } // namespace homestore

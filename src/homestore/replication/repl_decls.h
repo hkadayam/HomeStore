@@ -56,6 +56,7 @@ using raft_lsn_t = int64_t;  // 1-indexed; nuraft's lsn space (= store_lsn + 1)
 using RaftBufferPtr = nuraft::ptr< nuraft::buffer >;
 using RaftClusterConfig = nuraft::ptr< nuraft::cluster_config >;
 using RaftLogEntryPtr = nuraft::ptr< nuraft::log_entry >;
+using RaftSnapshotPtr = nuraft::ptr< nuraft::snapshot >;
 
 using TraceId = uint64_t;
 

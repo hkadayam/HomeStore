@@ -123,6 +123,26 @@ table LogStore {
     // is found within this window, the break is treated as a torn middle write (recovery aborts loudly)
     // rather than the legitimate tail. 0 = stop at first invalid group (legacy behavior).
     recovery_max_blks_read_for_additional_check: uint32 = 20;
+
+    // Period between LogStoreManager auto-truncate sweeps: fans out LogStore::truncate(MAX) over opt-in stores,
+    // then aggregates the cross-store min anchor and reclaims stream storage via LogStream::truncate.  Larger
+    // intervals reduce metadata write amplification; smaller intervals reclaim storage sooner.
+    auto_truncate_frequency_ms: uint64 = 300000 (hotswap); // 5 minutes
+}
+
+table ResourceLimits {
+    // Absolute homestore process memory budget in bytes.  0 => derive proportionally from sys_mem_use_percent
+    // (a fraction of total system RAM).
+    process_mem_budget_bytes: uint64 = 0 (hotswap);
+
+    // Percentage of total system memory to use as the process budget when process_mem_budget_bytes == 0.
+    sys_mem_use_percent: uint32 = 60;
+
+    // Percentage of the resolved process memory budget allocated to the homestore cache.
+    cache_size_percent: uint32 = 65;
+
+    // resource audit timer in ms
+    resource_audit_timer_ms: uint32 = 120000;
 }
 
 table Generic {
@@ -146,9 +166,6 @@ table Generic {
     // if this value is set to 0, no sanity check will be run;
     sanity_check_level: uint32 = 1 (hotswap);
 
-    // max iteration of unmap done in a cp
-    max_unmap_iterations : uint32 = 64;
-
     // number of threads for btree writes;
     num_btree_write_threads : uint32 = 2;
 
@@ -159,52 +176,20 @@ table Generic {
     // Number of chunks in journal chunk pool.
     journal_chunk_pool_capacity: uint32 = 5;
 
-    // Check for repl_dev cleanup in this interval
-    repl_dev_cleanup_interval_sec : uint32 = 60;
 }
 
-table ResourceLimits {
-    // it is going to use 2 times of this space because of two concurrent cps
-
-    // Percentage of Total IO Memory size with which we can have dirty buffer, beyond which it will force flush by
-    // triggering Checkpoint
+// Fields no longer read by any code, parked here pending removal so the schema stays valid (and their defaults
+// are preserved) without cluttering the live tables.  Do NOT add new references — delete this table once the
+// removal is confirmed safe.
+table Unused {
     index_max_dirty_memory_percent: double = 1 (hotswap);
-
-    // Percentage of Index VDev space upto which we allow freed space are allowed to be made pending, after which a
-    // checkpoint is triggered and capture the free space.
     index_max_free_space_accumulate_percent: double = 1 (hotswap);
-
-    // it is going to use 2 times of this space because of two concurrent cps
     free_blk_cnt: uint32 = 10000000 (hotswap);
     free_blk_size_percent: uint32 = 2 (hotswap);
-
-    // Percentage of system memory ResourceMgr will treat as the homestore process budget when the caller does
-    // not pass an explicit mem_cap to ResourceMgr::start(). Ignored when mem_cap is provided.
-    sys_mem_use_percent: uint32 = 60;
-
-    // Percentage of ResourceMgr's mem_cap allocated to the homestore cache.
-    cache_size_percent: uint32 = 65;
-
-    // precentage of memory used during recovery
     memory_in_recovery_precent: uint32 = 40;
-
-    // journal size used percentage high watermark -- trigger cp
     journal_vdev_size_percent: uint32 = 50;
-
-    // journal size used percentage critical watermark -- trigger truncation
     journal_vdev_size_percent_critical: uint32 = 90;
-
-    // [not used] journal descriptor size (NuObject: Per PG) Threshold in MB -- ready for truncation
-    journal_descriptor_size_threshold_mb: uint32 = 2048(hotswap);
-
-    // num entries that raft logstore wants to reserve -- its truncate should not across this
-    // 0 means HomeStore doesn't reserve anything and let nuraft controlls the truncation
-    raft_logstore_reserve_threshold: uint32 = 0 (hotswap);
-
-    // resource audit timer in ms
-    resource_audit_timer_ms: uint32 = 120000;
-
-    // We crash if volume is 95 percent filled and no disk space left
+    journal_descriptor_size_threshold_mb: uint32 = 2048 (hotswap);
     vol_threshhold_used_size_p: uint32 = 95;
 }
 
@@ -212,14 +197,14 @@ table MetaBlkStore {
     // turn on/off compression feature
     compress_feature_on : bool = true (hotswap);
 
+    // Try to do compress only when input buffer is larger than this size
+    min_compress_size_mb: uint32 = 1 (hotswap);
+
     // Compress buffer larger than this memory limit in MB will not trigger compress;
-    max_compress_memory_size_mb: uint32 = 512 (hotswap);
+    max_compress_size_mb: uint32 = 512 (hotswap);
 
     // Inital memory allocated for compress buffer
     init_compress_memory_size_mb: uint32 = 10 (hotswap);
-
-    // Try to do compress only when input buffer is larger than this size
-    min_compress_size_mb: uint32 = 1 (hotswap);
 
     // Percentage of compress ratio that allowed for compress to take place
     compress_ratio_limit: uint32 = 75 (hotswap);
@@ -268,12 +253,6 @@ table Consensus {
     // Leadership expiry (=0 indicates 20 times heartbeat period), set -1 to never expire
     leadership_expiry_ms: int32 = 0;
 
-    // data fetch max size limit in KB (2MB by default)
-    data_fetch_max_size_kb: uint32 = 2048;
-
-    // Timeout for data to be received after raft entry after which raft entry is rejected.
-    data_receive_timeout_ms: uint64 = 10000;
-
     // ReplicaSet Reqs timeout in seconds.
     repl_req_timeout_sec: uint32 = 300;
 
@@ -287,19 +266,36 @@ table Consensus {
     // Log difference to determine if the follower is in resync mode
     resync_log_idx_threshold: int64 = 100;
 
-    // Log difference from leader's point of view,  to determine if the
-    // follower is laggy and if so, leader will stop pushing data until it drops under this threshold.
+    // Log difference from leader's point of view, to determine if the follower is laggy and if so, leader will stop
+    // pushing data until it drops under this threshold.
     laggy_threshold: int64 = 2000;
 
-    // Reading snapshot objects will be done by a background thread asynchronously
-    // instead of synchronous read by Raft worker threads
+    // Reading snapshot objects will be done by a background thread asynchronously instead of synchronous read by 
+    // Raft worker threads
     use_bg_thread_for_snapshot_io: bool = true;
 
-    // Maximum number of election timeout rounds to wait during a prioritized leader election process.
-    // Every election timeout will compare its priority with the target_priority(max priority of the peers initially)
-    // then decay the target_priority and wait again until its priority >= target_priority. This setting helps us to set proper priority for peers.
-    // 0 means all members have the same priority.
+    // Maximum number of election timeout rounds to wait during a prioritized leader election process. Every election
+    // timeout will compare its priority with the target_priority(max priority of the peers initially) then decay the
+    // target_priority and wait again until its priority >= target_priority. This setting helps us to set proper
+    // priority for peers. 0 means all members have the same priority.
     max_wait_rounds_of_priority_election: uint32 = 2;
+
+    // How often ReplicationManager scans replica_sets_ for the "reaper" pass — finish_destroy_local() on any
+    // set that has been in the DESTROYED state longer than replica_set_cleanup_interval_sec.  Smaller values
+    // reclaim resources sooner at the cost of more idle scans; the SB writes inside finish_destroy_local()
+    // dominate cost anyway so keep this in the "occasional" range.
+    gc_scan_interval_ms: uint64 = 30000;
+
+    // Default election priority handed to a member that a group creates itself with (bootstrap of the initial
+    // config), and the reference from which new_member_priority is derived.  Operators tune this to bias
+    // leadership toward specific replicas.
+    default_leader_priority: int32 = 100;
+
+    // Multiplied against default_leader_priority to derive the priority given to a member joining an existing
+    // group after bootstrap.  Kept < 1 so new members prefer NOT to grab leadership until they have been
+    // caught up long enough for their durability to be worth trusting.  Result is truncated to int32; a value
+    // that rounds to 0 is clamped to 1 so the peer is never marked ineligible for leadership entirely.
+    priority_decay_coefficient: double = 0.8;
 
     // Maximum number of retries when raft is undergoing config changing
     config_changing_error_retries: int32 = 3;
@@ -309,6 +305,14 @@ table Consensus {
 
     // The interval in ms to check if the new member in replace_member is fully synced and ready to take over
     replace_member_sync_check_interval_ms: uint64 = 60000;
+
+    // num entries that the raft logstore wants to reserve -- its truncate should not cross this.
+    // 0 means HomeStore doesn't reserve anything and lets nuraft control the truncation.
+    raft_logstore_reserve_threshold: uint32 = 0 (hotswap);
+
+    // Grace period a replica set stays in the DESTROYED state before the reaper's finish_destroy_local() pass
+    // physically reclaims it.  Smaller values reclaim sooner at the cost of more idle scans.
+    replica_set_cleanup_interval_sec: uint32 = 60;
 }
 
 table HomeStoreSettings {
@@ -322,6 +326,7 @@ table HomeStoreSettings {
     resource_limits: ResourceLimits;
     metablk: MetaBlkStore;
     consensus: Consensus;
+    unused: Unused;
 }
 
 root_type HomeStoreSettings;

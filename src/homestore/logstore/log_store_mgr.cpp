@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 
@@ -26,7 +27,7 @@
 #include "sisl/logging/logging.h"
 
 #include "homestore/base/homestore_assert.h"
-#include "homestore/base/homestore_config.h" // HS_DYNAMIC_CONFIG
+#include "homestore/base/hs_runtime_config.h" // HS_RUNTIME_CONFIG
 #include "common/defs.h"
 #include "homestore/device/device_manager.h"
 #include "homestore/managers.h"
@@ -68,7 +69,9 @@ Async< void > LogStoreManager::create(uint64_t chunk_size, uint32_t initial_num_
 
     auto mgr =
         shared< LogStoreManager >(new LogStoreManager{std::move(meta_client), std::move(vdev), std::move(stream)});
+    cp_mgr().register_consumer("LogStore", std::make_shared< LogStoreManager::CPHandler >(mgr));
     Managers::init_log_store_mgr(mgr);
+    mgr->start_auto_truncate_timer();
     LOGINFO("LogStoreManager: ready (chunk_size={} initial_chunks={})", chunk_size, initial_num_chunks);
 }
 
@@ -132,9 +135,9 @@ Async< void > LogStoreManager::load() {
     for (auto& [sid, blk_and_data] : store_blks) {
         auto& [blk, data] = blk_and_data;
         auto wrapper = MetaBlkWrapper::load(mgr->meta_client_, std::move(blk));
-        // LogStore::load reads the sb via the wrapper internally; we already have data but pass through wrapper
-        // so the LogStore owns its sb mblk handle for future writes.  (We don't reuse `data` here — it's already
-        // captured inside the wrapper's lazy read.)
+
+        // append_mode is pulled from SB inside load(); auto_truncate / preserve_log_count come later
+        // via open_log_store once the caller supplies its options.
         auto store = co_await LogStore::load(mgr->log_stream_, std::move(wrapper));
         mgr->log_stores_.emplace(sid, std::move(store));
     }
@@ -143,11 +146,14 @@ Async< void > LogStoreManager::load() {
         mgr->next_store_id_.store(max_store_id + 1, std::memory_order_relaxed);
     }
 
+    cp_mgr().register_consumer("LogStore", std::make_shared< LogStoreManager::CPHandler >(mgr));
     Managers::init_log_store_mgr(mgr);
+    mgr->start_auto_truncate_timer();
     LOGINFO("LogStoreManager: loaded {} log_store(s)", mgr->log_stores_.size());
 }
 
 Async< void > LogStoreManager::shutdown() {
+    co_await auto_truncate_timer_.stop();
     if (log_stream_) {
         co_await log_stream_->stop();
     }
@@ -184,24 +190,40 @@ std::vector< shared< LogStore > > LogStoreManager::log_stores() const {
 // Store lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
 
-Async< shared< LogStore > > LogStoreManager::create_log_store(bool append_mode) {
+Async< shared< LogStore > > LogStoreManager::create_log_store(LogStoreOptions const& options) {
     const logstore_id_t sid = next_store_id_.fetch_add(1, std::memory_order_acq_rel);
-    auto store = co_await LogStore::create(sid, meta_client_, log_stream_, append_mode);
+    auto store = co_await LogStore::create(sid, meta_client_, log_stream_, options);
     {
         std::unique_lock lk{stores_mutex_};
         log_stores_.emplace(sid, store);
     }
-    LOGINFO("LogStoreManager: created log_store sid={} append_mode={}", sid, append_mode);
+
+    if (options.auto_truncate) {
+        num_stores_auto_truncate_.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    LOGINFO("LogStoreManager: created log_store sid={} append_mode={} auto_truncate={} preserve_log_count={}", sid,
+            options.append_mode, options.auto_truncate, options.preserve_log_count);
     co_return store;
 }
 
-shared< LogStore > LogStoreManager::open_log_store(logstore_id_t store_id, log_replay_cb handler) {
+shared< LogStore > LogStoreManager::open_log_store(logstore_id_t store_id, LogStoreOptions const& options,
+                                                   log_replay_cb handler) {
     auto store = get_log_store(store_id);
     if (!store) {
         LOGWARN("LogStoreManager: open_log_store sid={} — not found", store_id);
         return nullptr;
     }
-    store->open(std::move(handler));
+    // Adjust the auto_truncate counter for the (old options -> new options) delta before open, so a
+    // concurrent iteration sees a consistent count.  LogStore::open then asserts append_mode matches SB
+    // and installs the rest.
+    bool const was_auto = store->options().auto_truncate;
+    if (was_auto && !options.auto_truncate) {
+        num_stores_auto_truncate_.fetch_sub(1, std::memory_order_acq_rel);
+    } else if (!was_auto && options.auto_truncate) {
+        num_stores_auto_truncate_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    store->open(options, std::move(handler));
     return store;
 }
 
@@ -215,8 +237,8 @@ LogStore* LogStoreManager::lookup_store(logstore_id_t store_id) const {
     return (it != log_stores_.end()) ? it->second.get() : nullptr;
 }
 
-Async< void > LogStoreManager::recover() {
-    LOGINFO("LogStoreManager: starting recover, {} log_store(s) registered", log_stores_.size());
+Async< void > LogStoreManager::replay() {
+    LOGINFO("LogStoreManager: starting replay, {} log_store(s) registered", log_stores_.size());
 
     // Walk the LogStream's CRC chain; per-record on_log_found dispatches into the LogStore via lookup_store.
     co_await log_stream_->recover([this](logstore_id_t sid) { return lookup_store(sid); });
@@ -224,7 +246,7 @@ Async< void > LogStoreManager::recover() {
     // Drop unopened log_stores — those without a replay handler are presumed orphaned (their data is dead).
     co_await drop_unopened_stores();
 
-    LOGINFO("LogStoreManager: recover complete, {} log_store(s) remain after orphan cleanup", log_stores_.size());
+    LOGINFO("LogStoreManager: replay complete, {} log_store(s) remain after orphan cleanup", log_stores_.size());
 }
 
 Async< void > LogStoreManager::drop_unopened_stores() {
@@ -257,6 +279,10 @@ Async< void > LogStoreManager::destroy_log_store(logstore_id_t store_id) {
     }
     // Remove sb mblk so a subsequent restart won't re-discover this store.
     co_await meta_client_->remove_meta_blk(s->sb_blk());
+    if (s->options().auto_truncate) {
+        num_stores_auto_truncate_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
     {
         std::unique_lock lk{stores_mutex_};
         log_stores_.erase(store_id);
@@ -265,10 +291,72 @@ Async< void > LogStoreManager::destroy_log_store(logstore_id_t store_id) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CPHandler
+// ─────────────────────────────────────────────────────────────────────────────
+
+void LogStoreManager::CPHandler::on_switchover_cp(CP* /*cur_cp*/, CP* /*new_cp*/) {
+    auto mgr = mgr_.lock();
+    if (!mgr) {
+        return;
+    }
+    // Fan out synchronously — each LogStore just captures its tail into pending_checkpt_lsn_.
+    std::shared_lock lk{mgr->stores_mutex_};
+    for (auto& [_, s] : mgr->log_stores_) {
+        s->on_switchover_cp();
+    }
+}
+
+Async< bool > LogStoreManager::CPHandler::cp_flush(CP* /*cp*/) {
+    auto mgr = mgr_.lock();
+    if (!mgr) {
+        co_return true;
+    }
+    // Snapshot the store set under the shared lock, then fan out awaits outside the lock.  Sequential — CPs
+    // are low frequency and per-store flush is one MetaBlk write.
+    std::vector< shared< LogStore > > stores;
+    {
+        std::shared_lock lk{mgr->stores_mutex_};
+        stores.reserve(mgr->log_stores_.size());
+        for (auto& [_, s] : mgr->log_stores_) {
+            stores.push_back(s);
+        }
+    }
+    for (auto& s : stores) {
+        co_await s->cp_flush_persist();
+    }
+    co_return true;
+}
+
+void LogStoreManager::CPHandler::cp_cleanup(CP* /*cp*/) {
+}
+
+int LogStoreManager::CPHandler::cp_progress_percent() {
+    return 100;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Truncation
 // ─────────────────────────────────────────────────────────────────────────────
 
-Async< void > LogStoreManager::global_truncate() {
+Async< void > LogStoreManager::truncate() {
+    if (num_stores_auto_truncate_.load(std::memory_order_acquire) > 0) {
+        std::vector< shared< LogStore > > opt_in;
+        {
+            std::shared_lock lk{stores_mutex_};
+            opt_in.reserve(log_stores_.size());
+            for (auto const& [_, s] : log_stores_) {
+                if (s->options().auto_truncate) {
+                    opt_in.push_back(s);
+                }
+            }
+        }
+        for (auto const& s : opt_in) {
+            // We are calling to truncate till max for auto_truncate, because safe point to truncate is clamped
+            // by individual stores.
+            co_await s->truncate(std::numeric_limits< lsn_t >::max());
+        }
+    }
+
     // Min trunc offset across opened stores; std::nullopt-yielding stores (empty stores) don't constrain.
     std::optional< uint64_t > min_off;
     {
@@ -282,13 +370,20 @@ Async< void > LogStoreManager::global_truncate() {
         }
     }
     if (!min_off) {
-        LOGDEBUG("LogStoreManager::global_truncate: no store has a trunc anchor, no-op");
+        LOGDEBUG("LogStoreManager::truncate: no store has a trunc anchor, no-op");
         co_return;
     }
 
     // Build a stream_key with only group_stream_offset populated; LogStream::truncate uses just that field.
     co_await log_stream_->truncate(stream_key{/*log_id=*/-1, /*record_off=*/*min_off, /*group_off=*/*min_off});
-    LOGINFO("LogStoreManager::global_truncate: truncated stream to offset {}", *min_off);
+    LOGINFO("LogStoreManager::truncate: truncated stream to offset {}", *min_off);
+}
+
+void LogStoreManager::start_auto_truncate_timer() {
+    auto_truncate_timer_.start(
+        iomanager::ReactorTarget::any(),
+        std::chrono::milliseconds(HS_RUNTIME_CONFIG(logstore.auto_truncate_frequency_ms)),
+        iomanager::TimerKind::Recurring, [this]() -> Async< void > { co_await truncate(); });
 }
 
 } // namespace homestore

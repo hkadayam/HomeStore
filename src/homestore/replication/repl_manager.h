@@ -23,11 +23,10 @@
 
 #include <nlohmann/json.hpp>
 
-#include "common/homestore_config.h"
+#include "common/hs_runtime_config.h"
 #include "homestore/checkpoint/cp_mgr.h"
 #include "homestore/meta/meta_blk.h"
 #include "homestore/replication/repl_decls.h"
-#include "homestore/superblk_handler.hpp"
 
 namespace nuraft {
 class raft_server;
@@ -57,8 +56,8 @@ struct repl_dev_superblk;
 // (or away from) new-member leadership without recompiling.  Clamped to a minimum of 1 so a peer is never
 // completely locked out of leadership by aggressive decay.
 inline int32_t new_member_priority() {
-    auto const p = static_cast< int32_t >(HS_DYNAMIC_CONFIG(consensus.default_leader_priority) *
-                                          HS_DYNAMIC_CONFIG(consensus.priority_decay_coefficient));
+    auto const p = static_cast< int32_t >(HS_RUNTIME_CONFIG(consensus.default_leader_priority) *
+                                          HS_RUNTIME_CONFIG(consensus.priority_decay_coefficient));
     return p > 0 ? p : 1;
 }
 
@@ -70,7 +69,15 @@ public:
     ReplicationManager(ReplicationManager const&) = delete;
     ReplicationManager& operator=(ReplicationManager const&) = delete;
 
-    Async< void > start();
+    // Phased bring-up, driven by HomeStore (self-register via Managers::init_repl_mgr):
+    //   create()       — first-time boot: infra + register CP consumer + start_engine() (goes live, no sets).
+    //   load()         — recovery: infra + reconstruct replica sets (no engines); start_engine() deferred.
+    //   start_engine() — launch every reconstructed set's raft engine, then go live (open the listener + start
+    //                    the maintenance timers).  Called by create() (first boot, empty set loop) and by
+    //                    HomeStore::replay() (recovery, after LogStoreManager::replay()).
+    static Async< void > create(shared< ReplApplication > repl_app);
+    static Async< void > load(shared< ReplApplication > repl_app);
+    Async< void > start_engine();
     Async< void > stop();
 
     // -------- Public Task<>-driven API (proposer-style operations) --------
@@ -79,8 +86,8 @@ public:
     /// stamped into srv_config.aux), constructs a ReplicaSet, and brings it up.  Membership changes AFTER
     /// the group is created (add_member / remove_member / replace_member / flip_learner_flag) go directly
     /// on the ReplicaSet handle — no intermediate call through the manager.
-    Async< ReplResult< shared< ReplicaSet > > > create_replica_set(GroupId group_id,
-                                                                   std::set< ReplicaId > const& members);
+    Async< ReplResult< shared< ReplicaSet > > >
+    create_replica_set(GroupId group_id, std::set< ReplicaId > const& members, ReplicaSetOptions const& options);
 
     /// Construct a new ReplicaSet for an unknown group_id by asking the application via
     /// ReplApplication::create_replica_set_listener.  Peer-initiated path — called by the rpc listener when
@@ -92,6 +99,12 @@ public:
     /// the final teardown off to the reaper, which calls `rs->finish_destroy_local()` after a grace period
     /// then erases the group from the registry.
     Async< ReplError > remove_replica_set(GroupId group_id);
+
+    /// Fan out to every replica set: raft_server->schedule_snapshot_creation() + await completion.  The
+    /// resulting snapshot advances raft's last_snapshot, which lets its subsequent internal compact() trim
+    /// the log store's head_lsn.  Serial per set (snapshot creation is IO-heavy).  Groups whose raft engine
+    /// hasn't started yet are skipped.
+    Async< void > truncate();
 
     // -------- Synchronous accessors --------
 
@@ -120,7 +133,15 @@ public:
     static ReplError to_repl_error(nuraft::cmd_result_code code);
 
 private:
-    /// Reconstruct a ReplicaSet from its persisted SB during start().  Reads the group_id off the SB,
+    /// Common infra for create()/load(): resolve my uuid + bind port, build executors, rpc client factory, and
+    /// the (not-yet-listening) rpc listener, and register the two meta clients.  No CP consumer, no timers.
+    Async< void > setup_infra();
+
+    /// Recovery reconstruction: the two-pass raft-config + SB walk that rebuilds every ReplicaSet via
+    /// ReplicaSet::load() (no raft engine), destroying orphaned configs.  Called only from load().
+    Async< void > reconstruct_replica_sets();
+
+    /// Reconstruct a ReplicaSet from its persisted SB during load().  Reads the group_id off the SB,
     /// pulls the matching raft config out of pending_configs_ (populated by raft_group_config_found which
     /// ran first), and drives rs->start().  If no matching config is in pending_configs_, the SB is a
     /// no-config orphan and gets destroyed.
@@ -208,19 +229,6 @@ public:
 
     /// Return the current application/server repl uuid.
     virtual ReplicaId get_my_repl_id() const = 0;
-};
-
-// Hooks ReplicationManager into the HomeStore checkpoint lifecycle so per-group repl_dev superblks get
-// flushed during a CP.
-class ReplCPHandler : public CPCallbacks {
-public:
-    ReplCPHandler() = default;
-    ~ReplCPHandler() override = default;
-
-    void on_switchover_cp(CP* cur_cp, CP* new_cp) override;
-    Async< bool > cp_flush(CP* cp) override;
-    void cp_cleanup(CP* cp) override;
-    int cp_progress_percent() override;
 };
 
 } // namespace homestore

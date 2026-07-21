@@ -44,38 +44,14 @@ SETTINGS_INIT(homestorecfg::HomeStoreSettings, homestore_config);
 // the code for upgrade/revert.
 
 namespace homestore {
-#define HS_DYNAMIC_CONFIG_WITH(...) SETTINGS(homestore_config, __VA_ARGS__)
-#define HS_DYNAMIC_CONFIG_THIS(...) SETTINGS_THIS(homestore_config, __VA_ARGS__)
-#define HS_DYNAMIC_CONFIG_WITH_CAP(...) SETTINGS_THIS_CAP1(homestore_config, __VA_ARGS__)
-#define HS_DYNAMIC_CONFIG(...) SETTINGS_VALUE(homestore_config, __VA_ARGS__)
+#define HS_RUNTIME_CONFIG_WITH(...) SETTINGS(homestore_config, __VA_ARGS__)
+#define HS_RUNTIME_CONFIG_THIS(...) SETTINGS_THIS(homestore_config, __VA_ARGS__)
+#define HS_RUNTIME_CONFIG_WITH_CAP(...) SETTINGS_THIS_CAP1(homestore_config, __VA_ARGS__)
+#define HS_RUNTIME_CONFIG(...) SETTINGS_VALUE(homestore_config, __VA_ARGS__)
 
 #define HS_SETTINGS_FACTORY() SETTINGS_FACTORY(homestore_config)
 
-#define HS_STATIC_CONFIG(cfg) homestore::HomeStoreStaticConfig::instance().cfg
-
-struct HomeStoreStaticConfig {
-    static HomeStoreStaticConfig& instance() {
-        static HomeStoreStaticConfig s_inst;
-        return s_inst;
-    }
-
-    hs_engine_config engine;
-    hs_input_params input;
-    bool hdd_drive_present;
-
-    nlohmann::json to_json() const {
-        nlohmann::json json;
-        json["GenericConfig"] = engine.to_json();
-        json["InputParameters"] = input.to_json();
-        return json;
-    }
-};
-
-[[maybe_unused]] static bool is_data_drive_hdd() {
-    return HomeStoreStaticConfig::instance().hdd_drive_present;
-}
-
-class HomeStoreDynamicConfig {
+class HomeStoreRuntimeConfig {
 public:
     static const std::array< double, 9 >& default_slab_distribution() {
         // Assuming blk_size=4K [4K, 8K, 16K, 32K, 64K, 128K, 256K, 512K, 1M ]

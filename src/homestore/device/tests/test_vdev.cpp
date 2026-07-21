@@ -27,7 +27,7 @@
 #include "homestore/base/test_defs.h"
 
 #include "homestore/base/blk.h"
-#include "homestore/base/homestore_config.h"
+#include "homestore/base/hs_runtime_config.h"
 #include "homestore/device/device_manager.h"
 #include "homestore/device/physical_dev.h"
 #include "homestore/device/virtual_dev.h"
@@ -432,7 +432,7 @@ CORO_TEST_F(VDevTest, MostAvailableSpaceSelector) {
 int main(int argc, char* argv[]) {
     SISL_OPTIONS_LOAD(argc, argv);
     sisl::logging::SetLogger("test_vdev");
-    HomeStoreDynamicConfig::init_settings_default();
+    HomeStoreRuntimeConfig::init_settings_default();
     ::testing::InitGoogleTest(&argc, argv);
     iomanager::init_iomgr(2);
     int rc = RUN_ALL_TESTS();

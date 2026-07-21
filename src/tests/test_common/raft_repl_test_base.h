@@ -36,7 +36,7 @@
 #include "homestore/blkdata_service.hpp"
 #include "homestore/replication/repl_manager.h"
 #include "homestore/replication/replica_set.h"
-#include "common/homestore_config.h"
+#include "common/hs_runtime_config.h"
 #include "common/homestore_assert.h"
 #include "common/homestore_utils.h"
 

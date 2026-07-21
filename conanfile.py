@@ -77,7 +77,7 @@ class HomestoreConan(ConanFile):
 
     def requirements(self):
         # Core async / coroutines
-        self.requires("folly/2024.08.12.00", transitive_headers=True)
+        self.requires("folly/2026.07.13.00", transitive_headers=True)
 
         # Logging
         self.requires("spdlog/1.17.0", transitive_headers=True)

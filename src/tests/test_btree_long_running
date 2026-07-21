@@ -17,7 +17,7 @@
 #include <boost/uuid/random_generator.hpp>
 
 #include <sisl/utility/enum.hpp>
-#include "common/homestore_config.hpp"
+#include "common/hs_runtime_config.hpp"
 #include "common/resource_mgr.hpp"
 #include "test_common/homestore_test_common.hpp"
 #include "test_common/range_scheduler.hpp"

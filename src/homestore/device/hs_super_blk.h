@@ -27,6 +27,7 @@
 #include "common/defs.h"
 #include "homestore/device/device_decl.h"
 #include "homestore/base/crc.h"
+#include "homestore/base/hs_compile_config.h"
 
 #ifdef _PRERELEASE
 #include "sisl/flip/flip.h"
@@ -268,21 +269,8 @@ static_assert(sizeof(ChunkInfo) == ChunkInfo::SIZE, "ChunkInfo size mismatch");
 /////////////// Overarching super block information ////////////////
 class HSSuperBlk {
 public:
-    // Minium chunk size we can create in data device. Keeping this lower will increase number of chunks and thus
-    // area for super block will be higher.
-    static constexpr uint64_t MIN_CHUNK_SIZE_DATA_DEVICE = 16 * 1024 * 1024;
-
-    // Higher min chunk size than data device to ensure to limit max chunks in fast pdevs and thus lesser super block
-    // area on more expensive fast device.
-    static constexpr uint64_t MIN_CHUNK_SIZE_FAST_DEVICE = 32 * 1024 * 1024;
-
-    // Maximum number of chunks across all devices. We need to keep in mind the BlkId restriction (to address the
-    // chunks)
-    static constexpr uint32_t MAX_CHUNKS_IN_SYSTEM = 65536;
-
-    // Maximum vdevs in the system. Increasing this will have more vdev information in super block
-    static constexpr uint32_t MAX_VDEVS_IN_SYSTEM = 1024;
-
+    // System-wide vdev / chunk / min-chunk-size limits live in hs_compile_config.h — the single registry
+    // of compile-time restrictions (MAX_VDEVS_IN_SYSTEM, MAX_CHUNKS_IN_SYSTEM, MIN_CHUNK_SIZE_{DATA,FAST}_DEVICE).
     static constexpr uint64_t EXTRA_SB_SIZE_FOR_DATA_DEVICE = 8 * 1024 * 1024;
     static constexpr uint64_t EXTRA_SB_SIZE_FOR_FAST_DEVICE = 1 * 1024 * 1024;
 

@@ -6,7 +6,7 @@
 #include "homestore/index/btree/detail/btree_node.h"
 #include "homestore/index/btree/btree_base.h"
 
-#include "homestore/base/homestore_config.h"
+#include "homestore/base/hs_runtime_config.h"
 #include "homestore/base/homestore_utils.h"
 #include "homestore/blob/append_blk_stream.h"
 #include "homestore/blob/append_byte_stream.h"
@@ -62,14 +62,14 @@ COWBtreeSuperBlock& COWBtree::mutable_super_blk() {
 
 Async< shared< COWBtree > > COWBtree::create(COWBtreeManager& mgr, shared< BlobDev > blob_dev, MetaBlkWrapper&& mblk,
                                              shared< NodeCache > node_cache, shared< OverflowCache > overflow_cache) {
-    auto node_s = co_await blob_dev->create_append_blk_stream(HS_DYNAMIC_CONFIG(btree->cow_node_chunk_size));
-    auto overflow_s = co_await blob_dev->create_raw_blk_stream(HS_DYNAMIC_CONFIG(btree->cow_overflow_chunk_size));
+    auto node_s = co_await blob_dev->create_append_blk_stream(HS_RUNTIME_CONFIG(btree->cow_node_chunk_size));
+    auto overflow_s = co_await blob_dev->create_raw_blk_stream(HS_RUNTIME_CONFIG(btree->cow_overflow_chunk_size));
     auto incr_map_s =
-        co_await blob_dev->create_append_byte_stream(HS_DYNAMIC_CONFIG(btree->cow_incr_map_chunk_size), false);
+        co_await blob_dev->create_append_byte_stream(HS_RUNTIME_CONFIG(btree->cow_incr_map_chunk_size), false);
     auto full_map_1 =
-        co_await blob_dev->create_append_byte_stream(HS_DYNAMIC_CONFIG(btree->cow_full_map_chunk_size), false);
+        co_await blob_dev->create_append_byte_stream(HS_RUNTIME_CONFIG(btree->cow_full_map_chunk_size), false);
     auto full_map_2 =
-        co_await blob_dev->create_append_byte_stream(HS_DYNAMIC_CONFIG(btree->cow_full_map_chunk_size), false);
+        co_await blob_dev->create_append_byte_stream(HS_RUNTIME_CONFIG(btree->cow_full_map_chunk_size), false);
 
     auto& sb = *r_cast< COWBtreeSuperBlock* >(mblk.meta_blk().inline_data());
     sb.node_stream_id = node_s->stream_id();

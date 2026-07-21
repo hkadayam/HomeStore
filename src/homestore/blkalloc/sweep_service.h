@@ -116,7 +116,7 @@ private:
 
 // ---- Module-scoped service access ----
 
-/// Initializes the sweep service using current HS_DYNAMIC_CONFIG values:
+/// Initializes the sweep service using current HS_RUNTIME_CONFIG values:
 ///   blkallocator.num_slab_sweeper_threads
 ///   blkallocator.slab_refill_frequency_ms
 /// Idempotent: calling twice is a no-op.

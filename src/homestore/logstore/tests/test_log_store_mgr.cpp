@@ -33,7 +33,7 @@
 
 #include "iomanager/iomanager.h"
 #include "homestore/base/test_defs.h"
-#include "homestore/base/homestore_config.h"
+#include "homestore/base/hs_runtime_config.h"
 
 #include "common/defs.h"
 #include "homestore/device/device_manager.h"

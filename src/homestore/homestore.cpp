@@ -26,13 +26,14 @@
 #include "homestore/managers.h"
 
 #include "homestore/base/homestore_assert.h"
-#include "homestore/base/homestore_config.h"
+#include "homestore/base/hs_runtime_config.h"
 #include "homestore/device/device_manager.h"
 #include "homestore/checkpoint/cp_mgr.h"
 #include "homestore/meta/meta_blk_manager.h"
 #include "homestore/blob/blob_dev_mgr.h"
 #include "homestore/index/cow_btree/cow_btree_mgr.h"
 #include "homestore/logstore/log_store_mgr.h"
+#include "homestore/replication/repl_manager.h"
 #include "homestore/base/resource_mgr.h"
 
 #ifdef _PRERELEASE
@@ -63,19 +64,9 @@ bool HomeStore::is_first_time_boot() const {
     return device_mgr().is_first_time_boot();
 }
 
-uint64_t HomeStore::resolve_mem_cap(AppMemSize const& mem) {
-    return std::visit(
-        [](auto const& v) -> uint64_t {
-            using T = std::decay_t< decltype(v) >;
-            if constexpr (std::is_same_v< T, AbsoluteMem >) {
-                return v.bytes;
-            } else { // ProportionalMem
-                const uint64_t total = ResourceMgr::total_system_memory();
-                return static_cast< uint64_t >(static_cast< double >(total) * v.fraction);
-            }
-        },
-        mem);
-}
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//                                                start / boot
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 Async< bool > HomeStore::start(InputParams input) {
     if (input.devices.empty()) {
@@ -86,7 +77,7 @@ Async< bool > HomeStore::start(InputParams input) {
     // Process-level setup that runs once.
     sisl::ObjCounterRegistry::enable_metrics_reporting();
     sisl::MallocMetrics::enable();
-    HomeStoreDynamicConfig::init_settings_default();
+    HomeStoreRuntimeConfig::init_settings_default();
 
 #ifndef NDEBUG
     LOGINFO("HomeStore DEBUG version: {}", s_version);
@@ -102,45 +93,34 @@ Async< bool > HomeStore::start(InputParams input) {
     }
 #endif
 
-    // DeviceManager: synchronously construct, then either format (first-boot, deferred to format_and_start) or load.
-    // Copy input_.devices into DeviceManager — the vector stays in input_ so ResourceMgr::start can use it later.
+    // DeviceManager: synchronously construct — this probes the device headers so is_first_time_boot() is
+    // answerable immediately.  Copy input_.devices into DeviceManager — the vector stays in input_ so
+    // ResourceMgr::start can use it later.
     auto dm =
         DeviceManager::create(std::vector< DevInfo >{input_.devices}, input_.data_open_flags, input_.fast_open_flags);
     Managers::init_device_mgr(dm);
 
-    if (dm->is_first_time_boot()) {
-        LOGINFO("HomeStore::start — first-time boot detected; awaiting format_and_start()");
-        co_return true;
-    }
-
-    LOGINFO("HomeStore: recovery boot — loading managers");
-    co_await device_mgr().load_devices();
-    co_await MetaBlkManager::load();
-
-    auto cp = CPManager::create(); // self-registers via Managers::init_cp_mgr()
-    co_await cp->start(/*first_time_boot=*/false);
-
-    co_await BlobDevManager::load();
-    co_await COWBtreeManager::load();
-    co_await LogStoreManager::load();
-
-    cp->start_timer();
-    ResourceMgr::start(input_.devices, resolve_mem_cap(input_.mem_size));
-
-    init_done_.store(true, std::memory_order_release);
-    LOGINFO("HomeStore: recovery boot complete");
-
-    co_return false;
+    bool const first = dm->is_first_time_boot();
+    LOGINFO("HomeStore::start — {} boot detected", first ? "first-time" : "recovery");
+    co_return first;
 }
 
-Async< void > HomeStore::format_and_start(FormatOpts opts) {
-    HS_REL_ASSERT(device_mgr().is_first_time_boot(),
-                  "format_and_start called when device is not in first-time-boot state");
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//                                          format (first-time boot)
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
-    co_await device_mgr().format_devices();
+Async< void > HomeStore::format() {
+    HS_REL_ASSERT(device_mgr().is_first_time_boot(),
+                  "HomeStore::format called when device is not in first-time-boot state");
+    auto const& opts = input_.format_opts;
     LOGINFO("HomeStore: first-time boot — creating managers (meta_chunk_size={} logstore_chunk_size={} "
             "logstore_initial_num_chunks={})",
             opts.meta_chunk_size, opts.logstore_chunk_size, opts.logstore_initial_num_chunks);
+
+    co_await device_mgr().format_devices();
+
+    // ResourceMgr is foundational (journal throttle, index cache sizing) — up before any manager does real IO.
+    ResourceMgr::start(input_.devices);
 
     co_await MetaBlkManager::create(opts.meta_chunk_size);
     auto cp = CPManager::create();
@@ -150,18 +130,94 @@ Async< void > HomeStore::format_and_start(FormatOpts opts) {
     co_await COWBtreeManager::create();
     co_await LogStoreManager::create(opts.logstore_chunk_size, opts.logstore_initial_num_chunks);
 
-    // Force a CP so the first-time-boot state is committed before we declare success.
-    co_await cp_mgr().trigger_cp_flush(true /* force */, CPTriggerReason::Timer);
+    // Replication is optional — only brought up when the application handed us a ReplApplication.  create()
+    // sets up infra (executors, rpc client factory, listener object) and registers ReplCPHandler; no engines.
+    if (input_.repl_app) {
+        co_await ReplicationManager::create(input_.repl_app);
+    }
 
-    cp->start_timer();
-    ResourceMgr::start(input_.devices, resolve_mem_cap(input_.mem_size));
-
-    // Commit the formatting, so from now on it will not be treated as first-time boot
+    // Force a CP so the first-time-boot structures are durable, then commit formatting so subsequent boots are
+    // treated as recovery.
+    co_await cp_mgr().trigger_cp_flush(true /* force */, CPTriggerReason::SystemRestart);
     co_await device_mgr().commit_formatting();
 
+    // A fresh store has nothing to replay, so go live right here rather than forcing the caller through
+    // replay().  ReplicationManager::create() (above) already brought the replication service live (listener +
+    // maintenance timers); all that remains is to start the CP timer and mark the store initialized.
+    cp_mgr().start_timer();
     init_done_.store(true, std::memory_order_release);
-    LOGINFO("HomeStore: first-time boot formatting complete");
+    LOGINFO("HomeStore: first-time boot complete");
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//                                             load (recovery)
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+Async< void > HomeStore::load() {
+    HS_REL_ASSERT(!device_mgr().is_first_time_boot(),
+                  "HomeStore::load called on a first-time-boot device — call format() instead");
+    LOGINFO("HomeStore: recovery boot — loading managers");
+
+    co_await device_mgr().load_devices();
+
+    // ResourceMgr foundational — up before replay() drives real journal/blk IO.
+    ResourceMgr::start(input_.devices);
+
+    co_await MetaBlkManager::load();
+    auto cp = CPManager::create();
+    co_await cp->start(/*first_time_boot=*/false);
+
+    co_await BlobDevManager::load();
+    co_await COWBtreeManager::load(); // index self-recovers from its own CPs, independent of the log stream
+    co_await LogStoreManager::load(); // reconstruct LogStore instances; NO replay yet, tail_lsn stays -1
+
+    // Replication load(): reconstruct each ReplicaSet (ReplicaSet::load — read SB, seed watermarks,
+    // open_log_store + attach on_log_found handler; NO raft engine), then register ReplCPHandler AFTER the sets
+    // exist so its initial on_switchover_cp initializes each set's per-CP checkpoint tracking for the CP that
+    // replay() will dirty.
+    if (input_.repl_app) {
+        co_await ReplicationManager::load(input_.repl_app);
+    }
+    // TODO(repl-consistency): when repl_app is null but persisted replica-set SBs exist on disk, those groups
+    // have no host — HS_REL_ASSERT once ReplicationManager exposes a has_persisted_groups() probe.
+
+    LOGINFO("HomeStore: recovery managers loaded (awaiting app recovery + replay())");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//                                          replay (recovery go-live)
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+Async< void > HomeStore::replay() {
+    // Recovery-only — the first-time-boot path goes live inside format() and never reaches here.
+
+    // 1. Byte-level log replay.  Populates each LogStore's records_/tail_lsn and re-drives dispatch_commit into
+    //    the (already app-recovered) consumers, folding every ReplicaSet's commit_upto_lsn back to its pre-crash
+    //    value.  Deposits into the currently-open CP with all consumers already registered; no flush fires here.
+    co_await log_store_mgr().replay();
+
+    // 2. Bring raft engines up + go live — ONLY after step 1 restored their commit watermark, since nuraft
+    //    reads the state machine's last-committed index (== commit_upto_lsn_) at start_server.  Skipped
+    //    entirely when replication is disabled.
+    if (input_.repl_app) {
+        co_await repl_mgr().start_engine();
+    }
+
+    // 3. Seal a fresh recovery baseline so a crash shortly after boot does not redo the whole replay from the
+    //    pre-crash checkpoint.  Correctness note: this persists checkpoint_lsn, so it requires ReplCPHandler to
+    //    flush LAST among CP consumers (see cp_mgr.cpp cp-ordering TODO).
+    co_await cp_mgr().trigger_cp_flush(true /* force */, CPTriggerReason::SystemRestart);
+
+    // 4. Only now is periodic flushing allowed to fire.
+    cp_mgr().start_timer();
+
+    init_done_.store(true, std::memory_order_release);
+    LOGINFO("HomeStore: recovery boot complete");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//                                                 shutdown
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
 Async< void > HomeStore::shutdown() {
     if (!init_done_.exchange(false, std::memory_order_acq_rel)) {
@@ -170,7 +226,10 @@ Async< void > HomeStore::shutdown() {
     }
 
     LOGINFO("HomeStore: shutdown started");
-    // Reverse-of-bring-up order.
+    // Reverse-of-bring-up order: replication first (it sits on top of logstore + cp), then the rest.
+    if (input_.repl_app) {
+        co_await repl_mgr().stop();
+    }
     co_await cp_mgr().shutdown();
     ResourceMgr::stop();
 

@@ -36,7 +36,7 @@
 
 #include "iomanager/iomanager.h"
 #include "homestore/base/test_defs.h"
-#include "homestore/base/homestore_config.h"
+#include "homestore/base/hs_runtime_config.h"
 
 #include "common/defs.h"
 #include "homestore/device/device_manager.h"
@@ -436,7 +436,7 @@ CORO_TEST_F(LogStoreTest, GlobalTruncateMinAcrossStores) {
 
     // global_truncate uses min(a_anchor, b_anchor) = b_anchor.  Stream head must NOT advance past A's anchor —
     // doing so would discard A's surviving records.
-    co_await log_store_mgr().global_truncate();
+    co_await log_store_mgr().truncate();
     EXPECT_EQ(log_store_mgr().log_stream()->head_offset(), b_anchor)
         << "global_truncate should advance stream head to min(A's anchor, B's anchor) = B's anchor";
 
@@ -444,7 +444,7 @@ CORO_TEST_F(LogStoreTest, GlobalTruncateMinAcrossStores) {
     co_await b.store().truncate(4);
     const uint64_t b_anchor_2 = b.store().min_trunc_stream_offset().value();
     EXPECT_GT(b_anchor_2, a_anchor) << "B's new anchor is past A's";
-    co_await log_store_mgr().global_truncate();
+    co_await log_store_mgr().truncate();
     EXPECT_EQ(log_store_mgr().log_stream()->head_offset(), a_anchor)
         << "after B truncated past A, stream head advances only to A's anchor";
 
@@ -479,7 +479,7 @@ TEST_F(LogStoreTest, GlobalTruncateAcrossRestart) {
             }
             co_await a.store().flush();
             co_await a.store().truncate(4);
-            co_await log_store_mgr().global_truncate();
+            co_await log_store_mgr().truncate();
         }
         pre_restart_head = log_store_mgr().log_stream()->head_offset();
         EXPECT_GT(pre_restart_head, 0u) << "stream head advanced after global_truncate";
@@ -532,7 +532,7 @@ CORO_TEST_F(LogStoreTest, GlobalTruncateNoOpWhenStoreEmpty) {
     EXPECT_GT(a_anchor, 0u);
 
     // global_truncate should use A's anchor only — B being empty must not pin the stream head at 0.
-    co_await log_store_mgr().global_truncate();
+    co_await log_store_mgr().truncate();
     EXPECT_EQ(log_store_mgr().log_stream()->head_offset(), a_anchor)
         << "global_truncate uses A's anchor; B being empty doesn't constrain the min";
 

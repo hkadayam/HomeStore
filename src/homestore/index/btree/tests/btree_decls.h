@@ -16,7 +16,6 @@
  *********************************************************************************/
 #pragma once
 
-#include "homestore/index_service.hpp"
 #include "homestore/index/btree/detail/btree_internal.h"
 
 template < IndexStore::Type StoreType >

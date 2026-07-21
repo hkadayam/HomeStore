@@ -124,4 +124,8 @@ Async< sisl::IoBufView > MetaBlkWrapper::read() {
     co_return co_await client_->read_meta_blk(meta_blk_);
 }
 
+Async< void > MetaBlkWrapper::destroy() {
+    co_await client_->remove_meta_blk(meta_blk_);
+}
+
 } // namespace homestore

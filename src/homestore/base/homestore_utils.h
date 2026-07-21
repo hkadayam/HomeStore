@@ -15,7 +15,7 @@
  *********************************************************************************/
 #pragma once
 
-#include "homestore_config.h"
+#include "hs_runtime_config.h"
 #include "sisl/fds/buffer.h"
 
 namespace homestore {

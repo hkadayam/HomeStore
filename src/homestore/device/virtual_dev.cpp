@@ -444,13 +444,11 @@ VDevInfo VirtualDev::get_vdev_info() const {
 // Private Helpers - Initializers
 // ──────────────────────────────────────────────────────────────────────────────
 void VirtualDev::adjust_vdev_params(VDevParameters& p) {
-    constexpr uint64_t MIN_CHUNK_SIZE = 16ull * 1024 * 1024;
-    constexpr uint32_t MAX_CHUNKS_IN_SYSTEM = 65535;
-
     if (p.initial_chunk_size == 0) {
         throw std::invalid_argument("initial_chunk_size must be > 0 for vdev: " + p.vdev_name);
     }
-    p.initial_chunk_size = std::max(p.initial_chunk_size, MIN_CHUNK_SIZE);
+    // Floor the chunk size and cap the chunk count using the single-source compile-time limits.
+    p.initial_chunk_size = std::max(p.initial_chunk_size, MIN_CHUNK_SIZE_DATA_DEVICE);
     p.initial_chunk_size = ((p.initial_chunk_size + p.blk_size - 1) / p.blk_size) * p.blk_size;
 
     if (p.initial_chunk_size > Chunk::MAX_CHUNK_SIZE) {

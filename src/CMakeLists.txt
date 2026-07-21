@@ -91,11 +91,7 @@ add_subdirectory(homestore/blob)
 add_subdirectory(homestore/logstore)
 add_subdirectory(homestore/index)
 
-# if (DEFINED REPLICATION)
-#   if (${REPLICATION} STREQUAL "ON")
-#     add_subdirectory(homestore/replication/)
-#   endif()
-# endif()
+add_subdirectory(homestore/replication)
 
 # Aggregate STATIC library — every per-module OBJECT lib plus the top-level orchestrator (homestore.cpp).
 set(HOMESTORE_OBJECTS
@@ -108,6 +104,7 @@ set(HOMESTORE_OBJECTS
     $<TARGET_OBJECTS:hs_logstore>
     $<TARGET_OBJECTS:hs_mem_btree>
     $<TARGET_OBJECTS:hs_cow_btree>
+    $<TARGET_OBJECTS:hs_replication>
     homestore/homestore.cpp
 )
 add_library(homestore STATIC ${HOMESTORE_OBJECTS})

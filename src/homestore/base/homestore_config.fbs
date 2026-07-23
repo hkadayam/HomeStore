@@ -143,54 +143,12 @@ table ResourceLimits {
 
     // resource audit timer in ms
     resource_audit_timer_ms: uint32 = 120000;
-}
 
-table Generic {
-    // cp timer in us
-    cp_timer_us: uint64 = 60000000 (hotswap);
-
-    // Btree CP flush threads and fibers per thread. So effectively it will be threads * fibers concurrent IOs
-    btree_cp_flush_threads : uint32 = 2;
-    btree_cp_flush_fibers_per_thread : uint32 = 8; 
-
-    cp_watchdog_timer_sec : uint32 = 10; // it checks if cp stuck every 10 seconds
-
-    cache_max_throttle_cnt : uint32 = 4; // writeback cache max q depth
-
-    cache_min_throttle_cnt : uint32 = 4; // writeback cache min q depth
-
-    cache_hashmap_nbuckets : uint32 = 1000000; // num buckets for sisl::SimpleHashmap used in wbcache
-
-    cache_evictor_npartitions: uint32 = 1000; // num partitions for lru evictor in the cache
-
-    // if this value is set to 0, no sanity check will be run;
-    sanity_check_level: uint32 = 1 (hotswap);
-
-    // number of threads for btree writes;
-    num_btree_write_threads : uint32 = 2;
-
-    // percentage of cache used to create indx mempool. It should be more than 100 to
-    // take into account some floating buffers in writeback cache.
-    indx_mempool_percent : uint32 = 110;
-
-    // Number of chunks in journal chunk pool.
-    journal_chunk_pool_capacity: uint32 = 5;
-
-}
-
-// Fields no longer read by any code, parked here pending removal so the schema stays valid (and their defaults
-// are preserved) without cluttering the live tables.  Do NOT add new references — delete this table once the
-// removal is confirmed safe.
-table Unused {
-    index_max_dirty_memory_percent: double = 1 (hotswap);
-    index_max_free_space_accumulate_percent: double = 1 (hotswap);
-    free_blk_cnt: uint32 = 10000000 (hotswap);
-    free_blk_size_percent: uint32 = 2 (hotswap);
-    memory_in_recovery_precent: uint32 = 40;
-    journal_vdev_size_percent: uint32 = 50;
-    journal_vdev_size_percent_critical: uint32 = 90;
-    journal_descriptor_size_threshold_mb: uint32 = 2048 (hotswap);
-    vol_threshhold_used_size_p: uint32 = 95;
+    // Soft cap on the log-stream footprint (chunks it holds) as a percentage of FAST-device capacity.  The log
+    // stream lives on the fast tier and its VDev auto-expands, so this bounds its growth relative to fast storage.
+    // When footprint crosses this, ResourceMgr forces a truncation pass; the log stream itself also raises a
+    // LogStreamSpaceExhausted event on the flush that crosses it, so reclaim can run without waiting for the poll.
+    logstream_size_limit_pct: uint32 = 10 (hotswap);
 }
 
 table MetaBlkStore {
@@ -211,113 +169,197 @@ table MetaBlkStore {
 }
 
 table Consensus {
-    // Backoff for any rpc failure
-    rpc_backoff_ms: uint32 = 250;
+    // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+    // nuraft raft_params — fed straight to the consensus engine when a ReplicaSet starts (see build_raft_params).
+    // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
 
-    // Frequency of Raft heartbeat
+    // ── Leader election & heartbeat ─────────────────────────────────────────────────────────────────────────────
+
+    // Leader->follower heartbeat / append interval (nuraft hb_interval). Must stay well below elect_to_low_ms.
+    // Higher: less network/CPU overhead, but a dead leader is detected more slowly.
+    // Lower:  followers stay fresher and elections are rarer, at a constant higher network cost.
     heartbeat_period_ms: uint32 = 250;
 
-    // Re-election timeout low and high mark
+    // Randomized election-timeout window (nuraft election_timeout_lower/upper): a follower starts a new election if
+    // it hears nothing from the leader within a random value in [low, high].  Both must exceed heartbeat_period_ms;
+    // a wide (high-low) band avoids split votes.
+    // Higher: slower failover on a dead leader, but fewer spurious elections on a slow/jittery network.
+    // Lower:  faster failover, but more false-positive elections under transient delays.
     elect_to_low_ms: uint32 = 800;
     elect_to_high_ms: uint32 = 1700;
 
-    // When a new member is being synced, the batch size of number of logs to be shipped
-    log_sync_batch_size: int32 = 100;
-
-    // Log distance with which snapshot/compact needs to happen. 0 means snapshot is disabled
-    snapshot_freq_distance: uint32 = 2000;
-
-    // Num reserved log items while triggering compact from raft server, only consumed by nuraft server;
-    num_reserved_log_items: uint32 = 20000;
-
-    // Max append batch size
-    max_append_batch_size: int32 = 64;
-
-    // Max grpc message size, use 64M (max data size on data channel) + 128M (max snasphot batch size) + 1M
-    // Please adjust it if data_fetch_max_size_kb is increased as well
-    max_grpc_message_size: int32 = 202375168;
-
-    // Threshold of log gap from leader to consider a replica as stale
-    stale_log_gap_hi_threshold: int32 = 200;
-
-    // Threshold of log gap from leader to consider a replica as come out of stale and became fresh
-    stale_log_gap_lo_threshold: int32 = 30;
-
-    // Minimum log gap a replica has to be from leader before joining the replica set.
-    // 0 indicates the new member will join in cluster immediately.
-    min_log_gap_to_join: int32 = 0;
-    
-    // amount of time in millis to wait on data write before fetch data from remote;
-    wait_data_write_timer_ms: uint64 = 1500 (hotswap);
-    
-    // Leadership expiry (=0 indicates 20 times heartbeat period), set -1 to never expire
+    // How long a leader retains leadership after it can no longer reach a quorum (nuraft leadership_expiry).
+    // 0 = nuraft default (~20x heartbeat); -1 = never expire.
+    // Higher: leader clings to leadership longer during a partition (risk of a stale leader).
+    // Lower:  leader steps down quickly once it loses quorum -- faster failover, more leadership churn.
     leadership_expiry_ms: int32 = 0;
 
-    // ReplicaSet Reqs timeout in seconds.
-    repl_req_timeout_sec: uint32 = 300;
+    // Delay before retrying an RPC to a peer after a failure (nuraft rpc_failure_backoff).
+    // Higher: less retry traffic against a down/slow peer, but slower to resume once it recovers.
+    // Lower:  faster recovery, but more retries hammering an unhealthy peer.
+    rpc_backoff_ms: uint32 = 250;
 
-    // Timeout for snapshot sync context in ms. If the follower doesn't response
-    // within this timeout during snapshot resync,  the leader will release snapshot sync context.
+    // ── Log replication & follower catch-up ─────────────────────────────────────────────────────────────────────
+
+    // Max log entries packed into one append_entries RPC (nuraft max_append_size).
+    // Higher: better throughput / fewer RPCs during catch-up, at larger per-RPC memory and latency spikes.
+    // Lower:  smoother latency, but more RPC overhead.
+    max_append_batch_size: int32 = 64;
+
+    // Entries fetched per batch when a lagging follower bulk-syncs (nuraft log_sync_batch_size).
+    // Higher: faster catch-up, but more memory and larger transfers.
+    // Lower:  gentler on memory/network, but slower catch-up.
+    log_sync_batch_size: int32 = 100;
+
+    // Gap (entries) at which a catching-up member stops bulk log-sync and switches to normal replication -- i.e.
+    // effectively "joins" (nuraft log_sync_stop_gap).  Default matches nuraft's default.
+    // Higher: the member joins/votes sooner while still slightly behind (may briefly be a lagging voter).
+    // Lower:  the member fully catches up before joining -- safer, but slower to become an active voter.
+    min_log_gap_to_join: int32 = 99999;
+
+    // Follower catch-up hysteresis (nuraft stale_log_gap / fresh_log_gap): a follower lagging the leader by more
+    // than the hi threshold is "stale"; once it drops under the lo threshold it is "fresh" again.  hi > lo; widening
+    // the band avoids flapping between the two states.
+    stale_log_gap_hi_threshold: int32 = 200;
+    stale_log_gap_lo_threshold: int32 = 30;
+
+    // Log entries retained after a compaction so a lagging follower can catch up from the log instead of a full
+    // snapshot (nuraft reserved_log_items).  GLOBAL default; a per-group ReplicaSetOptions.preserve_log_count wins
+    // when set.
+    // Higher: more followers catch up cheaply via the log, at the cost of more retained log storage.
+    // Lower:  logs compact aggressively (less storage), but laggy followers more often need a full snapshot.
+    num_reserved_log_items: uint32 = 20000;
+
+    // ── Snapshots ───────────────────────────────────────────────────────────────────────────────────────────────
+
+    // Committed-entry interval between automatic snapshots; 0 disables snapshotting (nuraft snapshot_distance).
+    // GLOBAL default; a per-group ReplicaSetOptions.snapshot_distance can be used to override.
+    // Higher: fewer snapshots (less snapshot IO/CPU), but longer retained logs and slower log-based catch-up.
+    // Lower:  more frequent snapshots (more IO), but shorter logs and faster snapshot-based recovery.
+    snapshot_freq_distance: uint32 = 2000;
+
+    // Timeout for an in-progress snapshot install to a follower (nuraft snapshot_sync_ctx_timeout).  If the follower
+    // doesn't respond within this window the leader releases the sync context.
+    // Higher: tolerates slow followers / large snapshot transfers before aborting.
+    // Lower:  aborts and retries a stuck snapshot transfer sooner.
     snapshot_sync_ctx_timeout_ms: int32 = 60000;
 
-    // Frequency to flush durable commit LSN in millis
-    flush_durable_commit_interval_ms: uint64 = 500;
-
-    // Log difference to determine if the follower is in resync mode
-    resync_log_idx_threshold: int64 = 100;
-
-    // Log difference from leader's point of view, to determine if the follower is laggy and if so, leader will stop
-    // pushing data until it drops under this threshold.
-    laggy_threshold: int64 = 2000;
-
-    // Reading snapshot objects will be done by a background thread asynchronously instead of synchronous read by 
-    // Raft worker threads
+    // Run snapshot read/write IO on a background thread instead of the raft worker (nuraft use_bg_thread_for_snapshot_io).
+    // true:  keeps the raft loop responsive during large snapshot IO.
+    // false: simpler, but big snapshot IO can stall the raft thread.
     use_bg_thread_for_snapshot_io: bool = true;
 
-    // Maximum number of election timeout rounds to wait during a prioritized leader election process. Every election
-    // timeout will compare its priority with the target_priority(max priority of the peers initially) then decay the
-    // target_priority and wait again until its priority >= target_priority. This setting helps us to set proper
-    // priority for peers. 0 means all members have the same priority.
-    max_wait_rounds_of_priority_election: uint32 = 2;
+    // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
+    // HomeStore-internal -- consumed by the HomeStore replication layer, NOT passed to nuraft.
+    // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════
 
-    // How often ReplicationManager scans replica_sets_ for the "reaper" pass — finish_destroy_local() on any
-    // set that has been in the DESTROYED state longer than replica_set_cleanup_interval_sec.  Smaller values
-    // reclaim resources sooner at the cost of more idle scans; the SB writes inside finish_destroy_local()
-    // dominate cost anyway so keep this in the "occasional" range.
-    gc_scan_interval_ms: uint64 = 30000;
+    // Frequency to flush the durable commit LSN to the SB, in millis.
+    // Higher: less SB write amplification, but a crash loses a larger window of durable-commit progress (more replay).
+    // Lower:  tighter durability watermark (less replay on restart), at more frequent SB writes.
+    flush_durable_commit_interval_ms: uint64 = 500;
 
-    // Default election priority handed to a member that a group creates itself with (bootstrap of the initial
-    // config), and the reference from which new_member_priority is derived.  Operators tune this to bias
-    // leadership toward specific replicas.
+    // How often the reaper scans for DESTROYED replica sets to reclaim.
+    // Higher: fewer idle scans (less CPU), but destroyed sets linger longer before reclamation.
+    // Lower:  destroyed sets reclaimed sooner, at more frequent idle scans.
+    replica_set_reaper_scan_interval_ms: uint64 = 30000;
+
+    // Grace period a replica set stays DESTROYED before the reaper physically reclaims it (finish_destroy_local).
+    // Higher: longer window for in-flight ops/references to a just-destroyed set to drain, at more lingering resources.
+    // Lower:  faster resource reclamation, with less margin for stragglers still referencing the set.
+    replica_set_reaper_grace_sec: uint32 = 60;
+
+    // Log gap (leader's view) above which a follower is treated as laggy: the leader stops pushing data to it until
+    // it drops back under this threshold.
+    // Higher: leader keeps feeding a slow follower longer (more bandwidth to a laggard).
+    // Lower:  leader cuts off a lagging follower sooner (protects healthy peers' throughput).
+    laggy_threshold: int64 = 2000;
+
+    // Log-index gap above which a follower is put into resync (bulk catch-up) mode instead of normal incremental
+    // replication.
+    // Higher: tolerate a larger gap before switching to bulk resync (more incremental replication).
+    // Lower:  switch to bulk resync sooner when a follower falls behind.
+    resync_log_idx_threshold: int64 = 100;
+
+    // Base election priority for a member that a group bootstraps itself with, and the reference from which
+    // new_member_priority is derived.  (Handed to nuraft via srv_config, not raft_params.)
+    // Higher: this member is more strongly favored to win/hold leadership.
+    // Lower:  less favored; equal across all members means a priority-neutral election.
     default_leader_priority: int32 = 100;
 
-    // Multiplied against default_leader_priority to derive the priority given to a member joining an existing
-    // group after bootstrap.  Kept < 1 so new members prefer NOT to grab leadership until they have been
-    // caught up long enough for their durability to be worth trusting.  Result is truncated to int32; a value
-    // that rounds to 0 is clamped to 1 so the peer is never marked ineligible for leadership entirely.
+    // Multiplier applied to default_leader_priority to derive the priority of a member joining an existing group
+    // after bootstrap.  Truncated to int32; a result that rounds to 0 is clamped to 1.
+    // Higher (->1): new members join near full priority and may contend for leadership sooner.
+    // Lower  (->0): new members join at much lower priority, strongly avoiding leadership until proven caught up.
     priority_decay_coefficient: double = 0.8;
 
-    // Maximum number of retries when raft is undergoing config changing
-    config_changing_error_retries: int32 = 3;
+    // Election-timeout rounds to wait during a prioritized election before a lower-priority peer may win.
+    // NOTE: currently NOT consumed anywhere (no nuraft knob, no HomeStore reader) -- pending wiring or removal.
+    // Higher: stronger priority enforcement (a lower-priority peer waits more rounds), slower election.
+    // Lower:  weaker priority bias, faster election.  0 = all members equal.
+    max_wait_rounds_of_priority_election: uint32 = 2;
 
-    // The time to wait for config change to be applied in ms
-    wait_for_config_change_ms: uint32 = 500;
-
-    // The interval in ms to check if the new member in replace_member is fully synced and ready to take over
+    // How often replace_member checks whether the incoming member is fully synced and ready to take over.
+    // Higher: less polling overhead, but slower to detect readiness (longer replace latency).
+    // Lower:  detects readiness sooner (faster member replacement), at more frequent sync checks.
     replace_member_sync_check_interval_ms: uint64 = 60000;
 
-    // num entries that the raft logstore wants to reserve -- its truncate should not cross this.
-    // 0 means HomeStore doesn't reserve anything and lets nuraft control the truncation.
-    raft_logstore_reserve_threshold: uint32 = 0 (hotswap);
+    // Retries for a repl op that hits a "config changing" error while raft is mid-membership-change.
+    // Higher: more tolerance for transient config-change contention (fewer surfaced errors), at longer stalls.
+    // Lower:  fails config-dependent ops sooner during a config change.
+    config_changing_error_retries: int32 = 3;
 
-    // Grace period a replica set stays in the DESTROYED state before the reaper's finish_destroy_local() pass
-    // physically reclaims it.  Smaller values reclaim sooner at the cost of more idle scans.
-    replica_set_cleanup_interval_sec: uint32 = 60;
+    // Time to wait for a config (membership) change to be applied, in ms.
+    // Higher: waits longer for the change to commit before proceeding/erroring.
+    // Lower:  gives up on a slow config change sooner.
+    wait_for_config_change_ms: uint32 = 500;
+
+    // Num entries the raft logstore reserves -- its truncate should not cross this floor.
+    // Higher: more log retained so followers catch up via log rather than snapshot, at more log storage.
+    // Lower / 0: HomeStore reserves nothing and lets nuraft control truncation.
+    raft_logstore_reserve_threshold: uint32 = 0 (hotswap);
+}
+
+table Checkpoint {
+    // Interval between checkpoint flushes, in microseconds (read by CPManager).
+    // Higher: less frequent CPs -- lower write amplification, but more to replay after a crash.
+    // Lower:  more frequent CPs -- tighter durability, at higher background flush cost.
+    cp_timer_us: uint64 = 60000000 (hotswap);
+
+    // Period (in seconds) at which the watchdog checks whether a CP is stuck (read by CPManager).
+    // Higher: slower to detect a stuck CP; Lower: quicker detection, at more frequent checks.
+    cp_watchdog_timer_sec: uint32 = 10;
+}
+
+// Fields no longer read by any code, parked here pending removal so the schema stays valid (and their defaults
+// are preserved) without cluttering the live tables.  Do NOT add new references — delete this table once the
+// removal is confirmed safe.
+table Unused {
+    index_max_dirty_memory_percent: double = 1 (hotswap);
+    index_max_free_space_accumulate_percent: double = 1 (hotswap);
+    free_blk_cnt: uint32 = 10000000 (hotswap);
+    free_blk_size_percent: uint32 = 2 (hotswap);
+    memory_in_recovery_precent: uint32 = 40;
+    journal_vdev_size_percent: uint32 = 50;
+    journal_vdev_size_percent_critical: uint32 = 90;
+    journal_descriptor_size_threshold_mb: uint32 = 2048 (hotswap);
+    vol_threshhold_used_size_p: uint32 = 95;
+
+    // (moved out of the former Generic table -- unread by production code)
+    btree_cp_flush_threads: uint32 = 2;
+    btree_cp_flush_fibers_per_thread: uint32 = 8;
+    cache_max_throttle_cnt: uint32 = 4;
+    cache_min_throttle_cnt: uint32 = 4;
+    cache_hashmap_nbuckets: uint32 = 1000000;
+    cache_evictor_npartitions: uint32 = 1000;
+    sanity_check_level: uint32 = 1 (hotswap);
+    num_btree_write_threads: uint32 = 2;
+    indx_mempool_percent: uint32 = 110;
+    journal_chunk_pool_capacity: uint32 = 5;
 }
 
 table HomeStoreSettings {
     version: uint32 = 1;
-    generic: Generic;
+    checkpoint: Checkpoint;
     blkallocator: BlkAllocator;
     cache: Cache;
     btree: Btree;

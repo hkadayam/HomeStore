@@ -13,6 +13,7 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
+#include <algorithm>
 #include <folly/io/async/EventBaseManager.h>
 #include "common/async.h"
 #include <folly/io/async/Request.h>
@@ -88,7 +89,7 @@ Async< void > CPManager::start(bool first_time_boot) {
 }
 
 void CPManager::start_timer() {
-    const auto interval = std::chrono::microseconds(HS_RUNTIME_CONFIG(generic.cp_timer_us));
+    const auto interval = std::chrono::microseconds(HS_RUNTIME_CONFIG(checkpoint.cp_timer_us));
     LOGINFO("cp timer is set to {} usec", interval.count());
     cp_timer_.start(ReactorTarget::any(), interval, iomanager::TimerKind::Recurring, [this]() -> Async< void > {
         trigger_cp_flush(false, CPTriggerReason::Timer);
@@ -102,7 +103,18 @@ void CPManager::create_first_cp() {
     cur_cp_->cp_id_ = sb_->m_last_flushed_cp + 1;
 }
 
-Async< void > CPManager::shutdown() {
+Async< void > CPManager::prepare_shutdown() {
+    // Idempotent: cp_shutdown_initiated_ marks that quiesce already ran (either from an earlier prepare_shutdown()
+    // in a two-phase teardown, or from a lone shutdown()).  A second call is a no-op so shutdown() can always call
+    // it defensively.
+    {
+        std::unique_lock< std::mutex > lk(trigger_cp_mtx_);
+        if (cp_shutdown_initiated_) {
+            co_return;
+        }
+        cp_shutdown_initiated_ = true;
+    }
+
     // Request cancellation of the periodic timer (non-blocking). The timer coroutine will exit on its own.
     folly::SemiFuture< bool > wd_done = folly::SemiFuture< bool >::makeEmpty();
     cp_timer_.request_stop();
@@ -110,11 +122,6 @@ Async< void > CPManager::shutdown() {
     // Request the watchdog to stop (non-blocking). We co_await its completion after the flush.
     if (wd_cp_) {
         wd_done = wd_cp_->stop();
-    }
-
-    {
-        std::unique_lock< std::mutex > lk(trigger_cp_mtx_);
-        cp_shutdown_initiated_ = true;
     }
 
     // TODO: re-enable crash_simulator guard once HomeStore singleton is ported
@@ -129,17 +136,21 @@ Async< void > CPManager::shutdown() {
     //     }
     // #endif
 
-    // Wait for watchdog and timer coroutines to exit before tearing down state.
+    // Wait for watchdog and timer coroutines to exit. After this, no further CP flush can fire.
     if (wd_done.valid()) {
         co_await std::move(wd_done);
     }
     co_await cp_timer_.stop();
+}
 
-    // Don't reset wd_cp_ here: the co_await awaiter above still holds a Future
-    // referencing done_promise_'s Core. Destroying wd_cp_ would drop the
-    // SharedPromise refcount, and the awaiter's destructor would then crash
+Async< void > CPManager::shutdown() {
+    // Quiesce (idempotent) then free state. A lone shutdown() therefore still flushes-then-frees; a two-phase
+    // teardown calls prepare_shutdown() first and this just frees.
+    co_await prepare_shutdown();
+
+    // Don't reset wd_cp_ here: the prepare_shutdown() awaiter may still hold a Future referencing done_promise_'s
+    // Core. Destroying wd_cp_ would drop the SharedPromise refcount, and the awaiter's destructor would then crash
     // with a double-detach. Let ~CPManager handle wd_cp_ lifetime instead.
-
     auto* old_cp = sisl::Rcu::xchg_pointer(&cur_cp_, static_cast< CP* >(nullptr));
     sisl::Rcu::synchronize();
     delete old_cp;
@@ -147,18 +158,31 @@ Async< void > CPManager::shutdown() {
     metrics_.reset();
 }
 
-void CPManager::register_consumer(const CPConsumer& consumer, shared< CPCallbacks > callbacks) {
+void CPManager::register_consumer(const CPConsumer& consumer_id, shared< CPCallbacks > callbacks, uint32_t rank) {
+    HS_DBG_ASSERT_LT(rank, CPRank::Sentinel, "CP consumer rank must be < Sentinel");
     // Notify consumer of the current CP so it can initialize its own state.
     callbacks->on_switchover_cp(nullptr, cur_cp_);
 
     std::unique_lock lk(consumers_mtx_);
-    consumers_.emplace(consumer, std::move(callbacks));
+    // Keep consumers_ sorted by rank ascending so switchover / cp_flush / cp_cleanup run in deterministic rank
+    // order.  Duplicate ranks are a debug assert; in release the new consumer lands adjacent-after the existing
+    // one (upper_bound) so the process continues.
+    auto pos = std::upper_bound(consumers_.begin(), consumers_.end(), rank,
+                                [](uint32_t r, const CPConsumerEntry& e) { return r < e.rank; });
+    HS_DBG_ASSERT((pos == consumers_.begin()) || (std::prev(pos)->rank != rank),
+                  "duplicate CP consumer rank {} (existing '{}', new '{}')", rank,
+                  pos == consumers_.begin() ? "" : std::prev(pos)->name, consumer_id);
+    consumers_.insert(pos, CPConsumerEntry{rank, std::string{consumer_id}, std::move(callbacks)});
 }
 
-CPCallbacks* CPManager::get_consumer(const CPConsumer& consumer) {
+CPCallbacks* CPManager::get_consumer(const CPConsumer& consumer_id) {
     std::shared_lock lk(consumers_mtx_);
-    auto it = consumers_.find(consumer);
-    return (it != consumers_.end()) ? it->second.get() : nullptr;
+    for (auto& e : consumers_) {
+        if (e.name == consumer_id) {
+            return e.cb.get();
+        }
+    }
+    return nullptr;
 }
 
 [[nodiscard]] CPGuard CPManager::cp_guard() {
@@ -237,8 +261,8 @@ folly::SemiFuture< bool > CPManager::do_trigger_cp_flush(bool force, bool flush_
     CP_PERIODIC_LOG(DEBUG, new_cp->id(), "Create New CP session");
     {
         std::shared_lock lk(consumers_mtx_);
-        for (auto& [_, cb] : consumers_) {
-            cb->on_switchover_cp(cur_cp.get(), new_cp);
+        for (auto& e : consumers_) {
+            e.cb->on_switchover_cp(cur_cp.get(), new_cp);
         }
     }
 
@@ -269,28 +293,18 @@ void CPManager::cp_start_flush(CP* cp) {
     cp->cp_status_ = cp_status_t::cp_flushing;
 
     spawn_detached(ReactorTarget::any(), [this, cp]() -> Async< void > {
-        // Flush all consumers one at a time; sequential ordering is intentional.
-        // Snapshot callbacks under shared lock, then release before co_await.
-        //
-        // TODO(cp-ordering): the current flush order is whatever std::unordered_map iteration returns —
-        // NON-DETERMINISTIC.  This is a correctness bug for consumers whose durability watermark depends on
-        // OTHER consumers having flushed first.  Concrete case: ReplCPHandler persists checkpoint_lsn in its
-        // cp_flush, meaning "the consumer's on_commit results for LSNs <= checkpoint_lsn are durably applied
-        // through this CP".  But the consumer's on_commit writes into IndexCP / BlkAlloc / VDev — so
-        // Replication MUST flush LAST, only after every subsystem the consumer wrote into has already
-        // flushed.  Otherwise a crash between "repl SB persists checkpoint_lsn" and "index flush finishes"
-        // leaves us claiming a durability watermark the underlying data has not actually reached, and
-        // restart's on_log_found will skip re-dispatching commits whose consumer state was lost.
-        //
-        // Fix: let consumers declare an ordering priority at register_consumer() time (e.g. an enum:
-        // Index → BlkAlloc → VDev → ... → Replication), sort cbs by it before the flush loop, and add a
-        // dbg-assert that Replication comes last.  Same ordering probably wanted for on_switchover_cp for
-        // symmetry (checkpoint_lsn should be captured BEFORE anything downstream might race a new write).
+        // Flush consumers one at a time in ascending rank order (consumers_ is kept rank-sorted by
+        // register_consumer).  Ordering is a correctness requirement, not cosmetic: a consumer whose durability
+        // watermark depends on others must register at a higher rank so it flushes AFTER them.  Concrete case:
+        // Replication (rank CPRank::Replication, the highest) persists checkpoint_lsn only after every subsystem
+        // its on_commit wrote into (Index / BlkAlloc / VDev, all lower rank) has already flushed — otherwise a
+        // crash could claim a watermark the underlying data has not reached.  Snapshot callbacks under the shared
+        // lock (preserving rank order), then release before co_await.
         std::vector< shared< CPCallbacks > > cbs;
         {
             std::shared_lock lk(consumers_mtx_);
-            for (auto& [_, cb] : consumers_) {
-                cbs.push_back(cb);
+            for (auto& e : consumers_) {
+                cbs.push_back(e.cb);
             }
         }
         for (auto& cb : cbs) {
@@ -341,8 +355,8 @@ void CPManager::cp_start_flush(CP* cp) {
 void CPManager::cleanup_cp(CP* cp) {
     cp->cp_status_ = cp_status_t::cp_cleaning;
     std::shared_lock lk(consumers_mtx_);
-    for (auto& [id, cb] : consumers_) {
-        cb->cp_cleanup(cp);
+    for (auto& e : consumers_) {
+        e.cb->cp_cleanup(cp);
     }
 }
 
@@ -416,7 +430,7 @@ CP* CPGuard::get() {
 ////////////////////////////////////////////////////////////////////////////
 
 CPWatchdog::CPWatchdog(CPManager* cp_mgr) :
-        cp_{nullptr}, cp_mgr_{cp_mgr}, timer_sec_{HS_RUNTIME_CONFIG(generic.cp_watchdog_timer_sec)} {
+        cp_{nullptr}, cp_mgr_{cp_mgr}, timer_sec_{HS_RUNTIME_CONFIG(checkpoint.cp_watchdog_timer_sec)} {
     LOGINFO("CP watchdog timer setting to : {} seconds", timer_sec_);
     wd_eb_ = iomgr().reactor_for(0);
     attachEventBase(wd_eb_);
@@ -468,9 +482,9 @@ void CPWatchdog::watch_cp() {
     uint32_t count{0};
     {
         std::shared_lock lk(cp_mgr_->consumers_mtx_);
-        for (auto& [id, cb] : cp_mgr_->consumers_) {
+        for (auto& e : cp_mgr_->consumers_) {
             ++count;
-            cum_pct += cb->cp_progress_percent();
+            cum_pct += e.cb->cp_progress_percent();
         }
     }
     if (progress_pct_ > cum_pct / count) {
@@ -487,10 +501,10 @@ void CPWatchdog::watch_cp() {
     if (get_elapsed_time_ms(last_state_ch_time_) < max_time_multiplier * timer_sec_ * 1000) {
         uint32_t repair_attempted{0};
         std::shared_lock lk2(cp_mgr_->consumers_mtx_);
-        for (auto& [id, cb] : cp_mgr_->consumers_) {
-            const auto pct = cb->cp_progress_percent();
+        for (auto& e : cp_mgr_->consumers_) {
+            const auto pct = e.cb->cp_progress_percent();
             if (pct != 100) {
-                cb->repair_slow_cp();
+                e.cb->repair_slow_cp();
                 ++repair_attempted;
             }
             if (repair_attempted) {

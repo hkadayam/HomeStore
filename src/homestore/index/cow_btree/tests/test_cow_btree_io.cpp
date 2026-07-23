@@ -158,8 +158,8 @@ static Async< void > shutdown_stack() {
     blob_dev_mgr().shutdown();
     cow_btree_mgr().shutdown();
     co_await device_mgr().close_devices();
+    co_await ResourceMgr::stop();
     Managers::reset();
-    ResourceMgr::stop();
 }
 
 template < typename TestType >

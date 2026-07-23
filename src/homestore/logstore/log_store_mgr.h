@@ -74,6 +74,10 @@ public:
 
     const shared< LogStream >& log_stream() const { return log_stream_; }
 
+    /// Live physical footprint of the log stream in bytes (chunks it currently holds).  ResourceMgr polls this
+    /// against the resource_limits.logstream_size_limit_pct budget to decide when to force a truncation pass.
+    uint64_t footprint_bytes() const { return log_stream_ ? log_stream_->footprint_bytes() : 0; }
+
     shared< LogStore > get_log_store(logstore_id_t store_id) const;
     std::vector< shared< LogStore > > log_stores() const;
 

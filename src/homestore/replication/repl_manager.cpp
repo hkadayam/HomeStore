@@ -108,7 +108,7 @@ Async< void > ReplicationManager::start_engine() {
         std::chrono::milliseconds{HS_RUNTIME_CONFIG(consensus.flush_durable_commit_interval_ms)},
         iomanager::TimerKind::Recurring, [this]() -> Async< void > { co_await persist_commit_lsn(); });
     gc_timer_.start(iomanager::ReactorTarget::any(),
-                    std::chrono::milliseconds{HS_RUNTIME_CONFIG(consensus.gc_scan_interval_ms)},
+                    std::chrono::milliseconds{HS_RUNTIME_CONFIG(consensus.replica_set_reaper_scan_interval_ms)},
                     iomanager::TimerKind::Recurring, [this]() -> Async< void > { co_await gc_replica_sets(); });
 
     RM_LOG(INFO, NO_TRACE_ID, "Replication service live ({} replica set(s))", sets.size());
@@ -167,6 +167,23 @@ Async< void > ReplicationManager::stop() {
     // stop() is idempotent and blocks until the currently-scheduled coroutine (if any) has drained.
     gc_timer_.stop();
     persist_commit_lsn_timer_.stop();
+
+    // Shut down every raft engine BEFORE freeing the RPC transport / executor it references.  Each engine's
+    // nuraft::context holds mgr_.rpc_listener() / rpc_client_factory() and the reactor executor; freeing those
+    // first would leave the servers dangling, and nuraft's raft_server destructor asserts shutdown() ran.
+    // Snapshot the registry under the shared lock, then release it before co_awaiting (never hold rs_mtx_ across
+    // a suspension point).
+    std::vector< shared< ReplicaSet > > sets;
+    {
+        std::shared_lock lk{rs_mtx_};
+        sets.reserve(replica_sets_.size());
+        for (auto const& [_, rs] : replica_sets_) {
+            sets.push_back(rs);
+        }
+    }
+    for (auto const& rs : sets) {
+        co_await rs->stop_engine();
+    }
 
     if (rpc_listener_) {
         rpc_listener_->shutdown();
@@ -282,6 +299,7 @@ Async< ReplResult< shared< ReplicaSet > > > ReplicationManager::create_replica_s
 
     auto raft_cfg_mblk =
         co_await MetaBlkWrapper::create(rs_raft_cfg_meta_client_, fmt::format("cfg_{}", gid_str), /*size=*/{});
+
     // User-initiated create: options come from the caller arg (not the listener).
     auto rs = std::make_shared< ReplicaSet >(*this, std::move(sb_mblk), options);
     rs->attach_listener(std::move(listener));
@@ -469,7 +487,7 @@ Async< void > ReplicationManager::raft_group_config_found(MetaBlk const& blk, si
 
 Async< void > ReplicationManager::gc_replica_sets() {
     // Snapshot the reap candidates under the shared lock — never hold the lock across a co_await.
-    auto const grace = std::chrono::seconds{HS_RUNTIME_CONFIG(consensus.replica_set_cleanup_interval_sec)};
+    auto const grace = std::chrono::seconds{HS_RUNTIME_CONFIG(consensus.replica_set_reaper_grace_sec)};
     auto const now = Clock::now();
     std::vector< std::pair< GroupId, shared< ReplicaSet > > > reap_list;
     {

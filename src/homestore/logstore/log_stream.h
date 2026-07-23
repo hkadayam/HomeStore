@@ -270,6 +270,10 @@ private:
     std::atomic< logid_t > log_id_{0};
     std::atomic< int64_t > pending_flush_size_{0};
 
+    // Set by stop(): once true, append() spawns no new size-triggered flush.  stop() then drains any in-flight
+    // flush via flush_mtx_ so on_write_completion can't fire into a LogStore the manager is about to drop.
+    std::atomic< bool > stopping_{false};
+
     folly::coro::Mutex flush_mtx_;
 
     logid_t last_flush_idx_{-1};

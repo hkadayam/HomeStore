@@ -143,8 +143,9 @@ Async< void > HomeStore::format() {
 
     // A fresh store has nothing to replay, so go live right here rather than forcing the caller through
     // replay().  ReplicationManager::create() (above) already brought the replication service live (listener +
-    // maintenance timers); all that remains is to start the CP timer and mark the store initialized.
+    // maintenance timers); all that remains is to start the periodic timers and mark the store initialized.
     cp_mgr().start_timer();
+    ResourceMgr::start_timer();
     init_done_.store(true, std::memory_order_release);
     LOGINFO("HomeStore: first-time boot complete");
 }
@@ -208,8 +209,9 @@ Async< void > HomeStore::replay() {
     //    flush LAST among CP consumers (see cp_mgr.cpp cp-ordering TODO).
     co_await cp_mgr().trigger_cp_flush(true /* force */, CPTriggerReason::SystemRestart);
 
-    // 4. Only now is periodic flushing allowed to fire.
+    // 4. Only now are the periodic timers allowed to fire (CP flush + ResourceMgr storage-pressure poll).
     cp_mgr().start_timer();
+    ResourceMgr::start_timer();
 
     init_done_.store(true, std::memory_order_release);
     LOGINFO("HomeStore: recovery boot complete");
@@ -226,17 +228,26 @@ Async< void > HomeStore::shutdown() {
     }
 
     LOGINFO("HomeStore: shutdown started");
-    // Reverse-of-bring-up order: replication first (it sits on top of logstore + cp), then the rest.
+
+    // ── Pass 1: quiesce the autonomous drivers, while every module is still alive ────────────────────────────────
+    // Only CP and ResourceMgr drive work INTO other modules (CP flushes its consumers; ResourceMgr truncates
+    // LogStore/Repl), so only they need a prepare phase before the reverse-order teardown below.  ResourceMgr
+    // first, so no in-flight truncation dirties the final CP; then CP takes its final durability flush into
+    // still-live consumers and stops its timer.  After this, nothing autonomously calls between modules.
+    co_await ResourceMgr::prepare_shutdown();
+    co_await cp_mgr().prepare_shutdown();
+
+    // ── Pass 2: tear down in strict reverse of boot order ───────────────────────────────────────────────────────
+    // Boot: Device → ResourceMgr → Meta → CP → Blob → COWBtree → LogStore → Repl.
     if (input_.repl_app) {
         co_await repl_mgr().stop();
     }
-    co_await cp_mgr().shutdown();
-    ResourceMgr::stop();
-
     co_await log_store_mgr().shutdown();
     cow_btree_mgr().shutdown();
     blob_dev_mgr().shutdown();
-    // MetaBlkManager has no explicit shutdown — Managers::reset() drops it last.
+    co_await cp_mgr().shutdown();     // prepare_shutdown() already ran above; this just frees CP state
+    // MetaBlkManager has no explicit shutdown — Managers::reset() drops it.
+    co_await ResourceMgr::stop();     // prepare_shutdown() already ran; this drops the subscription + singleton
 
     co_await device_mgr().close_devices();
     Managers::reset();

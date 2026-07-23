@@ -519,6 +519,12 @@ public:
     /// role-change callback, and co_awaits start_server.
     Async< bool > start_engine();
 
+    /// Clean shutdown of the consensus engine — co_awaits raft_server_->shutdown() (mandatory: nuraft's
+    /// raft_server destructor asserts shutdown was completed) and drops the engine.  Must run while the RPC
+    /// transport / executor the engine references are still alive, i.e. before ReplicationManager::stop() frees
+    /// them.  Idempotent — a no-op if the engine was never started (raft_server_ is null).
+    Async< void > stop_engine();
+
     /// Consumer-initiated wind-down — the "start" of a two-phase destroy.  Only the leader can call this
     /// successfully; proposes an HS_CTRL_DESTROY log entry through consensus and resolves once it commits
     /// on this node — by which point every replica that saw the commit has already run start_destroy_local()

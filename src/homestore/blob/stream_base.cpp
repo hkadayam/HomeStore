@@ -25,6 +25,8 @@
 #include "homestore/blob/stream_base.h"
 #include "homestore/device/chunk.h"
 #include "homestore/device/virtual_dev.h"
+#include "homestore/base/event_manager.h"  // EventManager::publish
+#include "homestore/base/resource_event.h" // ResourceEvent
 #include "homestore/meta/meta_client.h"
 
 namespace homestore {
@@ -99,10 +101,21 @@ Async< void > StreamBase::expand_to(size_t n) {
         co_return; // already has enough chunks
     }
 
-    // Expand until we have at least n+1 chunks.
+    // Expand until we have at least n+1 chunks.  vdev_->expand() throws when the device physically has no room for
+    // another chunk — the true, single source of write-path space exhaustion.  Signal DiskFullOnWrite so
+    // ResourceMgr can reclaim space (e.g. truncate the log stream), then re-throw: this expand still fails and the
+    // caller's write aborts, to be retried once reclaim frees chunks.
     const size_t old_size = new_list.size();
     while (new_list.size() <= n) {
-        shared< Chunk > chunk = co_await vdev_->expand(chunk_size_);
+        shared< Chunk > chunk;
+        try {
+            chunk = co_await vdev_->expand(chunk_size_);
+        } catch (const std::exception& e) {
+            LOGERROR("StreamBase[{}]: chunk expand failed ({}) — device out of space, raising DiskFullOnWrite",
+                     dev_name_, e.what());
+            EventManager::publish(ResourceEvent{ResourceEvent::Kind::DiskFullOnWrite, dev_name_, chunk_size_});
+            throw;
+        }
         new_list.push_back(std::move(chunk));
     }
 

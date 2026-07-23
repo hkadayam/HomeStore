@@ -18,7 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <stack>
-#include <unordered_map>
+#include <vector>
 
 #include "sisl/metrics/metrics.h"
 #include "sisl/fds/enum.h"
@@ -52,6 +52,23 @@ public:
     CPMgrMetrics& operator=(const CPMgrMetrics&) = delete;
     CPMgrMetrics& operator=(const CPMgrMetrics&&) noexcept = delete;
     ~CPMgrMetrics() { deregister_me_from_farm(); }
+};
+
+// Per-consumer rank passed to CPManager::register_consumer(); determines the deterministic order in which
+// switchover / cp_flush / cp_cleanup are invoked across consumers (ascending rank = flushed first).
+//
+// Consumers pick their own rank at the call site in the range [1, Sentinel - 2]. Suggested layering (leave
+// 10-unit gaps for future insertions):
+//     10   COWBtree
+//     20   BlobDev
+//     30   LogStore
+//    999   Replication  (== CPRank::Sentinel - 1, reserved)
+//
+// Ranks must be unique across all registered consumers. Duplicates are a debug assert; in release the new
+// consumer is inserted adjacent-after the existing one so the process continues.
+struct CPRank {
+    static constexpr uint32_t Sentinel = 1000;
+    static constexpr uint32_t Replication = Sentinel - 1;
 };
 
 class CPCallbacks {
@@ -174,8 +191,12 @@ private:
     std::unique_ptr< CPWatchdog > wd_cp_;
     ModuleMetaBlk< CPManagerSuperBlock > sb_;
 
-    using ConsumerMap = std::unordered_map< CPConsumer, shared< CPCallbacks > >;
-    ConsumerMap consumers_;
+    struct CPConsumerEntry {
+        uint32_t rank;
+        std::string name;
+        shared< CPCallbacks > cb;
+    };
+    std::vector< CPConsumerEntry > consumers_; // kept sorted by rank (ascending)
     mutable folly::SharedMutex consumers_mtx_;
 
     // State maintanence
@@ -222,8 +243,15 @@ public:
     /// @brief Start the cp timer so that periodic cps are started
     void start_timer();
 
-    /// @brief Shutdown the checkpoint manager services. It will trigger a flush, wait for the CP to be flushed
-    /// and does a clean shutdown
+    /// @brief Phase 1 of a two-phase teardown: quiesce the checkpoint manager without freeing its state. Requests
+    /// the periodic timer + watchdog to stop, takes the final durability flush (flush_on_shutdown) so consumers'
+    /// last dirty state is persisted while they are still alive, and drains the timer/watchdog coroutines. After
+    /// this returns, no further CP flush will fire. Idempotent — safe to call once here and again via shutdown().
+    /// Callers doing an ordered multi-module teardown call this on every module BEFORE any shutdown().
+    Async< void > prepare_shutdown();
+
+    /// @brief Phase 2 of teardown: free CP state (current CP, metrics). Calls prepare_shutdown() first (a no-op if
+    /// it already ran), so a lone shutdown() remains a complete flush-then-free for single-call sites.
     Async< void > shutdown();
 
     /// @brief Register a CP consumer. The consumer is immediately notified via on_switchover_cp(nullptr, cur_cp)
@@ -231,7 +259,9 @@ public:
     /// callbacks. Consumers own their per-CP state; nothing is stored in the CP object itself.
     /// @param consumer_id Consumer identifier a string that uniquely identifies the consumer (e.g. "IndexService")
     /// @param callbacks   Consumer's callbacks implementation (shared ownership, passed as shared<CPCallbacks>)
-    void register_consumer(const CPConsumer& consumer_id, shared< CPCallbacks > callbacks);
+    /// @param rank        Determines flush order (ascending). See CPRank docs. Must be < CPRank::Sentinel and unique
+    ///                    across all consumers.
+    void register_consumer(const CPConsumer& consumer_id, shared< CPCallbacks > callbacks, uint32_t rank);
 
     CPCallbacks* get_consumer(const CPConsumer& consumer_id);
 

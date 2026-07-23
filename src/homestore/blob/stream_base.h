@@ -79,6 +79,11 @@ public:
     /// Number of chunks currently in this stream (lock-free snapshot).
     size_t num_chunks() const;
 
+    /// Physical device bytes the stream currently occupies: the chunks it still holds.  truncate/shrink release
+    /// chunks fully below the head, so this shrinks on truncation — it is the stream's live footprint, not its
+    /// logical (tail_offset) size.
+    uint64_t footprint_bytes() const { return num_chunks() * chunk_size_; }
+
     // ── Chunk-list mutations (serialised coroutines) ──────────────────────────
 
     /// Ensure at least n+1 chunks exist, expanding via vdev.expand() as needed.

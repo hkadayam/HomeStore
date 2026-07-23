@@ -54,6 +54,12 @@ public:
 
     static void reset_resource_mgr() { s_resource_mgr_.reset(); }
 
+    // Presence probes — ResourceMgr's poll loop starts before the log-store / replication managers exist (during
+    // boot) and replication is optional, so pressure-driven truncation must check before dereferencing them.
+    static bool has_resource_mgr() { return s_resource_mgr_ != nullptr; }
+    static bool has_log_store_mgr() { return s_log_store_mgr_ != nullptr; }
+    static bool has_repl_mgr() { return s_repl_mgr_ != nullptr; }
+
     static void reset() {
         s_meta_mgr_.reset();
         s_device_mgr_.reset();

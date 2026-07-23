@@ -31,8 +31,11 @@
 #include "common/defs.h"
 #include "homestore/device/chunk.h"
 #include "homestore/device/virtual_dev.h"
+#include "homestore/device/device_manager.h"  // device_mgr().total_capacity_by_type
 #include "iomanager/iomanager.h" // iomanager::spawn_detached for size-triggered auto-flush
 #include "homestore/managers.h"
+#include "homestore/base/event_manager.h"  // EventManager::publish
+#include "homestore/base/resource_event.h" // ResourceEvent
 #include "homestore/meta/meta_client.h"
 
 namespace homestore {
@@ -137,7 +140,7 @@ logid_t LogStream::append(LogStreamClient* client, lsn_t lsn, const LogBlob& dat
     // threshold spawns the detached flush.  Subsequent appenders that observe an already-above-threshold value
     // skip the spawn — flush() decrements the counter on success, naturally re-arming the next crossing.
     const int64_t threshold = to_i64(HS_RUNTIME_CONFIG(logstore.flush_threshold_size));
-    if (prev < threshold && (prev + sz) >= threshold) {
+    if (prev < threshold && (prev + sz) >= threshold && !stopping_.load(std::memory_order_acquire)) {
         iomanager::spawn_detached(iomanager::ReactorTarget::any(),
                                   [self = shared_from_this()]() -> Async< void > { co_await self->flush(); });
     }
@@ -178,8 +181,24 @@ Async< void > LogStream::flush() {
     LSTREAM_LOG(TRACE, "flush: emplaced {} group(s), tail_off={}", emplaced.size(), tail_offset());
 
     // Single underlying write of everything emplaced above.  Throws on failure; the tracker is left populated and
-    // completion firing is skipped — a flush-write failure is fatal at this layer.
+    // completion firing is skipped — a flush-write failure is fatal at this layer.  Capture the chunk count first
+    // so we can tell below whether this flush grew the stream onto a new chunk.
+    const size_t chunks_before = num_chunks();
     co_await AppendByteStream::flush();
+
+    // Emergency space signal: only when this flush actually consumed a new chunk (naturally rate-limits the check
+    // to chunk-boundary crossings), and our live footprint has crossed the configured share of the fast tier, push
+    // a LogStreamSpaceExhausted event so ResourceMgr runs a truncation pass now rather than at its next poll tick.
+    if (num_chunks() > chunks_before) {
+        const uint64_t fast_cap = device_mgr().total_capacity_by_type(HSDevType::Fast);
+        const uint64_t limit = (fast_cap * HS_RUNTIME_CONFIG(resource_limits.logstream_size_limit_pct)) / 100;
+        if ((limit > 0) && (footprint_bytes() >= limit)) {
+            LSTREAM_LOG(WARN, "footprint {} crossed fast-tier soft limit {} — raising LogStreamSpaceExhausted",
+                        footprint_bytes(), limit);
+            EventManager::publish(
+                ResourceEvent{ResourceEvent::Kind::LogStreamSpaceExhausted, "LogStream", footprint_bytes()});
+        }
+    }
 
     // Fire per-record on_write_completion for every record in every group we just made durable.  Walk groups in
     // emplace order, advancing record_stream_offset as we go (group_offset → +log_group_header → +per-record).
@@ -220,7 +239,12 @@ void LogStream::start_flush_timer() {
 }
 
 Async< void > LogStream::stop() {
+    // Reject new size-triggered flushes, cancel the timer, then drain any in-flight flush by taking flush_mtx_ —
+    // flush() holds it for its whole duration (incl. the on_write_completion loop), so once we hold it no flush is
+    // firing completions into a LogStore the manager is about to drop.
+    stopping_.store(true, std::memory_order_release);
     co_await flush_timer_.stop();
+    { auto lk = co_await flush_mtx_.co_scoped_lock(); }
 }
 
 Async< void > LogStream::truncate(const stream_key& key) {

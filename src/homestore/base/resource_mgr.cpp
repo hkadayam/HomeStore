@@ -26,6 +26,9 @@
 #include "hs_runtime_config.h"
 #include "homestore/managers.h"
 #include "event_manager.h"
+#include "homestore/device/device_manager.h"        // device_mgr().total_capacity_by_type
+#include "homestore/logstore/log_store_mgr.h"        // log_store_mgr().footprint_bytes / truncate
+#include "homestore/replication/repl_manager.h"      // repl_mgr().truncate
 #include "iomanager/iomanager.h"
 
 namespace homestore {
@@ -73,14 +76,42 @@ void ResourceMgr::start(std::vector< DevInfo > const& devs) {
 
     EventManager::subscribe< ResourceEvent >(
         [raw = mgr.get()](ResourceEvent const& ev) { raw->on_resource_event(ev); });
-
-    // TODO: start poll_timer_ once the manager getters it depends on are in place
-    // (cow_btree_mgr().total_dirty_bytes(), log_store_mgr().total_log_bytes(),
-    // device_mgr().free_capacity_by_type(), chunk_pool().resize_to_fit()).  For now the poll loop
-    // infrastructure is wired but the rule bodies are stubs.
+    // Poll timer is NOT started here — start_timer() is called at go-live.  This keeps the boot window (and tests)
+    // free of autonomous truncations.
 }
 
-void ResourceMgr::stop() {
+void ResourceMgr::start_timer() {
+    if (!Managers::has_resource_mgr()) {
+        return;
+    }
+    // Proactive storage-pressure poll.  Fires on any IO reactor at resource_audit_timer_ms cadence and evaluates
+    // the pressure rules (currently: log-stream footprint vs its fast-tier budget).  The emergency ResourceEvent
+    // subscription short-circuits this cadence when a lower module hits a wall between ticks.
+    ResourceMgr* self = &resource_mgr();
+    self->poll_timer_.start(iomanager::ReactorTarget::any(),
+                            std::chrono::milliseconds(HS_RUNTIME_CONFIG(resource_limits.resource_audit_timer_ms)),
+                            iomanager::TimerKind::Recurring,
+                            [self]() -> Async< void > { co_await self->poll_tick(); });
+}
+
+Async< void > ResourceMgr::prepare_shutdown() {
+    if (!Managers::has_resource_mgr()) {
+        co_return;
+    }
+    ResourceMgr& rm = resource_mgr();
+    if (rm.stopping_.exchange(true)) {
+        co_return; // already prepared
+    }
+    // Drain the poll timer (this also joins any poll-driven reclaim, since the tick awaits reclaim_log_space).
+    co_await rm.poll_timer_.stop();
+    // Then wait for any in-flight EMERGENCY reclaim (spawn_detached from on_resource_event, which the timer stop
+    // does not join).  Acquiring the gate blocks until the running pass releases it; stopping_ prevents new passes.
+    { auto lk = co_await rm.reclaim_gate_.co_scoped_lock(); }
+}
+
+Async< void > ResourceMgr::stop() {
+    // Quiesce (idempotent) then drop the subscription + singleton.  A lone stop() therefore still quiesces first.
+    co_await prepare_shutdown();
     EventManager::reset();
     Managers::reset_resource_mgr();
 }
@@ -113,11 +144,21 @@ uint64_t ResourceMgr::mem_free_bytes() const {
 // ────────────────────────────────────────────────── Poll loop ────────────────────────────────────────────────────────
 
 Async< void > ResourceMgr::poll_tick() {
-    // TODO: implement rule bodies once the per-manager getters land:
-    //   • check_btree_dirty()    — cow_btree_mgr().total_dirty_bytes() vs mem-derived limit
-    //   • check_log_size()       — log_store_mgr().total_log_bytes() vs disk-free-derived limit
-    //   • check_disk_used()      — fast_free_bytes() / data_free_bytes() vs threshold
-    //   • check_chunk_pool()     — device_mgr().chunk_pool().resize_to_fit(...)
+    // Log-stream storage pressure.  The log stream lives on the fast tier; when the chunks it holds exceed the
+    // configured share of FAST-device capacity, force a truncation pass.  We read actual device capacity (not the
+    // summed DevInfo sizes, which are 0 when device sizes are auto-assigned).  Guarded because the poll timer can
+    // fire before the log-store manager has been constructed during boot.
+    if (Managers::has_log_store_mgr()) {
+        const uint64_t fast_cap = device_mgr().total_capacity_by_type(HSDevType::Fast);
+        const uint64_t limit = (fast_cap * HS_RUNTIME_CONFIG(resource_limits.logstream_size_limit_pct)) / 100;
+        const uint64_t footprint = log_store_mgr().footprint_bytes();
+        if ((limit > 0) && (footprint >= limit)) {
+            LOGINFO("ResourceMgr: log-stream footprint {} >= fast-tier limit {} — reclaiming log space", footprint,
+                    limit);
+            co_await reclaim_log_space();
+        }
+    }
+    // TODO: additional rule bodies as the getters land (btree dirty bytes, chunk-pool right-sizing).
     co_return;
 }
 
@@ -126,11 +167,58 @@ Async< void > ResourceMgr::poll_tick() {
 void ResourceMgr::on_resource_event(ResourceEvent const& ev) {
     LOGINFO("ResourceMgr received ResourceEvent kind={} source={} payload={}", static_cast< int >(ev.kind), ev.source,
             ev.payload);
-    // TODO: per-kind reactions:
-    //   • LogStreamSpaceExhausted → spawn cp_mgr().trigger_cp_flush(force=true) + log_store_mgr().force_truncate()
-    //   • DiskFullOnWrite         → propagate to status manager / app callback
-    //   • BlkAllocFailed          → trigger CP, retry hint
-    //   • MemAllocFailed          → drop caches, throttle writers
+    switch (ev.kind) {
+    case ResourceEvent::Kind::LogStreamSpaceExhausted:
+    case ResourceEvent::Kind::DiskFullOnWrite:
+        // Emergency reclaim without waiting for the next poll tick.  on_resource_event runs synchronously on the
+        // publisher's (mid-write) thread, so we must not block here — hand the async reclaim to a reactor.  Capture
+        // a shared_ptr (self) so the detached task keeps ResourceMgr alive until it finishes, and skip once we're
+        // stopping so teardown isn't chased by a fresh reclaim.
+        if (!stopping_.load(std::memory_order_acquire)) {
+            iomanager::spawn_detached(iomanager::ReactorTarget::any(),
+                                      [self = shared_from_this()]() -> Async< void > { co_await self->reclaim_log_space(); });
+        }
+        break;
+    case ResourceEvent::Kind::BlkAllocFailed:
+    case ResourceEvent::Kind::MemAllocFailed:
+        // TODO: trigger CP / drop caches / throttle writers.
+        break;
+    }
+}
+
+// ───────────────────────────────────────────── Storage-pressure truncation ───────────────────────────────────────────
+
+Async< void > ResourceMgr::reclaim_log_space() {
+    // Don't start a reclaim once teardown has begun.
+    if (stopping_.load(std::memory_order_acquire)) {
+        co_return;
+    }
+    // Collapse overlapping triggers (poll tick + emergency event) into a single pass.
+    if (truncation_in_flight_.exchange(true)) {
+        co_return;
+    }
+    // Hold the gate for the whole pass so prepare_shutdown() can wait for us to finish before LogStore/Repl are
+    // torn down.  Re-check stopping_ under the gate: a pass that slipped past the check above must not proceed if
+    // prepare_shutdown() set stopping_ while we were queued on the gate.
+    auto lk = co_await reclaim_gate_.co_scoped_lock();
+    if (stopping_.load(std::memory_order_acquire)) {
+        truncation_in_flight_.store(false);
+        co_return;
+    }
+    try {
+        // Replicated groups first: repl truncate takes a snapshot and compacts, which advances each raft log's head
+        // so the underlying log-store records become truncatable.  Then the log-store truncate reclaims the stream
+        // chunks (this is also the whole job for a non-replicated deployment).
+        if (Managers::has_repl_mgr()) {
+            co_await repl_mgr().truncate();
+        }
+        if (Managers::has_log_store_mgr()) {
+            co_await log_store_mgr().truncate();
+        }
+    } catch (const std::exception& e) {
+        LOGERROR("ResourceMgr: log-space reclaim failed: {}", e.what());
+    }
+    truncation_in_flight_.store(false);
 }
 
 } // namespace homestore

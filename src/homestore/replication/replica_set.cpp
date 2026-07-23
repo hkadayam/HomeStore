@@ -683,6 +683,19 @@ Async< bool > ReplicaSet::start_engine() {
     co_return true;
 }
 
+Async< void > ReplicaSet::stop_engine() {
+    if (!raft_server_) {
+        co_return; // engine never started (or already stopped)
+    }
+    RS_LOG(INFO, NO_TRACE_ID, "Shutting down raft engine");
+    // Mandatory before dropping the server: nuraft's raft_server destructor asserts shutdown() completed.  This
+    // joins the commit loop, stops the election timer, and closes the RPC listener — all of which need the
+    // transport/executor (owned by ReplicationManager) still alive, which is why the manager shuts every engine
+    // down before freeing them.
+    co_await raft_server_->shutdown();
+    raft_server_.reset();
+}
+
 Async< ReplError > ReplicaSet::destroy() {
     stage_.update([](auto* s) { *s = ReplicaSetStage::DESTROYING; });
 
@@ -730,6 +743,11 @@ Async< void > ReplicaSet::finish_destroy_local() {
     if (listener_) {
         listener_->on_destroy(group_id_);
     }
+
+    // Shut the consensus engine before freeing the log store it runs on (raft's log store IS log_store_) and
+    // before this ReplicaSet is dropped from the registry — nuraft's raft_server destructor asserts shutdown()
+    // completed.  Idempotent, and the RPC transport is still alive during a runtime destroy.
+    co_await stop_engine();
 
     // Order: JSON raft config → log store (which handles main log + IndirectBlkHandler internally) → mark
     // stage → rs_sb LAST.  Freeing rs_sb last leaves a discoverable stale SB for crash recovery to finish
@@ -1478,7 +1496,7 @@ Async< void > ReplicaSet::dispatch_commit(int64_t lsn, JournalType type, sisl::B
     case JournalType::HS_CTRL_DESTROY:
         // Every replica lands here when the leader's HS_CTRL_DESTROY commits.  start_destroy_local() marks
         // DESTROYED + persists destroy_pending — actual resource teardown deferred to the ReplicationManager's
-        // reaper calling finish_destroy_local() after replica_set_cleanup_interval_sec.
+        // reaper calling finish_destroy_local() after replica_set_reaper_grace_sec.
         co_await start_destroy_local();
         break;
     case JournalType::HS_CTRL_START_REPLACE:

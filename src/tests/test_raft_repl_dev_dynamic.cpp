@@ -415,7 +415,7 @@ int main(int argc, char* argv[]) {
     // leadership_expiry time.
     //
     HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
-        s.consensus.replica_set_cleanup_interval_sec = 1;
+        s.consensus.replica_set_reaper_grace_sec = 1;
 
         // Disable implicit flush and timer.
         s.logstore.flush_threshold_size = 0;

@@ -49,6 +49,9 @@ SISL_OPTION_GROUP(test_cp_mgr,
 static constexpr uint64_t DEV_SIZE = 256 * 1024 * 1024;      // 256 MB per device
 static constexpr uint64_t META_VDEV_SIZE = 64 * 1024 * 1024; // 64 MB for meta vdev
 
+// CP flush rank for the test consumer.  Chosen well below any production rank so this test file remains isolated.
+static constexpr uint32_t kCPRank_Test = 100;
+
 // ─── Test CP consumer
 // ───────────────────────────────────────────────────────────────────────────────────────────────── Tracks values added
 // during each CP session via atomic counter. On flush, validates that all values belong to the expected CP id.
@@ -129,7 +132,7 @@ public:
         co_await cpmgr->start(true /* first_time_boot */);
 
         test_cb_ = std::make_shared< TestCPCallbacks >();
-        cpmgr->register_consumer("test_consumer", test_cb_);
+        cpmgr->register_consumer("test_consumer", test_cb_, kCPRank_Test);
 
         co_return dm;
     }
@@ -145,7 +148,7 @@ public:
         co_await cpmgr->start(false /* first_time_boot */);
 
         test_cb_ = std::make_shared< TestCPCallbacks >();
-        cpmgr->register_consumer("test_consumer", test_cb_);
+        cpmgr->register_consumer("test_consumer", test_cb_, kCPRank_Test);
 
         co_return dm;
     }
@@ -305,7 +308,7 @@ TEST_F(CPMgrTest, CPIdSurvivesRestart) {
         auto cpmgr = CPManager::create();
         co_await cpmgr->start(false /* first_time_boot */);
         test_cb_ = std::make_shared< TestCPCallbacks >();
-        cpmgr->register_consumer("test_consumer", test_cb_);
+        cpmgr->register_consumer("test_consumer", test_cb_, kCPRank_Test);
 
         cp_id_t id_after_restart{};
         {

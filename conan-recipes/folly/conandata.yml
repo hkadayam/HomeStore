@@ -1,0 +1,9 @@
+sources:
+  "2026.07.13.00":
+    url: "https://github.com/facebook/folly/releases/download/v2026.07.13.00/folly-v2026.07.13.00.tar.gz"
+    sha256: "b2d4bc0029d466328e807efa673ad01c1086c385ffa800f2055543c3b9640a72"
+patches:
+  "2026.07.13.00":
+    - patch_file: "patches/0001-cmake-deps.patch"
+      patch_description: "Adjust folly-deps.cmake to work with modern CMake and Conan-provided dependencies"
+      patch_type: "portability"

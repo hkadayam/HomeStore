@@ -371,14 +371,9 @@ TEST_F(RaftReplicaSetTest, GCReplReqs) {
     LOGINFO("Homestore replica={} setup completed", g_helper->replica_num());
     g_helper->sync_for_test_start();
 
-    uint32_t prev_timeout_sec{0};
-    LOGINFO("Set the repl_req_timout_sec to be fairly small to force GC to kick in");
-    HS_SETTINGS_FACTORY().modifiable_settings([&prev_timeout_sec](auto& s) {
-        prev_timeout_sec = s.consensus.repl_req_timeout_sec;
-        s.consensus.repl_req_timeout_sec = 5;
-    });
-    HS_SETTINGS_FACTORY().save();
-
+    // NOTE: this test was built around consensus.repl_req_timeout_sec (now removed) to force repl-request GC.
+    // That timeout-based GC lives only in the old repl (to_remove); the new repl does not implement it, so this
+    // test no longer exercises req-GC and should be repurposed or removed in the test overhaul.
     if (g_helper->replica_num() != 0) {
         LOGINFO("Set flip to fake fetch data request on data channel");
         g_helper->set_basic_flip("drop_push_data_request");
@@ -398,12 +393,6 @@ TEST_F(RaftReplicaSetTest, GCReplReqs) {
 
     LOGINFO("Validate all data written so far by reading them");
     this->validate_data();
-
-    // step-5: Set the settings back and save. This is needed (if we ever give a --config in the test)
-    LOGINFO("Set the repl_req_timeout back to previous value={}", prev_timeout_sec);
-    HS_SETTINGS_FACTORY().modifiable_settings(
-        [prev_timeout_sec](auto& s) { s.consensus.repl_req_timeout_sec = prev_timeout_sec; });
-    HS_SETTINGS_FACTORY().save();
 
     g_helper->sync_for_cleanup_start();
 }
@@ -585,7 +574,7 @@ int main(int argc, char* argv[]) {
     //
     HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
         s.consensus.leadership_expiry_ms = -1; // -1 means never expires;
-        s.consensus.replica_set_cleanup_interval_sec = 1;
+        s.consensus.replica_set_reaper_grace_sec = 1;
 
         // Disable implicit flush and timer.
         s.logstore.flush_threshold_size = 0;

@@ -140,7 +140,7 @@ struct BtreeTest : public BtreeTestHelper< TestType >, public ::testing::Test {
 
         // Test cp flush of write back.
         HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
-            s.generic.cache_max_throttle_cnt = 10000;
+            s.unused.cache_max_throttle_cnt = 10000;
             HS_SETTINGS_FACTORY().save();
         });
         homestore::hs()->resource_mgr().reset_dirty_buf_qd();

@@ -17,6 +17,9 @@ namespace homestore {
 // Logical name registered with the MetaBlkManager.  All COWBtree per-instance MetaBlks live under this single client.
 static constexpr char COW_BTREE_MGR_META_CLIENT_NAME[] = "cow_btree_mgr";
 
+// CP flush rank for COWBtreeManager. See CPRank docs in cp_mgr.h for the layering scheme.
+static constexpr uint32_t kCPRank_COWBtree = 10;
+
 // ──────────────────────────────────────────────── Lifecycle ──────────────────────────────────────────────────────────
 
 Async< void > COWBtreeManager::create() {
@@ -90,7 +93,7 @@ COWBtreeManager::COWBtreeManager() : cp_callbacks_{std::make_shared< CPCallbacks
     overflow_cache_ = std::make_shared< OverflowCache >(
         overflow_cfg, evictor_, [](OverflowEntry const& entry) -> BlkId { return entry.blkid; });
 
-    cp_mgr().register_consumer("COWBtreeManager", cp_callbacks_);
+    cp_mgr().register_consumer("COWBtreeManager", cp_callbacks_, kCPRank_COWBtree);
 }
 
 std::vector< COWBtreeSuperBlock const* > COWBtreeManager::list_persisted_btrees() const {

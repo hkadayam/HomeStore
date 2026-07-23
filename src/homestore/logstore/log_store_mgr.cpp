@@ -38,6 +38,9 @@ namespace homestore {
 
 static constexpr std::string_view kLogStoreSbPrefix = "LogStore_";
 
+// CP flush rank for LogStoreManager. See CPRank docs in cp_mgr.h for the layering scheme.
+static constexpr uint32_t kCPRank_LogStore = 30;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Construction
 // ─────────────────────────────────────────────────────────────────────────────
@@ -69,7 +72,7 @@ Async< void > LogStoreManager::create(uint64_t chunk_size, uint32_t initial_num_
 
     auto mgr =
         shared< LogStoreManager >(new LogStoreManager{std::move(meta_client), std::move(vdev), std::move(stream)});
-    cp_mgr().register_consumer("LogStore", std::make_shared< LogStoreManager::CPHandler >(mgr));
+    cp_mgr().register_consumer("LogStore", std::make_shared< LogStoreManager::CPHandler >(mgr), kCPRank_LogStore);
     Managers::init_log_store_mgr(mgr);
     mgr->start_auto_truncate_timer();
     LOGINFO("LogStoreManager: ready (chunk_size={} initial_chunks={})", chunk_size, initial_num_chunks);
@@ -146,7 +149,7 @@ Async< void > LogStoreManager::load() {
         mgr->next_store_id_.store(max_store_id + 1, std::memory_order_relaxed);
     }
 
-    cp_mgr().register_consumer("LogStore", std::make_shared< LogStoreManager::CPHandler >(mgr));
+    cp_mgr().register_consumer("LogStore", std::make_shared< LogStoreManager::CPHandler >(mgr), kCPRank_LogStore);
     Managers::init_log_store_mgr(mgr);
     mgr->start_auto_truncate_timer();
     LOGINFO("LogStoreManager: loaded {} log_store(s)", mgr->log_stores_.size());

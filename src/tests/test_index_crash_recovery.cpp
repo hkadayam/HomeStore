@@ -293,8 +293,8 @@ struct IndexCrashTest : public test_common::HSTestHelper, BtreeTestHelper< TestT
     void SetUp() override {
         // Set the cp_timer_us to very high value to avoid any automatic checkpointing.
         HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
-            s.generic.cache_max_throttle_cnt = 10000;
-            s.generic.cp_timer_us = 0x8000000000000000;
+            s.unused.cache_max_throttle_cnt = 10000;
+            s.checkpoint.cp_timer_us = 0x8000000000000000;
             s.resource_limits.dirty_buf_percent = 100;
             HS_SETTINGS_FACTORY().save();
         });

@@ -40,6 +40,9 @@
 
 namespace homestore {
 
+// CP flush rank for BlobDevManager. See CPRank docs in cp_mgr.h for the layering scheme.
+static constexpr uint32_t kCPRank_BlobDev = 20;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // create
 // ─────────────────────────────────────────────────────────────────────────────
@@ -48,7 +51,7 @@ Async< void > BlobDevManager::create() {
     LOGINFO("BlobDevManager: first boot — creating fresh manager");
     auto mgr = shared< BlobDevManager >(new BlobDevManager{co_await meta_mgr().register_client("BlobDevManager")});
     Managers::init_blob_dev_mgr(mgr);
-    cp_mgr().register_consumer("BlobDevManager", mgr->shared_from_this());
+    cp_mgr().register_consumer("BlobDevManager", mgr->shared_from_this(), kCPRank_BlobDev);
     LOGINFO("BlobDevManager: ready");
 }
 
@@ -239,7 +242,7 @@ Async< void > BlobDevManager::load() {
     }
 
     Managers::init_blob_dev_mgr(mgr);
-    cp_mgr().register_consumer("BlobDevManager", mgr->shared_from_this());
+    cp_mgr().register_consumer("BlobDevManager", mgr->shared_from_this(), kCPRank_BlobDev);
     LOGINFO("BlobDevManager: recovery complete — {} BlobDev(s) active", dev_map.size());
 }
 

@@ -32,7 +32,6 @@
 
 #include "iomanager/iomanager.h"
 #include "homestore/base/test_defs.h"
-#include "homestore/base/resource_mgr.h"
 
 #include "common/defs.h"
 #include "homestore/device/device_manager.h"
@@ -70,6 +69,7 @@ static constexpr uint64_t CHUNK_SIZE = 32ull * 1024 * 1024;     // 32 MB blob ch
 static constexpr uint32_t BLK_SIZE = 4096;
 static constexpr size_t NUM_DEVS = 2;
 static constexpr uint32_t NODE_SIZE = 4096;
+static constexpr uint64_t CACHE_SIZE = 256ull * 1024 * 1024; // 256 MB evictor budget (prod: ResourceMgr-provided)
 static constexpr char BLOB_DEV_NAME[] = "cow_local_bd";
 static constexpr char BTREE_NAME[] = "local_btree";
 
@@ -106,14 +106,12 @@ static Async< shared< BlobDev > > bootstrap_stack(bool first_time_boot) {
     auto cpmgr = CPManager::create();
     co_await cpmgr->start(first_time_boot);
 
-    ResourceMgr::start(make_dev_infos());
-
     if (first_time_boot) {
         co_await BlobDevManager::create();
-        co_await COWBtreeManager::create();
+        co_await COWBtreeManager::create(CACHE_SIZE);
     } else {
         co_await BlobDevManager::load();
-        co_await COWBtreeManager::load();
+        co_await COWBtreeManager::load(CACHE_SIZE);
     }
 
     if (first_time_boot) {
@@ -140,7 +138,6 @@ static Async< void > shutdown_stack() {
     blob_dev_mgr().shutdown();
     cow_btree_mgr().shutdown();
     co_await device_mgr().close_devices();
-    co_await ResourceMgr::stop();
     Managers::reset();
 }
 

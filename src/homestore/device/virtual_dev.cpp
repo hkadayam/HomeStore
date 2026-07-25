@@ -665,7 +665,7 @@ Async< void > VirtualDev::write_vdev_info() {
     }
     vinfo.compute_checksum();
 
-    IoBuf buf{sizeof(VDevInfo)};
+    sisl::IoBufOwn buf{sizeof(VDevInfo)};
     std::memcpy(buf.bytes(), vinfo.to_bytes(), sizeof(VDevInfo));
 
     const uint64_t offset = VDevInfo::vdev_info_offset(vdev_id_);

@@ -5,7 +5,6 @@
 #include "homestore/index/cow_btree/cow_btree_mgr.h"
 #include "homestore/index/cow_btree/cow_btree.h"
 #include "homestore/base/hs_runtime_config.h" // HS_RUNTIME_CONFIG
-#include "homestore/base/resource_mgr.h"
 #include "homestore/blob/blob_dev.h"
 #include "homestore/blob/blob_dev_mgr.h"
 #include "homestore/device/device_manager.h"
@@ -22,16 +21,16 @@ static constexpr uint32_t kCPRank_COWBtree = 10;
 
 // ──────────────────────────────────────────────── Lifecycle ──────────────────────────────────────────────────────────
 
-Async< void > COWBtreeManager::create() {
-    auto mgr = shared< COWBtreeManager >(new COWBtreeManager());
+Async< void > COWBtreeManager::create(uint64_t cache_size) {
+    auto mgr = shared< COWBtreeManager >(new COWBtreeManager(cache_size));
     mgr->meta_client_ =
         std::make_shared< MetaClient >(co_await meta_mgr().register_client(COW_BTREE_MGR_META_CLIENT_NAME));
     Managers::init_cow_btree_mgr(std::move(mgr));
     co_return;
 }
 
-Async< void > COWBtreeManager::load() {
-    auto mgr = shared< COWBtreeManager >(new COWBtreeManager());
+Async< void > COWBtreeManager::load(uint64_t cache_size) {
+    auto mgr = shared< COWBtreeManager >(new COWBtreeManager(cache_size));
     mgr->meta_client_ =
         std::make_shared< MetaClient >(co_await meta_mgr().register_client(COW_BTREE_MGR_META_CLIENT_NAME));
 
@@ -63,11 +62,12 @@ void COWBtreeManager::shutdown() {
 
 // ────────────────────────────────────────────── Implementation ──────────────────────────────────────────────────────
 
-COWBtreeManager::COWBtreeManager() : cp_callbacks_{std::make_shared< CPCallbacksImpl >(*this)} {
-    // Single evictor shared by both caches — total cache budget is split across node and overflow data.
-    // ResourceMgr owns the global cache budget (mem_cap * resource_limits.cache_size_percent).
+COWBtreeManager::COWBtreeManager(uint64_t cache_size) : cp_callbacks_{std::make_shared< CPCallbacksImpl >(*this)} {
+    // Single evictor shared by both caches — total cache budget is split across node and overflow data.  cache_size is
+    // the global budget (mem_cap * resource_limits.cache_size_percent), computed by ResourceMgr and passed down by the
+    // boot sequence — COWBtree does not depend on the resource layer.
     sisl::TwoQEvictor::Config ev_cfg;
-    ev_cfg.max_size = resource_mgr().cache_size();
+    ev_cfg.max_size = cache_size;
     ev_cfg.num_partitions = HS_RUNTIME_CONFIG(cache->num_evictor_partitions);
     ev_cfg.hot_pct = static_cast< float >(HS_RUNTIME_CONFIG(cache->hot_size_pct) / 100.0);
     ev_cfg.high_wm_pct = static_cast< float >(HS_RUNTIME_CONFIG(cache->high_watermark_pct) / 100.0);

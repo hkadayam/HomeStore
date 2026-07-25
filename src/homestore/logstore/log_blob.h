@@ -20,7 +20,7 @@
 #include "sisl/fds/buffer.h"
 
 #include "common/defs.h"
-#include "common/homestore_assert.h"
+#include "homestore/base/homestore_assert.h"
 
 namespace homestore {
 
@@ -41,7 +41,10 @@ namespace homestore {
 struct LogBlob {
     static constexpr uint8_t kMaxParts = 4;
 
-    sisl::IoBufSpan parts[kMaxParts]{};
+    // Store the plain {bytes, size} view (sisl::Blob), NOT sisl::IoBufSpan: IoBufSpan derives the polymorphic
+    // sisl::IoBuf (vtable) and is no longer trivially copyable, which StreamTracker requires.  LogBlob only ever
+    // reads part data (cbytes()/size()), so the POD base is exactly right; IoBufSpan callers slice in implicitly.
+    sisl::Blob parts[kMaxParts]{};
     uint8_t n_parts{0};
 
     LogBlob() = default;

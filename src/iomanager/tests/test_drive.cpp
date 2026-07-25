@@ -102,13 +102,13 @@ TEST_F(DriveTest, SingleReactorWriteReadVerify) {
             const uint64_t offset = i * kBlockSize;
 
             // Write
-            IoBuf wbuf{static_cast< uint32_t >(kBlockSize)};
+            sisl::IoBufOwn wbuf{static_cast< uint32_t >(kBlockSize)};
             fill_pattern(wbuf, offset);
             auto wec = co_await drive.write(*m_iodev, wbuf, offset);
             EXPECT_FALSE(wec) << "write failed at offset " << offset << ": " << wec.message();
 
             // Read back
-            IoBuf rbuf{static_cast< uint32_t >(kBlockSize)};
+            sisl::IoBufOwn rbuf{static_cast< uint32_t >(kBlockSize)};
             auto rec = co_await drive.read(*m_iodev, rbuf, offset);
             EXPECT_FALSE(rec) << "read failed at offset " << offset << ": " << rec.message();
             EXPECT_TRUE(verify_pattern(rbuf, offset)) << "data mismatch at offset " << offset;
@@ -145,13 +145,13 @@ TEST_F(DriveTest, MultiReactorConcurrentWriteReadVerify) {
                         continue;
 
                     // Write
-                    IoBuf wbuf{static_cast< uint32_t >(kBlockSize)};
+                    sisl::IoBufOwn wbuf{static_cast< uint32_t >(kBlockSize)};
                     fill_pattern(wbuf, aligned);
                     auto wec = co_await drive.write(*m_iodev, wbuf, aligned);
                     EXPECT_FALSE(wec) << "write error: " << wec.message();
 
                     // Read back
-                    IoBuf rbuf{static_cast< uint32_t >(kBlockSize)};
+                    sisl::IoBufOwn rbuf{static_cast< uint32_t >(kBlockSize)};
                     auto rec = co_await drive.read(*m_iodev, rbuf, aligned);
                     EXPECT_FALSE(rec) << "read error: " << rec.message();
                     EXPECT_TRUE(verify_pattern(rbuf, aligned)) << "mismatch at " << aligned;
@@ -181,7 +181,7 @@ TEST_F(DriveTest, WriteZeroThenVerify) {
     iomgr().spawn_and_block(ReactorTarget::reactor(0), [this, &drive, offset, size]() -> Async< void > {
         // First write a non-zero pattern.
         for (uint64_t off = offset; off < offset + size; off += kBlockSize) {
-            IoBuf wbuf{static_cast< uint32_t >(kBlockSize)};
+            sisl::IoBufOwn wbuf{static_cast< uint32_t >(kBlockSize)};
             fill_pattern(wbuf, off + 1); // non-zero
             co_await drive.write(*m_iodev, wbuf, off);
         }
@@ -192,7 +192,7 @@ TEST_F(DriveTest, WriteZeroThenVerify) {
 
         // Verify zeros.
         for (uint64_t off = offset; off < offset + size; off += kBlockSize) {
-            IoBuf rbuf{static_cast< uint32_t >(kBlockSize)};
+            sisl::IoBufOwn rbuf{static_cast< uint32_t >(kBlockSize)};
             auto rec = co_await drive.read(*m_iodev, rbuf, off);
             EXPECT_FALSE(rec) << "read failed: " << rec.message();
             const auto* p = reinterpret_cast< const uint64_t* >(rbuf.cbytes());
@@ -209,7 +209,7 @@ TEST_F(DriveTest, FsyncAfterWrite) {
     DriveInterface drive;
 
     iomgr().spawn_and_block(ReactorTarget::reactor(0), [this, &drive]() -> Async< void > {
-        IoBuf wbuf{static_cast< uint32_t >(kBlockSize)};
+        sisl::IoBufOwn wbuf{static_cast< uint32_t >(kBlockSize)};
         fill_pattern(wbuf, 0);
         co_await drive.write(*m_iodev, wbuf, 0);
         auto ec = co_await drive.fsync(*m_iodev);

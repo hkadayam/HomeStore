@@ -303,7 +303,7 @@ private:
             [&m, &found](const MetaBlk& blk, const sisl::IoBufView& data) -> Async< void > {
                 if (!found) {
                     try {
-                        std::string_view const sv{c_charptr_cast(data.bytes()), data.size()};
+                        std::string_view const sv{c_charptr_cast(data.cbytes()), data.size()};
                         m.json_ = nlohmann::json::from_msgpack(sv);
                     } catch (const nlohmann::json::exception& e) {
                         throw std::runtime_error{std::string{"JsonMetaBlk::load_existing: msgpack parse failed: "} +

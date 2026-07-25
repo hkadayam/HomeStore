@@ -15,7 +15,7 @@
 //
 // test_cow_btree_io — mirrors test_mem_btree using the same BtreeTestHelper, but writes onto COWBtree (which exercises
 // the BlobDev / VirtualDev / blkalloc IO path). Bootstraps a fresh stack per test
-// (DeviceManager → MetaBlk → CPManager → ResourceMgr → BlobDevManager → COWBtreeManager → BlobDev → Btree<K,V>).
+// (DeviceManager → MetaBlk → CPManager → BlobDevManager → COWBtreeManager → BlobDev → Btree<K,V>).
 // No restart/recovery here — that goes in a separate test once recovery is wired up.
 //
 #include <filesystem>
@@ -33,7 +33,6 @@
 
 #include "iomanager/iomanager.h"
 #include "homestore/base/test_defs.h"
-#include "homestore/base/resource_mgr.h"
 
 #include "common/defs.h"
 #include "homestore/device/device_manager.h"
@@ -81,6 +80,7 @@ static constexpr uint64_t META_VDEV_SIZE = 64 * 1024 * 1024; // 64 MB for meta v
 static constexpr uint64_t CHUNK_SIZE = 32 * 1024 * 1024;     // 32 MB initial blob chunk size (streams override)
 static constexpr uint32_t BLK_SIZE = 4096;
 static constexpr size_t NUM_DEVS = 2;
+static constexpr uint64_t CACHE_SIZE = 256 * 1024 * 1024;    // 256 MB evictor budget (prod: ResourceMgr-provided)
 
 struct FixedLenBtreeTest {
     using KeyType = TestFixedKey;
@@ -138,9 +138,8 @@ static Async< shared< BlobDev > > bootstrap_stack() {
     auto cpmgr = CPManager::create();
     co_await cpmgr->start(true /* first_time_boot */);
 
-    ResourceMgr::start(make_dev_infos());
     co_await BlobDevManager::create();
-    co_await COWBtreeManager::create();
+    co_await COWBtreeManager::create(CACHE_SIZE);
 
     VDevParameters params;
     params.initial_chunk_size = CHUNK_SIZE;
@@ -158,7 +157,6 @@ static Async< void > shutdown_stack() {
     blob_dev_mgr().shutdown();
     cow_btree_mgr().shutdown();
     co_await device_mgr().close_devices();
-    co_await ResourceMgr::stop();
     Managers::reset();
 }
 

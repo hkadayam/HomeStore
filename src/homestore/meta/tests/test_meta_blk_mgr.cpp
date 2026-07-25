@@ -66,7 +66,7 @@ static sisl::IoBufShared make_pattern_buf(uint64_t id, size_t size) {
 static bool verify_pattern(const sisl::IoBufView& buf, uint64_t id, size_t size) {
     if (buf.size() < size)
         return false;
-    const auto* p = buf.bytes();
+    const auto* p = buf.cbytes();
     for (size_t i = 0; i < size; ++i) {
         if (p[i] != static_cast< uint8_t >((id + i) & 0xFF))
             return false;

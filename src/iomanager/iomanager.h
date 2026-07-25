@@ -17,6 +17,14 @@
 
 #include <sisl/logging/logging.h>
 
+// Forward-declare the global iomgr() accessor (fully declared lower in this header) so template helpers defined
+// inside namespace iomanager — e.g. blocking_wait — can name it, since a non-dependent name must be declared
+// before use in a template definition.
+namespace iomanager {
+class IOManager;
+}
+iomanager::IOManager& iomgr();
+
 namespace iomanager {
 
 // Extracts T from Async<T>
@@ -138,13 +146,13 @@ void IOManager::spawn_detached(ReactorTarget target, F factory) {
     // lambda closure outlives all suspension points (CP.51 fix).
     auto task = folly::coro::co_invoke(std::move(factory));
     eb->runInEventBaseThread(
-        [eb, task = std::move(task)]() mutable { std::move(task).scheduleOn(eb).startInlineUnsafe([](auto) {}); });
+        [eb, task = std::move(task)]() mutable { folly::coro::co_withExecutor(eb, std::move(task)).startInlineUnsafe([](auto) {}); });
 }
 
 template < typename T >
 Async< T > IOManager::spawn_waitable(ReactorTarget target, Async< T > task) {
     auto* eb = resolve_target(target);
-    co_return co_await std::move(task).scheduleOn(eb);
+    co_return co_await folly::coro::co_withExecutor(eb, std::move(task));
 }
 
 template < typename T >
@@ -157,7 +165,7 @@ T IOManager::spawn_and_block(ReactorTarget target, Async< T > task) {
     folly::Try< T > result;
 
     eb->runInEventBaseThread([eb, task = std::move(task), &baton, &result]() mutable {
-        std::move(task).scheduleOn(eb).startInlineUnsafe([&baton, &result](folly::Try< T > t) {
+        folly::coro::co_withExecutor(eb, std::move(task)).startInlineUnsafe([&baton, &result](folly::Try< T > t) {
             result = std::move(t);
             baton.post();
         });
@@ -174,13 +182,13 @@ auto IOManager::spawn_waitable_all(Fn&& fn)
     using R = task_value_t< Fn, size_t >;
     if constexpr (std::is_void_v< R >) {
         for (size_t i = 0; i < num_reactors_; ++i) {
-            co_await fn(i).scheduleOn(shard_ebs_[i]);
+            co_await folly::coro::co_withExecutor(shard_ebs_[i], fn(i));
         }
     } else {
         std::vector< R > results;
         results.reserve(num_reactors_);
         for (size_t i = 0; i < num_reactors_; ++i) {
-            results.push_back(co_await fn(i).scheduleOn(shard_ebs_[i]));
+            results.push_back(co_await folly::coro::co_withExecutor(shard_ebs_[i], fn(i)));
         }
         co_return std::move(results);
     }
@@ -215,7 +223,7 @@ auto spawn_waitable_all(Fn&& fn) -> Async< std::conditional_t< std::is_void_v< t
 /// this everywhere instead of folly::coro::blockingWait so reactor-context misuse is caught at debug time.
 template < typename T >
 T blocking_wait(Async< T >&& task) {
-    DEBUG_ASSERT(::iomgr().current_reactor_id() >= ::iomgr().num_reactors(),
+    DEBUG_ASSERT(iomgr().current_reactor_id() >= iomgr().num_reactors(),
                  "iomanager::blocking_wait called from reactor — would deadlock");
     return folly::coro::blockingWait(std::move(task));
 }

@@ -66,12 +66,13 @@ public:
 
     // Called from HomeStore::do_start().  Registers with cp_mgr, reads persisted metablks from meta service, stashes
     // them for the upper layer to iterate.  Registered in Managers as cow_btree_mgr().
-    // First-time boot: construct an empty manager, register with cp_mgr, install in Managers.
-    static Async< void > create();
+    // First-time boot: construct an empty manager, register with cp_mgr, install in Managers.  cache_size is the
+    // evictor budget, obtained by the boot sequence from ResourceMgr and passed down (COWBtree does not depend on it).
+    static Async< void > create(uint64_t cache_size);
 
     // Recovery boot: same as create(), plus read all persisted COWBtree metablks and stash them for the upper layer
     // to iterate via list_persisted_btrees().
-    static Async< void > load();
+    static Async< void > load(uint64_t cache_size);
 
     void shutdown();
 
@@ -102,7 +103,7 @@ public:
     uint64_t incr_map_total_bytes() const noexcept { return incr_map_total_bytes_.load(std::memory_order_relaxed); }
 
 private:
-    COWBtreeManager();
+    COWBtreeManager(uint64_t cache_size);
 
     // Computed once per CP by the manager — not exposed to btrees.  Returns true when accumulated incr_map bytes
     // exceed the configured percent of fast-dev capacity, indicating the next CP should do a full_map_flush.

@@ -526,7 +526,7 @@ public:
         DEBUG_ASSERT_LE((void*)(base_buf_->cbytes() + base_buf_->size()), (void*)(view_.cbytes() + view_.size()),
                         "Invalid IoBufView");
     }
-    std::string get_string() const { return std::string(r_cast< const char* >(bytes()), uint64_cast(size())); }
+    std::string get_string() const { return std::string(r_cast< const char* >(cbytes()), uint64_cast(size())); }
 
 private:
     IoBufShared base_buf_;

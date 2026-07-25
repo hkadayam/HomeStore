@@ -64,7 +64,7 @@ BtreeTask< BtreeStatus > NodeOps< K, V >::leaf_read_value(Node const& node, uint
         ValueOrOverflow< V > vref;
         node->get_nth_value(idx, &vref, /*copy=*/false);
         if (vref.is_overflow()) {
-            sisl::ByteArray buf;
+            sisl::IoBufShared buf;
             auto status = CO_AWAIT underlying_.read_overflow(vref.blkid(), buf);
             if (status != BtreeStatus::success) {
                 CO_RETURN status;

@@ -34,7 +34,7 @@
 #include "homestore/index/cow_btree/cow_btree_mgr.h"
 #include "homestore/logstore/log_store_mgr.h"
 #include "homestore/replication/repl_manager.h"
-#include "homestore/base/resource_mgr.h"
+#include "homestore/resource/resource_mgr.h"
 
 #ifdef _PRERELEASE
 #include "homestore/common/crash_simulator.h"
@@ -127,7 +127,7 @@ Async< void > HomeStore::format() {
     co_await cp->start(/*first_time_boot=*/true);
 
     co_await BlobDevManager::create();
-    co_await COWBtreeManager::create();
+    co_await COWBtreeManager::create(resource_mgr().cache_size());
     co_await LogStoreManager::create(opts.logstore_chunk_size, opts.logstore_initial_num_chunks);
 
     // Replication is optional — only brought up when the application handed us a ReplApplication.  create()
@@ -169,7 +169,7 @@ Async< void > HomeStore::load() {
     co_await cp->start(/*first_time_boot=*/false);
 
     co_await BlobDevManager::load();
-    co_await COWBtreeManager::load(); // index self-recovers from its own CPs, independent of the log stream
+    co_await COWBtreeManager::load(resource_mgr().cache_size()); // index self-recovers from its own CPs, independent of the log stream
     co_await LogStoreManager::load(); // reconstruct LogStore instances; NO replay yet, tail_lsn stays -1
 
     // Replication load(): reconstruct each ReplicaSet (ReplicaSet::load — read SB, seed watermarks,

@@ -388,7 +388,11 @@ Async< void > AppendByteStream::persist_stream_sb() {
     sb->tail_offset = tail_offset_;
     sb->n_chunks = to_u32(cids.size());
     sb->chain_seed = chain_seed_;
-    std::memcpy(sb->chunk_ids(), cids.data(), cids.size() * sizeof(uint32_t));
+    // Guard against memcpy(dst, nullptr, 0): an empty stream has no chunk_ids and cids.data() is null, which is UB
+    // (memcpy's src is declared nonnull) even for a zero byte count.
+    if (!cids.empty()) {
+        std::memcpy(sb->chunk_ids(), cids.data(), cids.size() * sizeof(uint32_t));
+    }
 
     auto lock = co_await mblk_mutex_.co_scoped_lock();
     co_await meta_client_.write_meta_blk(sb_mblk_, buf);

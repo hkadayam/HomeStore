@@ -93,6 +93,9 @@ add_subdirectory(homestore/index)
 
 add_subdirectory(homestore/replication)
 
+# ResourceMgr is the top layer — it depends (at compile time) on every module below it.
+add_subdirectory(homestore/resource)
+
 # Aggregate STATIC library — every per-module OBJECT lib plus the top-level orchestrator (homestore.cpp).
 set(HOMESTORE_OBJECTS
     $<TARGET_OBJECTS:hs_base>
@@ -105,6 +108,7 @@ set(HOMESTORE_OBJECTS
     $<TARGET_OBJECTS:hs_mem_btree>
     $<TARGET_OBJECTS:hs_cow_btree>
     $<TARGET_OBJECTS:hs_replication>
+    $<TARGET_OBJECTS:hs_resource>
     homestore/homestore.cpp
 )
 add_library(homestore STATIC ${HOMESTORE_OBJECTS})

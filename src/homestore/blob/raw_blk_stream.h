@@ -173,7 +173,7 @@ private:
 
     // Per-CP write buffer.  Extends base FlushSessionBase with a lock-free per-thread vector of pending writes.
     struct CPSession : StreamBase::FlushSessionBase {
-        sisl::ConcurrentInsertVector< std::pair< BlkId, sisl::IoBuf > > writes;
+        sisl::ConcurrentInsertVector< std::pair< BlkId, sisl::IoBufOwn > > writes;
     };
     CPSession cp_session_[CPManager::max_concurent_cps];
     CPSession& cp_session(cp_id_t cp_id) { return cp_session_[cp_id % CPManager::max_concurent_cps]; }

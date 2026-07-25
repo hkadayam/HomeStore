@@ -112,7 +112,9 @@ public:
         };
         auto task = folly::coro::co_invoke(std::move(factory));
         eb->runInEventBaseThread(
-            [eb, task = std::move(task)]() mutable { std::move(task).scheduleOn(eb).startInlineUnsafe([](auto) {}); });
+            [eb, task = std::move(task)]() mutable {
+                folly::coro::co_withExecutor(eb, std::move(task)).startInlineUnsafe([](auto) {});
+            });
     }
 
     /// Non-blocking: hops to the timer's EB to set stop_requested_ and post the wakeup baton.  Caller MUST still
@@ -147,13 +149,13 @@ public:
         auto* eb = eb_;
         // Hop to eb_'s thread, set stop flag + post wakeup baton synchronously.  When this co_await resolves, the
         // EB lambda has completed, so there is no queued reference to `this` left in the EB queue.
-        co_await folly::coro::co_invoke([this]() -> Async< void > {
+        co_await folly::coro::co_withExecutor(eb, folly::coro::co_invoke([this]() -> Async< void > {
             if (started_ && !stop_requested_) {
                 stop_requested_ = true;
                 wakeup_baton_.post();
             }
             co_return;
-        }).scheduleOn(eb);
+        }));
         co_await done_baton_;
         done_baton_.reset();
         started_ = false;

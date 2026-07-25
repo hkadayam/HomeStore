@@ -10,7 +10,6 @@
 #include <folly/Expected.h>
 
 #include "homestore/base/blk.h"
-#include "homestore/checkpoint/cp_mgr.h"
 #include "sisl/fds/buffer.h"
 #include "sisl/fds/enum.h"
 #include "sisl/metrics/metrics.h"

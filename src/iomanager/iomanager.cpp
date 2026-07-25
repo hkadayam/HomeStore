@@ -10,7 +10,7 @@
 #include <folly/io/async/EventBaseManager.h>
 
 #ifdef __linux__
-#include <folly/experimental/io/IoUringBackend.h>
+#include <folly/io/async/IoUringBackend.h>
 #endif
 
 #include "sisl/logging/logging.h"
@@ -35,12 +35,11 @@ void IOManager::start(size_t num_reactors) {
     // Build an EventBaseManager whose per-thread EventBases use IoUringBackend
     // (Linux) or the default epoll/kqueue backend (non-Linux).
 #ifdef __linux__
-    folly::IoUringBackend::Options uring_opts;
-    uring_opts.setCapacity(512);
-
     ebm_ = std::make_unique< folly::EventBaseManager >(
-        folly::EventBase::Options().setBackendFactory([uring_opts]() -> std::unique_ptr< folly::EventBaseBackendBase > {
-            return std::make_unique< folly::IoUringBackend >(uring_opts);
+        folly::EventBase::Options().setBackendFactory([]() -> std::unique_ptr< folly::EventBaseBackendBase > {
+            folly::IoUringBackend::Options uring_opts;
+            uring_opts.setCapacity(512);
+            return std::make_unique< folly::IoUringBackend >(std::move(uring_opts));
         }));
 #else
     ebm_ = std::make_unique< folly::EventBaseManager >();

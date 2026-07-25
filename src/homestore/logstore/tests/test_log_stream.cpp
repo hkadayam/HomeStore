@@ -98,7 +98,7 @@ public:
             Record r;
             r.lsn = lsn;
             r.key = key;
-            r.data.assign(data.bytes(), data.bytes() + data.size());
+            r.data.assign(data.cbytes(), data.cbytes() + data.size());
             recoveries_.push_back(std::move(r));
         }
         co_return;
@@ -244,11 +244,17 @@ public:
             // recover() can throw (torn-write detection).  We must stop the LogStream's flush timer before the
             // shared_ptr unwinds — its body captures `this` raw, and a queued tick referencing the freed object
             // surfaces as a UAF in a later test.
+            // co_await is not permitted inside a catch handler, so capture the exception and do the async cleanup
+            // (stop the flush timer before the shared_ptr unwinds) outside the handler, then rethrow.
+            std::exception_ptr eptr;
             try {
                 co_await s->recover(lookup);
             } catch (...) {
+                eptr = std::current_exception();
+            }
+            if (eptr) {
                 co_await s->stop();
-                throw;
+                std::rethrow_exception(eptr);
             }
             out.push_back(std::move(s));
         }
@@ -318,7 +324,7 @@ public:
         const uint64_t pdev_offset = chunk->start_offset() + aligned_in_chunk;
         const uint32_t in_block = to_u32(in_chunk - aligned_in_chunk);
 
-        sisl::IoBuf iobuf{block, block};
+        sisl::IoBufOwn iobuf{block, block};
         auto ec = co_await chunk->physical_dev()->read(iobuf, pdev_offset);
         EXPECT_FALSE(ec) << "RMW read for corruption helper failed";
         std::memcpy(iobuf.bytes() + in_block, bytes, len);

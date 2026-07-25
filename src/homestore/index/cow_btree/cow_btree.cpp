@@ -387,7 +387,7 @@ Async< void > flush_dirty_nodes(COWBtree& bt, CP* cp, OnNodeFlushed&& on_flushed
         sisl::IoBufShared buf = std::move(node.flush_buf);
         auto bid = bt.node_stream_->quick_append(cp, /*segment_id=*/0, buf);
         if (!bid) {
-            flush_futs.push_back(bt.node_stream_->flush(cp).scheduleOn(executor).start());
+            flush_futs.push_back(folly::coro::co_withExecutor(executor, bt.node_stream_->flush(cp)).start());
             bid = co_await bt.node_stream_->append(cp, /*segment_id=*/0, std::move(buf));
         }
 
@@ -401,7 +401,7 @@ Async< void > flush_dirty_nodes(COWBtree& bt, CP* cp, OnNodeFlushed&& on_flushed
     }
 
     // Flush last WriteUnit to disk.
-    flush_futs.push_back(bt.node_stream_->flush(cp).scheduleOn(executor).start());
+    flush_futs.push_back(folly::coro::co_withExecutor(executor, bt.node_stream_->flush(cp)).start());
 
     co_await folly::collectAll(std::move(flush_futs));
 }
@@ -435,7 +435,7 @@ Async< void > flush_overflow_nodes(COWBtree& bt, CP* cp) {
 
     // Invalidate deleted overflow blocks.
     for (auto const& blkid : session->deleted_overflow_blks_) {
-        co_await bt.overflow_stream_->invalidate(cp, blkid);
+        co_await bt.overflow_stream_->invalidate_blk(cp, blkid);
     }
     co_return;
 }

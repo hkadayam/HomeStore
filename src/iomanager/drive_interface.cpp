@@ -18,7 +18,7 @@
 #include <sys/ioctl.h>
 #include <linux/fs.h>     // BLKGETSIZE64, BLKZEROOUT
 #include <linux/falloc.h> // FALLOC_FL_ZERO_RANGE
-#include <folly/experimental/io/IoUringBackend.h>
+#include <folly/io/async/IoUringBackend.h>
 #endif
 
 namespace iomanager {
@@ -131,8 +131,8 @@ Async< std::error_code > DriveInterface::read(const IoDevice& dev, IoBuf& buf, u
         }
         DRIVE_LOG(TRACE, dev, "read[unaligned-fallback]: size={} offset={} completed ec={}", buf.size(), offset,
                   ec.message());
+        co_return ec;
     }
-    co_return ec;
 }
 
 Async< std::error_code > DriveInterface::write(const IoDevice& dev, const IoBuf& buf, uint64_t offset) {
@@ -156,8 +156,8 @@ Async< std::error_code > DriveInterface::write(const IoDevice& dev, const IoBuf&
         auto ec = to_ec(co_await std::move(sf).via(t_dr->eb));
         DRIVE_LOG(TRACE, dev, "write[unaligned-fallback]: size={} offset={} completed ec={}", buf.size(), offset,
                   ec.message());
+        co_return ec;
     }
-    co_return ec;
 }
 
 Async< std::error_code > DriveInterface::readv(const IoDevice& dev, sisl::SgList const& sg, uint64_t offset) {
@@ -319,26 +319,26 @@ Async< std::error_code > DriveInterface::read(const IoDevice& dev, IoBuf& buf, u
     int fd = dev.fd;
     void* ptr = buf.bytes();
     size_t sz = buf.size();
-    co_return co_await folly::coro::co_invoke([fd, ptr, sz, offset]() -> Async< std::error_code > {
+    co_return co_await folly::coro::co_withExecutor(folly::getGlobalCPUExecutor().get(), folly::coro::co_invoke([fd, ptr, sz, offset]() -> Async< std::error_code > {
         ssize_t n = ::pread(fd, ptr, sz, (off_t)offset);
         co_return (n < 0) ? std::error_code(errno, std::generic_category()) : std::error_code{};
-    }).scheduleOn(folly::getGlobalCPUExecutor().get());
+    }));
 }
 
 Async< std::error_code > DriveInterface::write(const IoDevice& dev, const IoBuf& buf, uint64_t offset) {
     int fd = dev.fd;
     const void* ptr = buf.cbytes();
     size_t sz = buf.size();
-    co_return co_await folly::coro::co_invoke([fd, ptr, sz, offset]() -> Async< std::error_code > {
+    co_return co_await folly::coro::co_withExecutor(folly::getGlobalCPUExecutor().get(), folly::coro::co_invoke([fd, ptr, sz, offset]() -> Async< std::error_code > {
         ssize_t n = ::pwrite(fd, ptr, sz, (off_t)offset);
         co_return (n < 0) ? std::error_code(errno, std::generic_category()) : std::error_code{};
-    }).scheduleOn(folly::getGlobalCPUExecutor().get());
+    }));
 }
 
 Async< std::error_code > DriveInterface::readv(const IoDevice& dev, sisl::SgList const& sg, uint64_t offset) {
     int fd = dev.fd;
     auto const* bufs_ptr = &sg.bufs;
-    co_return co_await folly::coro::co_invoke([fd, bufs_ptr, offset]() mutable -> Async< std::error_code > {
+    co_return co_await folly::coro::co_withExecutor(folly::getGlobalCPUExecutor().get(), folly::coro::co_invoke([fd, bufs_ptr, offset]() mutable -> Async< std::error_code > {
         for (auto* b : *bufs_ptr) {
             ssize_t n = ::pread(fd, b->bytes(), b->size(), (off_t)offset);
             if (n < 0) {
@@ -347,13 +347,13 @@ Async< std::error_code > DriveInterface::readv(const IoDevice& dev, sisl::SgList
             offset += b->size();
         }
         co_return std::error_code{};
-    }).scheduleOn(folly::getGlobalCPUExecutor().get());
+    }));
 }
 
 Async< std::error_code > DriveInterface::do_writev(const IoDevice& dev, std::vector< struct iovec >&& iovs,
                                                    uint64_t offset) {
     int fd = dev.fd;
-    co_return co_await folly::coro::co_invoke([fd, iovs = std::move(iovs),
+    co_return co_await folly::coro::co_withExecutor(folly::getGlobalCPUExecutor().get(), folly::coro::co_invoke([fd, iovs = std::move(iovs),
                                                offset]() mutable -> Async< std::error_code > {
         for (auto& iov : iovs) {
             ssize_t n = ::pwrite(fd, iov.iov_base, iov.iov_len, (off_t)offset);
@@ -363,7 +363,7 @@ Async< std::error_code > DriveInterface::do_writev(const IoDevice& dev, std::vec
             offset += iov.iov_len;
         }
         co_return std::error_code{};
-    }).scheduleOn(folly::getGlobalCPUExecutor().get());
+    }));
 }
 
 Async< std::error_code > DriveInterface::writev(const IoDevice& dev, sisl::SgList const& sg, uint64_t offset) {
@@ -377,7 +377,7 @@ Async< std::error_code > DriveInterface::writev(const IoDevice& dev, sisl::SgLis
 
 Async< std::error_code > DriveInterface::fsync(const IoDevice& dev) {
     int fd = dev.fd;
-    co_return co_await folly::coro::co_invoke([fd]() -> Async< std::error_code > {
+    co_return co_await folly::coro::co_withExecutor(folly::getGlobalCPUExecutor().get(), folly::coro::co_invoke([fd]() -> Async< std::error_code > {
 #ifdef __APPLE__
         // macOS lacks fdatasync; F_FULLFSYNC flushes write-back cache too
         int rc = ::fcntl(fd, F_FULLFSYNC);
@@ -385,12 +385,12 @@ Async< std::error_code > DriveInterface::fsync(const IoDevice& dev) {
         int rc = ::fdatasync(fd);
 #endif
         co_return (rc < 0) ? std::error_code(errno, std::generic_category()) : std::error_code{};
-    }).scheduleOn(folly::getGlobalCPUExecutor().get());
+    }));
 }
 
 Async< std::error_code > DriveInterface::write_zero(const IoDevice& dev, uint64_t size, uint64_t offset) {
     int fd = dev.fd;
-    co_return co_await folly::coro::co_invoke([fd, size, offset]() -> Async< std::error_code > {
+    co_return co_await folly::coro::co_withExecutor(folly::getGlobalCPUExecutor().get(), folly::coro::co_invoke([fd, size, offset]() -> Async< std::error_code > {
         static constexpr size_t kChunk = 1u << 20; // 1 MiB
         IoBuf zbuf{static_cast< uint32_t >(std::min(size, (uint64_t)kChunk))};
         std::memset(zbuf.bytes(), 0, zbuf.size());
@@ -403,7 +403,7 @@ Async< std::error_code > DriveInterface::write_zero(const IoDevice& dev, uint64_
             rem -= n;
         }
         co_return std::error_code{};
-    }).scheduleOn(folly::getGlobalCPUExecutor().get());
+    }));
 }
 
 #endif // __linux__

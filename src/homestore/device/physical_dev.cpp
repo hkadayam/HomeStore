@@ -80,7 +80,7 @@ PDevInfoHeader PhysicalDev::create_pdev_info(const DevInfo& dinfo, uint32_t pdev
     hdr.max_pdev_chunks = 0; // populated by DeviceManager
     hdr.dev_attr = attr;
     hdr.mirror_super_block = 0x00;
-    std::memset(&hdr.system_uuid, 0, sizeof(hdr.system_uuid));
+    hdr.system_uuid = boost::uuids::uuid{};
     return hdr;
 }
 
@@ -88,7 +88,7 @@ Async< FirstBlock > PhysicalDev::read_first_block(const std::string& devname, in
     auto iodev = co_await open_and_cache_dev(devname, oflags);
 
     DriveInterface di{};
-    IoBuf buf{FirstBlock::s_io_fb_size};
+    sisl::IoBufOwn buf{FirstBlock::s_io_fb_size};
     auto ec = co_await di.read(*iodev, buf, HSSuperBlk::first_block_offset());
     if (ec) {
         throw std::system_error(ec, "read_first_block failed on " + devname);
@@ -111,7 +111,7 @@ Async< void > PhysicalDev::write_first_block(const FirstBlockHeader& fbhdr) {
     fb.checksum =
         crc32_ieee(hs_init_crc_32, reinterpret_cast< const unsigned char* >(&fb), FirstBlock::s_atomic_fb_size);
 
-    IoBuf buf{FirstBlock::s_io_fb_size};
+    sisl::IoBufOwn buf{FirstBlock::s_io_fb_size};
     std::memset(buf.bytes(), 0, FirstBlock::s_io_fb_size);
     std::memcpy(buf.bytes(), &fb, sizeof(FirstBlock));
 
@@ -119,7 +119,7 @@ Async< void > PhysicalDev::write_first_block(const FirstBlockHeader& fbhdr) {
 }
 
 Async< void > PhysicalDev::commit_formatting() {
-    IoBuf buf{FirstBlock::s_io_fb_size};
+    sisl::IoBufOwn buf{FirstBlock::s_io_fb_size};
     auto ec = co_await read_super_block(buf, HSSuperBlk::first_block_offset());
     if (ec) {
         throw std::system_error(ec, "commit_formatting: failed to read first block on " + devname_);
@@ -316,7 +316,7 @@ Async< shared< Chunk > > PhysicalDev::create_chunk(uint32_t vdev_id, uint64_t si
     populate_chunk_info_locked(prov, cinfo, vdev_id, size, chunk_id, vdev_order, user_private_data, up_size);
 
     // Write this chunk's metadata to the superblock.
-    IoBuf cinfo_buf{ChunkInfo::SIZE};
+    sisl::IoBufOwn cinfo_buf{ChunkInfo::SIZE};
     std::memcpy(cinfo_buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
     co_await write_super_block(cinfo_buf, chunk_info_offset_nth(to_u32(cslot)));
 
@@ -353,7 +353,7 @@ Async< std::vector< shared< Chunk > > > PhysicalDev::create_chunks(uint32_t vdev
         }
 
         // Build all chunk_infos for this contiguous block.
-        IoBuf buf{to_u32(ChunkInfo::SIZE * b.nbits)};
+        sisl::IoBufOwn buf{to_u32(ChunkInfo::SIZE * b.nbits)};
         uint8_t* ptr = buf.bytes();
 
         std::vector< shared< Chunk > > batch_chunks;
@@ -397,7 +397,7 @@ Async< std::unordered_map< uint32_t, std::vector< shared< Chunk > > > > Physical
 
     // Read the chunk slot bitmap from disk.
     const uint32_t bm_size = to_u32(chunk_info_bitmap_size());
-    IoBuf bm_buf{bm_size};
+    sisl::IoBufOwn bm_buf{bm_size};
     auto ec = co_await drive_iface_->read(*iodev_, bm_buf, chunk_sb_offset());
     if (ec) {
         throw std::system_error(ec, "load_chunks: bitmap read failed");
@@ -416,7 +416,7 @@ Async< std::unordered_map< uint32_t, std::vector< shared< Chunk > > > > Physical
         }
 
         // Read the chunk_info for this slot.
-        IoBuf ci_buf{ChunkInfo::SIZE};
+        sisl::IoBufOwn ci_buf{ChunkInfo::SIZE};
         auto ec2 = co_await drive_iface_->read(*iodev_, ci_buf, chunk_info_offset_nth(to_u32(b)));
         if (ec2) {
             throw std::system_error(ec2, "load_chunks: chunk_info read failed");
@@ -463,7 +463,7 @@ Async< void > PhysicalDev::remove_chunk(cshared< Chunk >& chunk) {
     prov.chunks.erase(chunk_id);
     free_chunk_info_locked(prov, cinfo);
 
-    IoBuf freed_buf{ChunkInfo::SIZE};
+    sisl::IoBufOwn freed_buf{ChunkInfo::SIZE};
     std::memcpy(freed_buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
     co_await write_super_block(freed_buf, chunk_info_offset_nth(slot));
 
@@ -487,7 +487,7 @@ Async< void > PhysicalDev::remove_chunks(const std::vector< shared< Chunk > >& c
         ChunkInfo cinfo = chunk->info();
         prov.chunks.erase(cinfo.chunk_id);
         free_chunk_info_locked(prov, cinfo);
-        IoBuf freed_buf{ChunkInfo::SIZE};
+        sisl::IoBufOwn freed_buf{ChunkInfo::SIZE};
         std::memcpy(freed_buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
         co_await write_super_block(freed_buf, chunk_info_offset_nth(chunk->slot_number()));
         prov.chunk_info_slots->reset_bit(chunk->slot_number());
@@ -522,7 +522,7 @@ Async< void > PhysicalDev::deactivate_chunk(cshared< Chunk >& chunk) {
     cinfo.set_free();
     cinfo.compute_checksum();
 
-    IoBuf buf{ChunkInfo::SIZE};
+    sisl::IoBufOwn buf{ChunkInfo::SIZE};
     std::memcpy(buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
     co_await write(buf, chunk_info_offset_nth(chunk->slot_number()));
 
@@ -537,7 +537,7 @@ Async< void > PhysicalDev::reactivate_chunk(cshared< Chunk >& chunk, uint64_t ne
     cinfo.chunk_vdev_order = new_vdev_order;
     cinfo.compute_checksum();
 
-    IoBuf buf{ChunkInfo::SIZE};
+    sisl::IoBufOwn buf{ChunkInfo::SIZE};
     std::memcpy(buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
     co_await write(buf, chunk_info_offset_nth(chunk->slot_number()));
 

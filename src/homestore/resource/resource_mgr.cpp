@@ -23,9 +23,9 @@
 
 #include "sisl/logging/logging.h"
 
-#include "hs_runtime_config.h"
+#include "homestore/base/hs_runtime_config.h"
 #include "homestore/managers.h"
-#include "event_manager.h"
+#include "homestore/base/event_manager.h"
 #include "homestore/device/device_manager.h"        // device_mgr().total_capacity_by_type
 #include "homestore/logstore/log_store_mgr.h"        // log_store_mgr().footprint_bytes / truncate
 #include "homestore/replication/repl_manager.h"      // repl_mgr().truncate

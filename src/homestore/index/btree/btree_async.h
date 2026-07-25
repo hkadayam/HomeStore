@@ -12,6 +12,7 @@
 #include <folly/ExceptionWrapper.h>
 #include <folly/ScopeGuard.h>
 #include <folly/Try.h>
+
 #include "common/async.h"
 
 namespace homestore {
@@ -115,7 +116,7 @@ public:
 };
 
 template < typename T >
-class FOLLY_NODISCARD BtreeTask {
+class [[nodiscard]] BtreeTask {
 public:
     using promise_type = BtreeTaskPromise< T >;
 

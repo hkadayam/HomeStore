@@ -83,8 +83,9 @@ class HomestoreConan(ConanFile):
         self.requires("spdlog/1.17.0", transitive_headers=True)
         self.requires("fmt/11.1.4", transitive_headers=True, override=True)
 
-        # Data structures / utilities (formerly from sisl)
-        self.requires("boost/1.85.0", transitive_headers=True)
+        # Data structures / utilities (formerly from sisl).  Kept at 1.91.0 to match the latest-folly recipe
+        # (folly/2026.07.13.00 requires boost/1.91.0); a lower pin conflicts in the dependency graph.
+        self.requires("boost/1.91.0", transitive_headers=True)
         self.requires("nlohmann_json/3.11.2", transitive_headers=True)
         self.requires("userspace-rcu/0.14.0", transitive_headers=True)
         self.requires("snappy/1.2.1", transitive_headers=True)

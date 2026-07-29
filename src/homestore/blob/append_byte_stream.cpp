@@ -30,6 +30,10 @@
 
 namespace homestore {
 
+// Byte-stream flush tracing on the blob_dev module (mirrors VDEV_LOG / LSTREAM_LOG), keyed by stream id so a
+// stream's flush phases group under `--log_mods blob_dev:trace`.
+#define BLOB_STREAM_LOG(level, ...) HS_SUBMOD_LOG(level, blob_dev, , "stream", stream_id(), ##__VA_ARGS__)
+
 using sisl::IoBufOwn;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -313,13 +317,17 @@ Async< bool > AppendByteStream::flush() {
     }
 
     if (bufs.empty()) {
+        BLOB_STREAM_LOG(TRACE, "flush: nothing to write (empty after swap)");
         co_return true;
     }
 
     // After the tail-carry step, total rounded up to block boundary is exactly what we're writing.
     uint64_t stream_offset = old_buf.start_offset;
     const uint64_t total_to_write = sisl::round_up(total, block_size());
+    BLOB_STREAM_LOG(TRACE, "flush: {} buf(s) total={} stream_off={}; expand_to(chunk={})", bufs.size(), total,
+                    stream_offset, nth_chunk(stream_offset + total_to_write - 1));
     co_await expand_to(nth_chunk(stream_offset + total_to_write - 1));
+    BLOB_STREAM_LOG(TRACE, "flush: expand_to done, starting writes");
 
     // Every buf is block-aligned now.  Walk them, writing directly; only split on chunk-straddle (one wbuf copy
     // per straddling buf).
@@ -357,7 +365,9 @@ Async< bool > AppendByteStream::flush() {
         }
     }
 
+    BLOB_STREAM_LOG(TRACE, "flush: writes done, persisting metadata");
     co_await persist_flush_metadata();
+    BLOB_STREAM_LOG(TRACE, "flush: complete");
     co_return true;
 }
 

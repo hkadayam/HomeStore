@@ -214,6 +214,9 @@ private:
     MetaBlk meta_blk_;
     shared< MetaClient > client_;
 
+public:
+    // Empty "unattached" wrapper.  Normal instances come from create()/load(); this exists so an owner can hold
+    // a MetaBlkWrapper member that is populated later by move-assignment (e.g. ReplicaSet::raft_cfg_mblk_).
     MetaBlkWrapper() = default;
 };
 

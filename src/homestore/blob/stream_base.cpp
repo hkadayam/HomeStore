@@ -88,6 +88,7 @@ Async< void > StreamBase::destroy() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 Async< void > StreamBase::expand_to(size_t n) {
+    LOGTRACEMOD(blob_dev, "expand_to(n={}) stream={}: acquiring expand_mutex", n, dev_name_);
     auto lock = co_await expand_mutex_.co_scoped_lock();
 
     // Snapshot current list — release the RCU guard before any co_await.
@@ -97,6 +98,7 @@ Async< void > StreamBase::expand_to(size_t n) {
         new_list = *acc; // copy; acc (rcu_reader) drops at end of block
     }
 
+    LOGTRACEMOD(blob_dev, "expand_to(n={}) stream={}: got lock, cur_chunks={}", n, dev_name_, new_list.size());
     if (new_list.size() > n) {
         co_return; // already has enough chunks
     }

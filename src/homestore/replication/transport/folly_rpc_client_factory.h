@@ -62,6 +62,11 @@ public:
     // to the same peer always land on the same reactor and reuse its socket.
     size_t pick_reactor_for_cold_path(std::string const& host, uint16_t port) const;
 
+    // Tear down every reactor's outbound sockets, each on that reactor's own EventBase thread (PeerOutboundSocket
+    // owns folly AsyncSocket/HHWheelTimer bound to that reactor). Must be called before the factory is destroyed,
+    // after the raft engines are stopped so nothing is opening new sockets concurrently.
+    void shutdown();
+
 private:
     struct PerReactorState {
         // "host:port" -> outbound socket owned by this reactor.

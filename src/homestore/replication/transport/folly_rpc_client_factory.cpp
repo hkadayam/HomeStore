@@ -2,6 +2,7 @@
 #include "folly_rpc_client.h"
 
 #include <folly/hash/Hash.h>
+#include <folly/io/async/EventBase.h>
 
 #include "iomanager/iomanager.h"
 
@@ -33,7 +34,7 @@ PeerOutboundSocket& FollyRpcClientFactory::get_or_open_outbound(std::string cons
     auto key = make_key(host, port);
     auto it = state.by_endpoint.find(key);
     if (it == state.by_endpoint.end()) {
-        auto* eb = iomanager::iomgr().reactor_for(iomanager::iomgr().current_reactor_id());
+        auto* eb = iomgr().reactor_for(iomgr().current_reactor_id());
         auto sock = std::make_unique< PeerOutboundSocket >(eb, host, port, cpu_executor_);
         it = state.by_endpoint.emplace(std::move(key), std::move(sock)).first;
     }
@@ -42,7 +43,17 @@ PeerOutboundSocket& FollyRpcClientFactory::get_or_open_outbound(std::string cons
 
 size_t FollyRpcClientFactory::pick_reactor_for_cold_path(std::string const& host, uint16_t port) const {
     auto key = make_key(host, port);
-    return folly::hash::fnv64(key) % iomanager::iomgr().num_reactors();
+    return folly::hash::fnv64(key) % iomgr().num_reactors();
+}
+
+void FollyRpcClientFactory::shutdown() {
+    // Clear each reactor's socket map on that reactor's own thread. Inside the hopped lambda we are that reactor,
+    // so get_for_reactor(i)'s "no concurrent slot access" precondition holds and the AsyncSocket destructors run
+    // on their owning EventBase (folly thread affinity). runImmediately... runs inline when already on reactor i.
+    for (size_t i = 0; i < outbound_.num_reactors(); ++i) {
+        iomgr().reactor_for(i)->runImmediatelyOrRunInEventBaseThreadAndWait(
+            [this, i]() { outbound_.get_for_reactor(i).by_endpoint.clear(); });
+    }
 }
 
 } // namespace homestore::replication

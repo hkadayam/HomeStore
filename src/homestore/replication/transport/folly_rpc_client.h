@@ -117,7 +117,7 @@ public:
     // the connect callback fires. The msg_type is retained so the response-side path can route hot vs slow.
     void send(nuraft::group_id_t const& group_id, uint8_t msg_type,
               unique< folly::IOBuf > payload, // takeOwnership-wrapped nuraft::buffer; no copies
-              nuraft::rpc_handler when_done, std::chrono::milliseconds timeout);
+              nuraft::rpc_handler when_done, nuraft::ptr< nuraft::req_msg > req, std::chrono::milliseconds timeout);
 
     // Register a FollyRpcClient that has routed through this socket so that it can be marked abandoned on
     // a socket-level failure.  Deduplicated by raw pointer identity; expired weaks are tolerated.
@@ -146,7 +146,7 @@ private:
     void open_connection();
     // Mark every registered FollyRpcClient as abandoned, then fail every pending request.  All error
     // callbacks (connectErr/writeErr/readErr/readEOF/dtor) funnel through here.
-    void fail_socket(nuraft::ptr< nuraft::rpc_exception > ex);
+    void fail_socket(std::string const& reason);
     // Invoked by a per-request TimeoutCallback when its timer fires.  Looks up the pending entry, removes
     // it, and invokes the handler with rpc_exception("send timeout").  No-op if the entry has already been
     // resolved or drained.
@@ -175,6 +175,9 @@ private:
         nuraft::rpc_handler when_done;
         uint8_t sent_msg_type;
         unique< TimeoutCallback > timeout;
+        // Originating request, carried so a failure rpc_exception exposes err->req(): nuraft's handle_peer_resp
+        // dereferences it unconditionally on the error path.
+        nuraft::ptr< nuraft::req_msg > req;
     };
     std::unordered_map< uint64_t /*req_id*/, PendingEntry > pending_;
     uint64_t next_req_id_{1};

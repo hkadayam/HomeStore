@@ -19,13 +19,10 @@
 #include <cstring>
 #include <stdexcept>
 
-#include <iomgr/iomgr.hpp>
-
 #include "iomanager/iomanager.h"
-#include <iomgr/iomgr_flip.hpp>
 #include <libnuraft/raft_server.hxx>
 
-#include "common/homestore_assert.h"
+#include "homestore/base/homestore_assert.h"
 #include "homestore/blob/raw_blk_stream.h"
 #include "homestore/homestore.h"
 #include "homestore/logstore/log_store.h"
@@ -37,13 +34,12 @@ using namespace homestore;
 
 #define REPL_STORE_LOG(level, msg, ...)                                                                                \
     LOG##level##MOD_FMT(replication, ([&](fmt::memory_buffer& buf, const char* msgcb, auto&&... args) -> bool {        \
-                            fmt::vformat_to(fmt::appender{buf}, fmt::string_view{"[{}:{}] "},                          \
-                                            fmt::make_format_args(file_name(__FILE__), __LINE__));                     \
-                            fmt::vformat_to(                                                                           \
-                                fmt::appender{buf}, fmt::string_view{"[{}={}] "},                                      \
-                                fmt::make_format_args("replstore", log_store_ ? log_store_->store_id() : UINT32_MAX)); \
-                            fmt::vformat_to(fmt::appender{buf}, fmt::string_view{msgcb},                               \
-                                            fmt::make_format_args(std::forward< decltype(args) >(args)...));           \
+                            fmt::format_to(fmt::appender{buf}, fmt::runtime("[{}:{}] "), file_name(__FILE__),          \
+                                           __LINE__);                                                                  \
+                            fmt::format_to(fmt::appender{buf}, fmt::runtime("[{}={}] "), "replstore",                  \
+                                           log_store_ ? log_store_->store_id() : UINT32_MAX);                          \
+                            fmt::format_to(fmt::appender{buf}, fmt::runtime(msgcb),                                    \
+                                           std::forward< decltype(args) >(args)...);                                   \
                             return true;                                                                               \
                         }),                                                                                            \
                         msg, ##__VA_ARGS__);
@@ -64,7 +60,7 @@ namespace {
 // Walks `entry`'s bufs_ chain skipping the first `skip` bytes (logical chain offset) and copying up to
 // `dst.size()` bytes into `dst.bytes()`.  Works for any bufs_ shape — coalesced (bufs_.size()==1, e.g.
 // from_serialized) or multi-piece chain.  Caller knows the byte count it expects.
-void copy_entry_slice(nuraft::log_entry const& entry, uint32_t skip, sisl::Blob& dst) {
+void copy_entry_slice(nuraft::log_entry const& entry, uint32_t skip, sisl::Blob dst) {
     auto const capacity = dst.size();
     auto* out = dst.bytes();
     uint32_t copied = 0;
@@ -111,11 +107,11 @@ std::pair< folly::small_vector< RaftBufferPtr, 4 >, uint32_t > get_entry_value(n
 } // namespace
 
 // raft_lsn (nuraft side) starts at 1; LogStore lsn starts at 0. Stay 1:1-shifted just like the legacy code.
-static constexpr logstore_seq_num_t to_store_lsn(uint64_t raft_lsn) {
-    return static_cast< logstore_seq_num_t >(raft_lsn - 1);
+static constexpr store_lsn_t to_store_lsn(uint64_t raft_lsn) {
+    return static_cast< store_lsn_t >(raft_lsn - 1);
 }
-static constexpr logstore_seq_num_t to_store_lsn(raft_lsn_t raft_lsn) {
-    return static_cast< logstore_seq_num_t >(raft_lsn - 1);
+static constexpr store_lsn_t to_store_lsn(raft_lsn_t raft_lsn) {
+    return static_cast< store_lsn_t >(raft_lsn - 1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -213,12 +209,12 @@ Async< void > HomeRaftLogStore::destroy() {
 
 ulong HomeRaftLogStore::next_slot() const {
     // tail_lsn is the last appended store_lsn (-1 when empty). next_slot is the next repl_lsn we'd assign.
-    return to_ulong(log_store_->tail_lsn() + 2);
+    return to_ulong64(log_store_->tail_lsn() + 2);
 }
 
 ulong HomeRaftLogStore::start_index() const {
     // start_index starts from 1. head_lsn is the lowest store_lsn still present.
-    return std::max< ulong >(1, to_ulong(log_store_->head_lsn() + 1));
+    return std::max< ulong >(1, to_ulong64(log_store_->head_lsn() + 1));
 }
 
 Async< RaftLogEntryPtr > HomeRaftLogStore::last_entry() const {
@@ -226,7 +222,7 @@ Async< RaftLogEntryPtr > HomeRaftLogStore::last_entry() const {
     if (max_seq < 0) {
         co_return dummy_log_entry_;
     }
-    ulong lsn = to_ulong(max_seq + 1);
+    ulong lsn = to_ulong64(max_seq + 1);
     co_return co_await fetch_entry(lsn);
 }
 
@@ -243,7 +239,9 @@ LogBlob HomeRaftLogStore::to_log_blob(RaftLogEntryPtr& entry) {
         }
         return lb;
     }
-    auto coalesced = nuraft::buffer::alloc(entry->total_size());
+    // Coalesced buffer holds the full record [kHdrSize header | value]; total_size() excludes the header, so add
+    // kHdrSize to match the header+value copied below.
+    auto coalesced = nuraft::buffer::alloc(nuraft::log_entry::kHdrSize + entry->total_size());
     size_t off = 0;
     for (auto const& b : bufs) {
         std::memcpy(coalesced->data_begin() + off, b->data_begin(), b->size());
@@ -273,7 +271,7 @@ Async< ulong > HomeRaftLogStore::append(RaftLogEntryPtr& entry) {
     }
 
     auto const store_lsn = log_store_->quick_append(lb);
-    ulong lsn = to_ulong(store_lsn + 1);
+    ulong lsn = to_ulong64(store_lsn + 1);
 
     if (is_indirect) {
         indirect_->on_blkids_written(static_cast< raft_lsn_t >(lsn), std::move(bids));
@@ -342,8 +340,11 @@ void HomeRaftLogStore::end_of_append_batch(ulong start, ulong cnt) {
     // timer auto-flush in parallel); once persisted, we update last_durable_lsn_ and notify the raft_server
     // so its durability_signal_ wakes any handle_append_entries coroutines waiting on this lsn.
     iomanager::spawn_detached(iomanager::ReactorTarget::any(), [this, end_repl_lsn, end_store_lsn]() -> Async< void > {
+        REPL_STORE_LOG(TRACE, "durability flush start end_lsn={}", end_repl_lsn);
         co_await log_store_->flush();
         last_durable_lsn_.store(end_store_lsn, std::memory_order_release);
+        REPL_STORE_LOG(TRACE, "durability flush done end_lsn={} raft_server_set={}", end_repl_lsn,
+                       (raft_server_ != nullptr));
         if (raft_server_) {
             raft_server_->notify_durable(end_repl_lsn);
         }
@@ -374,7 +375,7 @@ Async< RaftLogEntryPtr > HomeRaftLogStore::fetch_entry(ulong index, bool need_va
     auto byte_view = co_await log_store_->read(to_store_lsn(index));
     if (byte_view.size() == 0) {
         REPL_STORE_LOG(ERROR, "fetch_entry({}) out_of_range start={} end={}", index, start_index(),
-                       to_ulong(log_store_->flushed_upto() + 1));
+                       to_ulong64(log_store_->flushed_upto() + 1));
         co_return dummy_log_entry_;
     }
 
@@ -481,7 +482,7 @@ Async< RaftBufferPtr > HomeRaftLogStore::pack(ulong index, int32_t cnt) {
 
     for (int32_t i = 0; i < cnt; ++i) {
         auto entry = co_await fetch_entry(index + i);
-        auto serialized = entry->serialize();
+        auto serialized = entry->get_buf_ptr();
         size_t const total_entry_size = serialized->size() + sizeof(uint32_t);
         size_t avail_size = out_buf->size() - out_buf->pos();
         // available size of packing buffer should be able to hold entry.size() and the length of this entry
@@ -575,7 +576,7 @@ Async< bool > HomeRaftLogStore::flush() {
 ulong HomeRaftLogStore::last_durable_index() {
     auto durable = log_store_->flushed_upto();
     last_durable_lsn_.store(durable, std::memory_order_release);
-    return to_ulong(durable + 1);
+    return to_ulong64(durable + 1);
 }
 
 Async< void > HomeRaftLogStore::purge_all_logs() {
@@ -627,10 +628,11 @@ HomeRaftLogStore::IndirectBlkHandler::IndirectBlkHandler(shared< RawBlkStream > 
     // HomeRaftLogStore (which owns this) outlives the LogStoreManager's reference to the callback.
     free_blks_journal_ = log_store_mgr().open_log_store(
         free_blks_journal_id, LogStoreOptions{.append_mode = false, .auto_truncate = false},
-        [this](lsn_t store_lsn, sisl::IoBufView const& bv) {
+        [this](lsn_t store_lsn, sisl::IoBufView const& bv) -> Async< void > {
             BlkIds bids;
-            bids.deserialize(sisl::Blob{bv.bytes(), to_u32(bv.size())});
+            bids.deserialize(sisl::Blob{bv.cbytes(), to_u32(bv.size())});
             deferred_free_blkids_[to_raft_lsn(static_cast< store_lsn_t >(store_lsn))] = std::move(bids);
+            co_return;
         });
     if (!free_blks_journal_) {
         throw std::runtime_error(

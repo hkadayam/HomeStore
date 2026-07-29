@@ -16,8 +16,16 @@
 #include <libnuraft/rpc_exception.hxx>
 
 #include "iomanager/iomanager.h"
+#include "homestore/base/homestore_assert.h"
 
 namespace homestore::replication {
+
+// Per-peer RPC transport tracing on the replication log module (mirrors RM_LOG / REPL_STORE_LOG), keyed by the peer
+// endpoint so a peer's client + socket lines group together under `--log_mods replication:trace`.
+#define RPC_CLI_LOG(level, ...)                                                                                        \
+    HS_SUBMOD_LOG(level, replication, , "rpc_peer", fmt::format("{}:{}", peer_host_, peer_port_), ##__VA_ARGS__)
+#define RPC_SOCK_LOG(level, ...)                                                                                       \
+    HS_SUBMOD_LOG(level, replication, , "rpc_peer", fmt::format("{}:{}", host_, port_), ##__VA_ARGS__)
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
 //                                     FollyRpcClient
@@ -51,19 +59,25 @@ void FollyRpcClient::send(nuraft::ptr< nuraft::req_msg >& req, nuraft::group_id_
     // so we don't keep the client alive past nuraft's lifetime.
     std::weak_ptr< FollyRpcClient > weak_self = shared_from_this();
     auto do_send = [factory, host, port, group_id, msg_type, payload = std::move(payload),
-                    handler_copy = std::move(handler_copy), timeout, weak_self]() mutable {
+                    handler_copy = std::move(handler_copy), req, timeout, weak_self]() mutable {
+        HS_SUBMOD_LOG(TRACE, replication, , "rpc_peer", fmt::format("{}:{}", host, port),
+                      "do_send running on reactor={} msg_type={}", iomgr().current_reactor_id(), int(msg_type));
         auto& sock = factory->get_or_open_outbound(host, port);
         sock.register_client(weak_self);
-        sock.send(group_id, msg_type, std::move(payload), std::move(handler_copy), timeout);
+        sock.send(group_id, msg_type, std::move(payload), std::move(handler_copy), std::move(req), timeout);
     };
 
-    auto& iom = iomanager::iomgr();
+    auto& iom = iomgr();
     if (iom.current_reactor_id() < iom.num_reactors()) {
         // Already on a reactor — dispatch inline.
+        RPC_CLI_LOG(TRACE, "send msg_type={}: inline dispatch (cur_reactor={})", int(msg_type),
+                    iom.current_reactor_id());
         do_send();
     } else {
         // Cold path: hop to a sticky reactor chosen by hashing the peer endpoint.
         size_t rid = factory_->pick_reactor_for_cold_path(peer_host_, peer_port_);
+        RPC_CLI_LOG(TRACE, "send msg_type={}: cold-path hop to reactor={} (cur_reactor={} not a reactor)",
+                    int(msg_type), rid, iom.current_reactor_id());
         iom.reactor_for(rid)->runInEventBaseThread(std::move(do_send));
     }
 }
@@ -92,7 +106,7 @@ PeerOutboundSocket::PeerOutboundSocket(folly::EventBase* eb, std::string host, u
 }
 
 PeerOutboundSocket::~PeerOutboundSocket() {
-    fail_socket(nuraft::cs_new< nuraft::rpc_exception >("socket destroyed", nuraft::ptr< nuraft::req_msg >()));
+    fail_socket("socket destroyed");
     if (sock_) {
         sock_->closeNow();
     }
@@ -113,19 +127,20 @@ void PeerOutboundSocket::connectSuccess() noexcept {
 
 void PeerOutboundSocket::connectErr(folly::AsyncSocketException const& ex) noexcept {
     connected_ = false;
-    fail_socket(nuraft::cs_new< nuraft::rpc_exception >(std::string("connect failed: ") + ex.what(),
-                                                        nuraft::ptr< nuraft::req_msg >()));
+    fail_socket(std::string("connect failed: ") + ex.what());
 }
 
 void PeerOutboundSocket::send(nuraft::group_id_t const& group_id, uint8_t msg_type, unique< folly::IOBuf > payload,
-                              nuraft::rpc_handler when_done, std::chrono::milliseconds timeout) {
+                              nuraft::rpc_handler when_done, nuraft::ptr< nuraft::req_msg > req,
+                              std::chrono::milliseconds timeout) {
     uint64_t req_id = next_req_id_++;
     unique< TimeoutCallback > tcb;
     if (timeout.count() > 0) {
         tcb = std::make_unique< TimeoutCallback >(this, req_id);
         timer_wheel_->scheduleTimeout(tcb.get(), timeout);
     }
-    pending_.emplace(req_id, PendingEntry{std::move(when_done), msg_type, std::move(tcb)});
+    pending_.emplace(req_id, PendingEntry{std::move(when_done), msg_type, std::move(tcb), std::move(req)});
+    RPC_SOCK_LOG(TRACE, "tx request req_id={} msg_type={}", req_id, int(msg_type));
     auto wire = WireFrame::build(group_id, req_id, /*is_response=*/false, std::move(payload));
     sock_->writeChain(this, std::move(wire), folly::WriteFlags::WRITE_MSG_ZEROCOPY);
 }
@@ -138,13 +153,12 @@ void PeerOutboundSocket::fail_pending_request(uint64_t req_id) {
     auto entry = std::move(it->second);
     pending_.erase(it);
     nuraft::ptr< nuraft::resp_msg > null_resp;
-    auto ex = nuraft::cs_new< nuraft::rpc_exception >("send timeout", nuraft::ptr< nuraft::req_msg >());
+    auto ex = nuraft::cs_new< nuraft::rpc_exception >("send timeout", entry.req);
     entry.when_done(null_resp, ex);
 }
 
 void PeerOutboundSocket::writeErr(size_t /*bytes_written*/, folly::AsyncSocketException const& ex) noexcept {
-    fail_socket(nuraft::cs_new< nuraft::rpc_exception >(std::string("write failed: ") + ex.what(),
-                                                        nuraft::ptr< nuraft::req_msg >()));
+    fail_socket(std::string("write failed: ") + ex.what());
     if (sock_) {
         sock_->closeNow();
     }
@@ -194,6 +208,7 @@ void PeerOutboundSocket::readDataAvailable(size_t len) noexcept {
     if (rx_hdr_.is_response()) {
         auto resp = decode_resp_msg(*rx_body_);
         auto it = pending_.find(rx_hdr_.req_id);
+        RPC_SOCK_LOG(TRACE, "rx response req_id={} matched={}", rx_hdr_.req_id, (it != pending_.end()));
         if (it != pending_.end()) {
             auto entry = std::move(it->second);
             pending_.erase(it);
@@ -219,15 +234,14 @@ void PeerOutboundSocket::readDataAvailable(size_t len) noexcept {
 }
 
 void PeerOutboundSocket::readEOF() noexcept {
-    fail_socket(nuraft::cs_new< nuraft::rpc_exception >("peer closed connection", nuraft::ptr< nuraft::req_msg >()));
+    fail_socket("peer closed connection");
     if (sock_) {
         sock_->closeNow();
     }
 }
 
 void PeerOutboundSocket::readErr(folly::AsyncSocketException const& ex) noexcept {
-    fail_socket(nuraft::cs_new< nuraft::rpc_exception >(std::string("read failed: ") + ex.what(),
-                                                        nuraft::ptr< nuraft::req_msg >()));
+    fail_socket(std::string("read failed: ") + ex.what());
     if (sock_) {
         sock_->closeNow();
     }
@@ -247,7 +261,7 @@ void PeerOutboundSocket::register_client(std::weak_ptr< FollyRpcClient > client)
     clients_.push_back(std::move(client));
 }
 
-void PeerOutboundSocket::fail_socket(nuraft::ptr< nuraft::rpc_exception > ex) {
+void PeerOutboundSocket::fail_socket(std::string const& reason) {
     // Mark every still-live client routed through this socket as abandoned so nuraft drops them and
     // re-creates a fresh client on the next round.
     for (auto& w : clients_) {
@@ -257,8 +271,9 @@ void PeerOutboundSocket::fail_socket(nuraft::ptr< nuraft::rpc_exception > ex) {
     }
     clients_.clear();
 
-    // Drain pending request handlers with the rpc_exception.  Cancel each entry's timer first so the timer
-    // wheel doesn't hold a stale callback pointer past the entry's destruction.
+    // Drain pending request handlers with a per-request rpc_exception carrying that request (nuraft's error path
+    // dereferences err->req()).  Cancel each entry's timer first so the timer wheel doesn't hold a stale callback
+    // pointer past the entry's destruction.
     auto drained = std::move(pending_);
     pending_.clear();
     nuraft::ptr< nuraft::resp_msg > null_resp;
@@ -266,6 +281,7 @@ void PeerOutboundSocket::fail_socket(nuraft::ptr< nuraft::rpc_exception > ex) {
         if (kv.second.timeout) {
             kv.second.timeout->cancelTimeout();
         }
+        auto ex = nuraft::cs_new< nuraft::rpc_exception >(reason, kv.second.req);
         kv.second.when_done(null_resp, ex);
     }
 }

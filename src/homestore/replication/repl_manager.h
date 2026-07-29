@@ -23,10 +23,12 @@
 
 #include <nlohmann/json.hpp>
 
-#include "common/hs_runtime_config.h"
+#include "homestore/base/hs_runtime_config.h"
 #include "homestore/checkpoint/cp_mgr.h"
 #include "homestore/meta/meta_blk.h"
 #include "homestore/replication/repl_decls.h"
+
+#include <libnuraft/basic_types.hxx> // nuraft::group_id_t used in the public API signatures below
 
 namespace nuraft {
 class raft_server;
@@ -39,7 +41,8 @@ namespace homestore {
 // ReplicationManager-scoped log wrapper — mirrors RS_LOG (which is per-ReplicaSet).  Adds a fixed "ReplMgr"
 // tag so replication log lines from the manager are grepable, and threads a trace_id through when the caller
 // has one; use NO_TRACE_ID for background/lifecycle work.
-#define RM_LOG(level, traceID, ...) HS_SUBMOD_LOG(level, replication, traceID, "ReplMgr", ##__VA_ARGS__)
+#define RM_LOG(level, traceID, ...)                                                                                    \
+    HS_DETAILED_LOG(level, replication, , "rs", "ReplMgr", "trace_id", traceID, ##__VA_ARGS__)
 
 namespace replication {
 class FollyRpcClientFactory;
@@ -49,6 +52,7 @@ class FollyRpcListener;
 class ReplicaSet;
 class ReplicaSetListener;
 class ReplApplication;
+struct ReplicaSetOptions;
 struct repl_dev_superblk;
 
 // Priority policy for a member added to an existing group AFTER bootstrap.  Reads default_leader_priority
@@ -93,7 +97,7 @@ public:
     /// ReplApplication::create_replica_set_listener.  Peer-initiated path — called by the rpc listener when
     /// a message arrives for a group we do not know about.  Returns nullptr if the application rejects the
     /// group or if start fails.  Resolves after the new replica's engine is up.
-    Async< nuraft::ptr< nuraft::raft_server > > create_replica_set_on_demand(nuraft::group_id_t const& gid);
+    Async< nuraft::raft_server* > create_replica_set_on_demand(nuraft::group_id_t const& gid);
 
     /// Schedule a replica set for destruction.  Delegates to `rs->destroy()` (leader-initiated) and hands
     /// the final teardown off to the reaper, which calls `rs->finish_destroy_local()` after a grace period
@@ -118,7 +122,7 @@ public:
 
     /// Route an inbound wire frame's group_id to the owning raft_server. Returns nullptr if no replica
     /// set is registered for that group.
-    nuraft::ptr< nuraft::raft_server > lookup_raft_server(nuraft::group_id_t const& gid) const;
+    nuraft::raft_server* lookup_raft_server(nuraft::group_id_t const& gid) const;
 
     /// Folly transport — used by per-group ReplicaSet::start to build the consensus engine's context.
     shared< replication::FollyRpcClientFactory > rpc_client_factory() const { return rpc_client_factory_; }

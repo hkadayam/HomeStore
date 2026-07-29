@@ -25,6 +25,8 @@
 #include <fmt/ranges.h>
 #include <boost/uuid/uuid_io.hpp>
 #include <boost/uuid/random_generator.hpp>
+#include <boost/uuid/nil_generator.hpp>    // boost 1.91: nil_uuid() no longer pulled in transitively
+#include <boost/uuid/string_generator.hpp> // boost 1.91: string_generator no longer pulled in transitively
 #include <folly/Executor.h>
 #include <folly/hash/Hash.h>
 #include <folly/io/async/EventBase.h>
@@ -45,15 +47,13 @@
 
 #include "sisl/logging/logging.h"
 
-#include "common/homestore_assert.h"
-#include "common/hs_runtime_config.h"
+#include "homestore/base/homestore_assert.h"
+#include "homestore/base/hs_runtime_config.h"
 #include "homestore/homestore.h"
 #include "homestore/replication/repl_manager.h"
 #include "replication/transport/folly_rpc_client_factory.h"
 #include "replication/transport/folly_rpc_listener.h"
 #include "iomanager/iomanager.h"
-
-SISL_LOGGING_DECL(replication)
 
 namespace homestore {
 
@@ -108,8 +108,11 @@ class FollyEventBaseScheduler : public nuraft::delayed_task_scheduler {
 public:
     explicit FollyEventBaseScheduler(folly::EventBase* eb) : eb_{eb} {}
 
-    void schedule(nuraft::ptr< nuraft::delayed_task >& task, int32 milliseconds) override {
-        eb_->runAfterDelay([task]() { task->execute(); }, milliseconds);
+    void schedule(nuraft::ptr< nuraft::delayed_task >& task, int32_t milliseconds) override {
+        // folly's scheduleTimeout must run on eb_'s own EventBase thread, but nuraft can call schedule() from a
+        // different reactor — hop onto eb_'s thread before arming the timer.
+        eb_->runInEventBaseThread(
+            [eb = eb_, task, milliseconds]() { eb->runAfterDelay([task]() { task->execute(); }, milliseconds); });
     }
 
 private:
@@ -202,8 +205,8 @@ ReplicaSet::ReplicaSet(ReplicationManager& mgr, MetaBlkWrapper sb_mblk, ReplicaS
         mgr_{mgr},
         my_uuid_{mgr.get_my_repl_id()},
         raft_server_id_{to_server_id(my_uuid_)},
-        sb_mblk_{std::move(sb_mblk)},
-        options_{options} {
+        options_{options},
+        sb_mblk_{std::move(sb_mblk)} {
     // Single 4-byte sentinel handed back on every pre-commit/commit — nuraft treats the buffer as opaque here.
     success_ptr_ = nuraft::buffer::alloc(sizeof(int));
     success_ptr_->put(0);
@@ -238,10 +241,12 @@ Async< ReplResult<> > ReplicaSet::write(sisl::IoBuf const& user_header, sisl::Io
     chains.push_back(std::move(chain));
 
     auto result = co_await raft_server_->append_entries_chained(chains);
+    RS_LOG(TRACE, tid, "write result: accepted={} committed={} code={} has_err={}", result.accepted, result.committed,
+           to_int(result.code), (result.err != nullptr));
     if (!result.accepted || !result.committed) {
         co_return folly::makeUnexpected(ReplicationManager::to_repl_error(result.code));
     }
-    co_return ReplResult<>{};
+    co_return ReplResult<>{folly::Unit{}};
 }
 
 Async< void > ReplicaSet::free_indirect_blk(BlkId const& blkid, raft_lsn_t referenced_lsn) {
@@ -281,14 +286,14 @@ Async< ReplResult<> > ReplicaSet::add_member(ReplicaMemberInfo const& member, bo
         auto const code = result ? result->get_result_code() : nuraft::cmd_result_code::CANCELLED;
         if (code == nuraft::cmd_result_code::SERVER_ALREADY_EXISTS) {
             RS_LOG(INFO, tid, "add_member: {} already in cluster — treating as ok", boost::uuids::to_string(member.id));
-            co_return ReplResult<>{};
+            co_return ReplResult<>{folly::Unit{}};
         }
         RS_LOG(ERROR, tid, "add_member failed member={} learner={} code={}", boost::uuids::to_string(member.id),
                learner, to_int(code));
         co_return folly::makeUnexpected(ReplicationManager::to_repl_error(code));
     }
     RS_LOG(INFO, tid, "add_member accepted for {} learner={}", boost::uuids::to_string(member.id), learner);
-    co_return ReplResult<>{};
+    co_return ReplResult<>{folly::Unit{}};
 }
 
 Async< ReplResult<> > ReplicaSet::remove_member(ReplicaMemberInfo const& member, TraceId tid) {
@@ -312,13 +317,13 @@ Async< ReplResult<> > ReplicaSet::remove_member(ReplicaMemberInfo const& member,
         auto const code = result ? result->get_result_code() : nuraft::cmd_result_code::CANCELLED;
         if (code == nuraft::cmd_result_code::SERVER_NOT_FOUND) {
             RS_LOG(INFO, tid, "remove_member: {} not in cluster — treating as ok", boost::uuids::to_string(member.id));
-            co_return ReplResult<>{};
+            co_return ReplResult<>{folly::Unit{}};
         }
         RS_LOG(ERROR, tid, "remove_member failed member={} code={}", boost::uuids::to_string(member.id), to_int(code));
         co_return folly::makeUnexpected(ReplicationManager::to_repl_error(code));
     }
     RS_LOG(INFO, tid, "remove_member accepted for {}", boost::uuids::to_string(member.id));
-    co_return ReplResult<>{};
+    co_return ReplResult<>{folly::Unit{}};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -385,7 +390,7 @@ Async< ReplResult<> > ReplicaSet::flip_learner_flag(ReplicaMemberInfo const& mem
         co_return folly::makeUnexpected(ReplicationManager::to_repl_error(code));
     }
     RS_LOG(INFO, tid, "flip_learner_flag accepted member={} target={}", boost::uuids::to_string(member.id), target);
-    co_return ReplResult<>{};
+    co_return ReplResult<>{folly::Unit{}};
 }
 
 Async< ReplResult<> > ReplicaSet::become_leader(TraceId tid) {
@@ -396,7 +401,7 @@ Async< ReplResult<> > ReplicaSet::become_leader(TraceId tid) {
 
     if (raft_server_->is_leader()) {
         RS_LOG(INFO, tid, "become_leader: already leader — no-op");
-        co_return ReplResult<>{};
+        co_return ReplResult<>{folly::Unit{}};
     }
 
     // request_leadership sends a transfer request to the current leader; returns true only if the request was
@@ -407,7 +412,7 @@ Async< ReplResult<> > ReplicaSet::become_leader(TraceId tid) {
         co_return folly::makeUnexpected(ReplError::FAILED);
     }
     RS_LOG(INFO, tid, "become_leader: request accepted");
-    co_return ReplResult<>{};
+    co_return ReplResult<>{folly::Unit{}};
 }
 
 Async< ReplResult<> > ReplicaSet::set_priority(ReplicaId const& member, int32_t priority, TraceId tid) {
@@ -425,7 +430,7 @@ Async< ReplResult<> > ReplicaSet::set_priority(ReplicaId const& member, int32_t 
     case nuraft::raft_server::PrioritySetResult::BROADCAST:
         RS_LOG(INFO, tid, "set_priority member={} priority={} result={}", boost::uuids::to_string(member), priority,
                to_int(result));
-        co_return ReplResult<>{};
+        co_return ReplResult<>{folly::Unit{}};
     case nuraft::raft_server::PrioritySetResult::IGNORED:
         RS_LOG(WARN, tid, "set_priority member={} priority={} ignored — not leader", boost::uuids::to_string(member),
                priority);
@@ -607,7 +612,7 @@ Async< bool > ReplicaSet::load(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raft
     // (unclamped: HomeRaftLogStore forwards nuraft's ask as-is).
     HomeRaftLogStore::TruncateCeilingFn truncate_ceiling_cb = [this]() -> raft_lsn_t {
         return options_.allow_user_driven_truncate ? app_truncate_upto_.load(std::memory_order_acquire)
-                                                  : std::numeric_limits< raft_lsn_t >::max();
+                                                   : std::numeric_limits< raft_lsn_t >::max();
     };
     if (sb()->raft_log_store_id == UINT32_MAX) {
         log_store_ = co_await HomeRaftLogStore::create(*sb(), std::move(blob_stream), std::move(on_log_found_cb),
@@ -636,7 +641,7 @@ Async< bool > ReplicaSet::load(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raft
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 Async< bool > ReplicaSet::start_engine() {
     // Pin all this raft_server's coro work to one reactor — hash by group_id so each group sticks to one.
-    auto& iom = iomanager::iomgr();
+    auto& iom = iomgr();
     size_t reactor_id = folly::hash::fnv64_buf(group_id_.data, sizeof(group_id_.data)) % iom.num_reactors();
     auto* eb = iom.reactor_for(reactor_id);
 
@@ -648,9 +653,28 @@ Async< bool > ReplicaSet::start_engine() {
     // Snapshot cadence: nuraft auto-fires snapshot_and_compact every N commits (0 disables — only
     // explicit schedule_snapshot_creation triggers).  Log-entries floor: nuraft's on_snapshot_completed
     // uses this to compute compact_upto = snap_lsn - reserved.  Both fed from ReplicaSetOptions.
+    // Map the global consensus config (homestore_config.fbs Consensus table) straight into nuraft raft_params.
+    // Per-group ReplicaSetOptions override the two fields that have a per-group knob (snapshot_distance,
+    // preserve_log_count); every other nuraft-facing consensus field is applied from the global settings here.
     nuraft::raft_params params;
-    params.with_snapshot_enabled(to_int(options_.snapshot_distance))
-          .with_reserved_log_items(to_int(options_.preserve_log_count));
+    params.with_hb_interval(to_int(HS_RUNTIME_CONFIG(consensus.heartbeat_period_ms)))
+        .with_election_timeout_lower(to_int(HS_RUNTIME_CONFIG(consensus.elect_to_low_ms)))
+        .with_election_timeout_upper(to_int(HS_RUNTIME_CONFIG(consensus.elect_to_high_ms)))
+        .with_leadership_expiry(HS_RUNTIME_CONFIG(consensus.leadership_expiry_ms))
+        .with_rpc_failure_backoff(to_int(HS_RUNTIME_CONFIG(consensus.rpc_backoff_ms)))
+        .with_max_append_size(HS_RUNTIME_CONFIG(consensus.max_append_batch_size))
+        .with_log_sync_batch_size(HS_RUNTIME_CONFIG(consensus.log_sync_batch_size))
+        .with_log_sync_stopping_gap(HS_RUNTIME_CONFIG(consensus.min_log_gap_to_join))
+        .with_stale_log_gap(HS_RUNTIME_CONFIG(consensus.stale_log_gap_hi_threshold))
+        .with_fresh_log_gap(HS_RUNTIME_CONFIG(consensus.stale_log_gap_lo_threshold))
+        .with_snapshot_sync_ctx_timeout(HS_RUNTIME_CONFIG(consensus.snapshot_sync_ctx_timeout_ms))
+        .with_snapshot_enabled(to_int(options_.snapshot_distance))     // per-group override of snapshot_freq_distance
+        .with_reserved_log_items(to_int(options_.preserve_log_count)); // per-group override of num_reserved_log_items
+    params.use_bg_thread_for_snapshot_io_ = HS_RUNTIME_CONFIG(consensus.use_bg_thread_for_snapshot_io);
+
+    // Deliver client results asynchronously — they are co_awaited via append_entries_chained. The `blocking`
+    // method would park a reactor thread on commit_ret_cv. Not a .fbs field.
+    params.return_method_ = nuraft::raft_params::async_handler;
 
     // ReplicaSet inherits from both state_mgr and state_machine so both slots in the context are `this`.
     auto self = shared_from_this();
@@ -677,6 +701,11 @@ Async< bool > ReplicaSet::start_engine() {
     if (!raft_server_) {
         co_return false;
     }
+
+    // Wire the raft_server back into the log store so its detached durability-flush can call notify_durable(),
+    // which wakes the follower's `co_await durability_signal_.wait_until()` in handle_append_entries.  Must be set
+    // before start_server, since appends can begin as soon as the engine is live.
+    log_store_->set_raft_server(raft_server_.get());
     co_await raft_server_->start_server(/*skip_initial_election_timeout=*/false);
 
     RS_LOG(INFO, NO_TRACE_ID, "Joined raft group on reactor={}", reactor_id);
@@ -688,11 +717,21 @@ Async< void > ReplicaSet::stop_engine() {
         co_return; // engine never started (or already stopped)
     }
     RS_LOG(INFO, NO_TRACE_ID, "Shutting down raft engine");
-    // Mandatory before dropping the server: nuraft's raft_server destructor asserts shutdown() completed.  This
-    // joins the commit loop, stops the election timer, and closes the RPC listener — all of which need the
-    // transport/executor (owned by ReplicationManager) still alive, which is why the manager shuts every engine
-    // down before freeing them.
-    co_await raft_server_->shutdown();
+
+    // Mandatory before dropping the server: nuraft's raft_server destructor asserts shutdown() completed.  It joins
+    // the commit/append coroutines and cancels the scheduler's timers, all of which are pinned to the reactor
+    // start_engine hashed group_id to.  Run shutdown() on that reactor so the teardown respects folly's EventBase
+    // thread affinity (stop_engine itself may be driven from any reactor).
+    auto& iom = iomgr();
+    size_t reactor_id = folly::hash::fnv64_buf(group_id_.data, sizeof(group_id_.data)) % iom.num_reactors();
+    co_await folly::coro::co_withExecutor(folly::Executor::getKeepAliveToken(iom.reactor_for(reactor_id)),
+                                          raft_server_->shutdown());
+
+    // Clear the log store's back-pointer before the raft_server is freed so the detached durability-flush never
+    // dereferences a dangling server.
+    if (log_store_) {
+        log_store_->set_raft_server(nullptr);
+    }
     raft_server_.reset();
 }
 
@@ -877,9 +916,10 @@ void ReplicaSet::create_snapshot(RaftSnapshotPtr const& s, nuraft::async_result<
     iomgr().spawn_detached(
         iomanager::ReactorTarget::current(), [this, lsn, s, cb = when_done]() mutable -> Async< void > {
             auto exp = std::shared_ptr< std::exception >();
+            bool ok = false; // nuraft's when_done handler takes bool& — must pass an lvalue, not a literal
             if (!listener_) {
                 if (cb) {
-                    cb(/*ok=*/false, exp);
+                    cb(ok, exp);
                 }
                 co_return;
             }
@@ -888,7 +928,7 @@ void ReplicaSet::create_snapshot(RaftSnapshotPtr const& s, nuraft::async_result<
             if (res.hasError()) {
                 RS_LOG(ERROR, NO_TRACE_ID, "take_snapshot lsn={} failed", lsn);
                 if (cb) {
-                    cb(/*ok=*/false, exp);
+                    cb(ok, exp);
                 }
                 co_return;
             }
@@ -902,7 +942,8 @@ void ReplicaSet::create_snapshot(RaftSnapshotPtr const& s, nuraft::async_result<
             co_await write_sb();
 
             if (cb) {
-                cb(/*ok=*/true, exp);
+                ok = true;
+                cb(ok, exp);
             }
         });
 }
@@ -943,7 +984,7 @@ Async< bool > ReplicaSet::apply_snapshot(RaftSnapshotPtr const& s) {
         sb()->last_snapshot_lsn = lsn;
     }
     co_await write_sb();
-    co_await hs()->cp_mgr().trigger_cp_flush(/*force=*/true, CPTriggerReason::Snapshot);
+    co_await cp_mgr().trigger_cp_flush(/*force=*/true, CPTriggerReason::Snapshot);
 
     // Signal release: Repl-side use of this snap is done.  App now owns the object's future — it may be
     // returned from last_snapshot() indefinitely or dropped.
@@ -992,8 +1033,8 @@ Async< void > ReplicaSet::save_logical_snp_obj(RaftSnapshotPtr const& s, ulong& 
     // custom deleter that captures `data`; the resulting IoBufView carries this refcount forward, so the
     // app can retain the view across its own async I/O and nuraft's buffer stays alive until the last
     // referencing view drops.
-    sisl::IoBufView view{sisl::make_io_buf_shared(shared< uint8_t >{data->data_begin(), [data](uint8_t*) {}},
-                                                   to_u32(data->size()))};
+    sisl::IoBufView view{
+        sisl::make_io_buf_shared(shared< uint8_t >{data->data_begin(), [data](uint8_t*) {}}, to_u32(data->size()))};
     uint64_t cursor = obj_id;
     co_await incoming_snapshot_builder_->write_chunk(cursor, view);
     obj_id = cursor;
@@ -1042,8 +1083,7 @@ Async< int > ReplicaSet::read_logical_snp_obj(RaftSnapshotPtr const& s, void*& u
     // until nuraft drops the ptr<buffer>; at that point the deleter's captured `view` destructs and
     // releases the refcount.
     auto view = res.value();
-    data_out = nuraft::buffer::take_ownership(view.bytes(), view.size(),
-                                              [view](nuraft::byte*) mutable { (void)view; });
+    data_out = nuraft::buffer::take_ownership(view.bytes(), view.size(), [view](nuraft::byte*) mutable { (void)view; });
     co_return 0;
 }
 
@@ -1199,7 +1239,7 @@ Async< void > ReplicaSet::rollback_ext(ext_op_params const& params) {
     auto const lsn = to_i64(params.log_idx);
     auto ev = view_coalesced_entry(*params.data);
     if (listener_) {
-        listener_->on_rollback(lsn, view_user_header(ev));
+        co_await listener_->on_rollback(lsn, view_user_header(ev));
     }
     co_return;
 }
@@ -1277,7 +1317,7 @@ Async< void > ReplicaSet::rollback_config(ulong log_idx, nuraft::ptr< nuraft::cl
 
 ulong ReplicaSet::last_commit_index() {
     // commit_upto_lsn_ is advanced by every commit_ext / commit_ext_chained / commit_config that lands.
-    return to_ulong(commit_upto_lsn_.load());
+    return to_ulong64(commit_upto_lsn_.load());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -1350,7 +1390,7 @@ Async< ReplResult<> > ReplicaSet::do_replace_member(ReplicaMemberInfo const& out
     }
     }
     RS_LOG(INFO, tid, "do_replace_member: completed task_id={}", task_id);
-    co_return ReplResult<>{};
+    co_return ReplResult<>{folly::Unit{}};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -1411,7 +1451,7 @@ Async< void > ReplicaSet::resume_pending_replace_member() {
         RS_LOG(WARN, NO_TRACE_ID,
                "resume_pending_replace_member: divergent task_id={} out_present={} in_learner={} — clearing SB",
                task_id, out_present, in_present_as_learner);
-        std::memset(&sb()->replace_member_sb, 0, sizeof(sb()->replace_member_sb));
+        sb()->replace_member_sb = {};
         co_await write_sb();
         co_return;
     }
@@ -1458,8 +1498,8 @@ nuraft::cb_func::ReturnCode ReplicaSet::raft_event(nuraft::cb_func::Type type, n
         // forget onto the same reactor this ReplicaSet is pinned to — the coroutine internally waits for
         // is_ready_for_traffic() before touching cluster state so we never act on an uncommitted config view.
         if (sb()->replace_member_sb.task_id[0] != '\0') {
-            iomanager::iomgr().spawn_detached(iomanager::ReactorTarget::current(),
-                                              [this]() -> Async< void > { co_await resume_pending_replace_member(); });
+            iomgr().spawn_detached(iomanager::ReactorTarget::current(),
+                                   [this]() -> Async< void > { co_await resume_pending_replace_member(); });
         }
         break;
     }
@@ -1489,7 +1529,7 @@ Async< void > ReplicaSet::dispatch_commit(int64_t lsn, JournalType type, sisl::B
         // returns them (empty for pure inline entries).
         BlkIds const bids = log_store_->on_commit(lsn);
         if (listener_) {
-            listener_->on_commit(lsn, user_header, value, bids);
+            co_await listener_->on_commit(lsn, user_header, value, bids);
         }
         break;
     }
@@ -1532,7 +1572,7 @@ Async< void > ReplicaSet::dispatch_commit(int64_t lsn, JournalType type, sisl::B
                 listener_->on_start_replace_member(out, in, task_id_view);
             }
         } else {
-            std::memset(&sb()->replace_member_sb, 0, sizeof(sb()->replace_member_sb));
+            sb()->replace_member_sb = {};
             co_await write_sb();
             if (listener_) {
                 listener_->on_complete_replace_member(out, in, task_id_view);
@@ -1582,7 +1622,7 @@ Async< ReplResult<> > ReplicaSet::wait_for_catchup(ReplicaMemberInfo const& memb
         if (lag <= kMaxCatchupLag) {
             RS_LOG(INFO, tid, "wait_for_catchup: member={} caught up, lag={}, leader_tail={} peer_tail={}",
                    boost::uuids::to_string(member.id), lag, leader_tail, peer_tail);
-            co_return ReplResult<>{};
+            co_return ReplResult<>{folly::Unit{}};
         }
         if (Clock::now() >= deadline) {
             RS_LOG(ERROR, tid, "wait_for_catchup: member={} timed out, lag={}, leader_tail={} peer_tail={}",

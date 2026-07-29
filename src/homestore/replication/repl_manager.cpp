@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 #include <boost/uuid/uuid_io.hpp>
 #include <boost/uuid/string_generator.hpp>
+#include <folly/base64.h>
 #include <folly/executors/thread_factory/NamedThreadFactory.h>
 
 #include <libnuraft/async.hxx>
@@ -28,8 +29,8 @@
 
 #include "sisl/logging/logging.h"
 
-#include "common/homestore_assert.h"
-#include "common/hs_runtime_config.h"
+#include "homestore/base/homestore_assert.h"
+#include "homestore/base/hs_runtime_config.h"
 #include "homestore/homestore.h"
 #include "homestore/managers.h"
 #include "homestore/meta/meta_blk.h"
@@ -46,6 +47,13 @@ namespace homestore {
 
 static constexpr std::string_view kReplicaSetMetaName = "ReplicaSet";
 static constexpr std::string_view kReplicaRaftConfigMetaName = "ReplicaRaftConfig";
+
+// The MetaBlk name field holds at most 31 chars, so a group's 36-char uuid string does not fit.  base64url of the
+// uuid's 16 raw bytes is 22 chars and collision-free — recovery keys off the meta client and the group_id stored in
+// the SB payload, so this name only needs to be unique per replica set.
+static std::string gid_meta_tag(GroupId const& gid) {
+    return folly::base64URLEncode(std::string_view{r_cast< char const* >(&*gid.begin()), gid.size()});
+}
 
 ReplicationManager::ReplicationManager(shared< ReplApplication > repl_app) : repl_app_{std::move(repl_app)} {
 }
@@ -129,7 +137,7 @@ Async< void > ReplicationManager::setup_infra() {
     rpc_client_factory_ = std::make_shared< replication::FollyRpcClientFactory >(cpu_executor_.get());
     // Construct the listener but do NOT listen() yet — start_engine() opens inbound traffic once engines are up.
     rpc_listener_ =
-        std::make_shared< replication::FollyRpcListener >(iomanager::iomgr().reactor_for(0), bind_port, this);
+        std::make_shared< replication::FollyRpcListener >(iomgr().reactor_for(0), bind_port, this);
 
     rs_meta_client_ =
         std::make_shared< MetaClient >(co_await meta_mgr().register_client(std::string{kReplicaSetMetaName}));
@@ -165,8 +173,8 @@ Async< void > ReplicationManager::reconstruct_replica_sets() {
 Async< void > ReplicationManager::stop() {
     // Stop timers first so no new maintenance fires against a listener that's about to shut down.  Each
     // stop() is idempotent and blocks until the currently-scheduled coroutine (if any) has drained.
-    gc_timer_.stop();
-    persist_commit_lsn_timer_.stop();
+    co_await gc_timer_.stop();
+    co_await persist_commit_lsn_timer_.stop();
 
     // Shut down every raft engine BEFORE freeing the RPC transport / executor it references.  Each engine's
     // nuraft::context holds mgr_.rpc_listener() / rpc_client_factory() and the reactor executor; freeing those
@@ -188,6 +196,9 @@ Async< void > ReplicationManager::stop() {
     if (rpc_listener_) {
         rpc_listener_->shutdown();
         rpc_listener_.reset();
+    }
+    if (rpc_client_factory_) {
+        rpc_client_factory_->shutdown(); // tear down each reactor's outbound sockets on its own thread
     }
     rpc_client_factory_.reset();
     if (cpu_executor_) {
@@ -222,7 +233,7 @@ std::string ReplicationManager::lookup_peer_addr(ReplicaId const& peer) const {
     return fmt::format("{}:{}", p.first, p.second);
 }
 
-nuraft::ptr< nuraft::raft_server > ReplicationManager::lookup_raft_server(nuraft::group_id_t const& gid) const {
+nuraft::raft_server* ReplicationManager::lookup_raft_server(nuraft::group_id_t const& gid) const {
     GroupId group_id;
     std::memcpy(group_id.data, gid.data(), gid.size());
     auto rs = get_replica_set(group_id);
@@ -265,7 +276,8 @@ Async< ReplResult< shared< ReplicaSet > > > ReplicationManager::create_replica_s
     // SB — build initial ReplicaSetSuperBlk in a tmp buffer, persist, construct the ReplicaSet.  rs->start()
     // below reads the SB back into its own buffer.
     auto sb_mblk =
-        co_await MetaBlkWrapper::create(rs_meta_client_, fmt::format("rs_{}", gid_str), sizeof(ReplicaSetSuperBlk));
+        co_await MetaBlkWrapper::create(rs_meta_client_, fmt::format("rs_{}", gid_meta_tag(group_id)),
+                                        sizeof(ReplicaSetSuperBlk));
     {
         auto tmp = sisl::make_io_buf_shared(to_u32(sizeof(ReplicaSetSuperBlk)));
         auto* sb = new (tmp->bytes()) ReplicaSetSuperBlk{};
@@ -298,7 +310,8 @@ Async< ReplResult< shared< ReplicaSet > > > ReplicationManager::create_replica_s
                                       {"servers", std::move(servers)}}}};
 
     auto raft_cfg_mblk =
-        co_await MetaBlkWrapper::create(rs_raft_cfg_meta_client_, fmt::format("cfg_{}", gid_str), /*size=*/{});
+        co_await MetaBlkWrapper::create(rs_raft_cfg_meta_client_, fmt::format("cfg_{}", gid_meta_tag(group_id)),
+                                        /*size=*/{});
 
     // User-initiated create: options come from the caller arg (not the listener).
     auto rs = std::make_shared< ReplicaSet >(*this, std::move(sb_mblk), options);
@@ -322,7 +335,7 @@ Async< ReplResult< shared< ReplicaSet > > > ReplicationManager::create_replica_s
     co_return rs;
 }
 
-Async< nuraft::ptr< nuraft::raft_server > >
+Async< nuraft::raft_server* >
 ReplicationManager::create_replica_set_on_demand(nuraft::group_id_t const& gid) {
     GroupId group_id;
     std::memcpy(group_id.data, gid.data(), gid.size());
@@ -362,7 +375,8 @@ ReplicationManager::create_replica_set_on_demand(nuraft::group_id_t const& gid) 
     // options are NOT stamped into SB — the listener is the source of truth and gets queried again on
     // every restart.
     auto sb_mblk =
-        co_await MetaBlkWrapper::create(rs_meta_client_, fmt::format("rs_{}", gid_str), sizeof(ReplicaSetSuperBlk));
+        co_await MetaBlkWrapper::create(rs_meta_client_, fmt::format("rs_{}", gid_meta_tag(group_id)),
+                                        sizeof(ReplicaSetSuperBlk));
     {
         auto tmp = sisl::make_io_buf_shared(to_u32(sizeof(ReplicaSetSuperBlk)));
         auto* sb = new (tmp->bytes()) ReplicaSetSuperBlk{};
@@ -376,7 +390,8 @@ ReplicationManager::create_replica_set_on_demand(nuraft::group_id_t const& gid) 
     // restart's raft_group_config_found can pair the config to its SB.  The state_mgr load_config bootstrap
     // path fills in the "config" and "state" keys on first save.
     auto raft_cfg_mblk =
-        co_await MetaBlkWrapper::create(rs_raft_cfg_meta_client_, fmt::format("cfg_{}", gid_str), /*size=*/{});
+        co_await MetaBlkWrapper::create(rs_raft_cfg_meta_client_, fmt::format("cfg_{}", gid_meta_tag(group_id)),
+                                        /*size=*/{});
     auto rs = std::make_shared< ReplicaSet >(*this, std::move(sb_mblk), options);
     rs->attach_listener(std::move(listener));
     nlohmann::json raft_cfg_json = {{"group_id", gid_str}};
@@ -460,10 +475,16 @@ Async< void > ReplicationManager::load_replica_set(MetaBlk const& blk, sisl::IoB
 
 Async< void > ReplicationManager::raft_group_config_found(MetaBlk const& blk, sisl::IoBufView data) {
     nlohmann::json cfg_json;
+    bool corrupt = false;
+    std::string corrupt_msg;
     try {
         cfg_json = nlohmann::json::from_msgpack(data.cbytes(), data.cbytes() + data.size());
     } catch (std::exception const& e) {
-        RM_LOG(ERROR, NO_TRACE_ID, "Corrupt raft config block — destroying: {}", e.what());
+        corrupt = true;
+        corrupt_msg = e.what();
+    }
+    if (corrupt) {
+        RM_LOG(ERROR, NO_TRACE_ID, "Corrupt raft config block — destroying: {}", corrupt_msg);
         co_await MetaBlkWrapper::load(rs_raft_cfg_meta_client_, blk).destroy();
         co_return;
     }
@@ -473,10 +494,16 @@ Async< void > ReplicationManager::raft_group_config_found(MetaBlk const& blk, si
         co_return;
     }
     GroupId group_id;
+    bool malformed = false;
+    std::string malformed_msg;
     try {
         group_id = boost::uuids::string_generator{}(cfg_json["group_id"].get< std::string >());
     } catch (std::exception const& e) {
-        RM_LOG(ERROR, NO_TRACE_ID, "Raft config block has malformed group_id ({}) — destroying", e.what());
+        malformed = true;
+        malformed_msg = e.what();
+    }
+    if (malformed) {
+        RM_LOG(ERROR, NO_TRACE_ID, "Raft config block has malformed group_id ({}) — destroying", malformed_msg);
         co_await MetaBlkWrapper::load(rs_raft_cfg_meta_client_, blk).destroy();
         co_return;
     }

@@ -11,6 +11,7 @@
 #include <libnuraft/rpc_listener.hxx>
 #include <libnuraft/async.hxx>
 #include <libnuraft/basic_types.hxx>
+#include <libnuraft/raft_server_handler.hxx> // grants InboundConnection access to raft_server::process_req
 
 #include "common/defs.h"
 #include "wire_frame.h"
@@ -23,9 +24,12 @@ class buffer;
 class rpc_exception;
 } // namespace nuraft
 
+namespace homestore {
+class ReplicationManager; // defined in homestore namespace (repl_manager.h), NOT homestore::replication
+}
+
 namespace homestore::replication {
 
-class ReplicationManager;
 class FollyRpcListener;
 
 // Holds every live InboundConnection.  Owned by FollyRpcListener (strong); accessed by each connection via
@@ -70,6 +74,7 @@ public:
 private:
     class AcceptCb;
     class InboundConnection;
+    friend struct ConnectionRegistry; // namespace-scope registry names our nested InboundConnection type
 
     folly::EventBase* accept_eb_;
     uint16_t port_;
@@ -112,7 +117,10 @@ private:
 //    is_response flag set, and writeChain'd with WriteFlags::WRITE_MSG_ZEROCOPY.
 class FollyRpcListener::InboundConnection : public folly::AsyncReader::ReadCallback,
                                             public folly::AsyncWriter::WriteCallback,
+                                            public nuraft::raft_server_handler,
                                             public std::enable_shared_from_this< FollyRpcListener::InboundConnection > {
+    friend class FollyRpcListener; // shutdown() closes each connection via closed_ / sock_
+
 public:
     InboundConnection(folly::EventBase* eb, folly::AsyncSocket::UniquePtr sock, ReplicationManager* mgr,
                       shared< ConnectionRegistry > registry);

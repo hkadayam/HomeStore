@@ -6,7 +6,7 @@
 #include <folly/small_vector.h>
 #include <libnuraft/log_entry.hxx>
 #include <libnuraft/log_val_type.hxx>
-#include <libnuraft/cs_new.hxx>
+#include <libnuraft/pp_util.hxx> // nuraft::cs_new
 
 namespace homestore::replication {
 
@@ -93,7 +93,9 @@ unique< folly::IOBuf > encode_req_msg(nuraft::req_msg const& req) {
         put_u8    (p, le->has_crc32() ? 1 : 0);
         put_le_u32(p, le->get_crc32());
         put_le_u64(p, le->get_timestamp());
-        put_le_u32(p, to_u32(le->total_size()));
+        // On-wire payload length = full bufs() chain [kHdrSize header | value]; total_size() excludes the header,
+        // so add kHdrSize to match the bytes appended below (the receiver frames the payload by this length).
+        put_le_u32(p, to_u32(nuraft::log_entry::kHdrSize + le->total_size()));
     }
     head->append(head_size);
 
@@ -104,8 +106,13 @@ unique< folly::IOBuf > encode_req_msg(nuraft::req_msg const& req) {
             if (!part || part->size() == 0) {
                 continue;
             }
-            head->appendToChain(folly::IOBuf::takeOwnership(part->data_begin(), part->size(),
-                                                            [held = part](void*, void*) noexcept { (void)held; }));
+            // folly's takeOwnership takes a plain FreeFunction pointer + userData (no capturing-lambda overload):
+            // heap a copy of the ptr<buffer> as userData so the nuraft buffer stays alive until folly drops the
+            // IOBuf (after MSG_ZEROCOPY completion), then the captureless deleter releases it.
+            head->appendToChain(folly::IOBuf::takeOwnership(
+                part->data_begin(), part->size(),
+                [](void* /*buf*/, void* userData) noexcept { delete static_cast< RaftBufferPtr* >(userData); },
+                new RaftBufferPtr(part)));
         }
     }
     return head;

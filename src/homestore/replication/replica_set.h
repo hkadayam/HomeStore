@@ -27,7 +27,7 @@
 #include <libnuraft/snapshot.hxx>
 #include <libnuraft/callback.hxx>
 
-#include "homestore/blk.h"
+#include "homestore/base/blk.h"
 #include "homestore/logstore/log_stream.h" // logstore_id_t
 #include "homestore/replication/repl_decls.h"
 #include "homestore/meta/meta_blk.h"
@@ -50,7 +50,8 @@ class srv_state;
 namespace homestore {
 
 #define NO_TRACE_ID "n/a"
-#define RS_LOG(level, traceID, ...) HS_SUBMOD_LOG(level, replication, traceID, identify_str(), ##__VA_ARGS__)
+#define RS_LOG(level, traceID, ...)                                                                                    \
+    HS_DETAILED_LOG(level, replication, , "rs", identify_str(), "trace_id", traceID, ##__VA_ARGS__)
 
 class HomeRaftLogStore;
 class RawBlkStream;
@@ -261,7 +262,7 @@ struct ReplicaSetSuperBlk {
 class ReplicaSetMetrics : public sisl::MetricsGroup {
 public:
     explicit ReplicaSetMetrics(char const* inst_name);
-    ~ReplicaSetMetrics() override;
+    ~ReplicaSetMetrics();
 
     ReplicaSetMetrics(ReplicaSetMetrics const&) = delete;
     ReplicaSetMetrics(ReplicaSetMetrics&&) noexcept = delete;
@@ -287,13 +288,17 @@ public:
     /// the BlkIds into their index instead of copying the bytes.  The full value bytes are also handed in via
     /// `value` so applications that don't want to track BlkIds can ignore blob_refs entirely.  Multiple BlkIds
     /// only occur when the allocator handed back a discontiguous run for a single value.
-    virtual void on_commit(int64_t lsn, sisl::Blob const& header, sisl::Blob const& value, BlkIds const& blob_refs) = 0;
+    /// Awaited by the commit path — commit does not advance until the application has finished applying the
+    /// entry, so "committed" means "durably applied by the app".
+    virtual Async< void > on_commit(int64_t lsn, sisl::Blob const& header, sisl::Blob const& value,
+                                    BlkIds const& blob_refs) = 0;
 
     /// Called when a log entry has been received and pre-committed. Returning false aborts the commit.
     virtual bool on_pre_commit(int64_t lsn, sisl::Blob const& header) = 0;
 
-    /// Called when a previously pre-committed log entry has been rolled back.
-    virtual void on_rollback(int64_t lsn, sisl::Blob const& header) = 0;
+    /// Called when a previously pre-committed log entry has been rolled back.  Awaited, like on_commit, so the
+    /// app's un-apply completes before the rollback path proceeds.
+    virtual Async< void > on_rollback(int64_t lsn, sisl::Blob const& header) = 0;
 
     /// Called when a previously pre-committed cluster-config entry has been rolled back.
     virtual void on_config_rollback(int64_t lsn) = 0;

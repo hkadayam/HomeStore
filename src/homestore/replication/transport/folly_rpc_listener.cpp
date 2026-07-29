@@ -33,7 +33,7 @@ void FollyRpcListener::listen(nuraft::ptr< nuraft::msg_handler >& /*unused*/) {
     server_->bind(port_);
     server_->listen(/*backlog*/ 128);
     accept_cb_ = std::make_unique< AcceptCb >(mgr_, registry_);
-    server_->addAcceptCallback(accept_cb_.get(), accept_eb_);
+    server_->addAcceptCallback(accept_cb_.get(), nullptr);
     server_->startAccepting();
 }
 
@@ -45,10 +45,17 @@ void FollyRpcListener::stop() {
 
 void FollyRpcListener::shutdown() {
     if (server_) {
-        server_->stopAccepting();
-        server_.reset();
+        // The AsyncServerSocket is bound to accept_eb_ and folly requires it to be stopped/destroyed on that
+        // EventBase's thread. shutdown() may run on a different reactor (HomeStore shutdown dispatches to any
+        // reactor), so hop to accept_eb_ and wait. Runs inline when already on that thread.
+        accept_eb_->runImmediatelyOrRunInEventBaseThreadAndWait([this]() {
+            server_->stopAccepting();
+            server_.reset();
+            accept_cb_.reset();
+        });
+    } else {
+        accept_cb_.reset();
     }
-    accept_cb_.reset();
 
     // Snapshot the registry under the mutex, then post closeNow() onto each connection's reactor.  Tasks
     // still holding shared_from_this() keep their connection alive until they finish; their post-shutdown
@@ -75,7 +82,7 @@ void FollyRpcListener::shutdown() {
 
 void FollyRpcListener::AcceptCb::connectionAccepted(folly::NetworkSocket fd, folly::SocketAddress const& /*client*/,
                                                     AcceptInfo /*info*/) noexcept {
-    auto& iom = iomanager::iomgr();
+    auto& iom = iomgr();
     size_t rid = iom.next_reactor();
     auto* recv_eb = iom.reactor_for(rid);
     auto* mgr = mgr_;
@@ -168,17 +175,19 @@ void FollyRpcListener::InboundConnection::readDataAvailable(size_t len) noexcept
         // msg_type byte. Peeking it here lets routing decide reactor vs slow-executor without paying for full
         // req_msg decode up front.
         uint8_t const msg_type = rx_body_->size() >= 2 ? rx_body_->data_begin()[1] : 0;
+        HS_LOG(TRACE, replication, "rpc rx request type={} req_id={} len={}", int(msg_type), rx_hdr_.req_id,
+               rx_body_->size());
         if (is_cpu_intensive_rpc(msg_type) && mgr_->cpu_executor() != nullptr) {
             // Slow path: route to the CPU thread pool so the Task body (which may blocking-wait on log_store
             // reads via HomeRaftLogStore's sync API) does not stall any reactor.
-            std::move(dispatch_request(rx_hdr_.group_id, rx_hdr_.req_id, rx_body_))
-                .scheduleOn(folly::Executor::getKeepAliveToken(mgr_->cpu_executor()))
+            folly::coro::co_withExecutor(folly::Executor::getKeepAliveToken(mgr_->cpu_executor()),
+                                         dispatch_request(rx_hdr_.group_id, rx_hdr_.req_id, rx_body_))
                 .start();
         } else {
             // Hot path: startInlineUnsafe runs the Task body synchronously on this thread (we're already on
             // eb_) until process_req hits its first suspend point; no event-loop tick delay.
-            std::move(dispatch_request(rx_hdr_.group_id, rx_hdr_.req_id, rx_body_))
-                .scheduleOn(folly::Executor::getKeepAliveToken(eb_))
+            folly::coro::co_withExecutor(folly::Executor::getKeepAliveToken(eb_),
+                                         dispatch_request(rx_hdr_.group_id, rx_hdr_.req_id, rx_body_))
                 .startInlineUnsafe();
         }
     }
@@ -222,7 +231,10 @@ Async< void > FollyRpcListener::InboundConnection::dispatch_request(nuraft::grou
     // process_req's body. After the await returns we are guaranteed to be on eb_ where the socket lives,
     // so send_response can write directly with no runInEventBaseThread hop.
     nuraft::raft_server::req_ext_params ext{};
-    auto resp = co_await srv->process_req(*req, ext);
+    HS_LOG(TRACE, replication, "rpc process_req start type={} req_id={}", int(req->get_type()), req_id);
+    auto resp = co_await nuraft::raft_server_handler::process_req(srv, *req, ext);
+    HS_LOG(TRACE, replication, "rpc process_req done type={} req_id={} accepted={}", int(req->get_type()), req_id,
+           resp ? int(resp->get_accepted()) : -1);
     send_response(gid, req_id, resp);
     co_return;
 }

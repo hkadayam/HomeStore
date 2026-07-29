@@ -3,12 +3,26 @@
 #include <string>
 
 #include <folly/small_vector.h>
-#include <folly/futures/Future.h>
+#include <folly/Expected.h> // Result = folly::Expected
+#include <folly/Unit.h>     // folly::Unit
+#include "common/async.h"   // Async<> (folly::coro::Task)
 
 #include "sisl/logging/logging.h"
-#include "homestore/homestore_decl.hpp"
-#include "homestore/blk.h"
+#include "homestore/base/homestore_decl.h"
+#include "homestore/base/blk.h"
+#include "homestore/base/homestore_assert.h"
 #include "sisl/fds/buffer.h"
+
+#include <libnuraft/ptr.hxx> // nuraft::ptr<> alias template used by the RaftXxxPtr typedefs below
+
+// nuraft types are named below only through nuraft::ptr<> (shared_ptr) aliases — forward declarations suffice
+// and keep this decls header from pulling the full nuraft surface.
+namespace nuraft {
+class buffer;
+class cluster_config;
+class log_entry;
+class snapshot;
+} // namespace nuraft
 
 namespace homestore {
 // clang-format off
@@ -39,11 +53,11 @@ VENUM(ReplError, int32_t,
 template < typename V, typename E >
 using Result = folly::Expected< V, E >;
 
-template < class V >
+template < class V = folly::Unit >
 using ReplResult = Result< V, ReplError >;
 
 template < class V, class E >
-using AsyncResult = folly::SemiFuture< Result< V, E > >;
+using AsyncResult = Async< Result< V, E > >;
 
 template < class V = folly::Unit >
 using AsyncReplResult = AsyncResult< V, ReplError >;

@@ -11,6 +11,8 @@
 #include <folly/Try.h>
 #include <folly/synchronization/Baton.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
+
+#include "sisl/logging/logging.h"
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/EventBaseManager.h>
 #include "common/async.h"
@@ -145,8 +147,18 @@ void IOManager::spawn_detached(ReactorTarget target, F factory) {
     // co_invoke moves factory into a heap-allocated coroutine frame so the
     // lambda closure outlives all suspension points (CP.51 fix).
     auto task = folly::coro::co_invoke(std::move(factory));
-    eb->runInEventBaseThread(
-        [eb, task = std::move(task)]() mutable { folly::coro::co_withExecutor(eb, std::move(task)).startInlineUnsafe([](auto) {}); });
+    // A detached task is fire-and-forget: nobody awaits its result, so the completion handler is the terminal owner
+    // of any exception.  Rethrowing here would escape into the EventBase loop with no handler (std::terminate), so
+    // we must consume it — but never SILENTLY.  Log it on the iomgr module; a task that needs failure to be fatal
+    // must handle it itself before returning.
+    eb->runInEventBaseThread([eb, task = std::move(task)]() mutable {
+        folly::coro::co_withExecutor(eb, std::move(task)).startInlineUnsafe([](auto&& t) {
+            if (t.hasException()) {
+                LOGERRORMOD(iomgr, "spawn_detached task terminated with exception: {}",
+                            t.exception().what().toStdString());
+            }
+        });
+    });
 }
 
 template < typename T >

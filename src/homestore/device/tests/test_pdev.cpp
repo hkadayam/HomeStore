@@ -25,6 +25,7 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <folly/coro/Collect.h>
 #include <boost/uuid/random_generator.hpp>
 
 #include "sisl/logging/logging.h"
@@ -38,6 +39,7 @@
 using namespace homestore;
 using namespace iomanager;
 using sisl::IoBuf;
+using sisl::IoBufOwn;
 
 static constexpr uint64_t DEV_SIZE = 128 * 1024 * 1024; // 128 MB
 static constexpr uint32_t BLK_SIZE = 4096;
@@ -242,13 +244,13 @@ CORO_TEST_F(PDevTest, ChunkDeactivateReactivate) {
 CORO_TEST_F(PDevTest, WriteReadSingleBlock) {
     auto pdev = co_await PhysicalDev::create(self.make_dev_info(0), OFLAGS, /*pdev_id=*/0, self.fbhdr_);
 
-    IoBuf wbuf{BLK_SIZE, 512};
+    IoBufOwn wbuf{BLK_SIZE, 512};
     std::memset(wbuf.bytes(), 0x42, BLK_SIZE);
     uint64_t offset = pdev->data_start_offset();
 
     co_await pdev->write(wbuf, offset);
 
-    IoBuf rbuf{BLK_SIZE, 512};
+    IoBufOwn rbuf{BLK_SIZE, 512};
     auto ec = co_await pdev->read(rbuf, offset);
     CO_ASSERT_FALSE(ec);
     EXPECT_EQ(std::memcmp(wbuf.bytes(), rbuf.bytes(), BLK_SIZE), 0);
@@ -261,7 +263,7 @@ CORO_TEST_F(PDevTest, WriteReadLargeBuffer) {
     auto pdev = co_await PhysicalDev::create(self.make_dev_info(0), OFLAGS, /*pdev_id=*/0, self.fbhdr_);
 
     constexpr uint32_t large_size = 256 * 1024; // 256 KB
-    IoBuf wbuf{large_size, 512};
+    IoBufOwn wbuf{large_size, 512};
     for (uint32_t i = 0; i < large_size; ++i) {
         wbuf.bytes()[i] = to_u8(i & 0xFF);
     }
@@ -269,7 +271,7 @@ CORO_TEST_F(PDevTest, WriteReadLargeBuffer) {
 
     co_await pdev->write(wbuf, offset);
 
-    IoBuf rbuf{large_size, 512};
+    IoBufOwn rbuf{large_size, 512};
     auto ec = co_await pdev->read(rbuf, offset);
     CO_ASSERT_FALSE(ec);
     EXPECT_EQ(std::memcmp(wbuf.bytes(), rbuf.bytes(), large_size), 0);
@@ -282,7 +284,7 @@ CORO_TEST_F(PDevTest, WritevReadv) {
     auto pdev = co_await PhysicalDev::create(self.make_dev_info(0), OFLAGS, /*pdev_id=*/0, self.fbhdr_);
 
     constexpr uint32_t num_bufs = 4;
-    std::vector< IoBuf > wbufs;
+    std::vector< IoBufOwn > wbufs;
     wbufs.reserve(num_bufs);
     for (uint32_t i = 0; i < num_bufs; ++i) {
         wbufs.emplace_back(BLK_SIZE, 512);
@@ -290,22 +292,22 @@ CORO_TEST_F(PDevTest, WritevReadv) {
     }
 
     uint64_t offset = pdev->data_start_offset();
-    // writev takes rvalue ref to vector.
-    std::vector< IoBuf > wbufs_copy;
-    wbufs_copy.reserve(num_bufs);
-    for (auto& wb : wbufs) {
-        IoBuf copy{BLK_SIZE, 512};
-        std::memcpy(copy.bytes(), wb.bytes(), BLK_SIZE);
-        wbufs_copy.push_back(std::move(copy));
+    sisl::SgList wsg;
+    for (auto& b : wbufs) {
+        wsg.bufs.push_back(&b);
     }
-    co_await pdev->writev(std::move(wbufs_copy), offset);
+    co_await pdev->writev(wsg, offset);
 
-    std::vector< IoBuf > rbufs;
+    std::vector< IoBufOwn > rbufs;
     rbufs.reserve(num_bufs);
     for (uint32_t i = 0; i < num_bufs; ++i) {
         rbufs.emplace_back(BLK_SIZE, 512);
     }
-    auto ec = co_await pdev->readv(rbufs, offset);
+    sisl::SgList rsg;
+    for (auto& b : rbufs) {
+        rsg.bufs.push_back(&b);
+    }
+    auto ec = co_await pdev->readv(rsg, offset);
     CO_ASSERT_FALSE(ec);
 
     for (uint32_t i = 0; i < num_bufs; ++i) {
@@ -319,13 +321,13 @@ CORO_TEST_F(PDevTest, WritevReadv) {
 CORO_TEST_F(PDevTest, Fsync) {
     auto pdev = co_await PhysicalDev::create(self.make_dev_info(0), OFLAGS, /*pdev_id=*/0, self.fbhdr_);
 
-    IoBuf wbuf{BLK_SIZE, 512};
+    IoBufOwn wbuf{BLK_SIZE, 512};
     std::memset(wbuf.bytes(), 0xBB, BLK_SIZE);
     uint64_t offset = pdev->data_start_offset();
     co_await pdev->write(wbuf, offset);
     co_await pdev->fsync();
 
-    IoBuf rbuf{BLK_SIZE, 512};
+    IoBufOwn rbuf{BLK_SIZE, 512};
     auto ec = co_await pdev->read(rbuf, offset);
     CO_ASSERT_FALSE(ec);
     EXPECT_EQ(std::memcmp(wbuf.bytes(), rbuf.bytes(), BLK_SIZE), 0);
@@ -373,6 +375,44 @@ CORO_TEST_F(PDevTest, RandomChunkOps) {
     }
     EXPECT_EQ(total_loaded, live_chunks.size());
     co_await reloaded->close_device();
+}
+
+// ── InterleavedConcurrentWrites ──────────────────────────────────────────────────────────────────────────────────────
+// Concurrent writes from multiple reactors to adjacent (interleaved) offsets on ONE pdev: block i is written from
+// reactor i%N, so neighbouring blocks are written at the same time from different reactors.  All writes are issued
+// first (collectAllRange), then the whole range is read back and verified.  The drive layer beneath is already proven
+// clean (test_drive::InterleavedConcurrentWrites), so a failure here pins the race to PhysicalDev's write/offset path.
+CORO_TEST_F(PDevTest, InterleavedConcurrentWrites) {
+    auto pdev = co_await PhysicalDev::create(self.make_dev_info(0), OFLAGS, /*pdev_id=*/0, self.fbhdr_);
+
+    constexpr uint32_t N = 64;
+    const uint64_t base = pdev->data_start_offset();
+    const size_t nreactors = iomgr().num_reactors();
+
+    std::vector< Async< void > > writes;
+    writes.reserve(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        const uint64_t offset = base + static_cast< uint64_t >(i) * BLK_SIZE;
+        // Captureless coroutine lambda with by-value params (params live in the frame; a captured lambda coroutine
+        // would be a stack-use-after-scope).
+        writes.push_back(iomgr().spawn_waitable(
+            ReactorTarget::reactor(i % nreactors),
+            [](shared< PhysicalDev > pd, uint64_t off, uint8_t val) -> Async< void > {
+                IoBufOwn wbuf{BLK_SIZE, 512};
+                std::memset(wbuf.bytes(), val, BLK_SIZE);
+                co_await pd->write(wbuf, off);
+            }(pdev, offset, to_u8(i & 0xFF))));
+    }
+    co_await folly::coro::collectAllRange(std::move(writes));
+
+    for (uint32_t i = 0; i < N; ++i) {
+        const uint64_t offset = base + static_cast< uint64_t >(i) * BLK_SIZE;
+        IoBufOwn rbuf{BLK_SIZE, 512};
+        auto ec = co_await pdev->read(rbuf, offset);
+        CO_ASSERT_FALSE(ec);
+        EXPECT_EQ(rbuf.bytes()[0], to_u8(i & 0xFF)) << "block " << i << " (offset " << offset << ") wrong content";
+    }
+    co_await pdev->close_device();
 }
 
 int main(int argc, char* argv[]) {

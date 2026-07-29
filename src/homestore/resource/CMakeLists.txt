@@ -10,3 +10,8 @@ target_sources(hs_resource PRIVATE
         resource_mgr.cpp
       )
 target_link_libraries(hs_resource ${COMMON_DEPS})
+# resource_mgr.cpp includes repl_manager.h (for repl_mgr().truncate()), which transitively pulls libnuraft/*.hxx
+# via repl_decls.h — so this object lib needs NuRaft's INTERFACE include dir at compile time.
+if (TARGET NuRaft::static_lib)
+    target_link_libraries(hs_resource NuRaft::static_lib)
+endif()

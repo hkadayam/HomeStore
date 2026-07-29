@@ -15,6 +15,8 @@
  *********************************************************************************/
 #pragma once
 
+#include <boost/uuid/random_generator.hpp>
+
 #include "hs_runtime_config.h"
 #include "sisl/fds/buffer.h"
 
@@ -43,7 +45,9 @@ public:
                                                const size_t alignment);
     static sisl::IoBufShared make_io_buf_shared(const uint64_t size, const bool is_aligned_needed, const sisl::Buftag tag,
                                             const size_t alignment);
-    static uuid_t gen_random_uuid();
+    // Inlined here (rather than in homestore_utils.cpp, which is not compiled — it still uses the pre-port iomanager
+    // API) so callers don't need that translation unit just for a random uuid.
+    static uuid_t gen_random_uuid() { return boost::uuids::random_generator()(); }
 
     /**
      * @brief  given a DAG graph , build the partial order sequence.

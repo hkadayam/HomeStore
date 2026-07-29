@@ -16,10 +16,12 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <folly/coro/Collect.h>
 
 #include "sisl/logging/logging.h"
 #include "sisl/options/options.h"
@@ -37,6 +39,7 @@
 using namespace homestore;
 using namespace iomanager;
 using sisl::IoBuf;
+using sisl::IoBufOwn;
 
 static constexpr uint64_t DEV_SIZE = 256 * 1024 * 1024; // 256 MB
 static constexpr uint32_t BLK_SIZE = 4096;
@@ -134,7 +137,7 @@ CORO_TEST_F(VDevTest, FormatZerosData) {
 
     // Read first block from chunk 0 — should be all zeros.
     BlkId bid(0, 1, to_u16(vdev->get_nth_chunk(0)->chunk_id()));
-    IoBuf rbuf{BLK_SIZE, 512};
+    IoBufOwn rbuf{BLK_SIZE, 512};
     auto ec = co_await vdev->read(rbuf, bid);
     CO_ASSERT_FALSE(ec);
     for (uint32_t i = 0; i < BLK_SIZE; ++i) {
@@ -153,11 +156,11 @@ CORO_TEST_F(VDevTest, AllocWriteReadSingleBlock) {
     auto status = vdev->alloc_contiguous_blks(1, hints, blkid);
     CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
 
-    IoBuf wbuf{BLK_SIZE, 512};
+    IoBufOwn wbuf{BLK_SIZE, 512};
     std::memset(wbuf.bytes(), 0xAA, BLK_SIZE);
     co_await vdev->write(wbuf, blkid);
 
-    IoBuf rbuf{BLK_SIZE, 512};
+    IoBufOwn rbuf{BLK_SIZE, 512};
     auto ec = co_await vdev->read(rbuf, blkid);
     CO_ASSERT_FALSE(ec);
     EXPECT_EQ(std::memcmp(wbuf.bytes(), rbuf.bytes(), BLK_SIZE), 0);
@@ -177,13 +180,13 @@ CORO_TEST_F(VDevTest, AllocWriteReadMultiBlock) {
     CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
 
     uint32_t total_size = nblks * BLK_SIZE;
-    IoBuf wbuf{total_size, 512};
+    IoBufOwn wbuf{total_size, 512};
     for (uint32_t i = 0; i < total_size; ++i) {
         wbuf.bytes()[i] = to_u8(i & 0xFF);
     }
     co_await vdev->write(wbuf, blkid);
 
-    IoBuf rbuf{total_size, 512};
+    IoBufOwn rbuf{total_size, 512};
     auto ec = co_await vdev->read(rbuf, blkid);
     CO_ASSERT_FALSE(ec);
     EXPECT_EQ(std::memcmp(wbuf.bytes(), rbuf.bytes(), total_size), 0);
@@ -202,28 +205,37 @@ CORO_TEST_F(VDevTest, WritevReadv) {
     auto status = vdev->alloc_contiguous_blks(nblks, hints, blkid);
     CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
 
-    // Write 4 separate buffers with distinct patterns.
-    std::vector< IoBuf > wbufs;
+    // Write 4 separate buffers with distinct patterns.  reserve() keeps element addresses stable (IoBufOwn is
+    // move-only) so the SgList pointers below stay valid.
+    std::vector< IoBufOwn > wbufs;
     wbufs.reserve(nblks);
     for (int i = 0; i < nblks; ++i) {
         wbufs.emplace_back(BLK_SIZE, 512);
         std::memset(wbufs.back().bytes(), 0xC0 + i, BLK_SIZE);
     }
 
-    // Save copies for verification since writev takes rvalue ref.
+    // Save copies for verification.
     std::vector< std::vector< uint8_t > > saved(nblks);
     for (int i = 0; i < nblks; ++i) {
         saved[i].assign(wbufs[i].bytes(), wbufs[i].bytes() + BLK_SIZE);
     }
 
-    co_await vdev->writev(std::move(wbufs), blkid);
+    sisl::SgList wsg;
+    for (auto& b : wbufs) {
+        wsg.bufs.push_back(&b);
+    }
+    co_await vdev->writev(wsg, blkid);
 
-    std::vector< IoBuf > rbufs;
+    std::vector< IoBufOwn > rbufs;
     rbufs.reserve(nblks);
     for (int i = 0; i < nblks; ++i) {
         rbufs.emplace_back(BLK_SIZE, 512);
     }
-    auto ec = co_await vdev->readv(rbufs, blkid);
+    sisl::SgList rsg;
+    for (auto& b : rbufs) {
+        rsg.bufs.push_back(&b);
+    }
+    auto ec = co_await vdev->readv(rsg, blkid);
     CO_ASSERT_FALSE(ec);
 
     for (int i = 0; i < nblks; ++i) {
@@ -349,7 +361,7 @@ CORO_TEST_F(VDevTest, LoadRecovery) {
         auto status = vdev->alloc_contiguous_blks(1, hints, written_blk);
         CO_ASSERT_EQ(status, BlkAllocStatus::SUCCESS);
 
-        IoBuf wbuf{BLK_SIZE, 512};
+        IoBufOwn wbuf{BLK_SIZE, 512};
         std::memset(wbuf.bytes(), 0xDD, BLK_SIZE);
         co_await vdev->write(wbuf, written_blk);
         co_await vdev->fsync();
@@ -364,7 +376,7 @@ CORO_TEST_F(VDevTest, LoadRecovery) {
         CO_ASSERT_NE(vdev, nullptr);
         EXPECT_EQ(vdev->name(), "test_recovery");
 
-        IoBuf rbuf{BLK_SIZE, 512};
+        IoBufOwn rbuf{BLK_SIZE, 512};
         auto ec = co_await vdev->read(rbuf, written_blk);
         CO_ASSERT_FALSE(ec);
         // Verify the pattern we wrote.
@@ -391,7 +403,7 @@ CORO_TEST_F(VDevTest, FullWorkflow) {
 
     // Write.
     uint32_t total_size = 2 * BLK_SIZE;
-    IoBuf wbuf{total_size, 512};
+    IoBufOwn wbuf{total_size, 512};
     std::memset(wbuf.bytes(), 0xEE, total_size);
     co_await vdev->write(wbuf, blkid);
 
@@ -399,7 +411,7 @@ CORO_TEST_F(VDevTest, FullWorkflow) {
     co_await vdev->fsync();
 
     // Read + verify.
-    IoBuf rbuf{total_size, 512};
+    IoBufOwn rbuf{total_size, 512};
     auto ec = co_await vdev->read(rbuf, blkid);
     CO_ASSERT_FALSE(ec);
     EXPECT_EQ(std::memcmp(wbuf.bytes(), rbuf.bytes(), total_size), 0);
@@ -427,6 +439,255 @@ CORO_TEST_F(VDevTest, MostAvailableSpaceSelector) {
     EXPECT_EQ(status, BlkAllocStatus::SUCCESS);
 
     co_await dm->close_devices();
+}
+
+// ── ConcurrentWrites ─────────────────────────────────────────────────────────────────────────────────────────────────
+// Many writers hammering the SAME vdev in parallel, spread across reactors.  Every other VDev test issues IO from a
+// single coroutine, so nothing exercised concurrent VirtualDev::write — a data race or a lock held across a co_await
+// (e.g. chunk_mgmt_mutex_) would deadlock here.  Each block reads back its own writer's byte pattern.
+CORO_TEST_F(VDevTest, ConcurrentWrites) {
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto vdev = co_await dm->create_vdev(self.static_params("test_conc_write", 4));
+
+    constexpr int N = 16;
+    std::vector< BlkId > blkids(N);
+    for (int i = 0; i < N; ++i) {
+        blk_alloc_hints hints;
+        CO_ASSERT_EQ(vdev->alloc_contiguous_blks(1, hints, blkids[i]), BlkAllocStatus::SUCCESS);
+    }
+
+    const size_t nreactors = iomgr().num_reactors();
+    std::vector< Async< void > > writes;
+    writes.reserve(N);
+    for (int i = 0; i < N; ++i) {
+        // Captureless coroutine lambda invoked with by-value params — the params live in the coroutine frame, so
+        // they outlive the closure temporary (a captured lambda coroutine would be a stack-use-after-scope: CP.51).
+        writes.push_back(iomgr().spawn_waitable(
+            ReactorTarget::reactor(i % nreactors),
+            [](shared< VirtualDev > vd, BlkId bid, int val) -> Async< void > {
+                IoBufOwn wbuf{BLK_SIZE, 512};
+                std::memset(wbuf.bytes(), to_u8(val & 0xFF), BLK_SIZE);
+                co_await vd->write(wbuf, bid);
+            }(vdev, blkids[i], i)));
+    }
+    co_await folly::coro::collectAllRange(std::move(writes));
+
+    for (int i = 0; i < N; ++i) {
+        IoBufOwn rbuf{BLK_SIZE, 512};
+        auto ec = co_await vdev->read(rbuf, blkids[i]);
+        CO_ASSERT_FALSE(ec);
+        EXPECT_EQ(rbuf.bytes()[0], to_u8(i & 0xFF)) << "block " << i << " has wrong content after concurrent writes";
+    }
+    co_await dm->close_devices();
+}
+
+// ── ConcurrentExpand ─────────────────────────────────────────────────────────────────────────────────────────────────
+// Many expanders racing on the same vdev.  Exercises VirtualDev::expand under concurrency (chunk_mgmt_mutex_ + chunk
+// allocation).  A blocking mutex held across a co_await, or an RCU grace-period wait on a reactor thread, deadlocks
+// here; a state race yields a wrong final chunk count.
+CORO_TEST_F(VDevTest, ConcurrentExpand) {
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto vdev = co_await dm->create_vdev(self.dynamic_params("test_conc_expand"));
+    CO_ASSERT_EQ(vdev->num_chunks(), 0u);
+
+    constexpr int N = 4;
+    const size_t nreactors = iomgr().num_reactors();
+    std::vector< Async< shared< Chunk > > > expands;
+    expands.reserve(N);
+    for (int i = 0; i < N; ++i) {
+        expands.push_back(iomgr().spawn_waitable(
+            ReactorTarget::reactor(i % nreactors),
+            [](shared< VirtualDev > vd) -> Async< shared< Chunk > > { co_return co_await vd->expand(CHUNK_SIZE); }(vdev)));
+    }
+    auto chunks = co_await folly::coro::collectAllRange(std::move(expands));
+    for (auto& c : chunks) {
+        CO_ASSERT_NE(c, nullptr);
+    }
+    EXPECT_EQ(vdev->num_chunks(), to_u32(N)) << "concurrent expand produced wrong chunk count";
+    co_await dm->close_devices();
+}
+
+// ── ConcurrentWritesSinglePdev ───────────────────────────────────────────────────────────────────────────────────────
+// Narrows ConcurrentWrites: same interleaved concurrent-write pattern, but on a vdev with ONE chunk on ONE pdev so the
+// block->offset mapping is trivial (blk_num*blk_size within a single chunk).  PhysicalDev is already proven clean, so
+// if this PASSES the corruption is in VirtualDev's multi-chunk / striped mapping; if it FAILS the race is in
+// VirtualDev::write's core path.
+CORO_TEST_F(VDevTest, ConcurrentWritesSinglePdev) {
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    VDevParameters p;
+    p.vdev_name = "test_conc_1pdev";
+    p.initial_chunk_size = CHUNK_SIZE;
+    p.initial_num_chunks = 1;
+    p.blk_size = BLK_SIZE;
+    p.dev_type = HSDevType::Data;
+    p.multi_pdev_opts = MultiPDevOpts::SingleFirstPDev;
+    p.alloc_type = BlkAllocatorType::SlabCompact;
+    p.chunk_sel_type = ChunkSelectorType::RoundRobin;
+    auto vdev = co_await dm->create_vdev(std::move(p));
+
+    constexpr int N = 16;
+    std::vector< BlkId > blkids(N);
+    for (int i = 0; i < N; ++i) {
+        blk_alloc_hints hints;
+        CO_ASSERT_EQ(vdev->alloc_contiguous_blks(1, hints, blkids[i]), BlkAllocStatus::SUCCESS);
+    }
+
+    const size_t nreactors = iomgr().num_reactors();
+    std::vector< Async< void > > writes;
+    writes.reserve(N);
+    for (int i = 0; i < N; ++i) {
+        writes.push_back(iomgr().spawn_waitable(
+            ReactorTarget::reactor(i % nreactors),
+            [](shared< VirtualDev > vd, BlkId bid, int val) -> Async< void > {
+                IoBufOwn wbuf{BLK_SIZE, 512};
+                std::memset(wbuf.bytes(), to_u8(val & 0xFF), BLK_SIZE);
+                co_await vd->write(wbuf, bid);
+            }(vdev, blkids[i], i)));
+    }
+    co_await folly::coro::collectAllRange(std::move(writes));
+
+    for (int i = 0; i < N; ++i) {
+        IoBufOwn rbuf{BLK_SIZE, 512};
+        auto ec = co_await vdev->read(rbuf, blkids[i]);
+        CO_ASSERT_FALSE(ec);
+        EXPECT_EQ(rbuf.bytes()[0], to_u8(i & 0xFF)) << "block " << i << " wrong content (single-pdev, single-chunk)";
+    }
+    co_await dm->close_devices();
+}
+
+// ── ConcurrentWritesMultiChunkSinglePdev ─────────────────────────────────────────────────────────────────────────────
+// Next narrowing after ConcurrentWritesSinglePdev: 4 chunks but still ONE pdev (no striping).  If this PASSES, the
+// corruption is in the multi-pdev STRIPING offset math; if it FAILS, it's the multi-chunk / round-robin mapping.
+CORO_TEST_F(VDevTest, ConcurrentWritesMultiChunkSinglePdev) {
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    VDevParameters p;
+    p.vdev_name = "test_conc_multichunk_1pdev";
+    p.initial_chunk_size = CHUNK_SIZE;
+    p.initial_num_chunks = 4;
+    p.blk_size = BLK_SIZE;
+    p.dev_type = HSDevType::Data;
+    p.multi_pdev_opts = MultiPDevOpts::SingleFirstPDev;
+    p.alloc_type = BlkAllocatorType::SlabCompact;
+    p.chunk_sel_type = ChunkSelectorType::RoundRobin;
+    auto vdev = co_await dm->create_vdev(std::move(p));
+
+    constexpr int N = 16;
+    std::vector< BlkId > blkids(N);
+    for (int i = 0; i < N; ++i) {
+        blk_alloc_hints hints;
+        CO_ASSERT_EQ(vdev->alloc_contiguous_blks(1, hints, blkids[i]), BlkAllocStatus::SUCCESS);
+    }
+
+    const size_t nreactors = iomgr().num_reactors();
+    std::vector< Async< void > > writes;
+    writes.reserve(N);
+    for (int i = 0; i < N; ++i) {
+        writes.push_back(iomgr().spawn_waitable(
+            ReactorTarget::reactor(i % nreactors),
+            [](shared< VirtualDev > vd, BlkId bid, int val) -> Async< void > {
+                IoBufOwn wbuf{BLK_SIZE, 512};
+                std::memset(wbuf.bytes(), to_u8(val & 0xFF), BLK_SIZE);
+                co_await vd->write(wbuf, bid);
+            }(vdev, blkids[i], i)));
+    }
+    co_await folly::coro::collectAllRange(std::move(writes));
+
+    for (int i = 0; i < N; ++i) {
+        IoBufOwn rbuf{BLK_SIZE, 512};
+        auto ec = co_await vdev->read(rbuf, blkids[i]);
+        CO_ASSERT_FALSE(ec);
+        EXPECT_EQ(rbuf.bytes()[0], to_u8(i & 0xFF)) << "block " << i << " wrong content (4 chunks, single pdev)";
+    }
+    co_await dm->close_devices();
+}
+
+// ── SerialWritesStriped ──────────────────────────────────────────────────────────────────────────────────────────────
+// Control for ConcurrentWrites: identical striped config (4 chunks, AllPDevStriped over 2 pdevs) but writes issued
+// SERIALLY.  If this PASSES, the ConcurrentWrites corruption is a concurrency race in the striped write path; if it
+// FAILS, the striped block->(pdev,offset) mapping itself is wrong.
+CORO_TEST_F(VDevTest, SerialWritesStriped) {
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto vdev = co_await dm->create_vdev(self.static_params("test_serial_striped", 4));
+
+    constexpr int N = 16;
+    std::vector< BlkId > blkids(N);
+    for (int i = 0; i < N; ++i) {
+        blk_alloc_hints hints;
+        CO_ASSERT_EQ(vdev->alloc_contiguous_blks(1, hints, blkids[i]), BlkAllocStatus::SUCCESS);
+    }
+
+    // Serial writes.
+    for (int i = 0; i < N; ++i) {
+        IoBufOwn wbuf{BLK_SIZE, 512};
+        std::memset(wbuf.bytes(), to_u8(i & 0xFF), BLK_SIZE);
+        co_await vdev->write(wbuf, blkids[i]);
+    }
+    for (int i = 0; i < N; ++i) {
+        IoBufOwn rbuf{BLK_SIZE, 512};
+        auto ec = co_await vdev->read(rbuf, blkids[i]);
+        CO_ASSERT_FALSE(ec);
+        EXPECT_EQ(rbuf.bytes()[0], to_u8(i & 0xFF)) << "block " << i << " wrong content (serial striped)";
+    }
+    co_await dm->close_devices();
+}
+
+// ── StripedChunkIdsGloballyUnique ────────────────────────────────────────────────────────────────────────────────────
+// Directly asserts the fix: in a striped vdev spanning both pdevs, every chunk_id — and its narrowed chunk_num_t
+// (uint16) form used inside BlkId — must be globally distinct.  The old formula chunk_id = pdev_id*MAX_CHUNKS + cslot
+// overflowed the uint16 chunk_num for pdev_id >= 1, so pdev-1's chunks aliased pdev-0's and writes corrupted each
+// other.  With chunk_id drawn from the DeviceManager's global pool, all ids are unique in [0, 64K).
+CORO_TEST_F(VDevTest, StripedChunkIdsGloballyUnique) {
+    auto dm = co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+    auto vdev = co_await dm->create_vdev(self.static_params("test_unique_ids", 4)); // striped over 2 pdevs
+
+    const uint32_t n = vdev->num_chunks();
+    CO_ASSERT_EQ(n, 4u);
+
+    std::set< uint32_t > ids;
+    std::set< uint16_t > narrowed;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t cid = vdev->get_nth_chunk(i)->chunk_id();
+        ids.insert(cid);
+        narrowed.insert(to_u16(cid));
+    }
+    EXPECT_EQ(ids.size(), n) << "chunk_ids collide across pdevs in a striped vdev";
+    EXPECT_EQ(narrowed.size(), n) << "chunk_num_t (uint16) forms collide — BlkId would address the wrong chunk";
+
+    co_await dm->close_devices();
+}
+
+// ── ChunkIdPoolRebuiltOnRecovery ─────────────────────────────────────────────────────────────────────────────────────
+// Validates that the in-memory global chunk-id pool is rebuilt from loaded ChunkInfos on boot (mark_chunk_id_used).
+// Create a striped vdev, record its chunk_ids, reload, then create a SECOND striped vdev: its freshly-allocated
+// chunk_ids must not collide with the ones recovered from disk.  Without the rebuild, the pool would restart at 0 and
+// the new vdev's chunks would reuse the recovered ids.
+CORO_TEST_F(VDevTest, ChunkIdPoolRebuiltOnRecovery) {
+    std::set< uint32_t > first_ids;
+
+    // Phase 1: create a striped vdev, capture its chunk_ids.
+    {
+        auto dm =
+            co_await DeviceManager::create_and_format(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+        auto vdev = co_await dm->create_vdev(self.static_params("test_recov_v1", 4));
+        for (uint32_t i = 0; i < vdev->num_chunks(); ++i) {
+            first_ids.insert(vdev->get_nth_chunk(i)->chunk_id());
+        }
+        co_await dm->close_devices();
+    }
+
+    // Phase 2: reload (pool rebuilt from disk), then create a second vdev and check for collisions.
+    {
+        auto dm = DeviceManager::create(self.make_dev_infos(), IOFlag::BUFFERED_IO, IOFlag::BUFFERED_IO);
+        co_await dm->load_devices();
+
+        auto vdev2 = co_await dm->create_vdev(self.static_params("test_recov_v2", 4));
+        for (uint32_t i = 0; i < vdev2->num_chunks(); ++i) {
+            const uint32_t cid = vdev2->get_nth_chunk(i)->chunk_id();
+            EXPECT_EQ(first_ids.count(cid), 0u)
+                << "chunk_id " << cid << " reused after recovery — global pool was not rebuilt from disk";
+        }
+        co_await dm->close_devices();
+    }
 }
 
 int main(int argc, char* argv[]) {

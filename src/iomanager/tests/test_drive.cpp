@@ -13,6 +13,7 @@
 #endif
 
 #include <gtest/gtest.h>
+#include <folly/coro/Collect.h>
 
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
@@ -166,6 +167,47 @@ TEST_F(DriveTest, MultiReactorConcurrentWriteReadVerify) {
         EXPECT_GT(results[i], 0u) << "reactor " << i << " completed no IOs";
         LOGINFO("Reactor {}: {} IOs completed", i, results[i]);
     }
+}
+
+// ── Interleaved concurrent writes across reactors ──────────────────────────────
+//
+// The disjoint-region test above never has two reactors writing ADJACENT offsets at the same time.  This one does:
+// block i is written from reactor i%N, so neighbouring blocks land on different reactors concurrently.  ALL writes are
+// issued first (collectAllRange), then the whole range is read back and verified — so any cross-reactor write
+// interference surfaces as a block holding the wrong offset's pattern.  This isolates whether DriveInterface itself
+// races on concurrent writes to distinct, interleaved offsets.
+TEST_F(DriveTest, InterleavedConcurrentWrites) {
+    DriveInterface drive;
+    constexpr uint32_t N = 64;
+    const size_t nreactors = iomgr().num_reactors();
+
+    iomgr().spawn_and_block(ReactorTarget::reactor(0), [this, &drive, nreactors]() -> Async< void > {
+        std::vector< Async< void > > writes;
+        writes.reserve(N);
+        for (uint32_t i = 0; i < N; ++i) {
+            const uint64_t offset = static_cast< uint64_t >(i) * kBlockSize;
+            // Captureless coroutine lambda with by-value params (params live in the frame; a captured lambda
+            // coroutine would be a stack-use-after-scope).  drive/m_iodev outlive all writes via the outer frame.
+            writes.push_back(iomgr().spawn_waitable(
+                ReactorTarget::reactor(i % nreactors),
+                [](DriveInterface* dr, std::shared_ptr< IoDevice > dev, uint64_t off) -> Async< void > {
+                    sisl::IoBufOwn wbuf{static_cast< uint32_t >(kBlockSize)};
+                    fill_pattern(wbuf, off);
+                    auto ec = co_await dr->write(*dev, wbuf, off);
+                    EXPECT_FALSE(ec) << "write error at " << off << ": " << ec.message();
+                }(&drive, m_iodev, offset)));
+        }
+        co_await folly::coro::collectAllRange(std::move(writes));
+
+        // Read the whole range back (serially) and verify each block holds ITS own offset's pattern.
+        for (uint32_t i = 0; i < N; ++i) {
+            const uint64_t offset = static_cast< uint64_t >(i) * kBlockSize;
+            sisl::IoBufOwn rbuf{static_cast< uint32_t >(kBlockSize)};
+            auto ec = co_await drive.read(*m_iodev, rbuf, offset);
+            EXPECT_FALSE(ec) << "read error at " << offset;
+            EXPECT_TRUE(verify_pattern(rbuf, offset)) << "block at offset " << offset << " has wrong content";
+        }
+    }());
 }
 
 // ── WriteZero ─────────────────────────────────────────────────────────────────

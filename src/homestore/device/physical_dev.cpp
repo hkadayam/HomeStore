@@ -24,8 +24,14 @@
 #include <system_error>
 
 #include "homestore/device/physical_dev.h"
+#include "homestore/device/device_manager.h" // DeviceManager: global chunk_id authority
+#include "homestore/base/homestore_assert.h"
 
 namespace homestore {
+
+// Per-pdev logging on the device module (mirrors VDEV_LOG), keyed by device name so a pdev's lines group under
+// `--log_mods device:trace`.
+#define PDEV_LOG(level, ...) HS_SUBMOD_LOG(level, device, , "pdev", get_devname(), ##__VA_ARGS__)
 
 using namespace iomanager;
 using sisl::IoBuf;
@@ -158,10 +164,11 @@ Async< shared< PhysicalDev > > PhysicalDev::construct(const DevInfo& dinfo, int 
     const uint64_t page = pinfo.dev_attr.phys_page_size;
     const uint64_t rounded = (page > 0) ? (actual / page) * page : actual;
     if (rounded != actual) {
-        std::cout << "device size=" << actual << " is not a multiple of physical page; adjusted to " << rounded << "\n";
+        HS_LOG(INFO, device, "pdev {}: device size={} not a multiple of physical page; adjusted to {}", dinfo.dev_name,
+               actual, rounded);
     }
 
-    std::cout << "Device " << dinfo.dev_name << " opened, size=" << rounded << "\n";
+    HS_LOG(INFO, device, "pdev {} opened: size={}", dinfo.dev_name, rounded);
 
     pdev->devname_ = dinfo.dev_name;
     pdev->dev_type_ = dinfo.dev_type;
@@ -295,6 +302,21 @@ Async< void > PhysicalDev::format_chunks() {
     chunk_provisioner_.chunk_info_slots = std::make_unique< sisl::Bitset >(std::move(bitset));
 }
 
+uint32_t PhysicalDev::alloc_chunk_id_locked(uint64_t cslot) {
+    // Standalone single-pdev use (no DeviceManager): the per-pdev slot is itself globally unique, so use it directly.
+    if (dev_mgr_ == nullptr) {
+        return to_u32(cslot);
+    }
+    // Multi-pdev: draw a globally-unique id so pdev N's chunks never alias pdev 0's (the old pdev_id*64K+slot formula
+    // overflowed the uint16_t chunk_num for pdev_id >= 1).
+    auto id = dev_mgr_->allocate_chunk_id();
+    if (!id) {
+        throw std::out_of_range("No free global chunk_id; system limit of " +
+                                std::to_string(MAX_CHUNKS_IN_SYSTEM) + " chunks reached");
+    }
+    return *id;
+}
+
 Async< shared< Chunk > > PhysicalDev::create_chunk(uint32_t vdev_id, uint64_t size, uint64_t vdev_order,
                                                    const uint8_t* user_private_data, size_t up_size) {
     auto lock = co_await chunk_mutex_.co_scoped_lock();
@@ -310,7 +332,7 @@ Async< shared< Chunk > > PhysicalDev::create_chunk(uint32_t vdev_id, uint64_t si
     }
     prov.chunk_info_slots->set_bit(cslot);
 
-    const uint32_t chunk_id = to_u32(pdev_id() * MAX_CHUNKS_IN_SYSTEM + cslot);
+    const uint32_t chunk_id = alloc_chunk_id_locked(cslot);
 
     ChunkInfo cinfo{};
     populate_chunk_info_locked(prov, cinfo, vdev_id, size, chunk_id, vdev_order, user_private_data, up_size);
@@ -328,7 +350,8 @@ Async< shared< Chunk > > PhysicalDev::create_chunk(uint32_t vdev_id, uint64_t si
     const auto bm = prov.chunk_info_slots->serialize(pdev_info_.dev_attr.align_size);
     co_await write_super_block(*bm, chunk_sb_offset());
 
-    std::cout << "Created chunk " << chunk_id << " (slot " << cslot << ", vdev " << vdev_id << ")\n";
+    PDEV_LOG(INFO, "created chunk: chunk_id={} pdev_id={} cslot={} vdev_id={} vdev_order={}", chunk_id, pdev_id(),
+             cslot, vdev_id, vdev_order);
     co_return chunk;
 }
 
@@ -359,7 +382,7 @@ Async< std::vector< shared< Chunk > > > PhysicalDev::create_chunks(uint32_t vdev
         std::vector< shared< Chunk > > batch_chunks;
         for (uint32_t i = 0; i < b.nbits; ++i, ptr += ChunkInfo::SIZE) {
             const uint64_t cslot = b.start_bit + i;
-            const uint32_t chunk_id = to_u32(pdev_id() * MAX_CHUNKS_IN_SYSTEM + cslot);
+            const uint32_t chunk_id = alloc_chunk_id_locked(cslot);
             const uint64_t vdev_order = cur_vdev_order++;
 
             ChunkInfo cinfo{};
@@ -370,7 +393,8 @@ Async< std::vector< shared< Chunk > > > PhysicalDev::create_chunks(uint32_t vdev
 
             prov.chunks.emplace(chunk_id, chunk);
             batch_chunks.push_back(chunk);
-            std::cout << "Creating chunk " << chunk_id << " (slot " << cslot << ")\n";
+            PDEV_LOG(INFO, "created chunk: chunk_id={} pdev_id={} cslot={} vdev_id={} vdev_order={}", chunk_id,
+                     pdev_id(), cslot, vdev_id, vdev_order);
         }
 
         prov.chunk_info_slots->set_bits(b.start_bit, b.nbits);
@@ -445,6 +469,11 @@ Async< std::unordered_map< uint32_t, std::vector< shared< Chunk > > > > Physical
         prov.chunks.emplace(chunk_id, chunk);
         chunks_by_vdev[vdev_id].push_back(chunk);
 
+        // Rebuild the system-wide chunk-id pool: every loaded chunk (active or pooled) reserves its id.
+        if (dev_mgr_ != nullptr) {
+            dev_mgr_->mark_chunk_id_used(chunk_id);
+        }
+
         prev_bit = b + 1;
     }
     prov.chunk_info_slots = std::make_unique< sisl::Bitset >(std::move(bitset));
@@ -471,7 +500,12 @@ Async< void > PhysicalDev::remove_chunk(cshared< Chunk >& chunk) {
     const auto bm = prov.chunk_info_slots->serialize(pdev_info_.dev_attr.align_size);
     co_await write_super_block(*bm, chunk_sb_offset());
 
-    std::cout << "Removed chunk " << chunk_id << "\n";
+    // Release the global chunk-id now that the chunk is gone from disk.
+    if (dev_mgr_ != nullptr) {
+        dev_mgr_->free_chunk_id(chunk_id);
+    }
+
+    PDEV_LOG(INFO, "removed chunk: chunk_id={}", chunk_id);
     co_return;
 }
 
@@ -491,6 +525,9 @@ Async< void > PhysicalDev::remove_chunks(const std::vector< shared< Chunk > >& c
         std::memcpy(freed_buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
         co_await write_super_block(freed_buf, chunk_info_offset_nth(chunk->slot_number()));
         prov.chunk_info_slots->reset_bit(chunk->slot_number());
+        if (dev_mgr_ != nullptr) {
+            dev_mgr_->free_chunk_id(cinfo.chunk_id);
+        }
     }
 
     // Single bitmap write for the entire batch.
@@ -527,7 +564,7 @@ Async< void > PhysicalDev::deactivate_chunk(cshared< Chunk >& chunk) {
     co_await write(buf, chunk_info_offset_nth(chunk->slot_number()));
 
     chunk->update_info(cinfo);
-    std::cout << "Deactivated chunk " << chunk->chunk_id() << " for pooling\n";
+    PDEV_LOG(DEBUG, "deactivated chunk for pooling: chunk_id={}", chunk->chunk_id());
     co_return;
 }
 
@@ -542,7 +579,7 @@ Async< void > PhysicalDev::reactivate_chunk(cshared< Chunk >& chunk, uint64_t ne
     co_await write(buf, chunk_info_offset_nth(chunk->slot_number()));
 
     chunk->update_info(cinfo);
-    std::cout << "Reactivated chunk " << chunk->chunk_id() << " with vdev_order=" << new_vdev_order << "\n";
+    PDEV_LOG(DEBUG, "reactivated chunk: chunk_id={} vdev_order={}", chunk->chunk_id(), new_vdev_order);
     co_return;
 }
 

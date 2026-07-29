@@ -40,6 +40,8 @@ namespace homestore {
 Async< shared< iomanager::IoDevice > > open_and_cache_dev(const std::string& devname, int oflags);
 Async< void > close_and_uncache_dev(const std::string& devname);
 
+class DeviceManager;
+
 // ── ChunkProvisioner ──────────────────────────────────────────────────────────
 // All mutable chunk-related state is grouped here and protected by
 // PhysicalDev::chunk_mutex_ (a folly::coro::Mutex so it can be held across
@@ -121,7 +123,8 @@ public:
     /// Initialise the on-disk chunk slot bitmap (first-time format).
     Async< void > format_chunks();
 
-    /// Allocate one chunk slot; chunk_id = pdev_id * MAX_CHUNKS_IN_SYSTEM + slot_number.
+    /// Allocate one per-pdev chunk slot; chunk_id is a globally-unique id from the DeviceManager (or the slot itself
+    /// for standalone single-pdev use).
     Async< shared< Chunk > > create_chunk(uint32_t vdev_id, uint64_t size, uint64_t vdev_order,
                                           const uint8_t* user_private = nullptr, size_t user_private_size = 0);
 
@@ -158,6 +161,10 @@ public:
 
     // ── Parameter getters (sync — immutable after construction) ──────────────
     uint32_t pdev_id() const { return pdev_info_.pdev_id; }
+
+    /// Set the owning DeviceManager, the authority for globally-unique chunk_id allocation. Left null for standalone
+    /// (single-pdev) use, where the per-pdev chunk slot is itself globally unique.
+    void set_device_mgr(DeviceManager* dmgr) { dev_mgr_ = dmgr; }
     const std::string& get_devname() const { return devname_; }
     uint32_t optimal_page_size() const { return pdev_info_.dev_attr.phys_page_size; }
     uint32_t align_size() const { return pdev_info_.dev_attr.align_size; }
@@ -189,6 +196,9 @@ private:
     /// Clear chunk data-area bookkeeping and mark cinfo free.
     static void free_chunk_info_locked(ChunkProvisioner& prov, ChunkInfo& cinfo);
 
+    /// Obtain a globally-unique chunk_id: from the DeviceManager if set, else the per-pdev slot (standalone use).
+    uint32_t alloc_chunk_id_locked(uint64_t cslot);
+
     /// Walk chunk_data_area to find the first gap of at least `size` bytes.
     ChunkInterval find_next_chunk_area_locked(const ChunkIntervalSet& data_area, uint64_t size) const;
 
@@ -207,6 +217,10 @@ private:
     PDevInfoHeader pdev_info_;
     uint64_t devsize_{0};
     bool super_blk_in_footer_{false};
+
+    // Non-owning back-reference to the DeviceManager that owns this pdev; the authority for globally-unique chunk_id
+    // allocation. DeviceManager outlives all its pdevs. Null for standalone single-pdev use (see set_device_mgr).
+    DeviceManager* dev_mgr_{nullptr};
 
     // All mutable chunk state lives here, protected by chunk_mutex_.
     folly::coro::Mutex chunk_mutex_;

@@ -48,6 +48,14 @@ target_link_libraries(sisl_settings PUBLIC
     userspace-rcu::userspace-rcu
 )
 
+# ── version ───────────────────────────────────────────────────────────────────
+add_library(sisl_version OBJECT
+    version.cpp
+)
+target_link_libraries(sisl_version PUBLIC
+    ${COMMON_DEPS}
+)
+
 add_subdirectory(flip)
 
 if(NOT DEFINED BUILD_TESTING OR BUILD_TESTING)

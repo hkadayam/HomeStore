@@ -43,6 +43,10 @@ struct DeviceManagerState {
     std::unordered_map< uint8_t, std::vector< shared< PhysicalDev > > > pdevs_by_type;
 
     std::unique_ptr< sisl::Bitset > vdev_slot_bm; // one bit per vdev_id slot
+    // System-wide chunk-id allocator: one bit per chunk_id in [0, MAX_CHUNKS_IN_SYSTEM). Purely in-memory and derived —
+    // not persisted. Rebuilt on boot from the union of every loaded ChunkInfo's chunk_id. Decouples chunk_id from a
+    // pdev's physical slot so ids are globally unique across all pdevs.
+    std::unique_ptr< sisl::Bitset > chunk_id_bm;
     uint32_t cur_pdev_id{0};
     FirstBlockHeader first_blk_hdr{};
     bool first_time_boot{true};
@@ -108,6 +112,14 @@ public:
     // ── VDev slot bitmap management ───────────────────────────────────────────
     std::optional< uint32_t > allocate_vdev_id();
     void free_vdev_id(uint32_t vdev_id);
+
+    // ── System-wide chunk-id allocation (see DeviceManagerState::chunk_id_bm) ──
+    /// Reserve and return a free global chunk_id, or nullopt if all MAX_CHUNKS_IN_SYSTEM ids are in use.
+    std::optional< uint32_t > allocate_chunk_id();
+    /// Release a chunk_id back to the pool (on chunk removal).
+    void free_chunk_id(uint32_t chunk_id);
+    /// Recovery: mark a chunk_id as in-use while rebuilding the pool from loaded ChunkInfos.
+    void mark_chunk_id_used(uint32_t chunk_id);
 
 private:
     DeviceManager(std::vector< DevInfo >&& devs, IOFlag data_open_flags, IOFlag fast_open_flags);

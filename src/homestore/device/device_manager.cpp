@@ -59,6 +59,7 @@ DeviceManager::DeviceManager(std::vector< DevInfo >&& devs, IOFlag data_open_fla
         dev_infos_{std::move(devs)},
         data_open_flags_{io_flag_to_posix(data_open_flags)},
         fast_open_flags_{io_flag_to_posix(fast_open_flags)} {
+    state_.chunk_id_bm = std::make_unique< sisl::Bitset >(MAX_CHUNKS_IN_SYSTEM);
 }
 
 shared< DeviceManager > DeviceManager::create(std::vector< DevInfo >&& devs, IOFlag data_open_flags,
@@ -119,6 +120,7 @@ Async< void > DeviceManager::format_devices() {
         }
 
         auto pdev = co_await PhysicalDev::create(dinfo, oflags, pdev_id, state_.first_blk_hdr);
+        pdev->set_device_mgr(this); // authority for globally-unique chunk_id allocation
         const uint32_t id = pdev->pdev_id();
 
         {
@@ -173,6 +175,7 @@ Async< void > DeviceManager::load_devices() {
         const int oflags = device_open_flags(dinfo.dev_type);
 
         auto pdev = co_await PhysicalDev::load(dinfo, oflags, state_.first_blk_hdr);
+        pdev->set_device_mgr(this); // authority for globally-unique chunk_id allocation
         const uint32_t id = pdev->pdev_id();
 
         {
@@ -345,6 +348,29 @@ void DeviceManager::free_vdev_id(uint32_t vdev_id) {
     std::lock_guard lg{state_mutex_};
     assert(state_.vdev_slot_bm);
     state_.vdev_slot_bm->reset_bit(to_u64(vdev_id));
+}
+
+std::optional< uint32_t > DeviceManager::allocate_chunk_id() {
+    std::lock_guard lg{state_mutex_};
+    assert(state_.chunk_id_bm);
+    const uint64_t pos = state_.chunk_id_bm->get_next_reset_bit(0);
+    if (pos == sisl::Bitset::npos) {
+        return std::nullopt;
+    }
+    state_.chunk_id_bm->set_bit(pos);
+    return to_u32(pos);
+}
+
+void DeviceManager::free_chunk_id(uint32_t chunk_id) {
+    std::lock_guard lg{state_mutex_};
+    assert(state_.chunk_id_bm);
+    state_.chunk_id_bm->reset_bit(to_u64(chunk_id));
+}
+
+void DeviceManager::mark_chunk_id_used(uint32_t chunk_id) {
+    std::lock_guard lg{state_mutex_};
+    assert(state_.chunk_id_bm);
+    state_.chunk_id_bm->set_bit(to_u64(chunk_id));
 }
 
 // ── Private async helpers ─────────────────────────────────────────────────────

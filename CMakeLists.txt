@@ -89,7 +89,10 @@ endif()
 
 if(${CMAKE_BUILD_TYPE} STREQUAL "Debug")
     message(STATUS "Debug build")
-    add_flags("-DDEBUG_RCU -D_DEBUG")
+    # SISL_FLIP_ENABLED gates the entire flip fault-injection surface (see sisl/flip/flip.h).  Release builds do
+    # not define it: flip::test_flip/get_test_flip become constexpr constants (branches fold away) and the
+    # flip_test/flip_delay/flip_await_delay macros expand to nothing — call sites need no #ifdef of their own.
+    add_flags("-DDEBUG_RCU -D_DEBUG -DSISL_FLIP_ENABLED")
 else()
     message(STATUS "Release build")
     if((${CMAKE_CXX_COMPILER_ID} STREQUAL "GNU") OR (${CMAKE_CXX_COMPILER_ID} STREQUAL "Clang")) 

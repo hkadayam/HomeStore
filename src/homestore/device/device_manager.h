@@ -78,6 +78,10 @@ public:
     DeviceManager& operator=(const DeviceManager&) = delete;
 
     // ── Boot-time queries (valid after format_devices / load_devices) ─────────
+    // Probe the lead device's first block and record whether this is a first-time boot (no valid header) or a
+    // recovery boot (valid header).  Must run after create(), before the caller branches to format() vs load() —
+    // it makes is_first_time_boot() answerable up front.  Returns the recorded first-time-boot verdict.
+    Async< bool > determine_first_time_boot();
     bool is_first_time_boot() const;
     bool is_boot_in_degraded_mode() const;
 

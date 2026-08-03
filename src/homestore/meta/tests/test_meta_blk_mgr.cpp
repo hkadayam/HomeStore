@@ -537,6 +537,171 @@ CORO_TEST_F(MetaBlkMgrTest, SizeTransitions) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Test 9a: Rewrite a NON-TAIL block through the cached handle create() returned, then restart.
+//
+// This is the case the earlier in-place tests missed: they only ever rewrote a single-block (tail) chain, and always
+// re-fetched via get_meta_blk() first.  Here A is rewritten while B sits after it in the chain, and A is rewritten
+// through the same handle create() handed back — never re-fetched.  With a per-copy MetaBlk that stale handle used to
+// overwrite the chain linkage and orphan B; with the shared holder the linkage is authoritative and B survives.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+CORO_TEST_F(MetaBlkMgrTest, RewriteNonTailThroughCachedHandle) {
+    const size_t data_size = 100;
+
+    {
+        auto dm = co_await self.format_and_create_meta();
+        auto client = co_await meta_mgr().register_client("rewriter");
+
+        // A becomes the chain head.  Keep the handle create() returned — do NOT re-fetch via get_meta_blk.
+        auto blk_a = co_await client.create_meta_blk("A", data_size);
+        co_await client.write_meta_blk(blk_a, make_pattern_buf(1, data_size));
+
+        // B is appended after A, so A is now a non-tail (mid-chain) block.
+        auto blk_b = co_await client.create_meta_blk("B", data_size);
+        co_await client.write_meta_blk(blk_b, make_pattern_buf(2, data_size));
+
+        // Rewrite A through its cached handle.  The block is already linked, so this is a pure in-place payload update.
+        co_await client.write_meta_blk(blk_a, make_pattern_buf(11, data_size));
+
+        EXPECT_EQ(co_await client.num_meta_blks(), 2u);
+        co_await dm->close_devices();
+    }
+
+    {
+        auto dm = co_await self.reload_meta();
+        auto client = co_await meta_mgr().register_client("rewriter");
+        EXPECT_EQ(co_await client.num_meta_blks(), 2u) << "B must survive the rewrite of non-tail block A";
+
+        bool saw_a = false;
+        bool saw_b = false;
+        co_await client.for_each_recovered_block(
+            [&saw_a, &saw_b, data_size](const MetaBlk& blk, const sisl::IoBufView& data) -> Async< void > {
+                if (blk.name() == "A") {
+                    saw_a = true;
+                    EXPECT_TRUE(verify_pattern(data, 11, data_size)) << "A must hold its rewritten (v2) data";
+                } else if (blk.name() == "B") {
+                    saw_b = true;
+                    EXPECT_TRUE(verify_pattern(data, 2, data_size)) << "B must be intact";
+                }
+                co_return;
+            });
+        EXPECT_TRUE(saw_a) << "A missing after restart";
+        EXPECT_TRUE(saw_b) << "B orphaned by A's rewrite";
+        co_await dm->close_devices();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Test 9b: Repeatedly re-persist the head block through its cached handle with two successors behind it, then restart.
+//
+// Mirrors a COWBtree's per-flush pattern: three SB blocks (incr_map + full_map[0..1]) created up front, then the first
+// one re-written on every CP.  Every block must survive, and the repeatedly-rewritten one must hold its last value.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+CORO_TEST_F(MetaBlkMgrTest, RewriteHeadRepeatedlyThenRestart) {
+    const size_t data_size = 80;
+
+    {
+        auto dm = co_await self.format_and_create_meta();
+        auto client = co_await meta_mgr().register_client("flusher");
+
+        auto blk0 = co_await client.create_meta_blk("s0", data_size);
+        co_await client.write_meta_blk(blk0, make_pattern_buf(1000, data_size));
+        auto blk1 = co_await client.create_meta_blk("s1", data_size);
+        co_await client.write_meta_blk(blk1, make_pattern_buf(1001, data_size));
+        auto blk2 = co_await client.create_meta_blk("s2", data_size);
+        co_await client.write_meta_blk(blk2, make_pattern_buf(1002, data_size));
+
+        // Re-persist s0 (the head, with s1/s2 behind it) five times through its cached handle.
+        for (uint64_t v = 0; v < 5; ++v) {
+            co_await client.write_meta_blk(blk0, make_pattern_buf(2000 + v, data_size));
+        }
+        EXPECT_EQ(co_await client.num_meta_blks(), 3u);
+        co_await dm->close_devices();
+    }
+
+    {
+        auto dm = co_await self.reload_meta();
+        auto client = co_await meta_mgr().register_client("flusher");
+        EXPECT_EQ(co_await client.num_meta_blks(), 3u) << "all three blocks must survive repeated head rewrites";
+
+        std::unordered_map< std::string, bool > seen{{"s0", false}, {"s1", false}, {"s2", false}};
+        co_await client.for_each_recovered_block(
+            [&seen, data_size](const MetaBlk& blk, const sisl::IoBufView& data) -> Async< void > {
+                auto it = seen.find(blk.name());
+                if (it == seen.end()) {
+                    co_return;
+                }
+                it->second = true;
+                if (blk.name() == "s0") {
+                    EXPECT_TRUE(verify_pattern(data, 2004, data_size)) << "s0 must hold its last rewrite";
+                } else if (blk.name() == "s1") {
+                    EXPECT_TRUE(verify_pattern(data, 1001, data_size)) << "s1 corrupted";
+                } else {
+                    EXPECT_TRUE(verify_pattern(data, 1002, data_size)) << "s2 corrupted";
+                }
+                co_return;
+            });
+        for (auto& [name, ok] : seen) {
+            EXPECT_TRUE(ok) << "block " << name << " missing after restart";
+        }
+        co_await dm->close_devices();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Test 9c: Remove an ENTIRE chain, then build a fresh chain, then restart — mirrors a table (COWBtree) being dropped
+// and a new one created on the same device before the next boot.  Only the second chain must survive; none of the
+// first chain's blocks may reappear.  Removal follows the drop order: tail first, then head-first for the rest.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+CORO_TEST_F(MetaBlkMgrTest, RemoveChainThenReAddThenRestart) {
+    const size_t data_size = 64;
+
+    {
+        auto dm = co_await self.format_and_create_meta();
+        auto client = co_await meta_mgr().register_client("dev");
+
+        // Round A: chain a0 -> a1 -> a2 -> a3 (a3 appended last, like a node mblk written after the stream SBs).
+        std::vector< MetaBlk > a;
+        for (uint64_t id = 0; id < 4; ++id) {
+            auto blk = co_await client.create_meta_blk(fmt::format("a{}", id), data_size);
+            co_await client.write_meta_blk(blk, make_pattern_buf(id, data_size));
+            a.push_back(std::move(blk));
+        }
+
+        // Drop the whole chain in the COWBtree destroy order: tail (a3) first, then head-first (a0, a1, a2).
+        co_await client.remove_meta_blk(a[3]);
+        co_await client.remove_meta_blk(a[0]);
+        co_await client.remove_meta_blk(a[1]);
+        co_await client.remove_meta_blk(a[2]);
+        EXPECT_EQ(co_await client.num_meta_blks(), 0u);
+
+        // Round B: a fresh chain b10..b13 on the now-empty client.
+        for (uint64_t id = 10; id < 14; ++id) {
+            auto blk = co_await client.create_meta_blk(fmt::format("b{}", id), data_size);
+            co_await client.write_meta_blk(blk, make_pattern_buf(id, data_size));
+        }
+        EXPECT_EQ(co_await client.num_meta_blks(), 4u);
+        co_await dm->close_devices();
+    }
+
+    {
+        auto dm = co_await self.reload_meta();
+        auto client = co_await meta_mgr().register_client("dev");
+        EXPECT_EQ(co_await client.num_meta_blks(), 4u) << "only the round-B chain should survive the drop+recreate";
+
+        size_t found = 0;
+        co_await client.for_each_recovered_block(
+            [&found](const MetaBlk& blk, const sisl::IoBufView& data) -> Async< void > {
+                ++found;
+                EXPECT_EQ(blk.name().substr(0, 1), std::string{"b"})
+                    << "stale round-A block '" << blk.name() << "' reappeared after restart";
+                co_return;
+            });
+        EXPECT_EQ(found, 4u);
+        co_await dm->close_devices();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 // Test 10: Multiple restart cycles with interleaved write/remove.
 //   Cycle 1: create 3 blocks.
 //   Cycle 2: reload, verify 3, remove 1, add 2 more → 4 blocks.

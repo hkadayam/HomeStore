@@ -61,6 +61,9 @@ void IOManager::start(size_t num_reactors) {
 
             auto* eb = ebm_->getEventBase();
             shard_ebs_[my_id] = eb;
+            // Also publish this reactor's EventBase through the GLOBAL EventBaseManager, so folly-level layers that
+            // cannot depend on iomgr (e.g. sisl flip's delay timer) can target the calling reactor's own EB.
+            folly::EventBaseManager::get()->setEventBase(eb, /*takeOwnership=*/false);
             LOGINFO("Reactor {} init: eb={} backend={} isRunning={}", my_id, fmt::ptr(eb), fmt::ptr(eb->getBackend()),
                     eb->isRunning());
 
@@ -122,7 +125,7 @@ folly::EventBase* IOManager::resolve_target(ReactorTarget target) const {
     case ReactorTarget::Tag::Any:
         return shard_ebs_[const_cast< IOManager* >(this)->next_reactor()];
     case ReactorTarget::Tag::All:
-        throw std::logic_error("resolve_target called with ReactorTarget::All — use spawn_waitable_all");
+        throw std::logic_error("resolve_target called with ReactorTarget::All — use spawn_waitable_all_seq or _parallel");
     }
     __builtin_unreachable();
 }

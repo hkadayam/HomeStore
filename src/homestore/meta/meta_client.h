@@ -79,9 +79,9 @@ public:
 
     /// Write data to a MetaBlk.
     ///
-    /// - New block (is_fresh == true): data written, block appended to the tail, client info updated on disk,
-    ///   and is_fresh set to false so subsequent calls overwrite in-place.
-    /// - Existing block (is_fresh == false): data is overwritten in-place; no relinking.
+    /// - Fresh block (not yet linked): data written, block appended to the tail, client info updated on disk, and the
+    ///   block marked linked so subsequent calls overwrite in-place.
+    /// - Linked block: data is overwritten in-place on its shared holder; no relinking.
     Async< void > write_meta_blk(MetaBlk& blk, const sisl::IoBufShared& data);
 
     /// Read the payload from an existing MetaBlk.

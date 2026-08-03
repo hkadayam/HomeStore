@@ -13,8 +13,9 @@
  *
  *********************************************************************************/
 //
-// Multi-process replication bring-up + convergence test: stand up an N-replica raft group, propose a batch of
-// writes on the leader, and verify every replica converged to the identical committed key→value contents.
+// Replication test binary entry point + the canonical bring-up/convergence smoke test. The full suite is split by
+// category across sibling .cpp files (test_repl_writes/recovery/... — Category A/B/...) that all compile into this
+// one binary and share the ReplicaSetTest fixture from repl_test_base.h; main() and the smoke test live here.
 //
 #include <memory>
 #include <vector>
@@ -31,8 +32,6 @@ using namespace test_common;
 
 // The one multi-process helper for this run (declared extern in repl_test_base.h).
 std::unique_ptr< HSReplTestHelper > test_common::g_helper;
-
-class ReplicaSetTest : public ReplicaSetTestBase {};
 
 TEST_F(ReplicaSetTest, ReplicatedWrites) {
     auto const n = SISL_OPTIONS["num_io"].as< uint64_t >();
@@ -57,7 +56,18 @@ int main(int argc, char* argv[]) {
 
     // Pin leadership so the replica that creates the group stays leader for the whole test — makes the write path
     // deterministic (the leader never yields mid-run).
-    HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.consensus.leadership_expiry_ms = -1; });
+    HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) {
+        s.consensus.leadership_expiry_ms = -1;
+        // Election timeout must tolerate the multi-second btree store recovery: on a full-cluster restart the replicas
+        // boot at different speeds, and with the default ~800-1700ms window a fast replica election-times-out and steals
+        // leadership before a slow-booting peer's raft is even up, churning leadership so teardown/destroy never settles.
+        // Widen it well past the worst-case recovery boot so the pre-restart leader reasserts before anyone re-elects.
+        s.consensus.elect_to_low_ms = 5000;
+        s.consensus.elect_to_high_ms = 10000;
+        // Fast, grace-free group-destroy reaping so each test's teardown completes promptly between tests.
+        s.consensus.replica_set_reaper_scan_interval_ms = 1000;
+        s.consensus.replica_set_reaper_grace_sec = 0;
+    });
     HS_SETTINGS_FACTORY().save();
 
     g_helper = std::make_unique< HSReplTestHelper >("test_replica_set", args, argv);

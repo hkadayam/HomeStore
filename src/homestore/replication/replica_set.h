@@ -600,7 +600,12 @@ private:
 
     /// Persist the current sb_buffer_ contents through sb_mblk_.  Called after any sb()-> mutation to make
     /// the change durable.
-    Async< void > write_sb() { co_await sb_mblk_.write(sb_buffer_.cbytes(), sb_buffer_.size()); }
+    Async< void > write_sb() {
+        RS_LOG(DEBUG, NO_TRACE_ID, "write_sb: sb_blk_num={} raft_log_store_id={} free_blks_journal_id={} commit_lsn={}",
+               sb_mblk_.meta_blk().blkid().blk_num(), sb()->raft_log_store_id, sb()->free_blks_journal_id,
+               sb()->commit_lsn);
+        co_await sb_mblk_.write(sb_buffer_.cbytes(), sb_buffer_.size());
+    }
 
     /// Local half of the two-phase destroy — marks this replica as DESTROYED and persists destroy_pending
     /// in the SB.  Idempotent — subsequent calls no-op.  Invoked from dispatch_commit's CTRL_DESTROY branch

@@ -35,7 +35,7 @@
 #include "sisl/options/options.h"
 
 #include "homestore/test_common/hs_repl_test_common.h"
-#include "homestore/test_common/hs_test_mem_store.h"
+#include "homestore/test_common/hs_test_cow_store.h"
 
 namespace test_common {
 
@@ -49,13 +49,28 @@ inline uint32_t value_for(uint64_t key) {
 
 class ReplicaSetTestBase : public testing::Test {
 protected:
-    shared< MemBtreeStore > store_;
+    shared< TestStore > store_;
     uint64_t written_{0};    // cumulative # of keys proposed so far — keys are [0, written_); the next write starts here
     size_t write_qdepth_{8}; // max concurrent in-flight proposals per write_on_leader batch (a test may retune this)
 
     void SetUp() override {
-        store_ = std::make_shared< MemBtreeStore >();
+        // HomeStore is already booted by g_helper->setup() (called in main), so the durable COWBtree-backed store
+        // can attach its btree now. recover() creates a fresh btree on first boot / loads it on recovery.
+        store_ = make_cow_btree_store(g_helper->replica_num());
+        iomgr().spawn_and_block(iomanager::ReactorTarget::any(), store_->recover());
         g_helper->register_replica_set(store_); // hand the store in; the helper creates + registers the listener
+    }
+
+    // Destroy this test's replica set + btree so the next test in the binary starts clean on the shared HomeStore
+    // (tests all boot one HomeStore in main()).  Wait for the group (raft engine) teardown before dropping the btree
+    // so a late on_commit can't fire into a torn-down store.
+    void TearDown() override {
+        g_helper->destroy_replica_set(/*wait_for_destroy=*/true);
+        if (store_) {
+            iomgr().spawn_and_block(iomanager::ReactorTarget::any(), store_->destroy());
+            store_.reset();
+        }
+        written_ = 0;
     }
 
     shared< homestore::ReplicaSet > repl_set() { return g_helper->repl_set(); }
@@ -133,6 +148,10 @@ protected:
         LOGINFO("Replica={} received {} commits as expected", g_helper->replica_num(), total);
     }
 
+    // Force a checkpoint on this replica's store so its committed state is flushed durably to disk — a subsequent
+    // restart then recovers that state from the btree, with only the post-CP tail coming from raft log replay.
+    void trigger_cp() { iomgr().spawn_and_block(iomanager::ReactorTarget::any(), store_->checkpoint()); }
+
     // Validate keys [0, total): every replica must hold the identical (key -> value_for(key)) mapping.  `total` is
     // the CUMULATIVE count across all writes so far.
     void validate_data(uint64_t total) {
@@ -155,5 +174,9 @@ protected:
     void wait_for_all_commits() { wait_for_commits(written_); }
     void validate_all_data() { validate_data(written_); }
 };
+
+// Shared gtest fixture for every replication test category file. All categories compile into one binary (btree
+// compile cost is paid once, in hs_test_cow_store.cpp); each category lives in its own .cpp for readability.
+class ReplicaSetTest : public ReplicaSetTestBase {};
 
 } // namespace test_common

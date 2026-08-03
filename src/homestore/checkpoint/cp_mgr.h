@@ -158,6 +158,10 @@ public:
     CPGuard(const CPGuard& other);
     CPGuard operator=(const CPGuard& other);
 
+    // Move TRANSFERS stack-entry ownership (pushed_) — unlike a copy, which is non-owning by design.  Required for
+    // handing the one owning guard into a holder (e.g. OpGuard) without the source's destructor popping the pin.
+    CPGuard(CPGuard&& other) noexcept;
+
     CP* operator->();
     CP* get();
 };

@@ -117,6 +117,16 @@ Async< shared< AppendByteStream > > AppendByteStream::load(uint64_t stream_id, M
     co_return stream;
 }
 
+Async< void > AppendByteStream::destroy() {
+    // Remove the per-stream sb MetaBlk first, so a recovery scan can never load this stream once its chunks are gone.
+    // Then invalidate our handle before freeing the chunks: StreamBase::destroy() drives remove_chunk_mblk(), which for
+    // this stream type re-persists the sb — but the sb is gone now, so persist_stream_sb() must be a no-op.  Re-writing
+    // it would re-append the just-removed block to the client's chain and form a cycle.
+    co_await meta_client_.remove_meta_blk(sb_mblk_);
+    sb_mblk_ = MetaBlk{};
+    co_await StreamBase::destroy();
+}
+
 Async< void > AppendByteStream::resume_writes_at(uint64_t tail) {
     tail_offset_ = tail;
     const uint32_t blk_sz = block_size();
@@ -380,6 +390,12 @@ Async< void > AppendByteStream::persist_flush_metadata() {
 }
 
 Async< void > AppendByteStream::persist_stream_sb() {
+    // If the sb MetaBlk has already been removed (the stream is being destroyed), there is nothing to persist — and a
+    // write here would re-append the removed block to the client's chain.
+    if (!sb_mblk_.valid()) {
+        co_return;
+    }
+
     // Snapshot the current chunk list (chunk_ids).
     std::vector< uint32_t > cids;
     {

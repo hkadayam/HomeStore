@@ -33,6 +33,14 @@ PeerOutboundSocket& FollyRpcClientFactory::get_or_open_outbound(std::string cons
     auto& state = outbound_.get();
     auto key = make_key(host, port);
     auto it = state.by_endpoint.find(key);
+    if (it != state.by_endpoint.end() && it->second->failed()) {
+        // A prior connect/read/write error killed this socket, and PeerOutboundSocket has no self-reconnect.  Drop the
+        // dead entry so we open a fresh socket below (its ctor reconnects) — reusing it would queue sends forever and
+        // stall raft after a peer restart.  Safe to destroy here: this runs on the socket's own (current) reactor and
+        // the map is per-reactor.
+        state.by_endpoint.erase(it);
+        it = state.by_endpoint.end();
+    }
     if (it == state.by_endpoint.end()) {
         auto* eb = iomgr().reactor_for(iomgr().current_reactor_id());
         auto sock = std::make_unique< PeerOutboundSocket >(eb, host, port, cpu_executor_);

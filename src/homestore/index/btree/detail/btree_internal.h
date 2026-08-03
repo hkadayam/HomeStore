@@ -224,13 +224,17 @@ struct OpGuard {
     OpGuard& operator=(OpGuard const&) = delete;
     OpGuard& operator=(OpGuard&&) = delete;
 
+    // Forwarding, NOT by-value: the held type may own per-thread state whose ownership must transfer by move (e.g.
+    // CPGuard's thread-stack pin) — a by-value parameter would copy non-owningly and the temporary's destructor
+    // would release that state before make() even returns.
     template < typename T >
-    static OpGuard make(T val) {
-        static_assert(sizeof(T) <= kBufSize, "OpGuard buffer too small for this type");
-        static_assert(alignof(T) <= 8, "OpGuard alignment insufficient for this type");
+    static OpGuard make(T&& val) {
+        using U = std::decay_t< T >;
+        static_assert(sizeof(U) <= kBufSize, "OpGuard buffer too small for this type");
+        static_assert(alignof(U) <= 8, "OpGuard alignment insufficient for this type");
         OpGuard g;
-        new (g.buf_) T{std::move(val)};
-        g.dtor_ = [](uint8_t* p) { r_cast< T* >(p)->~T(); };
+        new (g.buf_) U{std::forward< T >(val)};
+        g.dtor_ = [](uint8_t* p) { r_cast< U* >(p)->~U(); };
         return g;
     }
 };
@@ -250,7 +254,8 @@ ENUM(BtreeStatus, uint32_t,
      space_not_avail,          // No space in the system to alloc a node
      node_read_failed,         // I/O error reading a node
      node_freed,               // Node was deleted by a concurrent merge, An internal status - not exposed to user
-     not_supported             // Operation not supported by the btree
+     not_supported,            // Operation not supported by the btree
+     btree_destroyed           // The btree is being (or has been) destroyed; no further IO is accepted
 );
 
 class NodeCore;

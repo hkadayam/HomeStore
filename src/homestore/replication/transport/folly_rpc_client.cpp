@@ -262,6 +262,10 @@ void PeerOutboundSocket::register_client(std::weak_ptr< FollyRpcClient > client)
 }
 
 void PeerOutboundSocket::fail_socket(std::string const& reason) {
+    // Terminal: this socket never reconnects on its own.  Mark it so the factory drops it from its per-reactor map on
+    // the next get_or_open_outbound and opens a fresh socket (which reconnects) instead of handing back this dead one.
+    failed_ = true;
+
     // Mark every still-live client routed through this socket as abandoned so nuraft drops them and
     // re-creates a fresh client on the next round.
     for (auto& w : clients_) {

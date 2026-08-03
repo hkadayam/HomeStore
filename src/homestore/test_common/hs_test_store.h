@@ -38,6 +38,8 @@ public:
     // Persistence hooks — no-ops for in-memory backends, meaningful for the COWBtree-backed store.
     virtual Async< void > checkpoint() { co_return; }
     virtual Async< void > recover() { co_return; }
+    // Tear down the durable state (e.g. drop the btree) so a subsequent test starts clean on the shared HomeStore.
+    virtual Async< void > destroy() { co_return; }
 };
 
 } // namespace test_common

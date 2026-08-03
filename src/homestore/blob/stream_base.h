@@ -93,8 +93,9 @@ public:
     /// shift down by n.
     Async< void > truncate_before(size_t nchunks);
 
-    /// Release all chunks via vdev.shrink() and leave the list empty.
-    Async< void > destroy();
+    /// Release all chunks via vdev.shrink() and leave the list empty.  Virtual so a subclass with its own per-stream
+    /// metadata (e.g. AppendByteStream's sb MetaBlk) can remove that too, otherwise it would be orphaned on recovery.
+    virtual Async< void > destroy();
 
     // ── Accessors ─────────────────────────────────────────────────────────────
     uint64_t stream_id() const { return stream_id_; }

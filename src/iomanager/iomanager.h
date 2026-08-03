@@ -110,12 +110,20 @@ public:
     template < typename T >
     T spawn_and_block(ReactorTarget target, Async< T > task);
 
-    // Run fn(reactor_id) on every reactor sequentially.
-    // fn must return Async<R>. Returns Task<vector<R>> for non-void R,
-    // or Task<void> for void R.
+    // Run fn(reactor_id) on every reactor SEQUENTIALLY — reactor i's task completes before i+1's starts.
+    // fn must return Async<R>. Returns Task<vector<R>> for non-void R, or Task<void> for void R.
     template < typename Fn >
-    auto spawn_waitable_all(Fn&& fn) -> Async< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
-                                                                   std::vector< task_value_t< Fn, size_t > > > >;
+    auto spawn_waitable_all_seq(Fn&& fn)
+        -> Async< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
+                                      std::vector< task_value_t< Fn, size_t > > > >;
+
+    // Run fn(reactor_id) on every reactor CONCURRENTLY (each task on its own reactor, all running at once);
+    // awaits their collective completion.  Same fn/return contract as the _seq variant; results stay indexed
+    // by reactor id.  On failure, remaining tasks are cancelled and the exception rethrown after all settle.
+    template < typename Fn >
+    auto spawn_waitable_all_parallel(Fn&& fn)
+        -> Async< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
+                                      std::vector< task_value_t< Fn, size_t > > > >;
 
     // Yield to the current EventBase loop.
     Async< void > yield_now();
@@ -188,7 +196,7 @@ T IOManager::spawn_and_block(ReactorTarget target, Async< T > task) {
 }
 
 template < typename Fn >
-auto IOManager::spawn_waitable_all(Fn&& fn)
+auto IOManager::spawn_waitable_all_seq(Fn&& fn)
     -> Async< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
                                   std::vector< task_value_t< Fn, size_t > > > > {
     using R = task_value_t< Fn, size_t >;
@@ -203,6 +211,23 @@ auto IOManager::spawn_waitable_all(Fn&& fn)
             results.push_back(co_await folly::coro::co_withExecutor(shard_ebs_[i], fn(i)));
         }
         co_return std::move(results);
+    }
+}
+
+template < typename Fn >
+auto IOManager::spawn_waitable_all_parallel(Fn&& fn)
+    -> Async< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
+                                  std::vector< task_value_t< Fn, size_t > > > > {
+    using R = task_value_t< Fn, size_t >;
+    std::vector< folly::coro::TaskWithExecutor< R > > tasks;
+    tasks.reserve(num_reactors_);
+    for (size_t i = 0; i < num_reactors_; ++i) {
+        tasks.push_back(folly::coro::co_withExecutor(shard_ebs_[i], fn(i)));
+    }
+    if constexpr (std::is_void_v< R >) {
+        co_await folly::coro::collectAllRange(std::move(tasks));
+    } else {
+        co_return co_await folly::coro::collectAllRange(std::move(tasks));
     }
 }
 
@@ -227,8 +252,14 @@ template < typename T >
 T spawn_and_block(ReactorTarget target, Async< T > task);
 
 template < typename Fn >
-auto spawn_waitable_all(Fn&& fn) -> Async< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
-                                                               std::vector< task_value_t< Fn, size_t > > > >;
+auto spawn_waitable_all_seq(Fn&& fn)
+    -> Async< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
+                                  std::vector< task_value_t< Fn, size_t > > > >;
+
+template < typename Fn >
+auto spawn_waitable_all_parallel(Fn&& fn)
+    -> Async< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
+                                  std::vector< task_value_t< Fn, size_t > > > >;
 
 /// Synchronously drive `task` to completion on the calling thread.  Debug-asserts the caller is NOT on an iomgr
 /// reactor — blocking a reactor deadlocks any work whose continuation routes back to that same reactor.  Use
@@ -268,9 +299,17 @@ T spawn_and_block(ReactorTarget target, Async< T > task) {
 }
 
 template < typename Fn >
-auto spawn_waitable_all(Fn&& fn) -> Async< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
-                                                               std::vector< task_value_t< Fn, size_t > > > > {
-    return ::iomgr().spawn_waitable_all(std::forward< Fn >(fn));
+auto spawn_waitable_all_seq(Fn&& fn)
+    -> Async< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
+                                  std::vector< task_value_t< Fn, size_t > > > > {
+    return ::iomgr().spawn_waitable_all_seq(std::forward< Fn >(fn));
+}
+
+template < typename Fn >
+auto spawn_waitable_all_parallel(Fn&& fn)
+    -> Async< std::conditional_t< std::is_void_v< task_value_t< Fn, size_t > >, void,
+                                  std::vector< task_value_t< Fn, size_t > > > > {
+    return ::iomgr().spawn_waitable_all_parallel(std::forward< Fn >(fn));
 }
 
 } // namespace iomanager

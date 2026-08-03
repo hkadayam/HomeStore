@@ -159,44 +159,43 @@ Async< std::optional< MetaBlk > > MetaClient::get_meta_blk(std::string_view name
 }
 
 Async< void > MetaClient::write_meta_blk(MetaBlk& mblk, const sisl::IoBufShared& data) {
-    // Write data to disk (inline or overflow). Done *before* acquiring state lock so I/O doesn't hold up other callers.
+    // Persist the payload. Done *before* acquiring the state lock so I/O doesn't hold up other callers. The header
+    // (incl. next_bid) lives in the one shared holder and is kept current by the chain ops below, so writing the block
+    // out here is always consistent — an already-linked block is simply overwritten in place.
     co_await mblk.write_data(data, *meta_vdev_);
 
     auto lock = co_await state_->mutex.co_scoped_lock();
-    const BlkId key = mblk.blkid;
 
-    // ── In-place update (block already in chain) ──────────────────────────────
-    auto it = state_->meta_blks.find(key);
-    if (it != state_->meta_blks.end()) {
-        assert(state_->info.first_blkid.is_valid());
-        it->second = mblk;
+    // Already in the chain — the write above updated the shared holder in place; nothing to relink.
+    if (mblk.linked()) {
         co_return;
     }
 
-    // ── New block: append to the tail ─────────────────────────────────────────
+    // First write of a fresh block: append it to the tail and mark it linked. The map stores a handle that shares the
+    // caller's holder, so from here on both observe one authoritative block.
+    const BlkId key = mblk.blkid();
     if (!state_->tail_blkid.is_valid()) {
         // First block in the chain.
         state_->info.first_blkid = key;
         co_await write_client_info(state_->info);
-        state_->meta_blks.emplace(key, mblk);
-        state_->tail_blkid = key;
     } else {
         // Link current tail → new block.
         const BlkId tail_bid = state_->tail_blkid;
         auto tail_it = state_->meta_blks.find(tail_bid);
         if (tail_it != state_->meta_blks.end()) {
-            mblk.prev_bid = tail_bid;
+            mblk.set_prev_bid(tail_bid);
             co_await tail_it->second.update_next_bid(key, *meta_vdev_);
         }
-        state_->meta_blks.emplace(key, mblk);
-        state_->tail_blkid = key;
     }
+    mblk.set_linked(true);
+    state_->meta_blks.emplace(key, mblk);
+    state_->tail_blkid = key;
 }
 
 Async< sisl::IoBufView > MetaClient::read_meta_blk(const MetaBlk& mblk) {
     {
         auto lock = co_await state_->mutex.co_scoped_lock();
-        if (!state_->meta_blks.count(mblk.blkid)) {
+        if (!state_->meta_blks.count(mblk.blkid())) {
             throw std::runtime_error{"MetaClient::read_meta_blk: block not found"};
         }
     }
@@ -206,11 +205,13 @@ Async< sisl::IoBufView > MetaClient::read_meta_blk(const MetaBlk& mblk) {
 Async< void > MetaClient::remove_meta_blk(const MetaBlk& mblk) {
     auto lock = co_await state_->mutex.co_scoped_lock();
 
-    const BlkId key = mblk.blkid;
+    const BlkId key = mblk.blkid();
     auto it = state_->meta_blks.find(key);
     if (it == state_->meta_blks.end()) {
         // Block was allocated (create_meta_blk) but never committed to the chain via write_meta_blk — just free its
         // allocated storage on the vdev.  This is a valid state for subclasses that lazily persist MetaBlks.
+        META_LOG(DEBUG, "remove_meta_blk: name={} blk_num={} NOT in chain — freeing storage only", mblk.name(),
+                 key.blk_num());
         MetaBlk tmp = mblk;
         co_await tmp.free(*meta_vdev_);
         co_return;
@@ -220,8 +221,10 @@ Async< void > MetaClient::remove_meta_blk(const MetaBlk& mblk) {
     MetaBlk removed = std::move(it->second);
     state_->meta_blks.erase(it);
 
-    const BlkId prev_bid = removed.prev_bid;
+    const BlkId prev_bid = removed.prev_bid();
     const BlkId next_bid = removed.header().next_bid;
+    META_LOG(DEBUG, "remove_meta_blk: name={} blk_num={} unlinking prev_blk_num={} next_blk_num={}", removed.name(),
+             key.blk_num(), prev_bid.is_valid() ? prev_bid.blk_num() : 0, next_bid.is_valid() ? next_bid.blk_num() : 0);
 
     if (prev_bid.is_valid()) {
         // Not the head — update prev block's next pointer.
@@ -237,7 +240,7 @@ Async< void > MetaClient::remove_meta_blk(const MetaBlk& mblk) {
             // Update next block's prev pointer (in-memory only).
             auto nit = state_->meta_blks.find(next_bid);
             if (nit != state_->meta_blks.end()) {
-                nit->second.prev_bid = prev_bid;
+                nit->second.set_prev_bid(prev_bid);
             }
         }
     } else {
@@ -251,7 +254,7 @@ Async< void > MetaClient::remove_meta_blk(const MetaBlk& mblk) {
             state_->info.first_blkid = next_bid;
             auto nit = state_->meta_blks.find(next_bid);
             if (nit != state_->meta_blks.end()) {
-                nit->second.prev_bid = BlkId{};
+                nit->second.set_prev_bid(BlkId{});
             }
         }
         co_await write_client_info(state_->info);
@@ -282,6 +285,8 @@ BlkId MetaClient::calc_info_bid(uint8_t client_id, const VirtualDev& vdev) {
 }
 
 Async< void > MetaClient::write_client_info(const MetaClientInfo& info) {
+    META_LOG(DEBUG, "write_client_info: client_id={} first_blk_num={}", info.client_id,
+             info.first_blkid.is_valid() ? info.first_blkid.blk_num() : 0);
     // Work on a copy so we can refresh the CRC without touching the caller's copy.
     MetaClientInfo updated = info;
     updated.update_crc();

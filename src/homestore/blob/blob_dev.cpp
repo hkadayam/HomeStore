@@ -21,6 +21,8 @@
 #include <string>
 #include <unordered_set>
 
+#include <sisl/logging/logging.h>
+
 #include "homestore/blob/blob_dev.h"
 #include "homestore/blob/raw_blk_stream.h"
 #include "homestore/blob/append_blk_stream.h"
@@ -97,6 +99,40 @@ shared< AppendBlkStream > BlobDev::get_append_blk_stream(uint64_t stream_id) con
 
 shared< AppendByteStream > BlobDev::get_append_byte_stream(uint64_t stream_id) const {
     return find_stream(streams_mutex_, append_byte_streams_, stream_id);
+}
+
+// Extract the stream from `map` under the lock (deregistering it so cp_flush won't touch it mid-teardown), then run
+// its destroy() outside the lock.  Returns without touching anything if the id isn't present.
+template < typename StreamT >
+static Async< void > destroy_stream(folly::SharedMutex& mtx, std::map< uint64_t, shared< StreamT > >& map,
+                                    uint64_t stream_id, const char* type) {
+    shared< StreamT > stream;
+    size_t remaining{0};
+    {
+        std::unique_lock lg{mtx};
+        auto it = map.find(stream_id);
+        if (it == map.end()) {
+            LOGINFOMOD(blob_dev, "destroy_stream: {} id={} not registered — nothing to do (map has {})", type,
+                       stream_id, map.size());
+            co_return;
+        }
+        stream = std::move(it->second);
+        map.erase(it);
+        remaining = map.size();
+    }
+    LOGINFOMOD(blob_dev, "destroy_stream: {} id={} deregistered, destroying (map now has {})", type, stream_id,
+               remaining);
+    co_await stream->destroy();
+}
+
+Async< void > BlobDev::destroy_raw_blk_stream(uint64_t stream_id) {
+    co_await destroy_stream(streams_mutex_, raw_blk_streams_, stream_id, "raw_blk");
+}
+Async< void > BlobDev::destroy_append_blk_stream(uint64_t stream_id) {
+    co_await destroy_stream(streams_mutex_, append_blk_streams_, stream_id, "append_blk");
+}
+Async< void > BlobDev::destroy_append_byte_stream(uint64_t stream_id) {
+    co_await destroy_stream(streams_mutex_, append_byte_streams_, stream_id, "append_byte");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

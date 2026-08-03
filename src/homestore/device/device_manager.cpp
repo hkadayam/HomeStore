@@ -82,6 +82,21 @@ Async< shared< DeviceManager > > DeviceManager::create_and_format(std::vector< D
 
 // ── Boot-time queries ─────────────────────────────────────────────────────────
 
+Async< bool > DeviceManager::determine_first_time_boot() {
+    // Read the lead device's first block: a formatted device carries a valid FirstBlock, a fresh one is
+    // zeroed/garbage.  This decides format() vs load() and must run before either — load() asserts the recorded
+    // verdict, and load_devices() re-reads the same header on the recovery path.
+    const auto& first_dev = dev_infos_.front();
+    const int oflags = device_open_flags(first_dev.dev_type);
+    auto fb = co_await PhysicalDev::read_first_block(first_dev.dev_name, oflags);
+    const bool first = !fb.is_valid();
+    {
+        std::lock_guard lg{state_mutex_};
+        state_.first_time_boot = first;
+    }
+    co_return first;
+}
+
 bool DeviceManager::is_first_time_boot() const {
     std::lock_guard lg{state_mutex_};
     return state_.first_time_boot;

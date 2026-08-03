@@ -13,6 +13,8 @@
 
 #include "sisl/fds/large_id_reserver.h"
 #include "sisl/fds/concurrent_insert_vector.h"
+#include "sisl/fds/rcu.h"
+#include <folly/coro/Baton.h>
 #include "homestore/index/cow_btree/cow_btree_mgr.h"
 
 namespace homestore {
@@ -212,6 +214,18 @@ public:
             return (nodeid < entries_.size()) ? entries_[nodeid].to_blkid() : BlkId{};
         }
 
+        // Invoke cb(compact_nodeid) for every live entry — used at destroy() to evict this btree's nodes from the
+        // shared node cache before the ordinal (and thus these node ids) can be reused by another btree.
+        template < typename Cb >
+        void for_each_live(Cb&& cb) const {
+            std::shared_lock lg{mtx_};
+            for (CompactNodeId nid = 0; nid < entries_.size(); ++nid) {
+                if (entries_[nid].is_valid) {
+                    cb(nid);
+                }
+            }
+        }
+
         size_t size() const {
             std::shared_lock lg{mtx_};
             return live_count_;
@@ -300,6 +314,7 @@ public:
     void add_to_remove_overflow_list(const BlkId& blkid);
 
     ////////// CP Helper methods //////////////////////////
+    Async< void > do_cp_flush(CP* cp, bool suggest_incremental);
     Async< bool > incr_cp_flush(CP* cp);
     Async< void > full_cp_flush(CP* cp);
     Async< void > recover();
@@ -328,6 +343,34 @@ private:
     // ── Per-CP sessions ───────────────────────────────────────────────────────
     std::array< unique< CPSession >, CPManager::max_concurent_cps > cp_sessions_;
     std::mutex id_mtx_;
+
+    // ── Runtime state (RCU-published) ─────────────────
+    // Read lock-free at every IO entry point; exchanged once, in quiesce_for_destroy.  destroying=true makes IO
+    // entries return btree_destroyed and makes a not-yet-started cp_flush skip this btree.
+    struct BtreeRuntimeState {
+        bool destroying{false};
+    };
+    sisl::Rcu::data< BtreeRuntimeState > state_;
+    void update_state(BtreeRuntimeState new_state) {
+        state_.make_and_exchange(std::move(new_state));
+    }
+
+    // IO-entry contract check: IO on a destroying btree is an upper-layer violation — asserts in debug builds,
+    // returns btree_destroyed in release so the op refuses to proceed either way.  Paths where seeing DESTROYING is
+    // legitimate (cp_flush skip, destroy itself) read state_ directly instead.
+    BtreeStatus validate_state() const {
+        bool const destroying = state_.get()->destroying;
+        HS_DBG_ASSERT(!destroying, "IO on a btree being destroyed, ordinal={}", btree_ordinal_);
+        return destroying ? BtreeStatus::btree_destroyed : BtreeStatus::success;
+    }
+
+    // ── Destroy ↔ CP-flush handshake ─────────────────────────────────────────
+    // Locked ONLY at cp_flush entry/exit and once in quiesce_for_destroy — never on the read/write IO path.
+    // Every interleaving is closed by the mutex alone: a cp_flush that set flushing_ before quiesce locked is
+    // waited out via the baton; one that locks after quiesce published destroying skips.
+    std::mutex flush_state_mtx_;
+    bool flushing_{false};
+    folly::coro::Baton* flush_waiter_{nullptr}; // at most one — double destroy is a contract violation
 
 private:
     CPSession* cp_session(cp_id_t cp_id);

@@ -715,6 +715,7 @@ public:
 
     // Acquire a lock on the node. Caller must have previously released or never locked.
     BtreeTask< void > acquire(LockType lt) {
+        HS_DBG_ASSERT(valid(), "acquire on a Node with an empty/moved-from handle");
         HS_DBG_ASSERT_EQ(lock_type_, LockType::None, "acquire called on already-locked node");
         lock_type_ = resolve_node_lock_type(lt, handle_->get()->is_leaf());
         if (lock_type_ == LockType::Read) {
@@ -737,8 +738,14 @@ public:
         lock_type_ = LockType::None;
     }
 
-    NodeCore* operator->() const { return handle_->get(); }
-    NodeCore& operator*() const { return *handle_->get(); }
+    NodeCore* operator->() const {
+        HS_DBG_ASSERT(valid(), "Node dereferenced with an empty/moved-from handle");
+        return handle_->get();
+    }
+    NodeCore& operator*() const {
+        HS_DBG_ASSERT(valid(), "Node dereferenced with an empty/moved-from handle");
+        return *handle_->get();
+    }
     bool valid() const { return handle_ && handle_->valid(); }
     LockType lock_type() const { return lock_type_; }
 

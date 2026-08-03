@@ -150,6 +150,10 @@ public:
         return do_emplace(size, std::forward< FillFn >(fill));
     }
 
+    /// Remove this stream's own sb MetaBlk, then release chunks via the base — so a later recovery never finds a
+    /// stream sb pointing at already-freed chunks.
+    Async< void > destroy() override;
+
     /// Read len bytes starting at byte_offset.  Returns a IoBufView whose bytes() points exactly at byte_offset
     /// (the underlying read is block-aligned, but that's hidden — the slice handles the in-block offset for the
     /// caller).  size() == len.

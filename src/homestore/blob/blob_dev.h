@@ -124,6 +124,14 @@ public:
     shared< AppendBlkStream > get_append_blk_stream(uint64_t stream_id) const;
     shared< AppendByteStream > get_append_byte_stream(uint64_t stream_id) const;
 
+    /// Destroy one stream of the given type: run its own destroy() (free chunks + remove its sb) and deregister it
+    /// from this BlobDev so cp_flush no longer iterates it (which would re-persist an inconsistent, chunks-freed sb).
+    /// No-op if the id isn't registered (e.g. the stream was never created).  The caller must also drop its own
+    /// handle to the stream for the object itself to be freed.
+    Async< void > destroy_raw_blk_stream(uint64_t stream_id);
+    Async< void > destroy_append_blk_stream(uint64_t stream_id);
+    Async< void > destroy_append_byte_stream(uint64_t stream_id);
+
     // ── CP lifecycle ──────────────────────────────────────────────────────────
 
     /// Flush dirty block-allocating streams (RawBlk, AppendBlk) for the given CP.

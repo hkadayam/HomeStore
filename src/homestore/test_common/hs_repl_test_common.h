@@ -45,7 +45,7 @@
 
 #include "homestore/replication/repl_manager.h" // ReplApplication, ReplicationManager, repl_service()
 #include "homestore/replication/replica_set.h"  // ReplicaSetListener, ReplicaSet, ReplicaSetOptions
-#include "homestore/base/homestore_utils.h"       // hs_utils::gen_random_uuid
+#include "homestore/base/homestore_utils.h"     // hs_utils::gen_random_uuid
 #include "homestore/test_common/hs_test_common.h"
 #include "homestore/test_common/hs_test_store.h" // TestStore (interface only — no btree dependency here)
 
@@ -158,7 +158,8 @@ public:
         void on_change_in_role(ReplicaRole role) override { role_ = role; }
         void on_destroy(GroupId const&) override {}
         void on_start_replace_member(ReplicaMemberInfo const&, ReplicaMemberInfo const&, std::string_view) override {}
-        void on_complete_replace_member(ReplicaMemberInfo const&, ReplicaMemberInfo const&, std::string_view) override {}
+        void on_complete_replace_member(ReplicaMemberInfo const&, ReplicaMemberInfo const&, std::string_view) override {
+        }
         void on_membership_change(std::set< ReplicaId > const&, std::set< ReplicaId > const&) override {}
 
         AsyncReplResult< shared< ReplSnapshot > > take_snapshot(lsn_t) override {
@@ -215,15 +216,45 @@ public:
         exclusive_replica([this]() { restart_homestore(5u); });
     }
 
-    // ── Group bring-up: create the standard listener over `store`, barrier, then replica 0 creates the raft group;
-    // peers rendezvous via get_listener(). The store is handed in so a test picks its backend (mem vs index). ──────
+    // Drive leadership onto member `member_idx` and block (on every replica) until it settles there.  Every replica
+    // calls this collectively: the target proactively requests promotion via its own ReplicaSet (become_leader routes
+    // a transfer through the live leader), the rest just wait for get_leader_id() to converge on the target.  Used by
+    // tests that need a deterministic leader (e.g. leadership/membership scenarios); the write path itself does not
+    // depend on it — write_on_leader waits for whatever leader the group elects.
+    void assign_leader(uint16_t member_idx) {
+        auto const target = replica_id(member_idx);
+        auto rs = repl_set();
+        if (!rs) {
+            return;
+        } // group not bound on this replica yet — nothing to drive
+        for (uint32_t waited_ms = 0; rs->get_leader_id() != target; waited_ms += 200) {
+            RELEASE_ASSERT(waited_ms < 60000u, "leadership did not settle on replica {} within 60s", member_idx);
+            if (replica_num_ == member_idx) {
+                iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [rs]() -> Async< void > {
+                    (void)co_await rs->become_leader();
+                    co_return;
+                }());
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{200});
+        }
+        LOGINFO("Leadership settled on replica={}", member_idx);
+    }
+
+    // Recovery boot path (runs between HomeStore load() and replay()): re-attach the durable store's btree by
+    // loading it from disk, so repl replay's re-fired on_commit calls land in a live btree.
+    Async< void > on_recover() override {
+        if (store_) {
+            co_await store_->recover();
+        }
+        co_return;
+    }
+
+    // ── Group bring-up: stash the store, barrier, then replica 0 creates the raft group.  The per-group listener is
+    // created on demand in get_listener() when repl calls create_replica_set_listener (on the creator during create,
+    // on peers when the group's first RPC arrives).  The store is handed in so a test picks its backend. ───────────
     void register_replica_set(shared< TestStore > store) {
         store_ = std::move(store);
-        listener_ = std::make_shared< ReplTestListener >(store_);
-
-        if (replica_num_ != 0) {
-            pending_listeners_.push_back(listener_);
-        }
+        listener_.reset(); // created on demand by get_listener() when repl brings the group up
 
         ipc_data_->sync_for_member_start();
 
@@ -240,11 +271,6 @@ public:
         }
 
         GroupId const group_id = hs_utils::gen_random_uuid();
-        {
-            std::unique_lock lg(groups_mtx_);
-            repl_groups_.emplace(group_id, listener_);
-        }
-
         auto result = iomgr().spawn_and_block(
             iomanager::ReactorTarget::any(), [group_id, members]() -> Async< ReplResult< shared< ReplicaSet > > > {
                 co_return co_await repl_service().create_replica_set(group_id, members, ReplicaSetOptions{});
@@ -262,35 +288,77 @@ public:
         }
     }
 
+    // Tear down this test's group.  Destroy is leader-initiated (HS_CTRL_DESTROY); after a restart the leader may be
+    // any replica, so whichever replica is currently the leader issues it (follower calls are no-ops).  The reaper
+    // finishes the destroy and erases the set from the service in the background.  wait_for_destroy=false: just issue
+    // it and return.  wait_for_destroy=true: block until get_replica_set() no longer returns it (reaper done).
+    void destroy_replica_set(bool wait_for_destroy = false) {
+        GroupId gid;
+        {
+            std::unique_lock lg(groups_mtx_);
+            if (repl_groups_.empty()) {
+                listener_.reset();
+                return;
+            }
+            gid = repl_groups_.begin()->first;
+        }
+
+        for (uint32_t waited_ms = 0;; waited_ms += 200) {
+            auto const rs = repl_service().get_replica_set(gid);
+            if (!rs.hasValue() || !rs.value()) {
+                break; // reaper erased it — done
+            }
+            // Issue the destroy from whichever replica is currently the leader; retry until leadership settles (after
+            // a restart it may not be settled at teardown).  is_destroy_pending() flips true once it commits, so this
+            // issues exactly once.
+            if (rs.value()->get_leader_id() == my_replica_id_ && !rs.value()->is_destroy_pending()) {
+                iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [gid]() -> Async< void > {
+                    (void)co_await repl_service().remove_replica_set(gid);
+                    co_return;
+                }());
+            }
+            if (!wait_for_destroy && rs.value()->is_destroy_pending()) {
+                break; // destroy committed; leave the erase to the background reaper
+            }
+            RELEASE_ASSERT(waited_ms < 60000u, "replica set {} not destroyed within 60s",
+                           boost::uuids::to_string(gid));
+            std::this_thread::sleep_for(std::chrono::milliseconds{200});
+        }
+
+        {
+            std::unique_lock lg(groups_mtx_);
+            repl_groups_.clear();
+        }
+        listener_.reset();
+    }
+
     // The standard listener/store/ReplicaSet this replica set up (valid after register_replica_set()).  On a
     // follower, repl_set() becomes non-null once the leader's first RPC binds the listener to a ReplicaSet.
     shared< ReplTestListener > listener() const { return listener_; }
     shared< TestStore > store() const { return store_; }
     shared< ReplicaSet > repl_set() const { return listener_ ? listener_->replica_set() : nullptr; }
 
-    // Called (via TestReplApplication) both when replica 0 creates the group and when a peer/reload brings one up.
+    // Called (via TestReplApplication::create_replica_set_listener) when repl brings a group up — on the creator
+    // during create_replica_set, on peers when the group's first RPC arrives, and again on a reload.  Creates the
+    // listener on demand over the current test's store, keyed by group_id.  Each group gets its own listener, so a
+    // stray RPC from an unrelated (e.g. still-reaping) group can't steal the one meant for this test's group.
     shared< ReplicaSetListener > get_listener(GroupId group_id) {
         std::unique_lock lg(groups_mtx_);
         if (auto it = repl_groups_.find(group_id); it != repl_groups_.end() && it->second) {
-            return it->second;
+            return it->second; // already up (e.g. the same group_id recovers on a restart within the test)
         }
 
-        RELEASE_ASSERT(!pending_listeners_.empty(), "get_listener for group_id with no pending listener registered");
-        auto listener = std::move(pending_listeners_.front());
-        pending_listeners_.erase(pending_listeners_.begin());
+        auto listener = std::make_shared< ReplTestListener >(store_);
         repl_groups_.emplace(group_id, listener);
-        LOGINFO("Bound listener to group_id={} on replica={}", boost::uuids::to_string(group_id), replica_num_);
+        listener_ = listener;
+        LOGINFO("Created listener on demand for group_id={} on replica={}", boost::uuids::to_string(group_id),
+                replica_num_);
         return listener;
     }
 
     void unregister_listener(GroupId group_id) {
         std::unique_lock lg(groups_mtx_);
         repl_groups_.erase(group_id);
-    }
-
-    void add_pending_listener(shared< ReplicaSetListener > listener) {
-        std::unique_lock lg(groups_mtx_);
-        pending_listeners_.push_back(std::move(listener));
     }
 
     size_t num_groups() const {
@@ -410,7 +478,6 @@ private:
 
     mutable std::mutex groups_mtx_;
     std::map< GroupId, shared< ReplicaSetListener > > repl_groups_;
-    std::vector< shared< ReplicaSetListener > > pending_listeners_;
     std::map< ReplicaId, uint16_t > members_;
     ReplicaId my_replica_id_;
 

@@ -76,7 +76,7 @@ TEST_F(IOMgrTest, RecurringTimerRunsNTimesOnEachReactor) {
     // Each reactor runs a sleep loop g_num_iters times.
     // We collect the per-reactor counts and verify they all hit g_num_iters.
     auto counts = iomgr().spawn_and_block(ReactorTarget::reactor(0),
-                                          iomgr().spawn_waitable_all([](size_t /*reactor_id*/) -> Async< uint32_t > {
+                                          iomgr().spawn_waitable_all_seq([](size_t /*reactor_id*/) -> Async< uint32_t > {
                                               uint32_t count = 0;
                                               for (uint32_t i = 0; i < g_num_iters; ++i) {
                                                   co_await iomgr().sleep(5ms);
@@ -151,14 +151,14 @@ TEST_F(IOMgrTest, YieldAllowsOtherTaskToRun) {
 // ── Messaging (dispatch between reactors) ─────────────────────────────────────
 //
 // Old: iomanager.run_on_wait(all_worker, fn)   — sync broadcast
-// New: spawn_and_block(reactor(0), spawn_waitable_all(fn))
+// New: spawn_and_block(reactor(0), spawn_waitable_all_seq(fn))
 
 TEST_F(IOMgrTest, SyncBroadcastToAllReactors) {
     std::atomic< uint32_t > rcvd{0};
 
     // Sequentially visits every reactor and increments the counter.
     iomgr().spawn_and_block(ReactorTarget::reactor(0),
-                            iomgr().spawn_waitable_all([&rcvd](size_t /*reactor_id*/) -> Async< void > {
+                            iomgr().spawn_waitable_all_seq([&rcvd](size_t /*reactor_id*/) -> Async< void > {
                                 rcvd.fetch_add(1, std::memory_order_relaxed);
                                 co_return;
                             }));
@@ -250,7 +250,7 @@ TEST_F(IOMgrTest, AsyncRelayBroadcast) {
 TEST_F(IOMgrTest, SpawnWaitableAllVisitsEveryReactor) {
     auto results = iomgr().spawn_and_block(
         ReactorTarget::reactor(0),
-        iomgr().spawn_waitable_all([](size_t /*i*/) -> Async< size_t > { co_return iomgr().current_reactor_id(); }));
+        iomgr().spawn_waitable_all_seq([](size_t /*i*/) -> Async< size_t > { co_return iomgr().current_reactor_id(); }));
 
     ASSERT_EQ(results.size(), iomgr().num_reactors());
     for (size_t i = 0; i < results.size(); ++i) {

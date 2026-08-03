@@ -131,7 +131,7 @@ TEST_F(DriveTest, MultiReactorConcurrentWriteReadVerify) {
 
     auto results = iomgr().spawn_and_block(
         ReactorTarget::reactor(0),
-        iomgr().spawn_waitable_all(
+        iomgr().spawn_waitable_all_seq(
             [this, &drive, per_reactor, ios_per_reactor](size_t reactor_id) -> Async< uint32_t > {
                 const uint64_t region_start = reactor_id * per_reactor;
                 const uint64_t region_end = region_start + per_reactor;

@@ -35,7 +35,8 @@ Async< void > MetaBlk::write_data(const sisl::IoBufShared& data, VirtualDev& vde
         // Inline: copy payload into the cached block after the header.
         std::memcpy(inline_data(), data->cbytes(), data->size());
         header().overflow_bid = BlkId{};
-        META_LOG(DEBUG, "write_data: name={} inline data_size={} blk_num={}", name(), data->size(), blkid.blk_num());
+        META_LOG(DEBUG, "write_data: name={} inline data_size={} blk_num={}", name(), data->size(),
+                 holder_->blkid.blk_num());
     } else {
         // Allocate contiguous overflow blocks for the data.
         const size_t blk_sz = vdev.block_size();
@@ -56,7 +57,7 @@ Async< void > MetaBlk::write_data(const sisl::IoBufShared& data, VirtualDev& vde
     header().data_crc = crc32_ieee(0, data->cbytes(), data->size());
 
     // Write the single cached block (header + inline data) to disk.
-    co_await vdev.write(*buffer, blkid);
+    co_await vdev.write(*holder_->buffer, holder_->blkid);
 
     // Free the old overflow block now that new data is safely on disk.
     if (old_ovf.is_valid()) {
@@ -68,8 +69,8 @@ Async< sisl::IoBufView > MetaBlk::read_data(VirtualDev& vdev) const {
     const uint32_t data_sz = header().data_size;
 
     if (!header().overflow_bid.is_valid()) {
-        META_LOG(DEBUG, "read_data: name={} inline data_size={} blk_num={}", name(), data_sz, blkid.blk_num());
-        co_return sisl::IoBufView{buffer, to_u32(MetaBlkHeader::SIZE), data_sz};
+        META_LOG(DEBUG, "read_data: name={} inline data_size={} blk_num={}", name(), data_sz, holder_->blkid.blk_num());
+        co_return sisl::IoBufView{holder_->buffer, to_u32(MetaBlkHeader::SIZE), data_sz};
     }
 
     // Overflow: read from overflow blocks on disk into a new IoBufShared, then wrap as IoBufView.
@@ -89,7 +90,7 @@ Async< void > MetaBlk::free(VirtualDev& vdev) {
     if (header().overflow_bid.is_valid()) {
         vdev.free_blk(header().overflow_bid);
     }
-    vdev.free_blk(blkid);
+    vdev.free_blk(holder_->blkid);
     co_return;
 }
 
@@ -98,8 +99,10 @@ Async< void > MetaBlk::free(VirtualDev& vdev) {
 // ──────────────────────────────────────────────────────────────────────────────
 Async< void > MetaBlk::update_next_bid(BlkId next, VirtualDev& vdev) {
     header().next_bid = next;
+    META_LOG(DEBUG, "update_next_bid: name={} blk_num={} set next_blk_num={}", name(), holder_->blkid.blk_num(),
+             next.is_valid() ? next.blk_num() : 0);
     // Write the cached block back to disk with the updated header.
-    co_await vdev.write(*buffer, blkid);
+    co_await vdev.write(*holder_->buffer, holder_->blkid);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

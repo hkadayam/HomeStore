@@ -125,6 +125,10 @@ public:
 
     folly::EventBase* event_base() const { return eb_; }
 
+    // True once this socket has hit a terminal error (connect/read/write failure or peer close).  A failed socket
+    // never reconnects on its own, so the factory must drop it and open a fresh one on the next send.
+    bool failed() const { return failed_; }
+
     // folly::AsyncSocket::ConnectCallback
     void connectSuccess() noexcept override;
     void connectErr(folly::AsyncSocketException const& ex) noexcept override;
@@ -198,6 +202,7 @@ private:
     size_t rx_body_filled_{0};
 
     bool connected_{false};
+    bool failed_{false};
 };
 
 } // namespace homestore::replication

@@ -93,14 +93,14 @@ Async< bool > HomeStore::start(InputParams input) {
     }
 #endif
 
-    // DeviceManager: synchronously construct — this probes the device headers so is_first_time_boot() is
-    // answerable immediately.  Copy input_.devices into DeviceManager — the vector stays in input_ so
-    // ResourceMgr::start can use it later.
+    // DeviceManager: construct, then probe the lead device's first block to decide first-time boot vs recovery so
+    // is_first_time_boot() is answerable before format()/load() run.  Copy input_.devices into DeviceManager — the
+    // vector stays in input_ so ResourceMgr::start can use it later.
     auto dm =
         DeviceManager::create(std::vector< DevInfo >{input_.devices}, input_.data_open_flags, input_.fast_open_flags);
     Managers::init_device_mgr(dm);
 
-    bool const first = dm->is_first_time_boot();
+    bool const first = co_await dm->determine_first_time_boot();
     LOGINFO("HomeStore::start — {} boot detected", first ? "first-time" : "recovery");
     co_return first;
 }

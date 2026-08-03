@@ -176,6 +176,11 @@ Async< void > ReplicationManager::stop() {
     co_await gc_timer_.stop();
     co_await persist_commit_lsn_timer_.stop();
 
+    // Final durable flush of every set's commit watermark before teardown.  The 500ms timer may not have ticked
+    // since the last commits, and a clean shutdown must leave each SB.commit_lsn current so the next boot recovers
+    // the correct tail directly rather than leaning on post-restart catch-up.
+    co_await persist_commit_lsn();
+
     // Shut down every raft engine BEFORE freeing the RPC transport / executor it references.  Each engine's
     // nuraft::context holds mgr_.rpc_listener() / rpc_client_factory() and the reactor executor; freeing those
     // first would leave the servers dangling, and nuraft's raft_server destructor asserts shutdown() ran.

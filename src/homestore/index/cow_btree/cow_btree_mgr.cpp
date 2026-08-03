@@ -114,14 +114,16 @@ Async< void > COWBtreeManager::destroy_cow_btree(cshared< BtreeBase >& base) {
     auto* cow_bt = COWBtree::cast_to(base.get());
     auto const ordinal = cow_bt->ordinal();
 
-    // Tears down on-disk state (streams + per-btree metablk). Cache entries become stale and evict naturally.
-    // The shared BlobDev is owned by BlobDevManager and is intentionally NOT destroyed here.
-    co_await cow_bt->destroy();
-
+    // Untrack FIRST: any cp_flush snapshot taken after this point no longer contains the btree.
     {
         std::lock_guard lk(tracking_mtx_);
         tracked_btrees_.erase(std::remove(tracked_btrees_.begin(), tracked_btrees_.end(), base), tracked_btrees_.end());
     }
+
+    // Tears down on-disk state (streams + per-btree metablk) and evicts this btree's cached nodes so a later btree
+    // reusing the ordinal can't collide.  destroy() waits out an in-flight flush).  The shared BlobDev is owned by
+    // BlobDevManager and is NOT destroyed here.
+    co_await cow_bt->destroy();
 
     ordinal_reserver_.unreserve(ordinal);
     co_return;
@@ -131,7 +133,7 @@ bool COWBtreeManager::should_force_full_flush() const {
     // Test-only override: when the "force_full_map_flush" flip is set, the next CP is forced to be a full-map flush
     // regardless of the incr-map size threshold below.  Recovery tests use this to deterministically drive full vs
     // incremental flush sequences.
-    if (flip::Flip::instance().test_flip("force_full_map_flush")) {
+    if (flip::is_fired("force_full_map_flush")) {
         return true;
     }
 

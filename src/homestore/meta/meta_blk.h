@@ -98,55 +98,72 @@ static_assert(sizeof(MetaBlkHeader) == META_BLK_HEADER_SIZE,
               "MetaBlkHeader must be exactly META_BLK_HEADER_SIZE bytes");
 
 // ──────────────────────────────────────────────────────────────────────────────
-// MetaBlk
+// MetaBlkHolder
 //
-// One metadata block owned by a MetaClient. Caches exactly one disk block
-// (header + inline data) in a IoBufShared (shared<IoBufOwn>). Overflow data
-// lives in separate blocks referenced by overflow_bid — never cached here.
+// The single in-memory instance of one meta block's state. Both the copy in
+// MetaClient's map and the copy held by the consumer point at one holder, so the
+// chain linkage (prev_bid) and the cached bytes (buffer) are shared — never
+// duplicated, and therefore never able to diverge.
 //
-// prev_bid is kept in memory only (not persisted in the header) to support
-// O(1) removal from the doubly-linked chain.
-//
-// Copyable via shared_ptr refcount bump — no buffer memcpy on copy.
+// prev_bid is kept in memory only (not persisted in the header) to support O(1)
+// removal; the on-disk chain is singly-linked (only next_bid, in the header).
 // ──────────────────────────────────────────────────────────────────────────────
-class MetaBlk {
-public:
+struct MetaBlkHolder {
     BlkId blkid{};            // Block ID on the vdev
     BlkId prev_bid{};         // Previous block in chain (in-memory only)
     sisl::IoBufShared buffer; // Exactly one block: header (64 B) + inline data (shared ownership)
-    bool is_fresh{true};      // true until first write into the client's chain
+    bool linked{false};       // false until the first write appends this block into the client's chain
+};
 
+// ──────────────────────────────────────────────────────────────────────────────
+// MetaBlk
+//
+// A lightweight handle over a shared MetaBlkHolder. Copying a MetaBlk shares the
+// holder (a refcount bump, no buffer memcpy), so every reference to one block
+// observes a single authoritative state. The static_assert below forbids adding
+// any per-copy field that would reintroduce divergence.
+// ──────────────────────────────────────────────────────────────────────────────
+class MetaBlk {
+public:
     // ── Factory ──────────────────────────────────────────────────────────────
     static MetaBlk create(BlkId blkid, uint32_t blk_sz, std::string_view name) {
-        MetaBlk blk;
-        blk.blkid = blkid;
-        blk.buffer = sisl::make_io_buf_shared(blk_sz);
-        blk.is_fresh = true;
+        auto holder = std::make_shared< MetaBlkHolder >();
+        holder->blkid = blkid;
+        holder->buffer = sisl::make_io_buf_shared(blk_sz);
         MetaBlkHeader hdr = MetaBlkHeader::make(name);
-        std::memcpy(blk.buffer->bytes(), &hdr, MetaBlkHeader::SIZE);
-        return blk;
+        std::memcpy(holder->buffer->bytes(), &hdr, MetaBlkHeader::SIZE);
+        return MetaBlk{std::move(holder)};
     }
 
     static MetaBlk load(BlkId blkid, BlkId prev_bid, sisl::IoBufShared buf) {
-        MetaBlk blk;
-        blk.blkid = blkid;
-        blk.prev_bid = prev_bid;
-        blk.buffer = std::move(buf);
-        blk.is_fresh = false;
-        return blk;
+        auto holder = std::make_shared< MetaBlkHolder >();
+        holder->blkid = blkid;
+        holder->prev_bid = prev_bid;
+        holder->buffer = std::move(buf);
+        holder->linked = true; // a recovered block is already part of the chain
+        return MetaBlk{std::move(holder)};
     }
 
+    // ── Handle / topology state (all forwarded to the shared holder) ──────────
+    bool valid() const { return holder_ != nullptr; }
+
+    BlkId blkid() const { return holder_->blkid; }
+    BlkId prev_bid() const { return holder_->prev_bid; }
+    void set_prev_bid(BlkId prev) { holder_->prev_bid = prev; }
+    bool linked() const { return holder_->linked; }
+    void set_linked(bool v) { holder_->linked = v; }
+
     // ── Accessors ────────────────────────────────────────────────────────────
-    MetaBlkHeader& header() { return *reinterpret_cast< MetaBlkHeader* >(buffer->bytes()); }
-    const MetaBlkHeader& header() const { return *reinterpret_cast< const MetaBlkHeader* >(buffer->cbytes()); }
+    MetaBlkHeader& header() { return *r_cast< MetaBlkHeader* >(holder_->buffer->bytes()); }
+    const MetaBlkHeader& header() const { return *r_cast< const MetaBlkHeader* >(holder_->buffer->cbytes()); }
 
     std::string name() const { return header().get_name(); }
 
     /// Inline data region: everything after the header in the single cached block.
-    uint8_t* inline_data() { return buffer->bytes() + MetaBlkHeader::SIZE; }
-    const uint8_t* inline_data() const { return buffer->cbytes() + MetaBlkHeader::SIZE; }
+    uint8_t* inline_data() { return holder_->buffer->bytes() + MetaBlkHeader::SIZE; }
+    const uint8_t* inline_data() const { return holder_->buffer->cbytes() + MetaBlkHeader::SIZE; }
 
-    size_t max_inline_data_size() const { return buffer->size() - MetaBlkHeader::SIZE; }
+    size_t max_inline_data_size() const { return holder_->buffer->size() - MetaBlkHeader::SIZE; }
 
     static uint32_t data_size_to_nblks(size_t data_size, size_t block_size) {
         return to_u32((data_size + MetaBlkHeader::SIZE + block_size - 1) / block_size);
@@ -165,7 +182,7 @@ public:
     /// Free this block (and any overflow blocks) on the vdev.
     Async< void > free(VirtualDev& vdev);
 
-    // ── Copyable (shared_ptr refcount bump), movable ─────────────────────────
+    // ── Handle: default = empty (null); copies/moves share the holder ─────────
     MetaBlk() = default;
     MetaBlk(const MetaBlk&) = default;
     MetaBlk& operator=(const MetaBlk&) = default;
@@ -174,10 +191,17 @@ public:
 
 private:
     friend class MetaClient;
+    explicit MetaBlk(shared< MetaBlkHolder > holder) : holder_{std::move(holder)} {}
 
     /// Update next_bid in the on-disk header and write the cached block back to disk.
     Async< void > update_next_bid(BlkId next, VirtualDev& vdev);
+
+    shared< MetaBlkHolder > holder_;
 };
+
+static_assert(sizeof(MetaBlk) == sizeof(shared< MetaBlkHolder >),
+              "MetaBlk must hold nothing but its shared holder; any extra field reintroduces per-copy state that "
+              "can diverge from the map's copy");
 
 // ──────────────────────────────────────────────────────────────────────────────
 // MetaBlkWrapper

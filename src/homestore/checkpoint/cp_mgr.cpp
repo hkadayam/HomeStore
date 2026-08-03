@@ -402,6 +402,12 @@ CPGuard::CPGuard(const CPGuard& other) : cp_{other.cp_}, pushed_{false} {
     }
 }
 
+CPGuard::CPGuard(CPGuard&& other) noexcept : cp_{other.cp_}, pushed_{other.pushed_} {
+    // Ownership transfer: no ref-count change, and the source no longer pops the thread-stack entry nor exits the CP.
+    other.cp_ = nullptr;
+    other.pushed_ = false;
+}
+
 CPGuard CPGuard::operator=(const CPGuard& other) {
     if (this != &other) {
         cp_ = other.cp_;

@@ -120,12 +120,17 @@ static constexpr store_lsn_t to_store_lsn(raft_lsn_t raft_lsn) {
 
 Async< shared< HomeRaftLogStore > > HomeRaftLogStore::create(ReplicaSetSuperBlk& sb, shared< RawBlkStream > blob_stream,
                                                              OnLogFound /*on_log_found*/,
-                                                             TruncateCeilingFn truncate_ceiling_cb) {
-    // Fresh create — no replay will happen on this store this boot, so the callback is unused here.  It's
-    // still part of the signature for API symmetry with load() so callers pass one uniform lambda.  Mutates
+                                                             TruncateCeilingFn truncate_ceiling_cb,
+                                                             CommitWatermarkFn commit_watermark_cb) {
+    // Fresh create — no replay will happen on this store this boot, so the replay callback is unused here.
+    // It's still part of the signature for API symmetry with load() so callers pass one uniform lambda.  The
+    // watermark callback IS wired immediately (via open with a null replay handler): CPs run from the first
+    // boot on, and checkpt_lsn must track the applied watermark from the very first capture.  Mutates
     // sb.raft_log_store_id and sb.free_blks_journal_id; caller persists the SB afterwards.
-    auto log_store =
-        co_await log_store_mgr().create_log_store(LogStoreOptions{.append_mode = true, .auto_truncate = false});
+    auto const options = LogStoreOptions{.append_mode = true, .auto_truncate = false};
+    auto log_store = co_await log_store_mgr().create_log_store(options);
+    log_store->open(options, nullptr,
+                    [cb = std::move(commit_watermark_cb)]() -> lsn_t { return to_store_lsn(cb()); });
     sb.raft_log_store_id = log_store->store_id();
 
     unique< IndirectBlkHandler > indirect;
@@ -145,14 +150,16 @@ Async< shared< HomeRaftLogStore > > HomeRaftLogStore::create(ReplicaSetSuperBlk&
 
 Async< shared< HomeRaftLogStore > > HomeRaftLogStore::load(ReplicaSetSuperBlk& sb, shared< RawBlkStream > blob_stream,
                                                            OnLogFound on_log_found,
-                                                           TruncateCeilingFn truncate_ceiling_cb) {
+                                                           TruncateCeilingFn truncate_ceiling_cb,
+                                                           CommitWatermarkFn commit_watermark_cb) {
     HS_REL_ASSERT_NE(sb.raft_log_store_id, UINT32_MAX, "load() called with no persisted raft_log_store_id");
 
     // Register the caller's replay handler on the main log_store.  LogStoreManager::recover() (driven by the
     // Manager after all opens are wired) walks persisted entries and dispatches through this callback —
     // ReplicaSet uses it to fold ReplLogHeader.commit_lsn_at_write into its commit_upto_lsn_ watermark.
     auto log_store = log_store_mgr().open_log_store(
-        sb.raft_log_store_id, LogStoreOptions{.append_mode = true, .auto_truncate = false}, std::move(on_log_found));
+        sb.raft_log_store_id, LogStoreOptions{.append_mode = true, .auto_truncate = false}, std::move(on_log_found),
+        [cb = std::move(commit_watermark_cb)]() -> lsn_t { return to_store_lsn(cb()); });
     if (!log_store) {
         throw std::runtime_error(
             fmt::format("HomeRaftLogStore::load: unknown raft_log_store_id={}", sb.raft_log_store_id));
@@ -577,6 +584,10 @@ ulong HomeRaftLogStore::last_durable_index() {
     auto durable = log_store_->flushed_upto();
     last_durable_lsn_.store(durable, std::memory_order_release);
     return to_ulong64(durable + 1);
+}
+
+raft_lsn_t HomeRaftLogStore::last_checkpt_lsn() const {
+    return to_raft_lsn(log_store_->checkpt_lsn());
 }
 
 Async< void > HomeRaftLogStore::purge_all_logs() {

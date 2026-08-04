@@ -24,15 +24,17 @@
 
 using namespace test_common;
 
-// A single proposed entry must replicate and commit on every replica — the minimal end-to-end path.
-TEST_F(ReplicaSetTest, SingleWrite) {
+// The canonical bring-up/convergence smoke test: N writes proposed on the leader must replicate, commit and
+// validate identically on every replica.
+TEST_F(ReplicaSetTest, ReplicatedWrites) {
+    auto const n = SISL_OPTIONS["num_io"].as< uint64_t >();
     g_helper->sync_for_test_start();
 
-    write_on_leader(1);
-    wait_for_commits(1);
+    write_on_leader(n);
+    wait_for_commits(n);
 
     g_helper->sync_for_verify_start();
-    validate_data(1);
+    validate_data(n);
     g_helper->sync_for_cleanup_start();
 }
 

@@ -39,7 +39,7 @@ namespace homestore {
 static constexpr std::string_view kLogStoreSbPrefix = "LogStore_";
 
 // CP flush rank for LogStoreManager. See CPRank docs in cp_mgr.h for the layering scheme.
-static constexpr uint32_t kCPRank_LogStore = 30;
+static constexpr uint32_t kCPRank_LogStore = CPRank::LogStore;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Construction
@@ -211,7 +211,7 @@ Async< shared< LogStore > > LogStoreManager::create_log_store(LogStoreOptions co
 }
 
 shared< LogStore > LogStoreManager::open_log_store(logstore_id_t store_id, LogStoreOptions const& options,
-                                                   log_replay_cb handler) {
+                                                   log_replay_cb handler, log_commit_watermark_cb watermark_cb) {
     auto store = get_log_store(store_id);
     if (!store) {
         LOGWARN("LogStoreManager: open_log_store sid={} — not found", store_id);
@@ -226,7 +226,7 @@ shared< LogStore > LogStoreManager::open_log_store(logstore_id_t store_id, LogSt
     } else if (!was_auto && options.auto_truncate) {
         num_stores_auto_truncate_.fetch_add(1, std::memory_order_acq_rel);
     }
-    store->open(options, std::move(handler));
+    store->open(options, std::move(handler), std::move(watermark_cb));
     return store;
 }
 

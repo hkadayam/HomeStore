@@ -28,6 +28,8 @@
 #include <boost/uuid/nil_generator.hpp>    // boost 1.91: nil_uuid() no longer pulled in transitively
 #include <boost/uuid/string_generator.hpp> // boost 1.91: string_generator no longer pulled in transitively
 #include <folly/Executor.h>
+#include <folly/coro/Invoke.h>
+#include <folly/coro/TimedWait.h>
 #include <folly/hash/Hash.h>
 #include <folly/io/async/EventBase.h>
 
@@ -296,6 +298,12 @@ Async< ReplResult<> > ReplicaSet::add_member(ReplicaMemberInfo const& member, bo
     co_return ReplResult<>{folly::Unit{}};
 }
 
+Async< bool > ReplicaSet::wait_to_be_leader(std::chrono::milliseconds timeout) {
+    auto const r = co_await folly::coro::timed_wait(
+        folly::coro::co_invoke([this]() -> Async< void > { co_await elected_as_leader_; }), timeout);
+    co_return r.has_value();
+}
+
 Async< ReplResult<> > ReplicaSet::remove_member(ReplicaMemberInfo const& member, TraceId tid) {
     if (!raft_server_ || !raft_server_->is_leader()) {
         RS_LOG(WARN, tid, "remove_member rejected — not leader, member={}", boost::uuids::to_string(member.id));
@@ -543,15 +551,10 @@ Async< bool > ReplicaSet::load(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raft
         identify_str_ = rset_name_ + ":" + boost::uuids::to_string(group_id_);
         metrics_ = std::make_unique< ReplicaSetMetrics >(identify_str_.c_str());
 
-        // Seed the running commit watermark from what was persisted on the last persist_commit_lsn.  Log-store
-        // replay below advances it further via on_log_found from each replayed entry's commit_lsn_at_write.
-        commit_upto_lsn_.store(sb()->commit_lsn);
         bool const fresh = (sb()->raft_log_store_id == UINT32_MAX);
-        RS_LOG(INFO, NO_TRACE_ID,
-               "Starting {} ReplicaSet replica_id={}, log_store_id={} raft_server_id={}, commit_lsn_from_sb={}, "
-               "sb_size={}",
+        RS_LOG(INFO, NO_TRACE_ID, "Starting {} ReplicaSet replica_id={}, log_store_id={} raft_server_id={}, sb_size={}",
                (fresh ? "Fresh" : "Reloaded"), my_replica_id_str(), sb()->raft_log_store_id, raft_server_id_,
-               sb()->commit_lsn, sb_buffer_.size());
+               sb_buffer_.size());
     }
 
     // Take ownership of the group's raft config (both the MetaBlk handle and the in-memory json body).  Held
@@ -582,17 +585,16 @@ Async< bool > ReplicaSet::load(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raft
 
     // Log store setup — must be ready before raft_server->start_server so nuraft's load_log_store override
     // can hand it out to the raft machinery.  Fresh vs existing is determined by the SB itself: sentinel
-    // raft_log_store_id means fresh (create); a real id means recovery loaded an existing SB (load).  The
-    // callback fires once per replayed entry during LogStoreManager::recover() — reads the ReplLogHeader
-    // off the front and folds commit_lsn_at_write into commit_upto_lsn_ (single-threaded replay so plain
-    // load-then-store is enough;)
+    // raft_log_store_id means fresh (create); a real id means recovery loaded an existing SB (load).
     auto blob_stream = listener_ ? listener_->blob_stream() : nullptr;
 
-    // Replay callback for LogStoreManager::replay().  Runs single-threaded per entry, in order, awaited by the
-    // recover walker.  For every replayed entry: fold ReplLogHeader.commit_lsn_at_write into commit_upto_lsn_ (each
-    // entry proves the commit watermark had reached that LSN when it was written, recovering a point at/ahead of the
-    // last-persisted sb.commit_lsn), then re-drive on_commit for entries the state machine must re-apply.  Entries
-    // above the durable commit point are not re-driven here — nuraft's commit_ext fires them once the engine starts.
+    // Replay callback for LogStoreManager::replay().  Runs single-threaded per entry, in lsn order, awaited by
+    // the recover walker.  The LogStore already floors delivery at its checkpt_lsn (applied-durable watermark),
+    // so every entry arriving here is above the floor.  Whether it is safe to re-drive depends on commit PROOF:
+    // an entry stamped commit_lsn_at_write=C proves entries <= C were quorum-committed, and each entry's own
+    // proof arrives only with LATER entries' stamps.  So entries queue in replay_pending_ and the proven prefix
+    // dispatches in order; whatever is never proven (uncommitted tail at crash) is dropped by start_engine() and
+    // nuraft re-commits any of it that actually reached quorum.
     auto on_log_found_cb = [this](lsn_t entry_lsn, sisl::IoBufView const& bv) -> Async< void > {
         // On-disk record: [nuraft 9B preamble (term | val_type) | ReplLogHeader | user_header | value].  Only
         // app_log entries carry a ReplLogHeader + user payload — nuraft control entries (config / cluster-server)
@@ -608,21 +610,27 @@ Async< bool > ReplicaSet::load(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raft
             co_return;
         }
         auto const* h = r_cast< ReplLogHeader const* >(bv.cbytes() + nuraft::log_entry::kHdrSize);
-        if (h->commit_lsn_at_write > commit_upto_lsn_.load(std::memory_order_relaxed)) {
-            commit_upto_lsn_.store(h->commit_lsn_at_write, std::memory_order_relaxed);
+        if (h->commit_lsn_at_write > replay_proven_upto_) {
+            replay_proven_upto_ = h->commit_lsn_at_write;
         }
-        // Gate on the stable persisted watermark, NOT commit_upto_lsn_ — dispatch_commit below advances
-        // commit_upto_lsn_ to each replayed LSN, so gating on it would skip everything past the first entry.
-        if (entry_lsn > sb()->commit_lsn) {
-            RS_LOG(DEBUG, NO_TRACE_ID, "on_log_found lsn={} SKIP gated entry_lsn>sb.commit_lsn={}", entry_lsn,
-                   sb()->commit_lsn);
-            co_return;
+        replay_pending_.push_back(PendingReplayEntry{entry_lsn, bv});
+        while (!replay_pending_.empty() && (replay_pending_.front().lsn <= replay_proven_upto_)) {
+            auto e = std::move(replay_pending_.front());
+            replay_pending_.pop_front();
+            auto const* eh = r_cast< ReplLogHeader const* >(e.bv.cbytes() + nuraft::log_entry::kHdrSize);
+            RS_LOG(DEBUG, NO_TRACE_ID, "on_log_found lsn={} DISPATCH code={} proven_upto={}", e.lsn,
+                   static_cast< int >(eh->code), replay_proven_upto_);
+            auto* payload = const_cast< uint8_t* >(e.bv.cbytes()) + nuraft::log_entry::kHdrSize + sizeof(ReplLogHeader);
+            sisl::Blob const user_header{payload, eh->user_header_size_};
+            sisl::Blob const value{payload + eh->user_header_size_, eh->value_size};
+            co_await dispatch_commit(e.lsn, s_cast< JournalType >(eh->code), user_header, value);
+            // The SM watermark reflects only applies actually re-driven — never the raw proof level, else
+            // nuraft would skip re-committing the dropped unproven tail.
+            if (e.lsn > commit_upto_lsn_.load(std::memory_order_relaxed)) {
+                commit_upto_lsn_.store(e.lsn, std::memory_order_relaxed);
+            }
         }
-        RS_LOG(DEBUG, NO_TRACE_ID, "on_log_found lsn={} DISPATCH code={}", entry_lsn, static_cast< int >(h->code));
-        auto* payload = const_cast< uint8_t* >(bv.cbytes()) + nuraft::log_entry::kHdrSize + sizeof(ReplLogHeader);
-        sisl::Blob const user_header{payload, h->user_header_size_};
-        sisl::Blob const value{payload + h->user_header_size_, h->value_size};
-        co_await dispatch_commit(entry_lsn, s_cast< JournalType >(h->code), user_header, value);
+        co_return;
     };
 
     // Compact ceiling callback — returns app_truncate_upto_ when the option is enabled, max() otherwise
@@ -631,14 +639,25 @@ Async< bool > ReplicaSet::load(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raft
         return options_.allow_user_driven_truncate ? app_truncate_upto_.load(std::memory_order_acquire)
                                                    : std::numeric_limits< raft_lsn_t >::max();
     };
+    // Commit-watermark provider for the LogStore's checkpt capture: commit_upto_lsn_ advances only after each
+    // apply completes, so its value at a CP switchover is exactly "applies registered in the CP being sealed".
+    HomeRaftLogStore::CommitWatermarkFn commit_watermark_cb = [this]() -> raft_lsn_t {
+        return commit_upto_lsn_.load(std::memory_order_acquire);
+    };
     if (sb()->raft_log_store_id == UINT32_MAX) {
         log_store_ = co_await HomeRaftLogStore::create(*sb(), std::move(blob_stream), std::move(on_log_found_cb),
-                                                       std::move(truncate_ceiling_cb));
+                                                       std::move(truncate_ceiling_cb), std::move(commit_watermark_cb));
         co_await write_sb(); // persist newly-allocated log_store ids
     } else {
         log_store_ = co_await HomeRaftLogStore::load(*sb(), std::move(blob_stream), std::move(on_log_found_cb),
-                                                     std::move(truncate_ceiling_cb));
+                                                     std::move(truncate_ceiling_cb), std::move(commit_watermark_cb));
     }
+
+    // Seed the running commit watermark from the last completed CP's applied checkpoint.  On a clean shutdown
+    // this equals the pre-shutdown commit watermark exactly (the shutdown CP runs after the engine quiesced),
+    // so the replay window above it is empty; after a crash, replay dispatch advances it entry by entry.
+    commit_upto_lsn_.store(log_store_->last_checkpt_lsn());
+    RS_LOG(INFO, NO_TRACE_ID, "commit watermark seeded from log store checkpt_lsn={}", commit_upto_lsn_.load());
 
     // Seed app_truncate_upto_ to the log's current first_lsn.  Any compact that already occurred pre-restart
     // implies the app authorized compact at least up to log_store_->start_index() - 1, so this is a safe
@@ -657,13 +676,16 @@ Async< bool > ReplicaSet::load(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raft
 // right after load() (nothing to replay).  Either way start_server then observes the correct tail.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 Async< bool > ReplicaSet::start_engine() {
-    // The log-replay walk folded each entry's commit_lsn_at_write into commit_upto_lsn_, recovering a commit point
-    // at/ahead of the last-persisted sb.commit_lsn.  Persist it so the SB reflects the true watermark before the
-    // engine goes live and subsequent boots start from it.
-    if (commit_upto_lsn_.load() > sb()->commit_lsn) {
-        sb()->commit_lsn = commit_upto_lsn_.load();
-        co_await write_sb();
+    // Replay is done at this point.  Entries still queued lacked commit proof (the uncommitted tail at
+    // crash): drop them — the SM watermark stayed below them, so nuraft re-commits any that actually
+    // reached quorum once the engine is live.
+    if (!replay_pending_.empty()) {
+        RS_LOG(INFO, NO_TRACE_ID, "dropping {} unproven replayed entries above commit_upto={} (proof reached {})",
+               replay_pending_.size(), commit_upto_lsn_.load(), replay_proven_upto_);
+        replay_pending_.clear();
     }
+    HS_DBG_ASSERT_LE(log_store_->last_checkpt_lsn(), commit_upto_lsn_.load(),
+                     "invariant violated: checkpt_lsn above commit watermark at engine start");
 
     // Pin all this raft_server's coro work to one reactor — hash by group_id so each group sticks to one.
     auto& iom = iomgr();
@@ -826,23 +848,6 @@ Async< void > ReplicaSet::finish_destroy_local() {
     RS_LOG(INFO, NO_TRACE_ID, "finish_destroy_local complete");
 }
 
-Async< void > ReplicaSet::persist_commit_lsn() {
-    // Called by ReplicationManager's low-frequency periodic timer.  Skip if destroyed — the SB is (or will be)
-    // torn down and writing would race.
-    if (is_destroyed()) {
-        co_return;
-    }
-    auto const lsn = commit_upto_lsn_.load();
-    if (lsn == last_flushed_commit_lsn_) {
-        // No new commits since last persist — save the SB write.
-        co_return;
-    }
-    sb()->commit_lsn = lsn;
-    co_await write_sb();
-    last_flushed_commit_lsn_ = lsn;
-    RS_LOG(TRACE, NO_TRACE_ID, "persist_commit_lsn — SB.commit_lsn advanced to {}", lsn);
-}
-
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 // nuraft::state_mgr overrides
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -923,8 +928,8 @@ void ReplicaSet::system_exit(int exit_code) {
 //                                    nuraft's ptr<buffer>, co_await builder->write_chunk.  is_last_obj
 //                                    ignored — finalize is state_machine::apply_snapshot's job.
 //   • apply_snapshot (follower)   → finalize the cached Builder, hand the resulting ReplSnapshot to
-//                                    listener->apply_snapshot, advance commit_upto_lsn_ / sb()->commit_lsn
-//                                    / sb()->last_snapshot_lsn (max-guarded), write SB, trigger CP flush
+//                                    listener->apply_snapshot, advance commit_upto_lsn_ /
+//                                    sb()->last_snapshot_lsn (max-guarded), write SB, trigger CP flush
 //                                    (Snapshot reason).  Release_snapshot on both success and rejection.
 //   • read_logical_snp_obj (ldr)  → assert s->last_log_idx <= commit_upto (corruption if not); box
 //                                    shared<ReplSnapshot> from listener->last_snapshot() into user_snp_ctx
@@ -961,8 +966,7 @@ void ReplicaSet::create_snapshot(RaftSnapshotPtr const& s, nuraft::async_result<
             auto new_snap = res.value();
             new_snap->nuraft_snapshot_ = s;
 
-            // Advance the snapshot watermark with max-guard.  commit_lsn is owned by persist_commit_lsn's
-            // periodic timer; not written here to avoid racing.
+            // Advance the snapshot watermark with max-guard.
             sb()->last_snapshot_lsn = std::max(sb()->last_snapshot_lsn, lsn);
             co_await write_sb();
 
@@ -1002,13 +1006,12 @@ Async< bool > ReplicaSet::apply_snapshot(RaftSnapshotPtr const& s) {
         auto cur = commit_upto_lsn_.load(std::memory_order_acquire);
         while (cur < lsn && !commit_upto_lsn_.compare_exchange_weak(cur, lsn, std::memory_order_acq_rel)) {}
     }
-    if (sb()->commit_lsn < lsn) {
-        sb()->commit_lsn = lsn;
-    }
     if (sb()->last_snapshot_lsn < lsn) {
         sb()->last_snapshot_lsn = lsn;
     }
     co_await write_sb();
+    // The CP flush also round-trips the advanced commit watermark into the log store's checkpt_lsn (via the
+    // commit-watermark callback at switchover), making the jump durable alongside the snapshot state.
     co_await cp_mgr().trigger_cp_flush(/*force=*/true, CPTriggerReason::Snapshot);
 
     // Signal release: Repl-side use of this snap is done.  App now owns the object's future — it may be
@@ -1292,26 +1295,17 @@ Async< void > ReplicaSet::commit_config(ulong log_idx, nuraft::ptr< nuraft::clus
     // durable at this point.
     commit_upto_lsn_.store(lsn);
 
-    // Self-remove path.  If I am no longer in the committed config, the leader removed me — tear down locally.
-    // start_destroy_local() is idempotent so a stray call during a whole-group destroy is a no-op.  Same landing
-    // point as CTRL_DESTROY, just a different trigger (leader-driven remove_srv vs group-wide destroy).
-    bool in_config = false;
+    // NOTE: being absent from a committed config is NOT an eviction signal here — a joiner's catch-up
+    // replays every config that predates its own add_srv, none of which contain it.  Real eviction is
+    // delivered by nuraft's RemovedFromCluster raft_event (fired only when !is_catching_up()), which
+    // raft_event() handles by driving start_destroy_local().
     std::set< ReplicaId > new_members;
     for (auto const& srv : new_conf->get_servers()) {
-        if (srv->get_id() == raft_server_id_) {
-            in_config = true;
-        }
         try {
             new_members.insert(boost::uuids::string_generator{}(srv->get_aux()));
         } catch (std::exception const&) {
             // Malformed aux — skip; peer would fail identity checks elsewhere too.
         }
-    }
-    if (!in_config) {
-        RS_LOG(INFO, NO_TRACE_ID,
-               "commit_config lsn={} — my server_id={} absent from new config, start_destroy_local()", lsn,
-               raft_server_id_);
-        co_await start_destroy_local();
     }
 
     // Diff against the last-known-committed membership and fire the listener with the delta.  When the delta
@@ -1514,6 +1508,7 @@ nuraft::cb_func::ReturnCode ReplicaSet::raft_event(nuraft::cb_func::Type type, n
     case nuraft::cb_func::Type::BecomeLeader: {
         auto const gate = raft_server_ ? raft_server_->get_last_log_idx() : 0ul;
         traffic_ready_lsn_.store(to_i64(gate));
+        elected_as_leader_.post();
         RS_LOG(INFO, NO_TRACE_ID, "raft_event BecomeLeader — traffic_ready_lsn set to {}", gate);
         if (listener_) {
             listener_->on_change_in_role(ReplicaRole::LEADER);
@@ -1536,6 +1531,16 @@ nuraft::cb_func::ReturnCode ReplicaSet::raft_event(nuraft::cb_func::Type type, n
         if (listener_) {
             listener_->on_change_in_role(ReplicaRole::FOLLOWER);
         }
+        break;
+    }
+    case nuraft::cb_func::Type::RemovedFromCluster: {
+        // nuraft fires this only on a genuine eviction (never while catching up), when a committed config
+        // drops this server.  Same landing point as CTRL_DESTROY, different trigger.  start_destroy_local
+        // persists the SB, so it must run as a coroutine — fire and forget onto this reactor; the reaper
+        // finishes the teardown later.  Idempotent against a concurrent whole-group destroy.
+        RS_LOG(INFO, NO_TRACE_ID, "raft_event RemovedFromCluster — start_destroy_local()");
+        iomgr().spawn_detached(iomanager::ReactorTarget::current(),
+                               [this]() -> Async< void > { co_await start_destroy_local(); });
         break;
     }
     default:

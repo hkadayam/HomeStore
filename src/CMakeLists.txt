@@ -97,6 +97,9 @@ add_subdirectory(homestore/replication)
 add_subdirectory(homestore/resource)
 
 # Aggregate STATIC library — every per-module OBJECT lib plus the top-level orchestrator (homestore.cpp).
+# hs_mem_btree is deliberately NOT part of the aggregate: it compiles the btree in sync mode, whose symbols share
+# mangled names with hs_cow_btree's async-mode copies but differ in ABI (coroutine sret vs plain returns).  A binary
+# must link either `homestore` (async btree) or `hs_mem_btree` (sync btree) — never both.
 set(HOMESTORE_OBJECTS
     $<TARGET_OBJECTS:hs_base>
     $<TARGET_OBJECTS:hs_device>
@@ -105,7 +108,6 @@ set(HOMESTORE_OBJECTS
     $<TARGET_OBJECTS:hs_checkpoint>
     $<TARGET_OBJECTS:hs_blob>
     $<TARGET_OBJECTS:hs_logstore>
-    $<TARGET_OBJECTS:hs_mem_btree>
     $<TARGET_OBJECTS:hs_cow_btree>
     $<TARGET_OBJECTS:hs_replication>
     $<TARGET_OBJECTS:hs_resource>

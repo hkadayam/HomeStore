@@ -72,6 +72,12 @@ public:
     // compact — no caching.
     using TruncateCeilingFn = std::function< raft_lsn_t() >;
 
+    // Provider of the ReplicaSet's applied watermark (commit_upto): entries at/below it have their applies
+    // registered in the CP being sealed.  Forwarded (store-lsn-shifted) to the LogStore as its
+    // log_commit_watermark_cb, so checkpt_lsn tracks applied-durable instead of tail — which is what makes
+    // replay skip-below-checkpt and auto-truncation safe for the raft store.
+    using CommitWatermarkFn = std::function< raft_lsn_t() >;
+
     // First-boot create. Allocates a fresh main log_store; if blob_stream is non-null, also allocates a
     // free_blks log_store. Records both ids back into `sb` (caller persists the SB separately — the caller
     // owns the underlying MetaBlk; HomeRaftLogStore only mutates the two id fields).  `on_log_found` is
@@ -79,14 +85,16 @@ public:
     // registering here keeps the API uniform with load().  Returns shared<> because nuraft's state_mgr
     // load_log_store() must hand back a shared_ptr<log_store>, and HomeRaftLogStore inherits log_store.
     static Async< shared< HomeRaftLogStore > > create(ReplicaSetSuperBlk& sb, shared< RawBlkStream > blob_stream,
-                                                      OnLogFound on_log_found, TruncateCeilingFn truncate_ceiling_cb);
+                                                      OnLogFound on_log_found, TruncateCeilingFn truncate_ceiling_cb,
+                                                      CommitWatermarkFn commit_watermark_cb);
 
     // Restart load. Opens existing log_stores from ids in `sb`; throws if sb.free_blks_journal_id is set but
     // blob_stream is null (app removed the optimization across restart but persisted state still needs it).
     // `on_log_found` is registered on the main log_store and fires per entry during LogStoreManager's
     // recovery walk.  Only reads from `sb`.
     static Async< shared< HomeRaftLogStore > > load(ReplicaSetSuperBlk& sb, shared< RawBlkStream > blob_stream,
-                                                    OnLogFound on_log_found, TruncateCeilingFn truncate_ceiling_cb);
+                                                    OnLogFound on_log_found, TruncateCeilingFn truncate_ceiling_cb,
+                                                    CommitWatermarkFn commit_watermark_cb);
 
     HomeRaftLogStore(HomeRaftLogStore const&) = delete;
     HomeRaftLogStore& operator=(HomeRaftLogStore const&) = delete;
@@ -199,6 +207,12 @@ public:
     Async< void > purge_all_logs();
 
     void set_last_durable_lsn(raft_lsn_t lsn);
+
+    /// Applied watermark that was checkpointed durably (LogStore checkpt_lsn, raft-lsn-shifted): entries
+    /// at/below it have their applies covered by a completed CP.  ReplicaSet seeds commit_upto_lsn_ from
+    /// this at open — on a clean shutdown it equals the pre-shutdown commit watermark exactly.  0 = never
+    /// checkpointed.  Invariant: last_checkpt_lsn() <= commit_upto <= tail, always.
+    raft_lsn_t last_checkpt_lsn() const;
 
     /// Stores a non-owning pointer to the raft_server.  Caller must null it back via
     /// set_raft_server(nullptr) before raft_server is destroyed.

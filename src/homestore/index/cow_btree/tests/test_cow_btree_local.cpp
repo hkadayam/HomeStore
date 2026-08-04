@@ -1175,6 +1175,55 @@ TEST_F(CowBtreeLocalTest, PrepareRetryUnderCpSwitchover) {
     verify_all();
 }
 
+TEST_F(CowBtreeLocalTest, GenericPutRestartLoop) {
+    // Drives the ROOTED tree through the generic put/get path across restart rounds: each round inserts enough
+    // keys through put_one to force leaf/root splits, checkpoints, restarts, and re-validates EVERY key so far
+    // through get_one (descending from the recovered root).  Covers the recover→put→flush→recover composition
+    // that per-node-id verification cannot see.
+    constexpr uint32_t kRounds = 3;
+    constexpr uint64_t kKeysPerRound = 300;
+    auto value_for = [](uint64_t k) { return to_u32((k * 2654435761ull + 1) & 0xFFFFFFFFull); };
+
+    uint64_t total = 0;
+    auto* self = this;
+    for (uint32_t r = 0; r < kRounds; ++r) {
+        LOGINFO("GenericPutRestartLoop round {}/{}: inserting keys [{}, {})", r + 1, kRounds, total,
+                total + kKeysPerRound);
+        iomgr().spawn_and_block(ReactorTarget::any(), [self, total, &value_for]() -> Async< void > {
+            for (uint64_t k = total; k < total + kKeysPerRound; ++k) {
+                K key{k};
+                V val{value_for(k)};
+                auto res = co_await self->bt_->put_one(key, val, BtreePutType::UPSERT, nullptr, nullptr);
+                HS_REL_ASSERT(res.hasValue(), "put_one failed for key={}", k);
+            }
+            co_return;
+        }());
+        total += kKeysPerRound;
+
+        flush_incremental();
+        restart();
+
+        uint64_t mismatches = 0;
+        uint64_t first_bad = 0;
+        iomgr().spawn_and_block(ReactorTarget::any(),
+                                [self, total, &value_for, &mismatches, &first_bad]() -> Async< void > {
+                                    for (uint64_t k = 0; k < total; ++k) {
+                                        K key{k};
+                                        auto res = co_await self->bt_->get_one(key);
+                                        if (!res.hasValue() || (res.value().value() != value_for(k))) {
+                                            if (mismatches == 0) {
+                                                first_bad = k;
+                                            }
+                                            ++mismatches;
+                                        }
+                                    }
+                                    co_return;
+                                }());
+        ASSERT_EQ(mismatches, 0u) << "round " << r + 1 << ": " << mismatches << " of " << total
+                                  << " keys wrong after restart, first bad key=" << first_bad;
+    }
+}
+
 // ──────────────────────────────────────────── main ───────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
     ::testing::InitGoogleTest(&argc, argv);

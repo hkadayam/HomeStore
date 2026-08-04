@@ -85,6 +85,7 @@ protected:
         uint32_t verify_start_count_{0};
         uint32_t cleanup_start_count_{0};
         uint64_t test_dataset_size_{0};
+        uint64_t sync_gen_{0};
 
         void sync_for_member_start(uint32_t n = 0) { sync_for(registered_count_, ReplTestPhase::MEMBER_START, n); }
         void sync_for_test_start(uint32_t n = 0) { sync_for(test_start_count_, ReplTestPhase::TEST_RUN, n); }
@@ -92,17 +93,22 @@ protected:
         void sync_for_cleanup_start(uint32_t n = 0) { sync_for(cleanup_start_count_, ReplTestPhase::CLEANUP, n); }
 
     private:
-        // Barrier: the last of `max_count` arrivals flips the phase and wakes the rest.
+        // Barrier: the last of `max_count` arrivals flips the phase, bumps the generation, and wakes the
+        // rest.  Waiters release on the generation (not the phase value), so every sync is safely reusable
+        // any number of times — including re-entering the same phase, which loop-shaped tests do when they
+        // rendezvous around each restart round.
         void sync_for(uint32_t& count, ReplTestPhase new_phase, uint32_t max_count) {
             if (max_count == 0) {
                 max_count = SISL_OPTIONS["replicas"].as< uint32_t >();
             }
             std::unique_lock< bip::interprocess_mutex > lg(mtx_);
+            auto const gen = sync_gen_;
             if (++count == max_count) {
                 phase_ = new_phase;
+                ++sync_gen_;
                 cv_.notify_all();
             } else {
-                cv_.wait(lg, [this, new_phase]() { return phase_ == new_phase; });
+                cv_.wait(lg, [this, gen]() { return sync_gen_ != gen; });
             }
             count = 0;
         }
@@ -209,6 +215,36 @@ public:
     void teardown() {
         LOGINFO("Stopping HomeStore replica={}", replica_num_);
         shutdown_homestore(dev_list_.empty() /* cleanup only generated devices */);
+    }
+
+    // Driver-only (peers_ is empty on followers): reap the spawned peer replicas and surface their exit
+    // codes.  A follower's gtest failure exits nonzero — without this the driver would report success while
+    // a peer failed.  Returns 0 when every peer exited clean, else the first nonzero exit code seen.
+    int wait_for_peers() {
+        int rc{0};
+        for (auto& c : peers_) {
+            auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{120};
+            while (c.running() && (std::chrono::steady_clock::now() < deadline)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{200});
+            }
+            if (c.running()) {
+                LOGERROR("Peer replica pid={} did not exit within 120s — terminating", c.id());
+                c.terminate();
+                if (rc == 0) {
+                    rc = 124;
+                }
+                continue;
+            }
+            c.wait(); // reap the already-exited child so exit_code() is valid
+            if (c.exit_code() != 0) {
+                LOGERROR("Peer replica pid={} exited with code {}", c.id(), c.exit_code());
+                if (rc == 0) {
+                    rc = c.exit_code();
+                }
+            }
+        }
+        peers_.clear();
+        return rc;
     }
 
     void restart(uint32_t shutdown_delay_secs = 5u) { restart_homestore(shutdown_delay_secs); }
@@ -441,8 +477,7 @@ private:
                     fmt::format_to(std::back_inserter(cmd), " {}", args_[j]);
                 }
                 LOGINFO("Spawning replica={} instance: {}", i, cmd);
-                bproc::child c(bproc::cmd = cmd, proc_grp_);
-                c.detach();
+                peers_.emplace_back(bproc::cmd = cmd, proc_grp_);
             }
         } else {
             shm_ = std::make_unique< bip::shared_memory_object >(bip::open_only, kShmem, bip::read_write);
@@ -472,6 +507,7 @@ private:
     std::vector< DevInfo > dev_list_; // this replica's slice of --replica_dev_list (empty => generated files)
 
     bproc::group proc_grp_;
+    std::vector< bproc::child > peers_; // driver-only: spawned replicas, reaped by wait_for_peers()
     std::unique_ptr< bip::shared_memory_object > shm_;
     std::unique_ptr< bip::mapped_region > region_;
     IPCData* ipc_data_{nullptr};

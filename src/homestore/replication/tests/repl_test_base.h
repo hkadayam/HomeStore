@@ -13,18 +13,20 @@
  *
  *********************************************************************************/
 //
-// ReplicaSetTestBase — the gtest base fixture for replication UNIT tests.  It stands up a MemBtree-backed store,
-// hands it to the shared HSReplTestHelper (which owns the listener + cluster), and offers the common operations
-// (write_on_leader / wait_for_commits / validate_data).  Being testing::Test-derived, this is unit-test-only; an
-// integ driver reuses HSReplTestHelper directly instead.  Different repl unit-test files derive from this base.
+// ReplicaSetTestBase — the gtest base fixture for replication UNIT tests.  It stands up a durable COWBtree-backed
+// store, hands it to the shared HSReplTestHelper (which owns the listener + cluster), and offers the common
+// operations (write_on_leader / wait_for_commits / validate_data).  Being testing::Test-derived, this is
+// unit-test-only; an integ driver reuses HSReplTestHelper directly instead.  Different repl unit-test files derive
+// from this base.
 //
-// NOTE: TUs that include this (via MemBtreeStore) compile in sync btree mode to match the hs_mem_btree library.
+// NOTE: TUs that include this compile in btree async mode (BTREE_ASYNC_MODE) to match the hs_cow_btree library.
 //
 #pragma once
 
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <thread>
 
 #include <gtest/gtest.h>
@@ -139,13 +141,32 @@ protected:
     // Poll this replica's committed-and-applied count (the listener's commit_count(), bumped in on_commit after the
     // store apply) until it reaches `total` — this is the CUMULATIVE expected count across all write_on_leader
     // calls, not a per-call count.  Same quantity the old harness's wait_for_commits() polled.
+    // Committed-and-applied count on this replica.  On a follower the listener is created only when the
+    // leader's join_cluster_request arrives, which trails the creator's self-election — a null listener here
+    // is a normal transient, counted as 0.
+    static uint64_t commit_count() {
+        auto l = g_helper->listener();
+        return l ? l->commit_count() : 0ul;
+    }
+
     void wait_for_commits(uint64_t total) {
-        while (g_helper->listener()->commit_count() < total) {
+        while (commit_count() < total) {
             std::this_thread::sleep_for(std::chrono::milliseconds{1000});
-            LOGINFO("Replica={} received {} commits, expected {}", g_helper->replica_num(),
-                    g_helper->listener()->commit_count(), total);
+            LOGINFO("Replica={} received {} commits, expected {}", g_helper->replica_num(), commit_count(), total);
         }
         LOGINFO("Replica={} received {} commits as expected", g_helper->replica_num(), total);
+    }
+
+    // Baseline-relative wait: `n` NEW commits on top of `baseline` (a commit_count() snapshot taken before
+    // the writes).  Loop-shaped tests use this so the expected count never depends on what a restart's
+    // replay did or didn't re-deliver.
+    void wait_for_commits_from(uint64_t baseline, uint64_t n) {
+        while (commit_count() < baseline + n) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1000});
+            LOGINFO("Replica={} received {} of {} commits (baseline {})", g_helper->replica_num(), commit_count(),
+                    baseline + n, baseline);
+        }
+        LOGINFO("Replica={} received {} new commits as expected", g_helper->replica_num(), n);
     }
 
     // Force a checkpoint on this replica's store so its committed state is flushed durably to disk — a subsequent
@@ -153,18 +174,40 @@ protected:
     void trigger_cp() { iomgr().spawn_and_block(iomanager::ReactorTarget::any(), store_->checkpoint()); }
 
     // Validate keys [0, total): every replica must hold the identical (key -> value_for(key)) mapping.  `total` is
-    // the CUMULATIVE count across all writes so far.
+    // the CUMULATIVE count across all writes so far.  Applies can still be streaming in when this is entered
+    // (replay re-delivery, raft re-commits after a restart), so the check polls to convergence: retry until clean
+    // or the deadline expires.  Real divergence still fails at the deadline — with the exact keys logged.
     void validate_data(uint64_t total) {
+        auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
         uint64_t mismatches = 0;
-        iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [this, total, &mismatches]() -> Async< void > {
-            for (uint64_t k = 0; k < total; ++k) {
-                auto const v = co_await store_->lookup(k);
-                if (!v.has_value() || *v != value_for(k)) {
-                    ++mismatches;
+        std::vector< std::pair< uint64_t, std::optional< uint32_t > > > bad;
+        while (true) {
+            mismatches = 0;
+            bad.clear();
+            iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [this, total, &mismatches,
+                                                                      &bad]() -> Async< void > {
+                for (uint64_t k = 0; k < total; ++k) {
+                    auto const v = co_await store_->lookup(k);
+                    if (!v.has_value() || *v != value_for(k)) {
+                        ++mismatches;
+                        if (bad.size() < 8) {
+                            bad.emplace_back(k, v);
+                        }
+                    }
                 }
+                co_return;
+            }());
+            if ((mismatches == 0) || (std::chrono::steady_clock::now() > deadline)) {
+                break;
             }
-            co_return;
-        }());
+            LOGINFO("Replica={} validate: {} of {} keys not converged yet, retrying", g_helper->replica_num(),
+                    mismatches, total);
+            std::this_thread::sleep_for(std::chrono::milliseconds{500});
+        }
+        for (auto const& [k, v] : bad) {
+            LOGERROR("Replica={} diverged key={} expected={} got={}", g_helper->replica_num(), k, value_for(k),
+                     v.has_value() ? std::to_string(*v) : "missing");
+        }
         ASSERT_EQ(mismatches, 0u) << "replica " << g_helper->replica_num() << " diverged on " << mismatches << " of "
                                   << total << " keys";
     }

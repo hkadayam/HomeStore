@@ -209,9 +209,12 @@ Async< void > FollyRpcListener::InboundConnection::dispatch_request(nuraft::grou
     }
     // Hot path: sync lookup of an already-registered group.
     auto srv = mgr_->lookup_raft_server(gid);
-    if (!srv) {
-        // Cold path: first message for an unknown group_id — ask the application if it wants to host this
-        // group, and (if so) construct the ReplicaSet.  Async because it does meta-block I/O.
+    if (!srv && (req->get_type() == nuraft::msg_type::join_cluster_request)) {
+        // Cold path: a join_cluster_request is the leader's explicit invitation into a new group — ask the
+        // application if it wants to host it, and (if so) construct the ReplicaSet.  Async because it does
+        // meta-block I/O.  Only a join may create the group: any other message type (append/heartbeat/vote)
+        // for an unknown group_id falls through to SERVER_NOT_FOUND below, so straggler traffic from peers
+        // whose reaper hasn't fired yet cannot resurrect a group this replica already destroyed and erased.
         srv = co_await mgr_->create_replica_set_on_demand(gid);
     }
     if (!srv) {

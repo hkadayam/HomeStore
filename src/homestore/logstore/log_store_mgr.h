@@ -91,7 +91,8 @@ public:
     /// Looks up an existing (already-loaded) LogStore by store_id, installs `options` (updating
     /// auto_truncate_count_ if the flag changed), and attaches the replay handler.  Returns nullptr if no
     /// store with that id exists.
-    shared< LogStore > open_log_store(logstore_id_t store_id, LogStoreOptions const& options, log_replay_cb handler);
+    shared< LogStore > open_log_store(logstore_id_t store_id, LogStoreOptions const& options, log_replay_cb handler,
+                                      log_commit_watermark_cb watermark_cb = nullptr);
 
     /// Destroy a single LogStore by id — removes its meta_blk so it won't be re-discovered on restart, then
     /// erases it from in-memory state.  Idempotent (warns and returns for unknown ids).

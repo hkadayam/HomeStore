@@ -107,14 +107,12 @@ Async< void > ReplicationManager::start_engine() {
         }
     }
 
-    // Go live: open the rpc listener to inbound traffic and start the gc / persist-commit-lsn maintenance loops
-    // (coroutines on any reactor — every SB write inside is co_await-able, so no dedicated reaper thread).
+    // Go live: open the rpc listener to inbound traffic and start the gc maintenance loop (coroutines on any
+    // reactor — every SB write inside is co_await-able, so no dedicated reaper thread).  Commit-watermark
+    // durability needs no loop here: each ReplicaSet's commit_upto rides its raft log store's checkpt_lsn,
+    // captured at every CP switchover.
     nuraft::ptr< nuraft::msg_handler > null_handler;
     rpc_listener_->listen(null_handler);
-    persist_commit_lsn_timer_.start(
-        iomanager::ReactorTarget::any(),
-        std::chrono::milliseconds{HS_RUNTIME_CONFIG(consensus.flush_durable_commit_interval_ms)},
-        iomanager::TimerKind::Recurring, [this]() -> Async< void > { co_await persist_commit_lsn(); });
     gc_timer_.start(iomanager::ReactorTarget::any(),
                     std::chrono::milliseconds{HS_RUNTIME_CONFIG(consensus.replica_set_reaper_scan_interval_ms)},
                     iomanager::TimerKind::Recurring, [this]() -> Async< void > { co_await gc_replica_sets(); });
@@ -174,12 +172,6 @@ Async< void > ReplicationManager::stop() {
     // Stop timers first so no new maintenance fires against a listener that's about to shut down.  Each
     // stop() is idempotent and blocks until the currently-scheduled coroutine (if any) has drained.
     co_await gc_timer_.stop();
-    co_await persist_commit_lsn_timer_.stop();
-
-    // Final durable flush of every set's commit watermark before teardown.  The 500ms timer may not have ticked
-    // since the last commits, and a clean shutdown must leave each SB.commit_lsn current so the next boot recovers
-    // the correct tail directly rather than leaning on post-restart catch-up.
-    co_await persist_commit_lsn();
 
     // Shut down every raft engine BEFORE freeing the RPC transport / executor it references.  Each engine's
     // nuraft::context holds mgr_.rpc_listener() / rpc_client_factory() and the reactor executor; freeing those
@@ -292,20 +284,20 @@ Async< ReplResult< shared< ReplicaSet > > > ReplicationManager::create_replica_s
         co_await sb_mblk.write(tmp->cbytes(), tmp->size());
     }
 
-    // Raft config MetaBlk.  Unlike on-demand, we PRE-POPULATE the cluster config with every `members`
-    // entry — the state_mgr load_config path finds "config" already present and returns it as-is instead
-    // of falling back to the single-self bootstrap.  Each server's aux holds the UUID string (matches
-    // add_member()'s stamping) so downstream int32-srv_id → ReplicaId reverse lookups uniformly work.
+    // Raft config MetaBlk.  The initial cluster config contains ONLY this creator — it self-elects as the
+    // leader of a 1-member group, and every other member is invited via add_member() below.  add_srv is what
+    // makes nuraft send each peer a join_cluster_request, and that join is the only message the RPC listener
+    // will create a group for — membership is established solely by explicit invitation, so a straggler
+    // append/vote for a destroyed group can never rebuild it.  The server's aux holds the UUID string
+    // (matches add_member()'s stamping) so downstream int32-srv_id → ReplicaId reverse lookups uniformly work.
     auto servers = nlohmann::json::array();
     auto const priority = HS_RUNTIME_CONFIG(consensus.default_leader_priority);
-    for (auto const& member_id : members) {
-        servers.push_back(nlohmann::json{{"id", to_server_id(member_id)},
-                                         {"dc_id", 0},
-                                         {"endpoint", lookup_peer_addr(member_id)},
-                                         {"aux", boost::uuids::to_string(member_id)},
-                                         {"learner", false},
-                                         {"priority", priority}});
-    }
+    servers.push_back(nlohmann::json{{"id", to_server_id(my_uuid_)},
+                                     {"dc_id", 0},
+                                     {"endpoint", lookup_peer_addr(my_uuid_)},
+                                     {"aux", boost::uuids::to_string(my_uuid_)},
+                                     {"learner", false},
+                                     {"priority", priority}});
     nlohmann::json raft_cfg_json = {{"group_id", gid_str},
                                     {"config",
                                      {{"log_idx", 0},
@@ -337,6 +329,40 @@ Async< ReplResult< shared< ReplicaSet > > > ReplicationManager::create_replica_s
         pending_creates_.erase(group_id);
     }
     RM_LOG(INFO, NO_TRACE_ID, "Created ReplicaSet group_id={} members={}", gid_str, members.size());
+
+    // A 1-member group elects itself once its election timer fires; add_srv is leader-only, so wait for
+    // the BecomeLeader event before inviting anyone.
+    auto const elect_timeout = std::chrono::milliseconds{3ul * HS_RUNTIME_CONFIG(consensus.elect_to_high_ms)};
+    if (!co_await rs->wait_to_be_leader(elect_timeout)) {
+        RM_LOG(ERROR, NO_TRACE_ID, "created group_id={} did not self-elect within {}ms", gid_str,
+               elect_timeout.count());
+        co_return folly::makeUnexpected(ReplError::TIMEOUT);
+    }
+
+    // Invite every other member.  nuraft allows one config change at a time and holds off further changes
+    // until the previous joiner has caught up, so retry while it reports CONFIG_CHANGING / SERVER_IS_JOINING;
+    // any other error is fatal for the create.  Each add_srv sends the peer a join_cluster_request — the only
+    // message its RPC listener will construct the group for.
+    for (auto const& member_id : members) {
+        if (member_id == my_uuid_) {
+            continue;
+        }
+        ReplicaMemberInfo info{};
+        info.id = member_id;
+        info.priority = to_int(HS_RUNTIME_CONFIG(consensus.default_leader_priority));
+        while (true) {
+            auto const res = co_await rs->add_member(info);
+            if (res.hasValue()) {
+                break;
+            }
+            if ((res.error() != ReplError::CONFIG_CHANGING) && (res.error() != ReplError::SERVER_IS_JOINING)) {
+                RM_LOG(ERROR, NO_TRACE_ID, "create: add_member {} to group_id={} failed err={}",
+                       boost::uuids::to_string(member_id), gid_str, to_int(res.error()));
+                co_return folly::makeUnexpected(res.error());
+            }
+            co_await iomgr().sleep(std::chrono::milliseconds{100});
+        }
+    }
     co_return rs;
 }
 
@@ -574,26 +600,6 @@ Async< void > ReplicationManager::truncate() {
         nuraft::Baton baton;
         cr->when_ready([&baton](uint64_t&, nuraft::ptr< std::exception >&) { baton.post(); });
         co_await baton.wait();
-    }
-    co_return;
-}
-
-Async< void > ReplicationManager::persist_commit_lsn() {
-    // Snapshot the current set of replica sets and fan out.  Under a shared lock we grab shared_ptrs so
-    // sets that get destroyed mid-fan-out stay alive until we're done touching them; the co_await calls run
-    // outside the lock.
-    std::vector< shared< ReplicaSet > > sets;
-    {
-        std::shared_lock lk{rs_mtx_};
-        sets.reserve(replica_sets_.size());
-        for (auto const& [_, rs] : replica_sets_) {
-            if (rs) {
-                sets.push_back(rs);
-            }
-        }
-    }
-    for (auto const& rs : sets) {
-        co_await rs->persist_commit_lsn();
     }
     co_return;
 }

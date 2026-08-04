@@ -71,7 +71,8 @@ struct LogStoreSb {
     uint8_t append_mode{0};
     uint8_t _reserved[3]{};
     lsn_t head_lsn{0};
-    lsn_t checkpt_lsn{-1}; // Tail lsn captured at CP switchover; -1 = never checkpointed
+    lsn_t checkpt_lsn{-1}; // Watermark captured at CP switchover (consumer watermark_cb value if registered,
+                           // else tail_lsn); -1 = never checkpointed
     uint32_t n_rollback_records{0};
     // followed by rollback_record rollback_records[n_rollback_records]
 
@@ -112,6 +113,15 @@ static_assert(std::is_trivially_copyable_v< LogStoreRecord >, "StreamTracker req
 using log_replay_cb = std::function< Async< void >(lsn_t lsn, const sisl::IoBufView& data) >;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Consumer durable-watermark provider, sampled by LogStore::on_switchover_cp.  A consumer whose state lives
+// OUTSIDE the log (e.g. the raft store, whose applies land in a btree) registers this at open(); the returned
+// lsn means "my state derived from entries up to here is registered in the CP being sealed" and must be
+// <= tail_lsn.  Stores that register it get checkpt_lsn == that watermark (instead of tail) AND replay-floor
+// semantics: on_log_found skips handler delivery for entries <= checkpt_lsn, since their effects are durable.
+// ─────────────────────────────────────────────────────────────────────────────
+using log_commit_watermark_cb = std::function< lsn_t() >;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // LogStore
 //
 // One per logical client of a shared LogStream.  Lifecycle (managed by LogStoreManager):
@@ -150,8 +160,9 @@ public:
     // ── Open / state ─────────────────────────────────────────────────────────
 
     /// Attach a replay handler.  Must be called before LogStoreManager::recover() if the client wants per-record
-    /// replay callbacks.  Transitions store to opened state.
-    void open(LogStoreOptions const& options, log_replay_cb handler);
+    /// replay callbacks.  Transitions store to opened state.  watermark_cb (optional) opts this store into
+    /// consumer-durable checkpt semantics — see log_commit_watermark_cb.
+    void open(LogStoreOptions const& options, log_replay_cb handler, log_commit_watermark_cb watermark_cb = nullptr);
 
     LogStoreOptions const& options() const { return options_; }
 
@@ -217,6 +228,7 @@ public:
     uint64_t stream_id() const { return stream_->stream_id(); }
     lsn_t head_lsn() const { return head_lsn_.load(std::memory_order_acquire); }
     lsn_t tail_lsn() const { return tail_lsn_.load(std::memory_order_acquire); }
+    lsn_t checkpt_lsn() const { return checkpt_lsn_.load(std::memory_order_acquire); }
     lsn_t flushed_upto() const;
 
     /// Returns the safest stream byte offset this store can be truncated to (== records_.at(head_lsn_).trunc_key
@@ -265,6 +277,7 @@ private:
     mutable std::atomic< lsn_t > prev_contiguous_lsn_hint_{-1};
 
     log_replay_cb handler_{};
+    log_commit_watermark_cb watermark_cb_{}; // set at open(); switches checkpt capture + replay floor semantics
 
     sisl::StreamTracker< LogStoreRecord, /*AutoTruncate=*/false, /*TrackCompletion=*/false > records_;
 

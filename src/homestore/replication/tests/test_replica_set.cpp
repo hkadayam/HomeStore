@@ -13,9 +13,9 @@
  *
  *********************************************************************************/
 //
-// Replication test binary entry point + the canonical bring-up/convergence smoke test. The full suite is split by
-// category across sibling .cpp files (test_repl_writes/recovery/... — Category A/B/...) that all compile into this
-// one binary and share the ReplicaSetTest fixture from repl_test_base.h; main() and the smoke test live here.
+// Replication test binary entry point.  The suite is split by category across sibling .cpp files
+// (test_repl_writes/recovery/... — Category A/B/...) that all compile into this one binary and share the
+// ReplicaSetTest fixture from repl_test_base.h; only main() lives here.
 //
 #include <memory>
 #include <vector>
@@ -32,18 +32,6 @@ using namespace test_common;
 
 // The one multi-process helper for this run (declared extern in repl_test_base.h).
 std::unique_ptr< HSReplTestHelper > test_common::g_helper;
-
-TEST_F(ReplicaSetTest, ReplicatedWrites) {
-    auto const n = SISL_OPTIONS["num_io"].as< uint64_t >();
-    g_helper->sync_for_test_start();
-
-    write_on_leader(n);
-    wait_for_commits(n);
-
-    g_helper->sync_for_verify_start();
-    validate_data(n);
-    g_helper->sync_for_cleanup_start();
-}
 
 int main(int argc, char* argv[]) {
     // Capture the full argv before gtest strips its own flags — peer processes are re-spawned with these args.
@@ -73,11 +61,16 @@ int main(int argc, char* argv[]) {
     g_helper = std::make_unique< HSReplTestHelper >("test_replica_set", args, argv);
     g_helper->setup(SISL_OPTIONS["replicas"].as< uint32_t >());
 
-    auto const ret = RUN_ALL_TESTS();
+    auto ret = RUN_ALL_TESTS();
     g_helper->teardown();
-    // Release the helper (and the per-replica listeners it holds → their MemBtree state machines) before main
-    // returns, while MemBtreeDrainer's function-local-static singleton is still alive. Left to static destruction,
-    // g_helper outlives the drainer and ~MemBtree's deregister() would touch a freed drainer.
+    // Driver-only (no-op on followers): a follower's gtest failure exits nonzero — fold it into our own
+    // exit code so a peer-side failure fails the whole run.
+    if (auto const peer_rc = g_helper->wait_for_peers(); (peer_rc != 0) && (ret == 0)) {
+        ret = peer_rc;
+    }
+    // Release the helper (and the per-replica listeners/stores it holds) before main returns, so their teardown
+    // runs while the function-local-static singletons they depend on are still alive. Left to static destruction,
+    // g_helper would outlive those singletons and its members' dtors would touch freed state.
     g_helper.reset();
     return ret;
 }

@@ -61,7 +61,8 @@ Async< shared< Btree< K, V > > > COWBtreeManager::load_cow_btree(BtreeConfig con
     auto mblk = MetaBlkWrapper::load(meta_client_, std::move(it->mblk));
 
     auto cow_bt = co_await COWBtree::load(*this, std::move(blob_dev), std::move(mblk), node_cache_, overflow_cache_);
-    auto btree = std::make_shared< Btree< K, V > >(cfg, std::move(cow_bt), sb.root_node_id);
+    auto const root_id = cow_bt->super_blk().root_node_id;
+    auto btree = std::make_shared< Btree< K, V > >(cfg, std::move(cow_bt), root_id);
 
     track(btree);
     pending_btrees_.erase(it);

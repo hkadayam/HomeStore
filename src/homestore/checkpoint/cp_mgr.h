@@ -61,14 +61,18 @@ public:
 // 10-unit gaps for future insertions):
 //     10   COWBtree
 //     20   BlobDev
-//     30   LogStore
-//    999   Replication  (== CPRank::Sentinel - 1, reserved)
+//    999   LogStore  (== CPRank::LogStore, the sentinel-adjacent slot)
+//
+// LogStore flushes LAST by design: its cp_flush persists each store's checkpt_lsn, and a checkpt on disk
+// must certify that every lower-rank consumer's state for this CP (btree nodes, blob streams) is already
+// durable — persisting it any earlier would let a crash strand a checkpt that promises state the CP never
+// flushed.
 //
 // Ranks must be unique across all registered consumers. Duplicates are a debug assert; in release the new
 // consumer is inserted adjacent-after the existing one so the process continues.
 struct CPRank {
     static constexpr uint32_t Sentinel = 1000;
-    static constexpr uint32_t Replication = Sentinel - 1;
+    static constexpr uint32_t LogStore = Sentinel - 1;
 };
 
 class CPCallbacks {

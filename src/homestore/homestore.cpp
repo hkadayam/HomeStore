@@ -232,16 +232,18 @@ Async< void > HomeStore::shutdown() {
     // ── Pass 1: quiesce the autonomous drivers, while every module is still alive ────────────────────────────────
     // Only CP and ResourceMgr drive work INTO other modules (CP flushes its consumers; ResourceMgr truncates
     // LogStore/Repl), so only they need a prepare phase before the reverse-order teardown below.  ResourceMgr
-    // first, so no in-flight truncation dirties the final CP; then CP takes its final durability flush into
-    // still-live consumers and stops its timer.  After this, nothing autonomously calls between modules.
+    // first, so no in-flight truncation dirties the final CP.  Replication stops BEFORE the final CP: with the
+    // engines quiesced, every apply has completed, so the CP's commit-watermark capture equals the commit
+    // watermark exactly — the next boot's replay window over this log is empty by construction.  Then CP takes
+    // its final durability flush into still-live consumers and stops its timer.
     co_await ResourceMgr::prepare_shutdown();
+    if (input_.repl_app) {
+        co_await repl_mgr().stop();
+    }
     co_await cp_mgr().prepare_shutdown();
 
     // ── Pass 2: tear down in strict reverse of boot order ───────────────────────────────────────────────────────
     // Boot: Device → ResourceMgr → Meta → CP → Blob → COWBtree → LogStore → Repl.
-    if (input_.repl_app) {
-        co_await repl_mgr().stop();
-    }
     co_await log_store_mgr().shutdown();
     cow_btree_mgr().shutdown();
     blob_dev_mgr().shutdown();

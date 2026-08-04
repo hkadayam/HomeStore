@@ -95,7 +95,7 @@ Async< shared< LogStore > > LogStore::load(shared< LogStream > stream, MetaBlkWr
                                            std::move(records));
 }
 
-void LogStore::open(LogStoreOptions const& options, log_replay_cb handler) {
+void LogStore::open(LogStoreOptions const& options, log_replay_cb handler, log_commit_watermark_cb watermark_cb) {
     // append_mode is durable — was pulled from SB at load() time into options_.  Caller must match; a
     // mismatch means their reopen would silently mis-interpret every existing record.
     HS_REL_ASSERT_EQ(options_.append_mode, options.append_mode,
@@ -103,9 +103,13 @@ void LogStore::open(LogStoreOptions const& options, log_replay_cb handler) {
                      options_.append_mode, options.append_mode);
     options_ = options;
     handler_ = std::move(handler);
-    THIS_LOGSTORE_LOG(INFO, "Opened append_mode={} auto_truncate={} preserve_log_count={} head_lsn={} handler={}",
+    watermark_cb_ = std::move(watermark_cb);
+    THIS_LOGSTORE_LOG(INFO,
+                      "Opened append_mode={} auto_truncate={} preserve_log_count={} head_lsn={} handler={} "
+                      "watermark_cb={}",
                       options_.append_mode, options_.auto_truncate, options_.preserve_log_count,
-                      head_lsn_.load(std::memory_order_relaxed), handler_ ? "set" : "none");
+                      head_lsn_.load(std::memory_order_relaxed), handler_ ? "set" : "none",
+                      watermark_cb_ ? "set" : "none");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -228,9 +232,15 @@ Async< void > LogStore::truncate(lsn_t upto_lsn, bool in_memory_only) {
 }
 
 void LogStore::on_switchover_cp() {
-    // Capture the current tail_lsn as the pending checkpoint watermark.  The next successful cp_flush_persist
-    // promotes this to checkpt_lsn_ + sb->checkpt_lsn.
-    pending_checkpt_lsn_.store(tail_lsn_.load(std::memory_order_acquire), std::memory_order_release);
+    // Capture the pending checkpoint watermark: the consumer's durable watermark when a watermark_cb is
+    // registered (its state derived from entries up to that lsn is registered in the CP being sealed), else
+    // the current tail_lsn (the log content itself is the consumer state).  The next successful
+    // cp_flush_persist promotes this to checkpt_lsn_ + sb->checkpt_lsn.
+    lsn_t const tail = tail_lsn_.load(std::memory_order_acquire);
+    lsn_t const watermark = watermark_cb_ ? watermark_cb_() : tail;
+    HS_DBG_ASSERT_LE(watermark, tail, "LogStore sid={} watermark_cb returned {} above tail {}", store_id_, watermark,
+                     tail);
+    pending_checkpt_lsn_.store(std::min(watermark, tail), std::memory_order_release);
 }
 
 Async< void > LogStore::cp_flush_persist() {
@@ -329,6 +339,14 @@ Async< void > LogStore::on_log_found(lsn_t lsn, const stream_key& key, const sis
     records_.create(lsn, key.log_id, key.record_stream_offset, trunc_stream_offset);
     THIS_LOGSTORE_LOG(TRACE, "on_log_found lsn={} log_id={} record_off={} trunc_off={}", lsn, key.log_id,
                       key.record_stream_offset, trunc_stream_offset);
+    // Replay floor for watermark-registered stores: entries at or below checkpt_lsn have their consumer-side
+    // effects durably checkpointed, so handler delivery is skipped.  records_ was still rebuilt above — the
+    // store's own index always covers the full retained log.
+    if (watermark_cb_ && (lsn <= checkpt_lsn_.load(std::memory_order_acquire))) {
+        THIS_LOGSTORE_LOG(DEBUG, "on_log_found lsn={} at/below checkpt_lsn={} — handler delivery skipped", lsn,
+                          checkpt_lsn_.load(std::memory_order_acquire));
+        co_return;
+    }
     if (handler_) {
         co_await handler_(lsn, data);
     }

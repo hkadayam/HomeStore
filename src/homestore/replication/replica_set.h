@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -14,6 +15,7 @@
 
 #include <boost/uuid/uuid_io.hpp>
 #include "common/async.h"
+#include <folly/coro/Baton.h>
 #include <folly/futures/Future.h>
 #include <folly/futures/Promise.h>
 
@@ -86,10 +88,11 @@ struct ReplLogHeader {
     uint8_t minor_version{0};
     uint32_t value_size{0};
     uint32_t user_header_size_{0};
-    // Snapshot of the proposer's commit_upto_lsn_ at the moment this entry was built.  During log-store
-    // replay in start(), the replay callback folds this back into commit_upto_lsn_ so restart can skip
-    // re-firing on_commit for entries already durably committed pre-crash.  Zero-filled for the very first
-    // entries written before any commit has advanced past 0.
+    // Snapshot of the proposer's commit_upto_lsn_ at the moment this entry was built — the per-entry commit
+    // proof.  During log-store replay a durable entry stamped C proves every entry <= C was quorum-committed
+    // pre-crash, so the replay callback dispatches exactly the proven prefix above the checkpt floor and
+    // leaves unproven tail entries to nuraft's re-commit.  Zero-filled for the very first entries written
+    // before any commit has advanced past 0.
     int64_t commit_lsn_at_write{0};
 
     uint32_t user_header_size() const { return user_header_size_; }
@@ -234,12 +237,11 @@ struct ReplicaSetSuperBlk {
     uint8_t destroy_pending{0};
     raft_lsn_t last_snapshot_lsn{0};
 
-    // Coarse-grained durability floor for committed LSNs.  Advanced periodically by persist_commit_lsn — the
-    // per-entry commit_lsn_at_write stamp in ReplLogHeader is the fine-grained path; this SB field is the
-    // idle-safety catch for the case where no new writes come in for a long time (no fresh headers being
-    // written means no fresh watermark, so we need this field for the "nothing happened for hours then we
-    // crashed" recovery case).
-    raft_lsn_t commit_lsn{0};
+    // NOTE: this SB carries NO commit watermark.  The applied-durable watermark lives in the raft LogStore's
+    // checkpt_lsn (captured from ReplicaSet's commit_upto at every CP switchover via the commit-watermark
+    // callback), and per-entry commit proof lives in ReplLogHeader.commit_lsn_at_write.  Together they cover
+    // every recovery case, including "idle for hours then crashed" — the last CP's checkpt already equals the
+    // commit watermark when nothing new was written.
 
     // Per-group log_store ids set by HomeRaftLogStore::create. raft_log_store_id is always valid.
     // free_blks_journal_id is set only when the listener provided a non-null blob_stream() at
@@ -433,6 +435,12 @@ public:
     /// already-a-member is treated as success.
     Async< ReplResult<> > add_member(ReplicaMemberInfo const& member, bool learner = false, TraceId tid = 0);
 
+    /// Suspends until this replica has won a leader election at least once (raft_event's BecomeLeader posts
+    /// the latch), or the timeout elapses.  Returns true when leadership was gained.  create_replica_set
+    /// awaits this on the freshly-created single-member group before inviting the other members, since
+    /// add_member is leader-only.
+    Async< bool > wait_to_be_leader(std::chrono::milliseconds timeout);
+
     /// Leader-only.  Removes a peer from the replication group.  Idempotent — not-a-member is treated as
     /// success.  If asked to remove myself while I am leader, I yield leadership first and return
     /// NOT_LEADER so the caller retries against the successor (self-removal from the leader seat would
@@ -545,13 +553,6 @@ public:
     /// to invoke twice.
     Async< void > finish_destroy_local();
 
-    /// Coarse-grained durability catch: writes `commit_upto_lsn_` into `sb()->commit_lsn`.  Driven by the
-    /// ReplicationManager on a low-frequency timer.  Not needed under a continuous write stream — every write's
-    /// ReplLogHeader.commit_lsn_at_write embeds the current commit LSN as a fine-grained watermark and start()'s
-    /// replay callback picks it up.  This SB field only matters when the group has been idle for a long stretch
-    /// and then crashes; without it recovery would rewind to whatever the last write's embedded stamp was.
-    Async< void > persist_commit_lsn();
-
     // ── ReplicationManager accessor methods ───────────────────────────────────────────────────────────────────
 
     void attach_listener(shared< ReplicaSetListener > listener);
@@ -601,9 +602,8 @@ private:
     /// Persist the current sb_buffer_ contents through sb_mblk_.  Called after any sb()-> mutation to make
     /// the change durable.
     Async< void > write_sb() {
-        RS_LOG(DEBUG, NO_TRACE_ID, "write_sb: sb_blk_num={} raft_log_store_id={} free_blks_journal_id={} commit_lsn={}",
-               sb_mblk_.meta_blk().blkid().blk_num(), sb()->raft_log_store_id, sb()->free_blks_journal_id,
-               sb()->commit_lsn);
+        RS_LOG(DEBUG, NO_TRACE_ID, "write_sb: sb_blk_num={} raft_log_store_id={} free_blks_journal_id={}",
+               sb_mblk_.meta_blk().blkid().blk_num(), sb()->raft_log_store_id, sb()->free_blks_journal_id);
         co_await sb_mblk_.write(sb_buffer_.cbytes(), sb_buffer_.size());
     }
 
@@ -713,11 +713,22 @@ private:
     // so no explicit synchronisation.
     std::set< ReplicaId > committed_members_;
 
-    // Initialized from sb()->commit_lsn in the ctor.  Advanced on-the-fly by on_log_found during log-store
-    // replay (max-CAS against ReplLogHeader.commit_lsn_at_write), then by every commit_ext / commit_config
-    // during steady-state operation.  Single running watermark — no separate "durable" companion.
+    // Seeded in load() from log_store_->last_checkpt_lsn() (the applied watermark of the last completed CP).
+    // Advanced during log-store replay to each proven-and-dispatched lsn, then by every commit_ext /
+    // commit_config during steady-state operation.  Sampled by the LogStore commit-watermark callback at
+    // every CP switchover, which is what round-trips it to disk.  Invariant: checkpt <= this <= tail.
     std::atomic< raft_lsn_t > commit_upto_lsn_{0};
-    raft_lsn_t last_flushed_commit_lsn_{0};
+
+    // Replay-only state (single-threaded boot walk, no locks).  Entries arrive from on_log_found in lsn
+    // order but each entry's commit proof arrives with LATER entries' commit_lsn_at_write stamps, so
+    // entries queue here until proven, then dispatch in order.  Entries never proven (uncommitted tail at
+    // crash) are dropped by start_engine() — nuraft re-commits any that actually reached quorum.
+    struct PendingReplayEntry {
+        raft_lsn_t lsn;
+        sisl::IoBufView bv; // owns a refcount on the log buffer backing
+    };
+    std::deque< PendingReplayEntry > replay_pending_;
+    raft_lsn_t replay_proven_upto_{0};
 
     // App-authorized compact ceiling.  Advanced monotonically by dispatch_commit's HS_CTRL_TRUNCATE branch
     // on every replica; HomeRaftLogStore::compact clamps its target to this value.  Not persisted — on
@@ -732,6 +743,11 @@ private:
     // when we drop back to follower / joined cluster so new writes are held again until the next promotion
     // gate is reached.
     std::atomic< raft_lsn_t > traffic_ready_lsn_{0};
+
+    // Latched "won a leader election at least once" signal — posted (idempotently) by raft_event's
+    // BecomeLeader branch, awaited by wait_to_be_leader().  Never reset: once elected, later role changes
+    // don't un-signal it.
+    folly::coro::Baton elected_as_leader_;
 
     Clock::time_point destroyed_time_;
 

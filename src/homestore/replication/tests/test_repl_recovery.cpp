@@ -13,10 +13,14 @@
  *
  *********************************************************************************/
 //
-// Category B — clean restart / recovery: no crash, just orderly shutdown + reboot of the whole cluster. These probe
-// the two durability sources that must compose on recovery: the state machine's own checkpointed btree (loaded by
-// on_recover) and the raft log tail (re-applied by replay). Every case asserts no key is lost or duplicated across
-// the reboot. Crash-in-the-middle variants live in the crash category; here shutdown is always graceful.
+// Category B — clean restart / recovery: no crash, just orderly shutdown + reboot of the whole cluster.  A clean
+// shutdown checkpoints every consumer (btree + log store watermark) as its final CP, so recovery loads the full
+// state from the btree with an empty replay window, and the reformed cluster must re-elect and accept writes whose
+// LSNs continue past the recovered tail.  One looped scenario covers it: each round writes fresh keys, quiesces the
+// cluster on a barrier (no replica restarts while peers still stream), restarts every replica, and rendezvous
+// before the next round writes on the recovered tail.  Final validation checks every key from every round on every
+// replica — nothing lost, nothing duplicated, across R reboots.  Crash-in-the-middle variants (where replay is
+// genuinely non-empty) live in the crash category.
 //
 #include <gtest/gtest.h>
 
@@ -25,94 +29,23 @@
 
 using namespace test_common;
 
-// Pure log-replay recovery: write, restart WITHOUT a checkpoint, so the entire committed set must be reconstructed
-// from raft log replay alone (the btree starts empty on every replica). Everything must come back.
-TEST_F(ReplicaSetTest, WriteRestartValidate) {
+TEST_F(ReplicaSetTest, WriteRestartMultiple) {
     auto const n = SISL_OPTIONS["num_io"].as< uint64_t >();
+    constexpr uint32_t rounds = 6;
     g_helper->sync_for_test_start();
 
-    write_on_leader(n);
-    wait_for_commits(n);
+    for (uint32_t r = 0; r < rounds; ++r) {
+        LOGINFO("Replica={} restart-loop round {}/{}: writing {} keys", g_helper->replica_num(), r + 1, rounds, n);
+        auto const baseline = commit_count();
+        write_on_leader(n);
+        wait_for_commits_from(baseline, n);
 
-    g_helper->restart(); // no trigger_cp() first: nothing is in the btree, all n must replay from the log
-
-    wait_for_all_commits();
-    validate_all_data();
-    g_helper->sync_for_cleanup_start();
-}
-
-// Checkpoint-then-recovery: write, checkpoint (flush the btree durably), restart. On recovery on_recover loads the
-// full committed set from the btree; log replay re-fires on already-applied entries and must be idempotent (UPSERT).
-TEST_F(ReplicaSetTest, CheckpointRestartValidate) {
-    auto const n = SISL_OPTIONS["num_io"].as< uint64_t >();
-    g_helper->sync_for_test_start();
-
-    write_on_leader(n);
-    wait_for_commits(n);
-    trigger_cp(); // whole set is now durable in the btree
-
-    g_helper->restart();
-
-    wait_for_all_commits();
-    validate_all_data();
-    g_helper->sync_for_cleanup_start();
-}
-
-// Checkpoint boundary: write, checkpoint, write more (post-CP → only in the log), restart. Recovery must load the
-// CP'd half from the btree AND replay the post-CP tail from the log — the state-machine-durability vs commit-lsn seam.
-TEST_F(ReplicaSetTest, WriteCheckpointWriteRestart) {
-    auto const n = SISL_OPTIONS["num_io"].as< uint64_t >();
-    g_helper->sync_for_test_start();
-
-    write_on_leader(n); // first half
-    wait_for_commits(n);
-    trigger_cp();       // flush the btree durably
-
-    write_on_leader(n); // second half — post-CP, lives only in the raft log until replay
-    wait_for_commits(2 * n);
-
-    g_helper->restart(); // full-cluster restart: recover btree + replay the tail
-
-    wait_for_all_commits();
-    validate_all_data(); // every key [0, 2n) must be present
-    g_helper->sync_for_cleanup_start();
-}
-
-// Recover, then keep writing: the reformed cluster must re-elect a leader and accept new proposals whose LSNs
-// continue past the recovered tail (write_on_leader waits for that leader). Catches recovery that leaves the
-// log/commit index in a state that rejects fresh writes.
-TEST_F(ReplicaSetTest, WriteRestartWrite) {
-    auto const n = SISL_OPTIONS["num_io"].as< uint64_t >();
-    g_helper->sync_for_test_start();
-
-    write_on_leader(n);
-    wait_for_commits(n);
-
-    g_helper->restart();
-    wait_for_all_commits(); // the recovered n
-
-    write_on_leader(n); // n more, on the reformed cluster
-    wait_for_all_commits();
+        g_helper->sync_for_test_start(); // everyone holds this round's commits before anyone restarts
+        g_helper->restart();
+        g_helper->sync_for_test_start(); // everyone is back up before the next round writes
+    }
 
     g_helper->sync_for_verify_start();
-    validate_all_data(); // all 2n
-    g_helper->sync_for_cleanup_start();
-}
-
-// Back-to-back restarts: replay must be idempotent across more than one reboot (each restart re-fires on_commit for
-// the un-checkpointed tail). No key may be lost or double-counted after two reboots.
-TEST_F(ReplicaSetTest, MultipleRestarts) {
-    auto const n = SISL_OPTIONS["num_io"].as< uint64_t >();
-    g_helper->sync_for_test_start();
-
-    write_on_leader(n);
-    wait_for_commits(n);
-
-    g_helper->restart();
-    wait_for_all_commits();
-    g_helper->restart();
-    wait_for_all_commits();
-
-    validate_all_data();
+    validate_all_data(); // all rounds * n keys, identical on every replica
     g_helper->sync_for_cleanup_start();
 }

@@ -161,10 +161,6 @@ private:
     /// finish_destroy_local co_awaits SB writes.
     Async< void > gc_replica_sets();
 
-    /// Periodic persistence body — fans out to `rs->persist_commit_lsn()` on every registered set.  Invoked
-    /// from persist_commit_lsn_timer_.
-    Async< void > persist_commit_lsn();
-
 private:
     shared< ReplApplication > repl_app_;
 
@@ -198,7 +194,6 @@ private:
     std::map< GroupId, std::pair< MetaBlkWrapper, nlohmann::json > > pending_configs_;
 
     iomanager::CoroTimer gc_timer_;
-    iomanager::CoroTimer persist_commit_lsn_timer_;
 };
 
 extern ReplicationManager& repl_service();

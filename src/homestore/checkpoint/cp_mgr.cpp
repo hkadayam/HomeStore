@@ -296,10 +296,10 @@ void CPManager::cp_start_flush(CP* cp) {
         // Flush consumers one at a time in ascending rank order (consumers_ is kept rank-sorted by
         // register_consumer).  Ordering is a correctness requirement, not cosmetic: a consumer whose durability
         // watermark depends on others must register at a higher rank so it flushes AFTER them.  Concrete case:
-        // Replication (rank CPRank::Replication, the highest) persists checkpoint_lsn only after every subsystem
-        // its on_commit wrote into (Index / BlkAlloc / VDev, all lower rank) has already flushed — otherwise a
-        // crash could claim a watermark the underlying data has not reached.  Snapshot callbacks under the shared
-        // lock (preserving rank order), then release before co_await.
+        // LogStore (rank CPRank::LogStore, the highest) persists each store's checkpt_lsn only after every
+        // subsystem the watermark certifies (COWBtree / BlobDev, all lower rank) has already flushed — otherwise
+        // a crash could claim a watermark the underlying data has not reached.  Snapshot callbacks under the
+        // shared lock (preserving rank order), then release before co_await.
         std::vector< shared< CPCallbacks > > cbs;
         {
             std::shared_lock lk(consumers_mtx_);

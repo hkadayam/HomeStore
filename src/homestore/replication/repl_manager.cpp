@@ -169,15 +169,35 @@ Async< void > ReplicationManager::reconstruct_replica_sets() {
 }
 
 Async< void > ReplicationManager::stop() {
-    // Stop timers first so no new maintenance fires against a listener that's about to shut down.  Each
-    // stop() is idempotent and blocks until the currently-scheduled coroutine (if any) has drained.
+    // Publish "stopping" FIRST: from here on, inbound joins and create/remove requests are refused.  A
+    // join_cluster_request arriving mid-teardown would otherwise construct a raft server on top of a
+    // HomeStore being freed underneath it — the sender gets SERVER_NOT_FOUND and its retry finds the
+    // group after the next boot instead.  Two-phase make() only: exchange()'s synchronize_rcu would BLOCK
+    // this reactor thread until every RCU reader quiesces — mid-shutdown a suspended reader may never
+    // resume, wedging the reactor and the iomgr join behind it.  The superseded node stays parked until
+    // the manager is destroyed; readers see the new state immediately.
+    state_.make(RuntimeState{.stopping = true});
+
+    // Close AND drain the inbound door before touching any engine.  The drain suspends until every in-flight
+    // dispatch Task has finished — including one mid create_replica_set_on_demand that passed the stopping
+    // gate before the store above: its ReplicaSet is registered by the time the drain releases, so the engine
+    // sweep below shuts it down, and nothing this function frees afterwards (engines, client factory,
+    // executor) can be observed half-torn-down by a dispatch.  Dispatches complete rather than wedge because
+    // engines and storage are all still fully live here (storage teardown happens after replication stops).
+    if (rpc_listener_) {
+        co_await rpc_listener_->shutdown_and_drain();
+        rpc_listener_.reset();
+    }
+
+    // Stop timers so no new maintenance fires against engines that are about to shut down.  Each stop()
+    // is idempotent and blocks until the currently-scheduled coroutine (if any) has drained.
     co_await gc_timer_.stop();
 
-    // Shut down every raft engine BEFORE freeing the RPC transport / executor it references.  Each engine's
-    // nuraft::context holds mgr_.rpc_listener() / rpc_client_factory() and the reactor executor; freeing those
+    // Shut down every raft engine BEFORE freeing the RPC client factory / executor it references.  Each
+    // engine's nuraft::context holds mgr_.rpc_client_factory() and the reactor executor; freeing those
     // first would leave the servers dangling, and nuraft's raft_server destructor asserts shutdown() ran.
-    // Snapshot the registry under the shared lock, then release it before co_awaiting (never hold rs_mtx_ across
-    // a suspension point).
+    // Snapshot the registry under the shared lock, then release it before co_awaiting (never hold rs_mtx_
+    // across a suspension point).
     std::vector< shared< ReplicaSet > > sets;
     {
         std::shared_lock lk{rs_mtx_};
@@ -188,11 +208,6 @@ Async< void > ReplicationManager::stop() {
     }
     for (auto const& rs : sets) {
         co_await rs->stop_engine();
-    }
-
-    if (rpc_listener_) {
-        rpc_listener_->shutdown();
-        rpc_listener_.reset();
     }
     if (rpc_client_factory_) {
         rpc_client_factory_->shutdown(); // tear down each reactor's outbound sockets on its own thread
@@ -243,6 +258,9 @@ nuraft::raft_server* ReplicationManager::lookup_raft_server(nuraft::group_id_t c
 Async< ReplResult< shared< ReplicaSet > > > ReplicationManager::create_replica_set(GroupId group_id,
                                                                                    std::set< ReplicaId > const& members,
                                                                                    ReplicaSetOptions const& options) {
+    if (state_.get()->stopping) {
+        co_return folly::makeUnexpected(ReplError::STOPPING);
+    }
     // Gate under rs_mtx_: if the group already exists, that's an idempotent return.  If a create is
     // in-flight (pending_creates_), a concurrent racer got here first — this call bails with
     // SERVER_ALREADY_EXISTS rather than duplicating the SB / raft_server setup and having to unwind
@@ -352,15 +370,32 @@ Async< ReplResult< shared< ReplicaSet > > > ReplicationManager::create_replica_s
         info.priority = to_int(HS_RUNTIME_CONFIG(consensus.default_leader_priority));
         while (true) {
             auto const res = co_await rs->add_member(info);
-            if (res.hasValue()) {
+            if (res.hasError()) {
+                if ((res.error() != ReplError::CONFIG_CHANGING) && (res.error() != ReplError::SERVER_IS_JOINING)) {
+                    RM_LOG(ERROR, NO_TRACE_ID, "create: add_member {} to group_id={} failed err={}",
+                           boost::uuids::to_string(member_id), gid_str, to_int(res.error()));
+                    co_return folly::makeUnexpected(res.error());
+                }
+                co_await iomgr().sleep(std::chrono::milliseconds{100});
+                continue;
+            }
+            // "Accepted" only means the join invitation was dispatched — the config entry is appended after
+            // the joiner confirms, and an invitation that dies in flight (peer restarting mid-handshake) is
+            // never retried by the engine.  Confirm the member actually landed in the raft config; re-invite
+            // if it didn't (idempotent: SERVER_ALREADY_EXISTS maps to success in add_member).
+            constexpr uint32_t confirm_attempts = 30;
+            bool in_config = false;
+            for (uint32_t i = 0; !in_config && (i < confirm_attempts); ++i) {
+                in_config = rs->has_member(member_id);
+                if (!in_config) {
+                    co_await iomgr().sleep(std::chrono::milliseconds{100});
+                }
+            }
+            if (in_config) {
                 break;
             }
-            if ((res.error() != ReplError::CONFIG_CHANGING) && (res.error() != ReplError::SERVER_IS_JOINING)) {
-                RM_LOG(ERROR, NO_TRACE_ID, "create: add_member {} to group_id={} failed err={}",
-                       boost::uuids::to_string(member_id), gid_str, to_int(res.error()));
-                co_return folly::makeUnexpected(res.error());
-            }
-            co_await iomgr().sleep(std::chrono::milliseconds{100});
+            RM_LOG(WARN, NO_TRACE_ID, "create: member {} accepted but absent from raft config — re-inviting",
+                   boost::uuids::to_string(member_id));
         }
     }
     co_return rs;
@@ -368,6 +403,9 @@ Async< ReplResult< shared< ReplicaSet > > > ReplicationManager::create_replica_s
 
 Async< nuraft::raft_server* >
 ReplicationManager::create_replica_set_on_demand(nuraft::group_id_t const& gid) {
+    if (state_.get()->stopping) {
+        co_return nullptr; // dispatch answers SERVER_NOT_FOUND; the peer's join retry lands after reboot
+    }
     GroupId group_id;
     std::memcpy(group_id.data, gid.data(), gid.size());
     auto const gid_str = boost::uuids::to_string(group_id);
@@ -444,6 +482,9 @@ ReplicationManager::create_replica_set_on_demand(nuraft::group_id_t const& gid) 
 }
 
 Async< ReplError > ReplicationManager::remove_replica_set(GroupId group_id) {
+    if (state_.get()->stopping) {
+        co_return ReplError::STOPPING;
+    }
     // Consumer-visible remove: delegates to rs->destroy() (leader-side proposes HS_CTRL_DESTROY), which
     // resolves once the CTRL entry commits.  By that point every replica that saw the commit has run
     // start_destroy_local() locally (via dispatch_commit).  The reaper (gc_replica_sets) picks it up on

@@ -11,7 +11,7 @@ target_sources(hs_replication PRIVATE
     transport/folly_rpc_listener.cpp
     transport/nuraft_codec.cpp
     )
-target_link_libraries(hs_replication PRIVATE ${COMMON_DEPS})
+target_link_libraries(hs_replication PRIVATE sisl_flip ${COMMON_DEPS})
 # NuRaft (coro-mode fork) supplies the libnuraft/*.hxx headers this layer compiles against.  Linking the target
 # propagates its INTERFACE include dir (extern/NuRaft/include) to the object-lib compilation.
 if (TARGET NuRaft::static_lib)

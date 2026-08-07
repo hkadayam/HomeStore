@@ -16,6 +16,7 @@
 
 #include "homestore/logstore/log_store_mgr.h"
 #include "common/async.h"
+#include "sisl/fds/utils.h"
 
 #include <algorithm>
 #include <charconv>
@@ -244,7 +245,15 @@ Async< void > LogStoreManager::replay() {
     LOGINFO("LogStoreManager: starting replay, {} log_store(s) registered", log_stores_.size());
 
     // Walk the LogStream's CRC chain; per-record on_log_found dispatches into the LogStore via lookup_store.
-    co_await log_stream_->recover([this](logstore_id_t sid) { return lookup_store(sid); });
+    // The walk also enforces the store-id reuse invariant: a DESTROYED store's records stay in the stream
+    // until truncation passes them, and its id must not be re-issued while any of them remain — a recycled id
+    // makes this very walk deliver the dead store's records into the new store on a later boot.  SB-based
+    // seeding forgets dead ids (a boot with zero store SBs reseeds from 0), so every record raises the floor
+    // to its sid+1; once truncation erases the records, boots stop seeing them and the id space replenishes.
+    co_await log_stream_->recover([this](logstore_id_t sid) {
+        atomic_update_max(next_store_id_, sid + 1);
+        return lookup_store(sid);
+    });
 
     // Drop unopened log_stores — those without a replay handler are presumed orphaned (their data is dead).
     co_await drop_unopened_stores();

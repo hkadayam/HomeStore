@@ -78,8 +78,12 @@ protected:
     shared< homestore::ReplicaSet > repl_set() { return g_helper->repl_set(); }
 
     // Propose the next n entries: keys [written_, written_ + n).  written_ advances on EVERY replica (so followers
-    // track the same expected total), but only the elected leader actually proposes — followers receive the entries
-    // by replication.  Waits for leader election and is_ready_for_traffic() before writing.
+    // track the same expected total), but exactly one member actually proposes — whoever holds leadership when the
+    // batch becomes writable.  Leader identity is never a safe exit for the rest: a claim can be stale (the
+    // claimed leader is down) or a downed leader can legitimately return and re-win, and no observer can tell the
+    // two apart.  A non-leader therefore leaves only on proof the batch landed: commit count >= written_ + n.
+    // Commit counts are cumulative across in-process restarts (the helper re-binds the same listener on
+    // recovery), so the target is absolute on every replica, restarted or not.
     void write_on_leader(uint64_t n) {
         uint64_t const start = written_;
         written_ += n;
@@ -90,18 +94,17 @@ protected:
         }
 
         while (true) {
-            auto const leader = rs->get_leader_id();
-            if (leader.is_nil()) {
-                LOGINFO("Replica={} waiting for leader election", g_helper->replica_num());
-                std::this_thread::sleep_for(std::chrono::milliseconds{500});
-                continue;
+            if (rs->get_leader_id() == g_helper->my_replica_id()) {
+                break; // I am the leader — the batch is mine
             }
-            if (leader != g_helper->my_replica_id()) {
-                LOGINFO("Replica={} is not the leader ({}); {} entries are written on the leader",
-                        g_helper->replica_num(), boost::uuids::to_string(leader), n);
+            if (commit_count() >= start + n) {
+                LOGINFO("Replica={} saw the batch of {} land under another leader (count={})",
+                        g_helper->replica_num(), n, commit_count());
                 return;
             }
-            break; // I am the leader
+            LOGINFO("Replica={} not the leader — waiting for leadership or batch commits ({}/{})",
+                    g_helper->replica_num(), commit_count(), start + n);
+            std::this_thread::sleep_for(std::chrono::milliseconds{500});
         }
 
         // A freshly elected leader must commit any carried-over entries from prior terms before it can accept new
@@ -141,6 +144,36 @@ protected:
     // Poll this replica's committed-and-applied count (the listener's commit_count(), bumped in on_commit after the
     // store apply) until it reaches `total` — this is the CUMULATIVE expected count across all write_on_leader
     // calls, not a per-call count.  Same quantity the old harness's wait_for_commits() polled.
+    // Member index currently holding leadership per this replica's raft view, or nullopt while unelected.
+    std::optional< uint16_t > leader_member_idx() {
+        auto rs = repl_set();
+        if (!rs) {
+            return std::nullopt;
+        }
+        auto const leader = rs->get_leader_id();
+        if (leader.is_nil()) {
+            return std::nullopt;
+        }
+        auto const replicas = SISL_OPTIONS["replicas"].as< uint32_t >();
+        for (uint16_t i = 0; i < replicas; ++i) {
+            if (g_helper->replica_id(i) == leader) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Block until a leader is known and return its member index.
+    uint16_t wait_leader_member() {
+        while (true) {
+            if (auto lm = leader_member_idx()) {
+                return *lm;
+            }
+            LOGINFO("Replica={} waiting for a leader to be known", g_helper->replica_num());
+            std::this_thread::sleep_for(std::chrono::milliseconds{500});
+        }
+    }
+
     // Committed-and-applied count on this replica.  On a follower the listener is created only when the
     // leader's join_cluster_request arrives, which trails the creator's self-election — a null listener here
     // is a normal transient, counted as 0.

@@ -6,6 +6,7 @@
 #include <folly/io/IOBuf.h>
 #include <folly/io/async/AsyncSocket.h>
 #include <folly/io/async/AsyncServerSocket.h>
+#include <folly/net/NetOps.h>
 #include <libnuraft/buffer.hxx>
 #include <libnuraft/raft_server.hxx>
 #include <libnuraft/req_msg.hxx>
@@ -76,6 +77,20 @@ void FollyRpcListener::shutdown() {
     }
 }
 
+Async< void > FollyRpcListener::shutdown_and_drain() {
+    {
+        // Same critical section as the accept path's draining check: after this store no InboundConnection
+        // can be constructed, so live_conns is monotonically non-increasing for the rest of the drain.
+        std::lock_guard lk{registry_->mtx};
+        registry_->draining.store(true);
+    }
+    shutdown();
+    if (registry_->live_conns.load() != 0) {
+        co_await registry_->drained;
+    }
+    co_return;
+}
+
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
 //                                          AcceptCb
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -88,13 +103,21 @@ void FollyRpcListener::AcceptCb::connectionAccepted(folly::NetworkSocket fd, fol
     auto* mgr = mgr_;
     auto registry = registry_; // captured shared so the registry outlives this lambda
     recv_eb->runInEventBaseThread([fd, recv_eb, mgr, registry]() {
-        folly::AsyncSocket::UniquePtr sock(new folly::AsyncSocket(recv_eb, fd));
-        sock->setZeroCopy(true);
-        auto conn = std::make_shared< FollyRpcListener::InboundConnection >(recv_eb, std::move(sock), mgr, registry);
+        shared< FollyRpcListener::InboundConnection > conn;
         {
-            // Insert into the registry BEFORE start().  Without this, conn (the only shared_ptr) would die
-            // when the lambda exits and the connection would be destroyed on the same tick it was created.
+            // Check draining and insert in ONE critical section, mirrored against shutdown_and_drain()'s
+            // draining-store + registry swap: a lambda that observes !draining inserts before the swap and
+            // is closed by it; one that observes draining arrived after the swap and must not create a
+            // connection nothing would ever close.  Inserting before start() also keeps conn alive past
+            // this lambda — this shared_ptr is otherwise the only owner.
             std::lock_guard lk{registry->mtx};
+            if (registry->draining.load()) {
+                folly::netops::close(fd);
+                return;
+            }
+            folly::AsyncSocket::UniquePtr sock(new folly::AsyncSocket(recv_eb, fd));
+            sock->setZeroCopy(true);
+            conn = std::make_shared< FollyRpcListener::InboundConnection >(recv_eb, std::move(sock), mgr, registry);
             registry->conns.emplace(conn.get(), conn);
         }
         conn->start();
@@ -112,11 +135,19 @@ void FollyRpcListener::AcceptCb::acceptError(folly::exception_wrapper /*ex*/) no
 FollyRpcListener::InboundConnection::InboundConnection(folly::EventBase* eb, folly::AsyncSocket::UniquePtr sock,
                                                        ReplicationManager* mgr, shared< ConnectionRegistry > registry) :
         eb_(eb), sock_(std::move(sock)), mgr_(mgr), registry_(registry) {
+    registry->live_conns.fetch_add(1);
 }
 
 FollyRpcListener::InboundConnection::~InboundConnection() {
     if (sock_) {
         sock_->closeNow();
+    }
+    // The expired-weak_ptr case needs no decrement: the listener is destroyed only after shutdown_and_drain()
+    // observed zero live connections, so a connection dying later has nothing waiting on its count.
+    if (auto reg = registry_.lock()) {
+        if ((reg->live_conns.fetch_sub(1) == 1) && reg->draining.load()) {
+            reg->drained.post();
+        }
     }
 }
 

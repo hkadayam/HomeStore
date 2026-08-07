@@ -40,6 +40,7 @@ VENUM(ReplError, int32_t,
       SERVER_IS_LEAVING = -10,
       TERM_MISMATCH = -11,
       RETRY_REQUEST = -12,
+      STOPPING = -13, // service is shutting down; request refused
       RESULT_NOT_EXIST_YET = -10000,
       NOT_IMPLEMENTED = -10001,
       NO_SPACE_LEFT = -20000,

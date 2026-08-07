@@ -71,6 +71,13 @@ public:
     // asynchronously; their post-shutdown writes silently no-op via the closed_ guard.
     void shutdown() override;
 
+    // shutdown() plus a rendezvous with in-flight work: marks the registry draining (no connection can be
+    // created past this point), closes everything shutdown() closes, then suspends until every
+    // InboundConnection object is destroyed.  Each in-flight dispatch_request Task owns its connection via
+    // shared_from_this(), so zero live connections == zero in-flight dispatches — once this returns, the
+    // caller may free anything a dispatch can touch (raft engines, client factory, executors).
+    Async< void > shutdown_and_drain();
+
 private:
     class AcceptCb;
     class InboundConnection;
@@ -206,6 +213,16 @@ private:
 struct ConnectionRegistry {
     std::mutex mtx;
     std::unordered_map< FollyRpcListener::InboundConnection*, shared< FollyRpcListener::InboundConnection > > conns;
+
+    // Drain machinery.  live_conns counts constructed-and-not-yet-destroyed InboundConnection OBJECTS — a
+    // superset of `conns`, since a connection erased from the map lives on while dispatch Tasks hold it.
+    // Both sides of the handshake are seq_cst so it cannot miss: shutdown_and_drain() stores `draining`
+    // before loading `live_conns`; a destructor decrements `live_conns` before loading `draining`.  The
+    // accept path additionally checks `draining` under `mtx` (the same critical section as the drain's
+    // registry swap) so no connection can be created after the swap.
+    std::atomic< int64_t > live_conns{0};
+    std::atomic< bool > draining{false};
+    folly::coro::Baton drained;
 };
 
 } // namespace homestore::replication

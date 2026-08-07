@@ -104,13 +104,15 @@ protected:
             std::unique_lock< bip::interprocess_mutex > lg(mtx_);
             auto const gen = sync_gen_;
             if (++count == max_count) {
+                // Only the releaser resets the count.  A waiter resetting it on exit could wipe arrivals
+                // already registered at the NEXT barrier by faster peers, leaving that barrier short forever.
+                count = 0;
                 phase_ = new_phase;
                 ++sync_gen_;
                 cv_.notify_all();
             } else {
                 cv_.wait(lg, [this, gen]() { return sync_gen_ != gen; });
             }
-            count = 0;
         }
     };
 

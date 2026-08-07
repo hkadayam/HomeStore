@@ -30,6 +30,7 @@
 #include <folly/Executor.h>
 #include <folly/coro/Invoke.h>
 #include <folly/coro/TimedWait.h>
+#include "sisl/flip/flip.h"
 #include <folly/hash/Hash.h>
 #include <folly/io/async/EventBase.h>
 
@@ -108,19 +109,42 @@ private:
 
 class FollyEventBaseScheduler : public nuraft::delayed_task_scheduler {
 public:
-    explicit FollyEventBaseScheduler(folly::EventBase* eb) : eb_{eb} {}
+    explicit FollyEventBaseScheduler(folly::EventBase* eb) :
+            eb_{eb}, generations_{std::make_shared< std::unordered_map< nuraft::delayed_task*, uint64_t > >()} {}
 
     void schedule(nuraft::ptr< nuraft::delayed_task >& task, int32_t milliseconds) override {
+        // nuraft re-schedules the SAME task object after cancelling it (restart_election_timer is cancel +
+        // schedule), so un-cancelling is the scheduler's job.  reset() must happen HERE, synchronously: nuraft
+        // orders cancel/schedule under its own lock, and a reset deferred onto eb_ would run after a cancel it
+        // was issued before — un-cancelling a task whose raft_server is being torn down (its executor binds a
+        // raw raft_server*, so a resurrected firing is a use-after-free).  cancelled_ is atomic; safe here.
+        task->reset();
+
         // folly's scheduleTimeout must run on eb_'s own EventBase thread, but nuraft can call schedule() from a
         // different reactor — hop onto eb_'s thread before arming the timer.
-        eb_->runInEventBaseThread(
-            [eb = eb_, task, milliseconds]() { eb->runAfterDelay([task]() { task->execute(); }, milliseconds); });
+        eb_->runInEventBaseThread([eb = eb_, gens = generations_, task, milliseconds]() {
+            // runAfterDelay has no cancel handle, so a superseded arming still fires — each arming bumps the
+            // task's generation and a firing only executes if its generation is still current.  Generation
+            // state is confined to eb_'s thread (both arming and firing run here): no locks.  The map is
+            // held via shared_ptr because pending firings can outlive the scheduler itself.
+            auto const gen = ++(*gens)[task.get()];
+            eb->runAfterDelay(
+                [gens, task, gen]() {
+                    if ((*gens)[task.get()] == gen) {
+                        task->execute();
+                    }
+                },
+                milliseconds);
+        });
     }
 
 private:
+    // The base class sets the task's cancelled flag synchronously, which any already-armed firing observes
+    // before the next schedule() resets it; a firing armed before that schedule is superseded by generation.
     void cancel_impl(nuraft::ptr< nuraft::delayed_task >& /*task*/) override {}
 
     folly::EventBase* eb_;
+    shared< std::unordered_map< nuraft::delayed_task*, uint64_t > > generations_; // touched only on eb_'s thread
 };
 
 // ── cluster_config / srv_config JSON serde ─────────────────────────────────────────────────────────────────────
@@ -447,8 +471,25 @@ Async< ReplResult<> > ReplicaSet::set_priority(ReplicaId const& member, int32_t 
     co_return folly::makeUnexpected(ReplError::FAILED);
 }
 
+Async< void > ReplicaSet::update_raft_params(std::function< void(nuraft::raft_params&) > const& mutator) {
+    if (!raft_server_) {
+        RS_LOG(WARN, NO_TRACE_ID, "update_raft_params rejected — raft_server not initialized");
+        co_return;
+    }
+    auto params = raft_server_->get_current_params();
+    mutator(params);
+    co_await raft_server_->update_params(params);
+    RS_LOG(INFO, NO_TRACE_ID, "raft params updated at runtime: elect_to=[{}, {}] hb={}",
+           params.election_timeout_lower_bound_, params.election_timeout_upper_bound_, params.heart_beat_interval_);
+    co_return;
+}
+
 bool ReplicaSet::is_leader() const {
     return raft_server_ && raft_server_->is_leader();
+}
+
+bool ReplicaSet::has_member(ReplicaId const& member) const {
+    return raft_server_ && (raft_server_->get_srv_config(to_server_id(member)) != nullptr);
 }
 
 bool ReplicaSet::is_ready_for_traffic() const {
@@ -555,6 +596,16 @@ Async< bool > ReplicaSet::load(MetaBlkWrapper raft_cfg_mblk, nlohmann::json raft
         RS_LOG(INFO, NO_TRACE_ID, "Starting {} ReplicaSet replica_id={}, log_store_id={} raft_server_id={}, sb_size={}",
                (fresh ? "Fresh" : "Reloaded"), my_replica_id_str(), sb()->raft_log_store_id, raft_server_id_,
                sb_buffer_.size());
+
+        // The reaper matches candidates on the in-memory stage, so a destroy that committed before a clean
+        // restart (destroy_pending persisted in the SB, physical teardown still owed) must be re-staged here
+        // or the set leaks forever.  destroyed_time_ is in-memory only — re-arming it from now restarts the
+        // full grace window on boot, preserving straggler-traffic protection.
+        if (sb()->destroy_pending != 0) {
+            stage_.update([](auto* s) { *s = ReplicaSetStage::DESTROYED; });
+            destroyed_time_ = Clock::now();
+            RS_LOG(INFO, NO_TRACE_ID, "Reloaded with destroy_pending set — re-staged DESTROYED for the reaper");
+        }
     }
 
     // Take ownership of the group's raft config (both the MetaBlk handle and the in-memory json body).  Held
@@ -1551,6 +1602,11 @@ nuraft::cb_func::ReturnCode ReplicaSet::raft_event(nuraft::cb_func::Type type, n
 
 Async< void > ReplicaSet::dispatch_commit(int64_t lsn, JournalType type, sisl::Blob const& user_header,
                                           sisl::Blob const& value) {
+    // Delays this replica's commit dispatch, to simulate slow replica or processing. Quorum still acks log appends, so
+    // the group commits at full speed while this replica falls behind on whichever dispatch kind the condition selects.
+    // (Debug build only)
+    flip_delay_if_fired("simulate_slow_replica_commit", to_int(type));
+
     switch (type) {
     case JournalType::HS_DATA_INLINE:
     case JournalType::HS_DATA_INDIRECT: {

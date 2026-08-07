@@ -27,6 +27,7 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <variant>
 #include <vector>
 
 #include "sisl/logging/logging.h"
@@ -42,10 +43,12 @@
 #include "homestore/device/hs_super_blk.h" // HSSuperBlk (raw-device zeroing)
 #include "homestore/base/homestore_assert.h"
 
-#ifdef _PRERELEASE
-#include <folly/synchronization/Baton.h>
+#ifdef SISL_FLIP_ENABLED
 #include "sisl/flip/flip.h"
 #include "sisl/flip/flip_client.h"
+#endif
+#ifdef _PRERELEASE
+#include <folly/synchronization/Baton.h>
 #include "homestore/base/crash_simulator.h"
 #endif
 
@@ -209,7 +212,7 @@ public:
     }
 
 #ifdef _PRERELEASE
-    // ── Fault injection (flip) + crash simulation ────────────────────────────────────────────────────────────────
+    // ── Crash simulation ─────────────────────────────────────────────────────────────────────────────────────────
     // Block until the crash-simulator's restart-and-recover cycle (wired in hs_start) has completed.
     void wait_for_crash_recovery(bool check_will_crash = false) {
         if (check_will_crash && !HomeStore::instance()->crash_simulator().will_crash()) {
@@ -219,17 +222,34 @@ public:
         crash_recovered_.reset();
         HomeStore::instance()->crash_simulator().set_will_crash(false);
     }
+#endif
 
-    // Fire `flip_name` unconditionally, `count` times, `percent`% of the eligible calls.
-    void set_flip(std::string const& flip_name, uint32_t count = 1, uint32_t percent = 100) {
-        flip::FlipClient::instance().inject_noreturn_flip(flip_name, {}, make_freq(count, percent));
+#ifdef SISL_FLIP_ENABLED
+    // ── Fault injection (flip) ───────────────────────────────────────────────────────────────────────────────────
+    // Compact flip-condition spec: `{{"param_name", flip::Operator::EQUAL, value}}` at the call site, one
+    // brace-triple per fire-site parameter (matched positionally).  `param_name` is documentation only —
+    // flip matches by position — but keeps call sites self-describing.
+    struct FlipCond {
+        std::string name;
+        flip::Operator oper;
+        std::variant< int, long, double, bool, std::string > value;
+    };
+
+    // Fire `flip_name` `count` times, `percent`% of the eligible calls, on fire sites whose parameters match
+    // `conds` (empty = unconditional).
+    void set_flip(std::string const& flip_name, uint32_t count = 1, uint32_t percent = 100,
+                  std::vector< FlipCond > const& conds = {}) {
+        flip::FlipClient::instance().inject_noreturn_flip(flip_name, make_conditions(conds),
+                                                          make_freq(count, percent));
         LOGDEBUG("Flip {} set (count={} percent={})", flip_name, count, percent);
     }
 
     // Fire `flip_name` but delay the caller by `delay_usec` instead of failing it.
-    void set_delay_flip(std::string const& flip_name, uint64_t delay_usec, uint32_t count = 1, uint32_t percent = 100) {
-        flip::FlipClient::instance().inject_delay_flip(flip_name, {}, make_freq(count, percent), delay_usec);
-        LOGDEBUG("Flip {} set (delay {}us)", flip_name, delay_usec);
+    void set_delay_flip(std::string const& flip_name, uint64_t delay_usec, uint32_t count = 1, uint32_t percent = 100,
+                        std::vector< FlipCond > const& conds = {}) {
+        flip::FlipClient::instance().inject_delay_flip(flip_name, make_conditions(conds), make_freq(count, percent),
+                                                       delay_usec);
+        LOGDEBUG("Flip {} set (delay {}us, {} condition(s))", flip_name, delay_usec, conds.size());
     }
 
     // Make the `set_minimum_chunk_size` flip return `chunk_size` so managers size their first chunk small.
@@ -256,7 +276,7 @@ protected:
         return input;
     }
 
-#ifdef _PRERELEASE
+#ifdef SISL_FLIP_ENABLED
     // Flip frequency (flatbuffer object-API): fire up to `count` times, `percent`% of eligible calls.
     static flip::FlipFrequencyT make_freq(uint32_t count, uint32_t percent) {
         flip::FlipFrequencyT freq;
@@ -265,6 +285,17 @@ protected:
         pf.v = percent;
         freq.kind.Set(pf);
         return freq;
+    }
+
+    static std::vector< flip::FlipConditionT > make_conditions(std::vector< FlipCond > const& conds) {
+        std::vector< flip::FlipConditionT > out;
+        out.reserve(conds.size());
+        for (auto const& c : conds) {
+            std::visit(
+                [&](auto const& v) { out.push_back(flip::FlipClient::instance().create_condition(c.name, c.oper, v)); },
+                c.value);
+        }
+        return out;
     }
 #endif
 

@@ -24,6 +24,7 @@
 #include <sisl/metrics/metrics.h>
 
 #include <libnuraft/buffer.hxx>
+#include <libnuraft/raft_params.hxx>
 #include <libnuraft/state_machine.hxx>
 #include <libnuraft/state_mgr.hxx>
 #include <libnuraft/snapshot.hxx>
@@ -465,6 +466,12 @@ public:
     /// NOT_LEADER means we are not the leader and the engine could not broadcast either.
     Async< ReplResult<> > set_priority(ReplicaId const& member, int32_t priority, TraceId tid = 0);
 
+    /// Apply `mutator` to a copy of the engine's current raft parameters and install the result via nuraft's
+    /// update_params — e.g. widening the election window at runtime.  Local to this node: every member that
+    /// should observe the change must call it on its own ReplicaSet.  An engine restart re-reads persisted
+    /// settings, so a runtime update does not survive a reboot.
+    Async< void > update_raft_params(std::function< void(nuraft::raft_params&) > const& mutator);
+
     /// Monotonically advance the app-authorized compact ceiling to `lsn`.  Writes a HS_CTRL_TRUNCATE journal
     /// entry that replicates across the group; on commit each replica updates its `app_truncate_upto_`
     /// atomic + SB, and subsequent HomeRaftLogStore::compact calls clamp their target to it.  Returns
@@ -479,6 +486,10 @@ public:
 
     /// UUID of the current leader as this replica sees it, or the nil UUID if unknown.
     ReplicaId get_leader_id() const;
+
+    /// True when the group contains `member` — its add_member config entry has been appended, so the engine
+    /// replicates to it durably (and keeps retrying while it is down).
+    bool has_member(ReplicaId const& member) const;
 
     /// Per-peer replication status — one entry per known member of the group.  Awaits the engine's live
     /// per-peer info fetch and cross-references the group config for priority / learner flags.  Only

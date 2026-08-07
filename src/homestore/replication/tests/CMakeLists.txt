@@ -19,6 +19,7 @@ target_compile_definitions(test_replica_set PRIVATE BTREE_ASYNC_MODE)
 target_link_libraries(test_replica_set PRIVATE
     homestore
     iomanager
+    sisl_flip
     sisl_cache
     sisl_metrics
     sisl_settings

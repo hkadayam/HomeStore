@@ -20,6 +20,7 @@
 
 #include "sisl/fds/buffer.h"
 #include "sisl/fds/enum.h"
+#include "sisl/fds/rcu.h"
 
 #include <nlohmann/json.hpp>
 
@@ -162,7 +163,14 @@ private:
     Async< void > gc_replica_sets();
 
 private:
+    // RCU-published manager runtime state, read on the RPC dispatch path with zero atomic cost.
+    struct RuntimeState {
+        bool stopping{false};
+    };
+
     shared< ReplApplication > repl_app_;
+
+    sisl::Rcu::data< RuntimeState > state_;
 
     mutable std::shared_mutex rs_mtx_;
     std::map< GroupId, shared< ReplicaSet > > replica_sets_;

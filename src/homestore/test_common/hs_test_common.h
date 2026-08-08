@@ -46,8 +46,6 @@
 #ifdef SISL_FLIP_ENABLED
 #include "sisl/flip/flip.h"
 #include "sisl/flip/flip_client.h"
-#endif
-#ifdef _PRERELEASE
 #include <folly/synchronization/Baton.h>
 #include "homestore/base/crash_simulator.h"
 #endif
@@ -110,7 +108,7 @@ public:
     // ── Coroutine boot phases (compose these inside your own spawn_and_block) ─────────────────────────────────────
     Async< bool > hs_start() {
         auto* hsi = HomeStore::instance();
-#ifdef _PRERELEASE
+#ifdef SISL_FLIP_ENABLED
         // Crash simulator: on a simulated crash HomeStore invokes this restart callback, which remounts the same
         // devices (recovery path, incl. on_recover()) and then releases wait_for_crash_recovery().
         hsi->with_crash_simulator([this]() {
@@ -171,7 +169,8 @@ public:
         if (HomeStore::safe_instance() == nullptr) {
             return;
         } // already down
-        iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [this]() -> Async< void > { co_await hs_shutdown(); }());
+        iomgr().spawn_and_block(iomanager::ReactorTarget::any(),
+                                [this]() -> Async< void > { co_await hs_shutdown(); }());
         iomanager::stop_iomgr(); // stop reactors only after HomeStore has released its references
         HomeStore::reset_instance();
         if (cleanup) {
@@ -211,16 +210,12 @@ public:
         return devs_;
     }
 
-#ifdef _PRERELEASE
+#ifdef SISL_FLIP_ENABLED
     // ── Crash simulation ─────────────────────────────────────────────────────────────────────────────────────────
     // Block until the crash-simulator's restart-and-recover cycle (wired in hs_start) has completed.
-    void wait_for_crash_recovery(bool check_will_crash = false) {
-        if (check_will_crash && !HomeStore::instance()->crash_simulator().will_crash()) {
-            return;
-        }
+    void wait_for_crash_recovery() {
         crash_recovered_.wait();
         crash_recovered_.reset();
-        HomeStore::instance()->crash_simulator().set_will_crash(false);
     }
 #endif
 
@@ -239,8 +234,7 @@ public:
     // `conds` (empty = unconditional).
     void set_flip(std::string const& flip_name, uint32_t count = 1, uint32_t percent = 100,
                   std::vector< FlipCond > const& conds = {}) {
-        flip::FlipClient::instance().inject_noreturn_flip(flip_name, make_conditions(conds),
-                                                          make_freq(count, percent));
+        flip::FlipClient::instance().inject_noreturn_flip(flip_name, make_conditions(conds), make_freq(count, percent));
         LOGDEBUG("Flip {} set (count={} percent={})", flip_name, count, percent);
     }
 
@@ -356,7 +350,7 @@ protected:
     BootParams boot_;
     std::vector< DevInfo > devs_;
     std::vector< std::string > generated_devs_;
-#ifdef _PRERELEASE
+#ifdef SISL_FLIP_ENABLED
     folly::Baton<> crash_recovered_; // posted by the crash restart_cb, awaited by wait_for_crash_recovery()
 #endif
 };

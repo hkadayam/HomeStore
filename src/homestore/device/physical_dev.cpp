@@ -25,6 +25,7 @@
 
 #include "homestore/device/physical_dev.h"
 #include "homestore/device/device_manager.h" // DeviceManager: global chunk_id authority
+#include "homestore/base/crash_simulator.h"  // is_crash_simulated() write gate
 #include "homestore/base/homestore_assert.h"
 
 namespace homestore {
@@ -102,6 +103,11 @@ Async< FirstBlock > PhysicalDev::read_first_block(const std::string& devname, in
 
     FirstBlock fb;
     std::memcpy(&fb, buf.bytes(), sizeof(FirstBlock));
+    // A valid-magic block with a bad checksum is corruption, never freshness — refuse it rather than let a
+    // torn/rotted first block masquerade as either a healthy header or a first-time boot.
+    if ((fb.get_magic() == FirstBlock::HOMESTORE_MAGIC) && !fb.verify_checksum()) {
+        throw std::runtime_error{"FirstBlock checksum mismatch on " + devname + " — corrupt first block"};
+    }
     co_return fb;
 }
 
@@ -220,6 +226,9 @@ Async< shared< PhysicalDev > > PhysicalDev::load(const DevInfo& dinfo, int oflag
 // ── Super block ───────────────────────────────────────────────────────────────
 
 Async< void > PhysicalDev::write_super_block(const IoBuf& buf, uint64_t offset) {
+    if (is_crash_simulated()) {
+        co_return; // fake success — the disk stays frozen at the crash instant
+    }
     auto ec = co_await drive_iface_->write(*iodev_, buf, offset);
     if (ec) {
         throw std::system_error(ec, "write_super_block failed on " + devname_);
@@ -253,6 +262,9 @@ Async< void > PhysicalDev::close_device() {
 // ── Data IO ───────────────────────────────────────────────────────────────────
 
 Async< void > PhysicalDev::write(const IoBuf& buf, uint64_t offset) {
+    if (is_crash_simulated()) {
+        co_return; // fake success — the disk stays frozen at the crash instant
+    }
     auto ec = co_await drive_iface_->write(*iodev_, buf, offset);
     if (ec) {
         throw std::system_error(ec, "write failed on " + devname_);
@@ -264,6 +276,9 @@ Async< std::error_code > PhysicalDev::read(IoBuf& buf, uint64_t offset) {
 }
 
 Async< void > PhysicalDev::writev(sisl::SgList const& sg, uint64_t offset) {
+    if (is_crash_simulated()) {
+        co_return; // fake success — the disk stays frozen at the crash instant
+    }
     auto ec = co_await drive_iface_->writev(*iodev_, sg, offset);
     if (ec) {
         throw std::system_error(ec, "writev failed on " + devname_);
@@ -275,6 +290,9 @@ Async< std::error_code > PhysicalDev::readv(sisl::SgList const& sg, uint64_t off
 }
 
 Async< void > PhysicalDev::write_zero(uint64_t size, uint64_t offset) {
+    if (is_crash_simulated()) {
+        co_return; // fake success — the disk stays frozen at the crash instant
+    }
     auto ec = co_await drive_iface_->write_zero(*iodev_, size, offset);
     if (ec) {
         throw std::system_error(ec, "write_zero failed on " + devname_);
@@ -282,6 +300,9 @@ Async< void > PhysicalDev::write_zero(uint64_t size, uint64_t offset) {
 }
 
 Async< void > PhysicalDev::fsync() {
+    if (is_crash_simulated()) {
+        co_return; // fake success — the disk stays frozen at the crash instant
+    }
     auto ec = co_await drive_iface_->fsync(*iodev_);
     if (ec) {
         throw std::system_error(ec, "fsync failed on " + devname_);
@@ -346,6 +367,12 @@ Async< shared< Chunk > > PhysicalDev::create_chunk(uint32_t vdev_id, uint64_t si
 
     prov.chunks.emplace(chunk_id, chunk);
 
+    // Crash point: ChunkInfo durable, slot bit not set — the slot reads as free on recovery and the chunk
+    // must vanish harmlessly (any data the caller placed in it is discarded by upper-layer CP gates).
+    if (crash_if_flip_fired("crash_after_chunk_info_write")) {
+        co_return chunk;
+    }
+
     // Persist the updated bitmap.
     const auto bm = prov.chunk_info_slots->serialize(pdev_info_.dev_attr.align_size);
     co_await write_super_block(*bm, chunk_sb_offset());
@@ -406,6 +433,12 @@ Async< std::vector< shared< Chunk > > > PhysicalDev::create_chunks(uint32_t vdev
             ret_chunks.push_back(c);
         }
         chunks_remaining -= b.nbits;
+    }
+
+    // Crash point: the batch's ChunkInfos are durable, no slot bit is set — all of them must vanish
+    // harmlessly on recovery.
+    if (crash_if_flip_fired("crash_after_chunk_info_write")) {
+        co_return ret_chunks;
     }
 
     // Persist the updated bitmap once for the entire batch.
@@ -496,6 +529,12 @@ Async< void > PhysicalDev::remove_chunk(cshared< Chunk >& chunk) {
     std::memcpy(freed_buf.bytes(), cinfo.to_bytes(), ChunkInfo::SIZE);
     co_await write_super_block(freed_buf, chunk_info_offset_nth(slot));
 
+    // Crash point: the freed ChunkInfo is durable but its slot bit is still set — recovery loads a
+    // free-marked record and must not resurrect it as a live (or wrongly pooled) chunk.
+    if (crash_if_flip_fired("crash_after_chunk_info_free")) {
+        co_return;
+    }
+
     prov.chunk_info_slots->reset_bit(slot);
     const auto bm = prov.chunk_info_slots->serialize(pdev_info_.dev_attr.align_size);
     co_await write_super_block(*bm, chunk_sb_offset());
@@ -528,6 +567,12 @@ Async< void > PhysicalDev::remove_chunks(const std::vector< shared< Chunk > >& c
         if (dev_mgr_ != nullptr) {
             dev_mgr_->free_chunk_id(cinfo.chunk_id);
         }
+    }
+
+    // Crash point: the batch's freed ChunkInfos are durable, their slot bits still set — none of them may
+    // resurrect on recovery.
+    if (crash_if_flip_fired("crash_after_chunk_info_free")) {
+        co_return;
     }
 
     // Single bitmap write for the entire batch.

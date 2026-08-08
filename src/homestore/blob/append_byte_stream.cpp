@@ -22,6 +22,7 @@
 #include <fmt/format.h>
 
 #include "homestore/blob/append_byte_stream.h"
+#include "homestore/base/crash_simulator.h"
 #include "homestore/blob/blob_dev.h"
 #include "homestore/device/chunk.h"
 #include "homestore/device/virtual_dev.h"
@@ -201,10 +202,13 @@ Async< void > AppendByteStream::truncate(uint64_t upto_offset) {
         tail_offset_ = 0;
         offset_in_first_chunk_ = 0;
         flush_buf_.reset();
-        co_await persist_stream_sb();
-        co_return;
     }
 
+    // Crash point: chunks are physically released but the stream sb still claims the old positions —
+    // recovery must tolerate a persisted head that points into freed chunks.
+    if (crash_if_flip_fired("crash_after_stream_chunk_release")) {
+        co_return;
+    }
     co_await persist_stream_sb();
 }
 

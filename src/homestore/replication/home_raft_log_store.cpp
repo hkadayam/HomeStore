@@ -15,6 +15,7 @@
 
 #include "home_raft_log_store.h"
 #include "common/async.h"
+#include "homestore/base/crash_simulator.h"
 
 #include <cstring>
 #include <stdexcept>
@@ -354,6 +355,11 @@ void HomeRaftLogStore::end_of_append_batch(ulong start, ulong cnt) {
                        (raft_server_ != nullptr));
         if (raft_server_) {
             raft_server_->notify_durable(end_repl_lsn);
+        }
+        // Crash point: this batch is durable in the log and acked to raft, but nothing is applied — recovery
+        // must leave the unproven tail to nuraft re-commit (or drop it) with zero double-applies.
+        if (crash_if_flip_fired("crash_after_log_append")) {
+            co_return;
         }
     });
 }

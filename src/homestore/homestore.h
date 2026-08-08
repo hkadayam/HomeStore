@@ -28,10 +28,6 @@
 
 namespace homestore {
 
-#ifdef _PRERELEASE
-class CrashSimulator;
-#endif
-
 // Forward-declared so InputParams can carry an optional ReplApplication without pulling the replication
 // headers into the core.  shared<> keeps the deleter type-erased, so a forward declaration is enough here.
 class ReplApplication;
@@ -138,21 +134,17 @@ public:
     bool is_first_time_boot() const;
     bool is_initialized() const { return init_done_.load(std::memory_order_acquire); }
 
-#ifdef _PRERELEASE
+#ifdef SISL_FLIP_ENABLED
+    /// Install the crash simulator's restart callback (invoked on a simulated crash to reboot this instance
+    /// through the ordinary recovery path).  The simulator itself lives in Managers so any layer can reach
+    /// crash_if_flip_fired() without depending on this header.
     HomeStore& with_crash_simulator(std::function< void() > restart_cb);
-    CrashSimulator& crash_simulator() {
-        return *crash_simulator_;
-    }
 #endif
 
 private:
     static HomeStoreSafePtr s_instance_;
     std::atomic< bool > init_done_{false};
     InputParams input_{};
-
-#ifdef _PRERELEASE
-    unique< CrashSimulator > crash_simulator_;
-#endif
 };
 
 inline HomeStore* hs() {

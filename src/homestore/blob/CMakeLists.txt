@@ -11,6 +11,6 @@ target_sources(hs_blob PRIVATE
     blob_dev.cpp
     blob_dev_mgr.cpp
 )
-target_link_libraries(hs_blob hs_device hs_meta hs_checkpoint ${COMMON_DEPS})
+target_link_libraries(hs_blob PRIVATE sisl_flip hs_device hs_meta hs_checkpoint ${COMMON_DEPS})
 
 add_subdirectory(tests)

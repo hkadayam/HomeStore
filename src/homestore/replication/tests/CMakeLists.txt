@@ -13,7 +13,8 @@ include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 add_executable(test_replica_set
     test_replica_set.cpp
     test_repl_writes.cpp
-    test_repl_recovery.cpp
+    test_repl_reboot.cpp
+    test_repl_crash.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../test_common/hs_test_cow_store.cpp)
 target_compile_definitions(test_replica_set PRIVATE BTREE_ASYNC_MODE)
 target_link_libraries(test_replica_set PRIVATE

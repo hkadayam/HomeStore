@@ -28,6 +28,9 @@ class COWBtreeManager;
 class ResourceMgr;
 class LogStoreManager;
 class ReplicationManager;
+#ifdef SISL_FLIP_ENABLED
+class CrashSimulator;
+#endif
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Managers
@@ -51,6 +54,12 @@ public:
     static void init_resource_mgr(shared< ResourceMgr > mgr) { s_resource_mgr_ = std::move(mgr); }
     static void init_log_store_mgr(shared< LogStoreManager > mgr) { s_log_store_mgr_ = std::move(mgr); }
     static void init_repl_mgr(shared< ReplicationManager > mgr) { s_repl_mgr_ = std::move(mgr); }
+#ifdef SISL_FLIP_ENABLED
+    // The crash simulator deliberately survives reset(): it orchestrates the crash-restart cycle ACROSS the
+    // dying and rebooting instances (each boot re-installs it with a fresh restart callback).
+    static void init_crash_simulator(shared< CrashSimulator > cs) { s_crash_simulator_ = std::move(cs); }
+    static bool has_crash_simulator() { return s_crash_simulator_ != nullptr; }
+#endif
 
     static void reset_resource_mgr() { s_resource_mgr_.reset(); }
 
@@ -80,6 +89,9 @@ private:
     friend ResourceMgr& resource_mgr();
     friend LogStoreManager& log_store_mgr();
     friend ReplicationManager& repl_mgr();
+#ifdef SISL_FLIP_ENABLED
+    friend CrashSimulator& crash_simulator();
+#endif
 
     inline static shared< MetaBlkManager > s_meta_mgr_;
     inline static shared< DeviceManager > s_device_mgr_;
@@ -89,6 +101,9 @@ private:
     inline static shared< ResourceMgr > s_resource_mgr_;
     inline static shared< LogStoreManager > s_log_store_mgr_;
     inline static shared< ReplicationManager > s_repl_mgr_;
+#ifdef SISL_FLIP_ENABLED
+    inline static shared< CrashSimulator > s_crash_simulator_; // survives reset(); see init_crash_simulator
+#endif
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -152,5 +167,14 @@ inline ReplicationManager& repl_mgr() {
     }
     return *Managers::s_repl_mgr_;
 }
+
+#ifdef SISL_FLIP_ENABLED
+inline CrashSimulator& crash_simulator() {
+    if (!Managers::s_crash_simulator_) {
+        throw std::logic_error{"crash_simulator() called before init_crash_simulator()"};
+    }
+    return *Managers::s_crash_simulator_;
+}
+#endif
 
 } // namespace homestore

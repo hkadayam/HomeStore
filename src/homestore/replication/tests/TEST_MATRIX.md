@@ -2,9 +2,12 @@
 
 Single multi-process binary: `test_replica_set` (one OS process per replica, boost interprocess
 barriers). Backend is the PERSISTENT COWBtree store. Fault injection uses the **Flip** framework
-(`flip::FlipClient::instance().inject_{noreturn,delay,retval}_flip(...)`) and, for crashes, the
-**CrashSimulator** (`base/crash_simulator.h`, gated on `iomgr_flip::test_flip(<name>)`), which
-aborts the process at a named point so the harness can restart and validate recovery.
+(armed via `HSTestHelper::set_flip`/`set_delay_flip`) and, for crashes, the **CrashSimulator**
+(`base/crash_simulator.h`, `SISL_FLIP_ENABLED` builds only): a product crash point is one line —
+`if (crash_if_flip_fired("<name>")) { co_return; }` — which freezes the device layer (every
+PhysicalDev write fake-succeeds via the `is_crash_simulated()` gate, so the disk stays exactly as of
+the crash instant, the dying shutdown's final CP included) and reboots the instance in-process
+through ordinary recovery.  Tests arm the flip and block on `wait_for_crash_recovery()`.
 
 Legend — Status: ✅ implemented & passing · 🟡 implemented, flaky · ⛔ not implemented (TODO) · ▫ infra missing.
 
@@ -46,7 +49,7 @@ consistent, group re-forms.
 | ID | Crash point (flip name) | Injected where | Restart expectation | Status |
 |----|-------------------------|----------------|---------------------|--------|
 | C1 | after raft log append, before commit | leader | uncommitted tail dropped or re-committed; no dup | ⛔ |
-| C2 | after commit (state-machine apply), before CP | any | recovered via log replay; count exact | ⛔ |
+| C2 | after commit (state-machine apply), before CP | follower | recovered via proof-gated log replay; state exact | ✅ `CrashAfterCommitFollower` (`crash_after_data_commit` flip) — verified from the recovery log: dying shutdown's CP never persisted (CP counter resumed at the same cp_id), log-store checkpt read back pre-crash (302), replay proved 303 and dropped 4 unproven tail entries to nuraft re-commit |
 | C3 | after CP, before commit_lsn persist | any | btree durable; replay from stale commit_lsn is idempotent | ⛔ |
 | C4 | during `write_sb` (RSSuperBlk persist) | any | SB either old or new, never torn; recovers | ⛔ |
 | C5 | after metablk `write_data`, before chain link | any | orphan blk reconciled; no ghost in chain | ⛔ |
@@ -90,8 +93,10 @@ consistent, group re-forms.
 
 ## Infra gaps to close before C/D/E/F land
 
-1. **CrashSimulator flip points** — add named crash flips at the C1–C11 sites (raft append,
-   post-commit, post-CP, `write_sb`, metablk link, truncate, snapshot, membership).
+1. **CrashSimulator flip points** — the infra is live (device-layer freeze, `crash_if_flip_fired`,
+   in-process crash-restart, `wait_for_crash_recovery`); `crash_after_commit` (C2) is the first
+   point.  Remaining named points to add: raft append (C1), CP mid-flush (C3), `write_sb` (C4),
+   metablk link (C5), truncate (C6), membership commit (C9); snapshot points ride the E infra.
 2. **Non-stub test listener** — implement `take_snapshot`/`build_snapshot`/`apply_snapshot` and the
    membership/replace hooks in `ReplTestListener` so E and F are observable.
 3. **Per-group commit tracking in harness** — `wait_for_commits` currently polls a single

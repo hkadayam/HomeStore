@@ -27,6 +27,7 @@
 #include "sisl/logging/logging.h"
 
 #include "homestore/blkalloc/sweep_service.h"
+#include "homestore/base/crash_simulator.h"
 #include "homestore/device/device_manager.h"
 #include "homestore/device/physical_dev.h"
 #include "homestore/device/virtual_dev.h"
@@ -156,6 +157,11 @@ Async< void > DeviceManager::commit_formatting() {
             pdevs.push_back(p);
         }
     }
+    // Crash point: managers formatted and durable, formatting_done still 0 on every pdev — the next boot
+    // must treat the device as first-time and re-format from scratch.
+    if (crash_if_flip_fired("crash_before_commit_formatting")) {
+        co_return;
+    }
     for (auto& pdev : pdevs) {
         co_await pdev->commit_formatting();
     }
@@ -242,6 +248,11 @@ Async< shared< VirtualDev > > DeviceManager::create_vdev(VDevParameters&& params
         state_.all_vdevs.emplace(vdev_id, vdev);
     }
 
+    // Crash point: chunks + VDevInfo durable, slot bit not set — recovery never loads the vdev and the
+    // dangling-chunk cleanup must reclaim everything it created.
+    if (crash_if_flip_fired("crash_after_vdev_info_write")) {
+        co_return vdev;
+    }
     co_await write_vdev_slot_bitmap();
 
     LOGINFO("Created VirtualDev '{}' id={}", vdev->name(), vdev_id);
@@ -493,6 +504,13 @@ Async< void > DeviceManager::load_vdevs() {
                 LOGWARN("Found stale-slot VDev id={} (bitmap set but no pdev has a valid vdev_info)", vdev_id);
                 stale_slot_vdev_ids.push_back(vdev_id);
                 continue;
+            }
+
+            // A corrupt record must halt the boot, never fall into the stale-slot path — stale treatment
+            // would destroy this vdev's chunks.
+            if (!vinfo.verify_checksum()) {
+                throw std::runtime_error{fmt::format("VDevInfo checksum mismatch for vdev_id={} name={}", vdev_id,
+                                                     vinfo.get_name())};
             }
 
             LOGINFO("Loading VirtualDev id={} name={}", vdev_id, vinfo.get_name());

@@ -36,9 +36,8 @@
 #include "homestore/replication/repl_manager.h"
 #include "homestore/resource/resource_mgr.h"
 
-#ifdef _PRERELEASE
-#include "homestore/common/crash_simulator.h"
-#include "sisl/flip/flip.hpp"
+#ifdef SISL_FLIP_ENABLED
+#include "homestore/base/crash_simulator.h"
 #endif
 
 namespace homestore {
@@ -53,9 +52,9 @@ HomeStore* HomeStore::instance() {
     return s_instance_.get();
 }
 
-#ifdef _PRERELEASE
+#ifdef SISL_FLIP_ENABLED
 HomeStore& HomeStore::with_crash_simulator(std::function< void() > restart_cb) {
-    crash_simulator_ = std::make_unique< CrashSimulator >(std::move(restart_cb));
+    Managers::init_crash_simulator(std::make_shared< CrashSimulator >(std::move(restart_cb)));
     return *this;
 }
 #endif
@@ -86,10 +85,9 @@ Async< bool > HomeStore::start(InputParams input) {
 #endif
     sisl::VersionMgr::addVersion(PACKAGE_NAME, version::Semver200_version(PACKAGE_VERSION));
 
-#ifdef _PRERELEASE
-    flip::Flip::instance().start_rpc_server();
-    if (!crash_simulator_) {
-        crash_simulator_ = std::make_unique< CrashSimulator >(nullptr);
+#ifdef SISL_FLIP_ENABLED
+    if (!Managers::has_crash_simulator()) {
+        Managers::init_crash_simulator(std::make_shared< CrashSimulator >(nullptr));
     }
 #endif
 
@@ -169,7 +167,7 @@ Async< void > HomeStore::load() {
     co_await cp->start(/*first_time_boot=*/false);
 
     co_await BlobDevManager::load();
-    co_await COWBtreeManager::load(resource_mgr().cache_size()); // index self-recovers from its own CPs, independent of the log stream
+    co_await COWBtreeManager::load(resource_mgr().cache_size()); // index self-recovers, independent of log stream
     co_await LogStoreManager::load(); // reconstruct LogStore instances; NO replay yet, tail_lsn stays -1
 
     // Replication load(): reconstruct each ReplicaSet (ReplicaSet::load — read SB, seed watermarks,
@@ -247,16 +245,13 @@ Async< void > HomeStore::shutdown() {
     co_await log_store_mgr().shutdown();
     cow_btree_mgr().shutdown();
     blob_dev_mgr().shutdown();
-    co_await cp_mgr().shutdown();     // prepare_shutdown() already ran above; this just frees CP state
+    co_await cp_mgr().shutdown(); // prepare_shutdown() already ran above; this just frees CP state
     // MetaBlkManager has no explicit shutdown — Managers::reset() drops it.
-    co_await ResourceMgr::stop();     // prepare_shutdown() already ran; this drops the subscription + singleton
+    co_await ResourceMgr::stop(); // prepare_shutdown() already ran; this drops the subscription + singleton
 
     co_await device_mgr().close_devices();
     Managers::reset();
 
-#ifdef _PRERELEASE
-    flip::Flip::instance().stop_rpc_server();
-#endif
     LOGINFO("HomeStore: shutdown complete");
 }
 

@@ -855,11 +855,24 @@ Async< sisl::IoBufView > COWBtree::read_from_incr_stream(uint64_t offset, size_t
 Async< uint64_t > COWBtree::recover_one_incr_cp(uint64_t offset, cp_id_t last_full_cp, cp_id_t cur_cp_id) {
     COWBT_LOG(DEBUG, "recover_one_incr_cp ENTRY offset={} sizes: Header={} NodeRecord={} CompactNodeId={} Footer={}",
               offset, sizeof(IncrMapHeader), sizeof(IncrMapNodeRecord), sizeof(CompactNodeId), sizeof(IncrMapFooter));
+    // The tail record is the only frame allowed to be incomplete: a record from a completed CP was fully
+    // flushed before that CP's superblock advanced, so a short or magic-less header here is the crash-torn
+    // in-flight record — end replay cleanly (the record's CP never completed; nothing is lost).
+    if (offset + sizeof(IncrMapHeader) > incr_map_stream_->tail_offset()) {
+        COWBT_LOG(WARN, "incr journal ends in a torn header at offset={} tail={} — stopping replay", offset,
+                  incr_map_stream_->tail_offset());
+        co_return 0;
+    }
     auto hdr_buf = co_await read_from_incr_stream(offset, sizeof(IncrMapHeader));
     auto const& hdr = *r_cast< IncrMapHeader const* >(hdr_buf.bytes());
     COWBT_LOG(DEBUG, "recover_one_incr_cp HDR cp_id={} num_updates={} num_deletes={} new_root={}", hdr.cp_id,
               hdr.num_updates, hdr.num_deletes, hdr.new_root_nodeid);
-    HS_REL_ASSERT_EQ(hdr.header_magic, IncrMapHeader::HEADER_MAGIC, "recover_one_incr_cp: invalid header magic");
+    if (hdr.header_magic != IncrMapHeader::HEADER_MAGIC) {
+        COWBT_LOG(WARN, "incr journal header magic mismatch at offset={} tail={} — torn in-flight record, "
+                        "stopping replay",
+                  offset, incr_map_stream_->tail_offset());
+        co_return 0;
+    }
 
     // Decide if we need the incr cp records to be processed.
     if (hdr.cp_id >= cur_cp_id) {
@@ -876,7 +889,10 @@ Async< uint64_t > COWBtree::recover_one_incr_cp(uint64_t offset, cp_id_t last_fu
                   hdr.cp_id, last_full_cp);
     }
 
-    // Walk IncrMapNodeRecords.
+    // Walk IncrMapNodeRecords.  Mirror the writer's checksum (crc32 over concatenated record buffers +
+    // delete ids, seed 0, header excluded) so the footer's stored checksum is actually verified for every
+    // record this replay applies.
+    uint32_t crc = 0;
     uint32_t updates_seen = 0;
     while (updates_seen < hdr.num_updates) {
         COWBT_LOG(DEBUG, "recover_one_incr_cp REC LOOP offset={} updates_seen={}", offset, updates_seen);
@@ -888,6 +904,7 @@ Async< uint64_t > COWBtree::recover_one_incr_cp(uint64_t offset, cp_id_t last_fu
         if (!skip) {
             auto full_rbuf = co_await read_from_incr_stream(offset, rec_size);
             auto const* rec = r_cast< IncrMapNodeRecord const* >(full_rbuf.bytes());
+            crc = crc32_ieee(crc, full_rbuf.bytes(), rec_size);
             for (uint16_t n = 0; n < rec->n_nodes; ++n) {
                 COWBT_LOG(DEBUG, "recover_one_incr_cp UPDATE compact_id={} -> base_blkid={} +offset={}", rec->nodes[n],
                           rec->base_blkid.to_string(), n);
@@ -907,6 +924,7 @@ Async< uint64_t > COWBtree::recover_one_incr_cp(uint64_t offset, cp_id_t last_fu
         for (uint32_t i = 0; i < hdr.num_deletes; ++i) {
             auto dbuf = co_await read_from_incr_stream(offset, sizeof(CompactNodeId));
             auto const del_id = *r_cast< CompactNodeId const* >(dbuf.bytes());
+            crc = crc32_ieee(crc, dbuf.bytes(), sizeof(CompactNodeId));
             bnodeid_map_.remove(del_id);
             nodeid_generator_.unreserve(del_id);
             offset += sizeof(CompactNodeId);
@@ -917,6 +935,11 @@ Async< uint64_t > COWBtree::recover_one_incr_cp(uint64_t offset, cp_id_t last_fu
     auto fbuf = co_await read_from_incr_stream(offset, sizeof(IncrMapFooter));
     auto const& footer = *r_cast< IncrMapFooter const* >(fbuf.bytes());
     HS_REL_ASSERT_EQ(footer.footer_magic, IncrMapFooter::FOOTER_MAGIC, "recover_one_incr_cp: invalid footer magic");
+    if (!skip) {
+        // A mismatch on a completed CP's record is real corruption (its flush finished before the CP SB
+        // advanced) — halting is honest; the torn in-flight record can never reach here.
+        HS_REL_ASSERT_EQ(footer.checksum, crc, "recover_one_incr_cp: journal checksum mismatch cp_id={}", hdr.cp_id);
+    }
     offset += sizeof(IncrMapFooter);
 
     if (!skip) {

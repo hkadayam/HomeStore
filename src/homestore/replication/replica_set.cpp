@@ -49,14 +49,14 @@
 #include <nlohmann/json.hpp>
 
 #include "sisl/logging/logging.h"
-
+#include "iomanager/iomanager.h"
 #include "homestore/base/homestore_assert.h"
 #include "homestore/base/hs_runtime_config.h"
 #include "homestore/homestore.h"
 #include "homestore/replication/repl_manager.h"
 #include "replication/transport/folly_rpc_client_factory.h"
 #include "replication/transport/folly_rpc_listener.h"
-#include "iomanager/iomanager.h"
+#include "homestore/base/crash_simulator.h"
 
 namespace homestore {
 
@@ -1320,6 +1320,9 @@ Async< void > ReplicaSet::rollback_ext(ext_op_params const& params) {
     if (listener_) {
         co_await listener_->on_rollback(lsn, view_user_header(ev));
     }
+    // Crash point: this entry's rollback side effects are delivered, then nothing survives — recovery must
+    // come up with the entry gone on every member (nuraft re-resolves the divergent tail).
+    crash_if_flip_fired("crash_after_data_rollback");
     co_return;
 }
 
@@ -1330,7 +1333,7 @@ Async< void > ReplicaSet::commit_config(ulong log_idx, nuraft::ptr< nuraft::clus
         co_return;
     }
 
-#ifdef _PRERELEASE
+#ifdef DEBUG
     // Log the resulting membership at INFO so cluster-change audits are visible in test/debug runs; skipped in
     // release builds to keep the commit path allocation-free.
     std::vector< int32_t > server_ids;
@@ -1372,6 +1375,10 @@ Async< void > ReplicaSet::commit_config(ulong log_idx, nuraft::ptr< nuraft::clus
     if (listener_ && (!added.empty() || !removed.empty())) {
         listener_->on_membership_change(added, removed);
     }
+    // Crash point: this member has committed and persisted the config change; peers may not have.  Recovery
+    // must come up with config old-or-new per member and heal to a symmetric view.  arg1 = 1 when this member
+    // is the leader, so a condition can target leader vs follower.
+    crash_if_flip_fired("crash_after_config_commit", is_leader() ? 1 : 0);
     co_return;
 }
 
@@ -1382,6 +1389,9 @@ Async< void > ReplicaSet::rollback_config(ulong log_idx, nuraft::ptr< nuraft::cl
     if (listener_) {
         listener_->on_config_rollback(lsn);
     }
+    // Crash point: the discarded config's rollback is processed, then nothing survives — the divergent config
+    // entry must stay gone after recovery.
+    crash_if_flip_fired("crash_after_config_rollback");
     co_return;
 }
 
@@ -1617,6 +1627,11 @@ Async< void > ReplicaSet::dispatch_commit(int64_t lsn, JournalType type, sisl::B
         RS_LOG(DEBUG, NO_TRACE_ID, "dispatch_commit lsn={} type=data listener={}", lsn, fmt::ptr(listener_.get()));
         if (listener_) {
             co_await listener_->on_commit(lsn, user_header, value, bids);
+        }
+        // Crash point: this entry is applied to the state machine but no checkpoint covers it — recovery must
+        // re-deliver the un-checkpointed suffix through the proof-gated replay.
+        if (crash_if_flip_fired("crash_after_data_commit")) {
+            co_return;
         }
         break;
     }

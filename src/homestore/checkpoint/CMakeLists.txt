@@ -7,6 +7,6 @@ add_library(hs_checkpoint OBJECT)
 target_sources(hs_checkpoint PRIVATE
         cp_mgr.cpp
       )
-target_link_libraries(hs_checkpoint ${COMMON_DEPS})
+target_link_libraries(hs_checkpoint PRIVATE sisl_flip ${COMMON_DEPS})
 
 add_subdirectory(tests)

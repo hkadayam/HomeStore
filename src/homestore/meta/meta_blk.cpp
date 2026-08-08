@@ -70,7 +70,11 @@ Async< sisl::IoBufView > MetaBlk::read_data(VirtualDev& vdev) const {
 
     if (!header().overflow_bid.is_valid()) {
         META_LOG(DEBUG, "read_data: name={} inline data_size={} blk_num={}", name(), data_sz, holder_->blkid.blk_num());
-        co_return sisl::IoBufView{holder_->buffer, to_u32(MetaBlkHeader::SIZE), data_sz};
+        sisl::IoBufView view{holder_->buffer, to_u32(MetaBlkHeader::SIZE), data_sz};
+        if (crc32_ieee(0, view.cbytes(), data_sz) != header().data_crc) {
+            throw std::runtime_error{"MetaBlk::read_data: payload crc mismatch (inline) name=" + name()};
+        }
+        co_return view;
     }
 
     // Overflow: read from overflow blocks on disk into a new IoBufShared, then wrap as IoBufView.
@@ -83,6 +87,9 @@ Async< sisl::IoBufView > MetaBlk::read_data(VirtualDev& vdev) const {
         throw std::system_error{err, "MetaBlk::read_data: overflow read failed"};
     }
     META_LOG(DEBUG, "read_data: name={} overflow read complete", name());
+    if (crc32_ieee(0, out->cbytes(), data_sz) != header().data_crc) {
+        throw std::runtime_error{"MetaBlk::read_data: payload crc mismatch (overflow) name=" + name()};
+    }
     co_return sisl::IoBufView{std::move(out)};
 }
 

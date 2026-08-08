@@ -26,6 +26,7 @@
 #include "homestore/blkalloc/slab_blk_allocator.h"
 #include "homestore/device/hs_super_blk.h" // HSSuperBlk layout constants
 #include "homestore/device/physical_dev.h" // PhysicalDev
+#include "homestore/base/crash_simulator.h"
 #include "homestore/device/virtual_dev.h"
 
 namespace homestore {
@@ -124,6 +125,11 @@ Async< unique< VirtualDev > > VirtualDev::create(VDevParameters&& params, uint32
         total_created += n;
     }
 
+    // Crash point: chunks are durable but no VDevInfo names them — recovery's dangling-chunk cleanup must
+    // reclaim every chunk this create wrote.
+    if (crash_if_flip_fired("crash_after_vdev_chunks_create")) {
+        co_return vdev;
+    }
     co_await vdev->write_vdev_info();
 
     LOGINFO("VirtualDev={} created with {} initial chunks (chunk_size={})", params.vdev_name, total_created,
@@ -227,6 +233,12 @@ Async< void > VirtualDev::destroy() {
         co_await write_vdev_info();
     }
     LOGINFO("VirtualDev '{}': stage 1 complete", name_);
+
+    // Crash point: VDevInfo freed, chunks still on disk with this vdev_id — recovery's dangling-chunk
+    // cleanup must finish the removal.
+    if (crash_if_flip_fired("crash_after_vdev_info_free")) {
+        co_return;
+    }
 
     // Stage 2: remove all chunks belonging to this vdev from every pdev.
     for (auto& pdev : pdevs_) {
@@ -502,7 +514,7 @@ void VirtualDev::on_chunks_added(const std::vector< shared< Chunk > >& chunks, b
             if (chunk_pool_) {
                 chunk_pool_->return_chunk(chunk);
             }
-            return;
+            continue;
         }
 
         new_state.pdevs.insert(chunk->info().vdev_id);

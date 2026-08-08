@@ -7,6 +7,6 @@ target_sources(hs_logstore PRIVATE
     log_store.cpp
     log_store_mgr.cpp
 )
-target_link_libraries(hs_logstore hs_blob ${COMMON_DEPS})
+target_link_libraries(hs_logstore PRIVATE sisl_flip hs_blob ${COMMON_DEPS})
 
 add_subdirectory(tests)

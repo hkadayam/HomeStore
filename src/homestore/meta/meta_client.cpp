@@ -20,6 +20,7 @@
 #include <stdexcept>
 
 #include "common/defs.h"
+#include "homestore/base/crash_simulator.h"
 #include "homestore/meta/meta_client.h"
 #include "homestore/meta/meta_blk_manager.h" // META_SUPER_HEADER_SIZE
 #include "homestore/device/virtual_dev.h"
@@ -159,6 +160,15 @@ Async< std::optional< MetaBlk > > MetaClient::get_meta_blk(std::string_view name
 }
 
 Async< void > MetaClient::write_meta_blk(MetaBlk& mblk, const sisl::IoBufShared& data) {
+    // Crash point: this SB write never happens — recovery must load the block's previous contents.  Every
+    // subsystem superblock funnels through here, so ONE flip serves them all.  Conditions are positional and
+    // unspecified args are don't-care: arg1 = client name (static registration constant, e.g.
+    // "LogStoreManager") targets a subsystem; arg2 = block name (may carry runtime ids, e.g. "LogStore_5" —
+    // ordering operators give prefix-style matching) targets one block.
+    if (crash_if_flip_fired("crash_before_sb_write", state_->info.get_client_name(), mblk.name())) {
+        co_return;
+    }
+
     // Persist the payload. Done *before* acquiring the state lock so I/O doesn't hold up other callers. The header
     // (incl. next_bid) lives in the one shared holder and is kept current by the chain ops below, so writing the block
     // out here is always consistent — an already-linked block is simply overwritten in place.
@@ -168,6 +178,12 @@ Async< void > MetaClient::write_meta_blk(MetaBlk& mblk, const sisl::IoBufShared&
 
     // Already in the chain — the write above updated the shared holder in place; nothing to relink.
     if (mblk.linked()) {
+        co_return;
+    }
+
+    // Crash point: a fresh block's payload is durable but it is not yet linked into the chain — recovery must
+    // reclaim it as an orphan.  Same (client name, block name) conditioning as crash_before_sb_write.
+    if (crash_if_flip_fired("crash_before_sb_linked", state_->info.get_client_name(), mblk.name())) {
         co_return;
     }
 
@@ -258,6 +274,13 @@ Async< void > MetaClient::remove_meta_blk(const MetaBlk& mblk) {
             }
         }
         co_await write_client_info(state_->info);
+    }
+
+    // Crash point: the block is unlinked from the chain (relink / head-advance persisted) but its storage is
+    // never freed — recovery's chain walk must not resurrect it, and the allocator must reclaim the leak.
+    // Same (client name, block name) conditioning as crash_before_sb_write.
+    if (crash_if_flip_fired("crash_during_sb_remove", state_->info.get_client_name(), removed.name())) {
+        co_return;
     }
 
     // Free the block's storage on the vdev.

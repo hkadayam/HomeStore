@@ -148,6 +148,16 @@ public:
             (std::string(hdr.product_name) == std::string(FirstBlockHeader::PRODUCT_NAME) && (formatting_done != 0x0)));
     }
 
+    /// Verify the stored checksum against a recompute over the atomic area (checksum field zeroed), exactly
+    /// mirroring the write-side computation.  Callers gate on magic first: an invalid-magic block is a fresh
+    /// device, not corruption.
+    bool verify_checksum() const {
+        alignas(8) uint8_t copy[s_atomic_fb_size]{};
+        std::memcpy(copy, this, std::min(sizeof(FirstBlock), size_t{s_atomic_fb_size}));
+        reinterpret_cast< FirstBlock* >(copy)->checksum = 0;
+        return checksum == crc32_ieee(hs_init_crc_32, copy, s_atomic_fb_size);
+    }
+
     std::string to_string() const {
         auto str = fmt::format("magic={:#x}, checksum={}, first_blk_header=[{}], this_pdev_info=[{}]", get_magic(),
                                checksum, hdr.to_string(), this_pdev_hdr.to_string());
@@ -201,6 +211,15 @@ struct VDevInfo {
     void compute_checksum() {
         checksum = 0;
         checksum = crc16_t10dif(hs_init_crc_16, reinterpret_cast< const unsigned char* >(this), sizeof(VDevInfo));
+    }
+
+    /// Verify the stored checksum against a recompute with the field zeroed (mirror of compute_checksum).
+    bool verify_checksum() const {
+        VDevInfo copy;
+        std::memcpy(&copy, this, sizeof(VDevInfo));
+        copy.checksum = 0;
+        return checksum ==
+            crc16_t10dif(hs_init_crc_16, reinterpret_cast< const unsigned char* >(&copy), sizeof(VDevInfo));
     }
 
     const uint8_t* to_bytes() const { return reinterpret_cast< const uint8_t* >(this); }

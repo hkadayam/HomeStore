@@ -115,7 +115,7 @@ set(HOMESTORE_OBJECTS
     homestore/homestore.cpp
 )
 add_library(homestore STATIC ${HOMESTORE_OBJECTS})
-target_link_libraries(homestore PRIVATE ${COMMON_DEPS})
+target_link_libraries(homestore PRIVATE sisl_flip ${COMMON_DEPS})
 # hs_replication's objects reference NuRaft (a static lib); since homestore is itself static, the dependency
 # must be PUBLIC so anything linking `homestore` also links NuRaft. Guarded: the target only exists when
 # REPLICATION=ON added extern/NuRaft.

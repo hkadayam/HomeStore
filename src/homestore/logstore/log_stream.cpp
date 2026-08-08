@@ -27,6 +27,7 @@
 #include "sisl/fds/utils.h" // Clock, get_elapsed_time_us
 
 #include "homestore/logstore/log_stream.h"
+#include "homestore/base/crash_simulator.h"
 #include "homestore/base/hs_runtime_config.h" // HS_RUNTIME_CONFIG
 #include "common/defs.h"
 #include "homestore/device/chunk.h"
@@ -254,6 +255,12 @@ Async< void > LogStream::truncate(const stream_key& key) {
     // groups left in the anchor chunk fail recovery's first-group prev_crc check.  Reset chain state and persist
     // the sb again to land the new seed on disk.
     if (head_offset_ == 0 && tail_offset_ == 0) {
+        // Crash point: the empty-stream reset is persisted but the chain seed below is still the old one —
+        // stale groups left in the kept anchor chunk must NOT pass recovery's first-group prev_crc check and
+        // resurrect pre-truncate records.
+        if (crash_if_flip_fired("crash_before_logstream_seed_refresh")) {
+            co_return;
+        }
         const uint32_t old_seed = chain_seed_;
         chain_seed_ = fresh_chain_seed();
         last_crc_ = chain_seed_;

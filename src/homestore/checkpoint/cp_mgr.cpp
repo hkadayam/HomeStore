@@ -20,15 +20,10 @@
 #include "sisl/fds/rcu.h"
 
 #include "homestore/checkpoint/cp_mgr.h"
+#include "homestore/base/crash_simulator.h"
 #include "homestore/base/homestore_assert.h"
 #include "homestore/base/hs_runtime_config.h"
 #include "homestore/managers.h"
-// TODO: re-enable once HomeStore singleton and crash_simulator are ported to new iomanager
-// #include "homestore/homestore.h"
-// #include "homestore/base/resource_mgr.h"
-// #ifdef _PRERELEASE
-// #include "homestore/base/crash_simulator.h"
-// #endif
 
 #include "iomanager/iomanager.h"
 
@@ -124,17 +119,10 @@ Async< void > CPManager::prepare_shutdown() {
         wd_done = wd_cp_->stop();
     }
 
-    // TODO: re-enable crash_simulator guard once HomeStore singleton is ported
-    // #ifdef _PRERELEASE
-    //     if (!hs()->crash_simulator().is_in_crashing_phase()) {
-    // #endif
     LOGINFO("Trigger cp flush at CP shutdown");
     auto success = co_await do_trigger_cp_flush(/*force=*/true, /*flush_on_shutdown=*/true, CPTriggerReason::Timer);
     HS_REL_ASSERT_EQ(success, true, "CP Flush failed");
     LOGINFO("Trigger cp done");
-    // #ifdef _PRERELEASE
-    //     }
-    // #endif
 
     // Wait for watchdog and timer coroutines to exit. After this, no further CP flush can fire.
     if (wd_done.valid()) {
@@ -311,6 +299,12 @@ void CPManager::cp_start_flush(CP* cp) {
             co_await cb->cp_flush(cp);
         }
 
+        // Crash point: every consumer flushed, CP superblock not yet advanced — recovery must resume from the
+        // previous CP id and treat this one as never taken.
+        if (crash_if_flip_fired("crash_during_cp_flush")) {
+            co_return;
+        }
+
         // Persist superblock with updated last-flushed CP id.
         HS_DBG_ASSERT_EQ(cp->cp_status_, cp_status_t::cp_flushing);
         cp->cp_status_ = cp_status_t::cp_flush_done;
@@ -342,12 +336,6 @@ void CPManager::cp_start_flush(CP* cp) {
                 COUNTER_INCREMENT(*metrics_, back_to_back_cps, 1);
                 trigger_cp_flush(false, CPTriggerReason::Timer);
             }
-            // TODO: re-enable crash_simulator guard once HomeStore singleton is ported
-            // #ifdef _PRERELEASE
-            //             if (hs()->crash_simulator().is_in_crashing_phase()) {
-            //                 hs()->crash_simulator().crash_now();
-            //             }
-            // #endif
         }
     });
 }

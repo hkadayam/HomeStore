@@ -135,7 +135,8 @@ Async< size_t > MetaClient::num_meta_blks() const {
 // ──────────────────────────────────────────────────────────────────────────────
 // Meta Blk Management Public APIs
 // ──────────────────────────────────────────────────────────────────────────────
-Async< MetaBlk > MetaClient::create_meta_blk(std::string_view name, std::optional< size_t > estimated_data_size) {
+Async< MetaBlk > MetaClient::create_meta_blk(std::string_view name, std::optional< size_t > estimated_data_size,
+                                             MetaBlkOwnership owner) {
     const uint32_t blk_sz = to_u32(meta_vdev_->block_size());
 
     // Allocate one block for the header + inline data.
@@ -146,7 +147,7 @@ Async< MetaBlk > MetaClient::create_meta_blk(std::string_view name, std::optiona
         throw std::runtime_error{"MetaClient::create_meta_blk: alloc failed"};
     }
 
-    co_return MetaBlk::create(out_bid, blk_sz, name);
+    co_return MetaBlk::create(out_bid, blk_sz, name, owner);
 }
 
 Async< std::optional< MetaBlk > > MetaClient::get_meta_blk(std::string_view name) {

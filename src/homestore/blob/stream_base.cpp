@@ -23,6 +23,7 @@
 #include "sisl/logging/logging.h"
 
 #include "homestore/blob/stream_base.h"
+#include "homestore/blkalloc/blk_allocator.h"
 #include "homestore/device/chunk.h"
 #include "homestore/device/virtual_dev.h"
 #include "homestore/base/event_manager.h"  // EventManager::publish
@@ -136,7 +137,19 @@ Async< void > StreamBase::expand_to(size_t n) {
 Async< void > StreamBase::init_chunk_mblk(const shared< Chunk >& chunk) {
     const uint32_t cid = chunk->chunk_id();
     auto name = fmt::format("{}_{}_{}_{}_{}", dev_name_, stream_type_name(), stream_id_, cid, blk_size_);
-    auto blk = co_await meta_client_.create_meta_blk(name, std::nullopt);
+    // Shared ownership: the payload is the chunk's live allocator bitmap, owned and mutated by the allocator;
+    // BufferGuard's divert protocol keeps it frozen during flushes — the caller-guaranteed contract.
+    auto blk = co_await meta_client_.create_meta_blk(name, std::nullopt, MetaBlkOwnership::Shared);
+
+    // Persist immediately with the chunk's allocator bitmap (empty for a brand-new chunk): the write is what
+    // links the block into the client chain, so recovery can attribute this chunk to the stream even if no CP
+    // ever flushes it.
+    {
+        auto buf_guard = chunk->blk_allocator_mutable()->acquire_buffer();
+        if (buf_guard.buf()) {
+            co_await meta_client_.write_meta_blk(blk, buf_guard.buf());
+        }
+    }
 
     auto lock = co_await mblk_mutex_.co_scoped_lock();
     chunk_mblks_.emplace(cid, std::move(blk));

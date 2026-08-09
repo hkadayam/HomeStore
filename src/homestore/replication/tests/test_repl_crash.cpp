@@ -60,3 +60,108 @@ TEST_F(ReplicaSetTest, CrashAfterCommitFollower) {
     validate_all_data();
     g_helper->sync_for_cleanup_start();
 }
+
+// C1: a follower crashes AFTER a batch is durable in its raft log and acked to the leader, but BEFORE any of
+// it is applied.  Recovery must leave the unproven durable tail to nuraft re-commit (or drop it) — zero
+// double-applies, exact state everywhere.
+TEST_F(ReplicaSetTest, CrashAfterLogAppendFollower) {
+    auto const n = SISL_OPTIONS["num_io"].as< uint64_t >();
+    auto const replicas = SISL_OPTIONS["replicas"].as< uint32_t >();
+    g_helper->sync_for_test_start();
+
+    write_on_leader(n);
+    wait_for_commits(n);
+    HSTestHelper::trigger_cp(); // checkpoint batch 1 so the crash window is exactly batch 2
+    g_helper->sync_for_test_start();
+
+    auto const lm = wait_leader_member();
+    auto const victim = (lm + 1) % replicas;
+    if (g_helper->replica_num() == victim) {
+        g_helper->set_flip("crash_after_log_append", 1, 100);
+    }
+    g_helper->sync_for_test_start();
+
+    write_on_leader(n); // the victim crashes on its first durable append of this batch
+    if (g_helper->replica_num() == victim) {
+        g_helper->wait_for_crash_recovery();
+    }
+    wait_for_commits(2 * n); // the victim converges via nuraft re-commit / catch-up
+
+    g_helper->sync_for_verify_start();
+    validate_all_data();
+    g_helper->sync_for_cleanup_start();
+}
+
+// A follower crashes at its destroy_pending SB write: the CTRL_DESTROY committed to its log, but the local
+// persist never happened.  Recovery replays the destroy (proof-gated), re-stages it, and the reaper erases
+// the group — no replica may leak the group and nobody re-issues a destroy.
+TEST_F(ReplicaSetTest, CrashBeforeDestroySbWrite) {
+    auto const n = SISL_OPTIONS["num_io"].as< uint64_t >();
+    auto const replicas = SISL_OPTIONS["replicas"].as< uint32_t >();
+    g_helper->sync_for_test_start();
+
+    write_on_leader(n);
+    wait_for_commits(n);
+    auto const gid = repl_set()->group_id();
+    auto const lm = wait_leader_member();
+    auto const victim = (lm + 1) % replicas;
+    if (g_helper->replica_num() == victim) {
+        g_helper->set_flip("crash_before_sb_write", 1, 100,
+                           {{"client", flip::Operator::EQUAL, std::string{"ReplicaSet"}}});
+    }
+    g_helper->sync_for_test_start();
+
+    // The victim must not run the helper's destroy poll loop — it would race its own crash-restart while
+    // the managers are mid-swap.  It is not the leader (destroy is leader-issued), so it just rides the
+    // crash and recovery.
+    if (g_helper->replica_num() == victim) {
+        g_helper->wait_for_crash_recovery();
+    } else {
+        g_helper->destroy_replica_set(false /* wait_for_destroy */);
+    }
+
+    for (uint32_t waited_ms = 0;; waited_ms += 200) {
+        auto const rs = homestore::repl_service().get_replica_set(gid);
+        if (!rs.hasValue() || !rs.value()) {
+            break; // reaper finished the destroy on this replica
+        }
+        RELEASE_ASSERT(waited_ms < 60000u, "group not destroyed within 60s after destroy-SB crash");
+        std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    }
+
+    g_helper->sync_for_verify_start();
+    g_helper->sync_for_cleanup_start(); // no data validation — the group's store is gone by design
+}
+
+// A follower crashes at a raft-state save (term/vote persist) during a forced re-election.  Recovery boots
+// with the pre-crash term; nuraft's vote-safety must hold — one leader per term, writes exactly-once.
+TEST_F(ReplicaSetTest, CrashOnRaftStateSave) {
+    auto const n = SISL_OPTIONS["num_io"].as< uint64_t >();
+    auto const replicas = SISL_OPTIONS["replicas"].as< uint32_t >();
+    g_helper->sync_for_test_start();
+
+    write_on_leader(n);
+    wait_for_commits(n);
+    g_helper->sync_for_test_start();
+
+    auto const lm = wait_leader_member();
+    auto const victim = (lm + 1) % replicas;
+    if (g_helper->replica_num() == victim) {
+        g_helper->set_flip("crash_before_sb_write", 1, 100,
+                           {{"client", flip::Operator::EQUAL, std::string{"ReplicaRaftConfig"}}});
+    }
+    g_helper->sync_for_test_start();
+
+    if (g_helper->replica_num() == lm) {
+        g_helper->restart(15); // > election window: survivors elect, the victim's save_state fires the crash
+    }
+    write_on_leader(n); // the takeover leader (or returned member) carries the batch
+    if (g_helper->replica_num() == victim) {
+        g_helper->wait_for_crash_recovery();
+    }
+    wait_for_commits(2 * n);
+
+    g_helper->sync_for_verify_start();
+    validate_all_data();
+    g_helper->sync_for_cleanup_start();
+}

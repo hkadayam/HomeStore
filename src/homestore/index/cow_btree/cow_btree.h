@@ -110,7 +110,6 @@ public:
 private:
     COWBtree(COWBtreeManager& mgr, shared< BlobDev > blob_dev, MetaBlkWrapper&& mblk, shared< NodeCache > node_cache,
              shared< OverflowCache > overflow_cache);
-    COWBtreeSuperBlock& mutable_super_blk();
 
 public:
     // ── UnderlyingBtree interface ─────────────────────────────

@@ -31,14 +31,16 @@ Async< shared< Btree< K, V > > > COWBtreeManager::create_cow_btree(BtreeConfig c
     auto const sb_size = sizeof(COWBtreeSuperBlock) + user_sb.size();
     auto mblk = co_await MetaBlkWrapper::create(meta_client_, cfg.name(), sb_size);
 
-    auto& sb = *r_cast< COWBtreeSuperBlock* >(mblk.meta_blk().inline_data());
-    sb = COWBtreeSuperBlock{};
-    sb.ordinal = ordinal;
-    sb.node_size = cfg.node_size();
-    sb.set_btree_name(cfg.name());
-    sb.user_sb_size = to_u32(user_sb.size());
-    if (user_sb.size() > 0) {
-        std::memcpy(sb.user_sb_data(), user_sb.cbytes(), user_sb.size());
+    {
+        auto g = mblk.template mutate_buf< COWBtreeSuperBlock >();
+        *g = COWBtreeSuperBlock{};
+        g->ordinal = ordinal;
+        g->node_size = cfg.node_size();
+        g->set_btree_name(cfg.name());
+        g->user_sb_size = to_u32(user_sb.size());
+        if (user_sb.size() > 0) {
+            std::memcpy(g->user_sb_data(), user_sb.cbytes(), user_sb.size());
+        }
     }
 
     auto cow_bt = co_await COWBtree::create(*this, std::move(blob_dev), std::move(mblk), node_cache_, overflow_cache_);

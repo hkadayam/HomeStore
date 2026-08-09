@@ -14,6 +14,7 @@
  *********************************************************************************/
 
 #include "homestore/replication/repl_manager.h"
+#include "homestore/base/crash_simulator.h"
 #include "common/async.h"
 
 #include <fmt/format.h>
@@ -585,6 +586,12 @@ Async< void > ReplicationManager::raft_group_config_found(MetaBlk const& blk, si
 }
 
 Async< void > ReplicationManager::gc_replica_sets() {
+    // A simulated crash freezes this instance's disk while its memory keeps running until the restart lands.
+    // The reaper must not dismantle live in-memory state on that corpse (destroying streams races the dying
+    // shutdown's final CP flush); in a real crash it would never run.  Folds to false in non-flip builds.
+    if (is_crash_simulated()) {
+        co_return;
+    }
     // Snapshot the reap candidates under the shared lock — never hold the lock across a co_await.
     auto const grace = std::chrono::seconds{HS_RUNTIME_CONFIG(consensus.replica_set_reaper_grace_sec)};
     auto const now = Clock::now();

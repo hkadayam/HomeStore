@@ -53,11 +53,7 @@ static inline bool is_overflow_node(bnodeid_t node_id) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 COWBtreeSuperBlock const& COWBtree::super_blk() const {
-    return *r_cast< COWBtreeSuperBlock const* >(mblk_.meta_blk().inline_data());
-}
-
-COWBtreeSuperBlock& COWBtree::mutable_super_blk() {
-    return *r_cast< COWBtreeSuperBlock* >(mblk_.meta_blk().inline_data());
+    return *mblk_.buf< COWBtreeSuperBlock >();
 }
 
 Async< shared< COWBtree > > COWBtree::create(COWBtreeManager& mgr, shared< BlobDev > blob_dev, MetaBlkWrapper&& mblk,
@@ -71,23 +67,27 @@ Async< shared< COWBtree > > COWBtree::create(COWBtreeManager& mgr, shared< BlobD
     auto full_map_2 =
         co_await blob_dev->create_append_byte_stream(HS_RUNTIME_CONFIG(btree->cow_full_map_chunk_size), false);
 
-    auto& sb = *r_cast< COWBtreeSuperBlock* >(mblk.meta_blk().inline_data());
-    sb.node_stream_id = node_s->stream_id();
-    sb.overflow_stream_id = overflow_s->stream_id();
-    sb.incr_map_stream_id = incr_map_s->stream_id();
-    sb.full_map_stream_ids[0] = full_map_1->stream_id();
-    sb.full_map_stream_ids[1] = full_map_2->stream_id();
-    sb.last_full_map_cp_id = -1;
+    {
+        auto g = mblk.mutate_buf< COWBtreeSuperBlock >();
+        g->node_stream_id = node_s->stream_id();
+        g->overflow_stream_id = overflow_s->stream_id();
+        g->incr_map_stream_id = incr_map_s->stream_id();
+        g->full_map_stream_ids[0] = full_map_1->stream_id();
+        g->full_map_stream_ids[1] = full_map_2->stream_id();
+        g->last_full_map_cp_id = -1;
+    }
 
-    co_await mblk.write(to_cu8ptr(&sb), sizeof(COWBtreeSuperBlock));
+    // First write carries the payload so data_size gets stamped; every later persist is payload-less.
+    co_await mblk.write(mblk.buf(), sizeof(COWBtreeSuperBlock));
 
     // Fresh streams — incr_map is empty, no accounting seed needed.
     auto cow = shared< COWBtree >(
         new COWBtree(mgr, std::move(blob_dev), std::move(mblk), std::move(node_cache), std::move(overflow_cache)));
+    auto const& csb = cow->super_blk();
     COWBT_SPECIFIC_LOG(
         INFO, *cow, "Created: ordinal={} node_stream={} overflow_stream={} incr_map_stream={} full_map_streams=[{},{}]",
-        cow->btree_ordinal_, sb.node_stream_id, sb.overflow_stream_id, sb.incr_map_stream_id, sb.full_map_stream_ids[0],
-        sb.full_map_stream_ids[1]);
+        cow->btree_ordinal_, csb.node_stream_id, csb.overflow_stream_id, csb.incr_map_stream_id,
+        csb.full_map_stream_ids[0], csb.full_map_stream_ids[1]);
     co_return cow;
 }
 
@@ -355,7 +355,7 @@ void COWBtree::on_root_changed(const Node& root) {
     if (validate_state() != BtreeStatus::success) {
         return;
     }
-    mutable_super_blk().root_node_id = root->node_id();
+    mblk_.mutate_buf< COWBtreeSuperBlock >()->root_node_id = root->node_id();
 
     CPGuard cpg = cp_mgr().cp_guard();
     COWBT_LOG(DEBUG, "on_root_changed: new_root={} cp={}", root->node_id(), cpg->id());
@@ -730,8 +730,8 @@ Async< void > COWBtree::full_cp_flush(CP* cp) {
     co_await active_stream.flush();
 
     // Update and persist the superblk with this CP's id as the last full map cp.
-    mutable_super_blk().last_full_map_cp_id = cp->id();
-    co_await mblk_.write(to_cu8ptr(&super_blk()), sizeof(COWBtreeSuperBlock));
+    mblk_.mutate_buf< COWBtreeSuperBlock >()->last_full_map_cp_id = cp->id();
+    co_await mblk_.write();
 
     // Swap: the passive stream is now stale; truncate up to its tail so all chunks get released (head==tail triggers
     // the fresh-start reset inside truncate).
@@ -944,7 +944,7 @@ Async< uint64_t > COWBtree::recover_one_incr_cp(uint64_t offset, cp_id_t last_fu
 
     if (!skip) {
         if (hdr.new_root_nodeid != EmptyCompactNodeId) {
-            mutable_super_blk().root_node_id = ordinal_shifted_ | hdr.new_root_nodeid;
+            mblk_.mutate_buf< COWBtreeSuperBlock >()->root_node_id = ordinal_shifted_ | hdr.new_root_nodeid;
         }
         COWBT_LOG(INFO, "Applied incr journal cp_id={}: updates={} deletes={} node_records={}{}", hdr.cp_id,
                   hdr.num_updates, hdr.num_deletes, footer.num_records,

@@ -72,7 +72,8 @@ public:
     // ── Block management ──────────────────────────────────────────────────────
 
     /// Allocate a fresh MetaBlk (not yet in the chain). Call write_meta_blk() to actually persist and link it.
-    Async< MetaBlk > create_meta_blk(std::string_view name, std::optional< size_t > estimated_data_size);
+    Async< MetaBlk > create_meta_blk(std::string_view name, std::optional< size_t > estimated_data_size,
+                                     MetaBlkOwnership owner = MetaBlkOwnership::Exclusive);
 
     /// Find a block by name.  Returns std::nullopt if not found.
     Async< std::optional< MetaBlk > > get_meta_blk(std::string_view name);
@@ -82,7 +83,7 @@ public:
     /// - Fresh block (not yet linked): data written, block appended to the tail, client info updated on disk, and the
     ///   block marked linked so subsequent calls overwrite in-place.
     /// - Linked block: data is overwritten in-place on its shared holder; no relinking.
-    Async< void > write_meta_blk(MetaBlk& blk, const sisl::IoBufShared& data);
+    Async< void > write_meta_blk(MetaBlk& blk, const sisl::IoBufShared& data = nullptr);
 
     /// Read the payload from an existing MetaBlk.
     Async< sisl::IoBufView > read_meta_blk(const MetaBlk& blk);

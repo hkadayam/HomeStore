@@ -32,7 +32,6 @@
 #include <variant>
 #include <vector>
 
-
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/EventBaseManager.h>
 #include <coroutine>
@@ -75,11 +74,13 @@ struct flip_instance {
             remain_exec_count_(static_cast< int32_t >(fspec_.flip_frequency ? fspec_.flip_frequency->count : 0)) {}
 
     flip_instance(const flip_instance& other) :
-            fspec_(other.fspec_), hit_count_(other.hit_count_.load()),
+            fspec_(other.fspec_),
+            hit_count_(other.hit_count_.load()),
             remain_exec_count_(other.remain_exec_count_.load()) {}
 
     flip_instance(flip_instance&& other) noexcept :
-            fspec_(std::move(other.fspec_)), hit_count_(other.hit_count_.load()),
+            fspec_(std::move(other.fspec_)),
+            hit_count_(other.hit_count_.load()),
             remain_exec_count_(other.remain_exec_count_.load()) {}
 
     std::string to_string() const {
@@ -301,7 +302,9 @@ struct compare_val< const char* > {
         case Operator::LESS_THAN_OR_EQUAL:
             return lhs && rhs ? std::strcmp(lhs, rhs) <= 0 : !lhs;
         case Operator::REG_EX: {
-            if (!lhs || !rhs) { return false; }
+            if (!lhs || !rhs) {
+                return false;
+            }
             const std::regex re(rhs);
             const std::string s(lhs);
             return std::sregex_iterator(s.begin(), s.end(), re) != std::sregex_iterator();
@@ -350,11 +353,12 @@ public:
         // global EventBaseManager), so a delayed coroutine resumes on the reactor that owns it; otherwise fall back to
         // the configured EventBase.  runAfterDelay must run on the target EB's thread, so hop when we're not on it.
         auto* target = folly::EventBaseManager::get()->getExistingEventBase();
-        if (target == nullptr) { target = eb_; }
+        if (target == nullptr) {
+            target = eb_;
+        }
 
         auto delay_ms = std::chrono::duration_cast< std::chrono::milliseconds >(delay).count();
-        auto arm = [this, target, closure = std::move(closure), flag, timer_name,
-                    delay_ms]() mutable {
+        auto arm = [this, target, closure = std::move(closure), flag, timer_name, delay_ms]() mutable {
             target->runAfterDelay(
                 [this, closure = std::move(closure), flag, timer_name] {
                     if (!flag->load(std::memory_order_acquire)) {
@@ -365,7 +369,9 @@ public:
                     if (auto it = cancel_flags_.find(timer_name); it != cancel_flags_.end()) {
                         auto& vec = it->second;
                         vec.erase(std::remove(vec.begin(), vec.end(), flag), vec.end());
-                        if (vec.empty()) { cancel_flags_.erase(it); }
+                        if (vec.empty()) {
+                            cancel_flags_.erase(it);
+                        }
                     }
                 },
                 static_cast< uint32_t >(delay_ms));
@@ -461,7 +467,9 @@ public:
     uint32_t remove(const std::string& flip_name) {
         std::unique_lock lock(mutex_);
         auto n = flip_specs_.erase(flip_name);
-        if (timer_) { timer_->cancel(flip_name); }
+        if (timer_) {
+            timer_->cancel(flip_name);
+        }
         return static_cast< uint32_t >(n);
     }
 
@@ -469,32 +477,46 @@ public:
 
     template < class... Args >
     bool test_flip(const std::string& flip_name, Args&&... args) {
-        if (!flip_enabled_) { return false; }
+        if (!flip_enabled_) {
+            return false;
+        }
         return __test_flip< bool, TEST_ONLY >(flip_name, std::forward< Args >(args)...).has_value();
     }
 
     template < typename T, class... Args >
     std::optional< T > get_test_flip(const std::string& flip_name, Args&&... args) {
-        if (!flip_enabled_) { return std::nullopt; }
+        if (!flip_enabled_) {
+            return std::nullopt;
+        }
         auto ret = __test_flip< T, RETURN_VAL >(flip_name, std::forward< Args >(args)...);
-        if (!ret) { return std::nullopt; }
+        if (!ret) {
+            return std::nullopt;
+        }
         return std::optional< T >(std::get< T >(*ret));
     }
 
     template < class... Args >
     bool delay_flip(const std::string& flip_name, std::function< void() > closure, Args&&... args) {
-        if (!flip_enabled_) { return false; }
+        if (!flip_enabled_) {
+            return false;
+        }
         auto ret = __test_flip< bool, SET_DELAY >(flip_name, std::forward< Args >(args)...);
-        if (!ret) { return false; }
+        if (!ret) {
+            return false;
+        }
         get_timer().schedule(flip_name, std::chrono::microseconds(std::get< uint64_t >(*ret)), std::move(closure));
         return true;
     }
 
     template < typename T, class... Args >
     bool get_delay_flip(const std::string& flip_name, std::function< void(T) > closure, Args&&... args) {
-        if (!flip_enabled_) { return false; }
+        if (!flip_enabled_) {
+            return false;
+        }
         auto ret = __test_flip< T, DELAYED_RETURN >(flip_name, std::forward< Args >(args)...);
-        if (!ret) { return false; }
+        if (!ret) {
+            return false;
+        }
         auto param = std::get< delayed_return_param< T > >(*ret);
         LOGDEBUGMOD(flip, "delay_flip {} delay={}us", flip_name, param.delay_usec);
         get_timer().schedule(flip_name, std::chrono::microseconds(param.delay_usec),
@@ -550,7 +572,9 @@ private:
         {
             std::shared_lock lock(mutex_);
             inst = match_flip(flip_name, std::forward< Args >(args)...);
-            if (!inst) { return std::nullopt; }
+            if (!inst) {
+                return std::nullopt;
+            }
 
             if (inst->fspec_.flip_frequency && !handle_hits(*inst->fspec_.flip_frequency, inst)) {
                 LOGDEBUGMOD(flip, "Flip {} rate-limited", flip_name);
@@ -607,7 +631,9 @@ private:
                 delayed_return_param< T > p;
                 if (dr) {
                     p.delay_usec = dr->delay_in_usec;
-                    if (dr->retval) { p.val = val_converter< T >()(*dr->retval); }
+                    if (dr->retval) {
+                        p.val = val_converter< T >()(*dr->retval);
+                    }
                 }
                 val = std::move(p);
             } else {
@@ -621,7 +647,9 @@ private:
 
         if (exec_completed) {
             std::unique_lock lock(mutex_);
-            if (inst->remain_exec_count_.load(std::memory_order_relaxed) == 0) { flip_specs_.erase(flip_name); }
+            if (inst->remain_exec_count_.load(std::memory_order_relaxed) == 0) {
+                flip_specs_.erase(flip_name);
+            }
         }
         return val;
     }
@@ -635,13 +663,15 @@ private:
             bool matched = true;
             auto i = 0U;
             for_each(arglist, [&](auto& v) {
-                if (i >= inst->fspec_.conditions.size() || !inst->fspec_.conditions[i] ||
+                if ((i < inst->fspec_.conditions.size()) && inst->fspec_.conditions[i] &&
                     !condition_matches(v, *inst->fspec_.conditions[i])) {
                     matched = false;
                 }
                 ++i;
             });
-            if (matched) { return inst; }
+            if (matched) {
+                return inst;
+            }
         }
         return nullptr;
     }
@@ -649,7 +679,9 @@ private:
     template < typename T >
     bool condition_matches(T& comp_val, const FlipConditionT& cond) {
         T val{};
-        if (cond.value) { val = val_converter< T >()(*cond.value); }
+        if (cond.value) {
+            val = val_converter< T >()(*cond.value);
+        }
         return compare_val< T >()(comp_val, val, cond.oper);
     }
 

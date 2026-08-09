@@ -199,8 +199,11 @@ private:
         T default_val{};
         std::memcpy(m.buffer_->bytes(), &default_val, sizeof(T));
 
-        // Pre-allocate the MetaBlk (not written to disk until write() is called).
-        m.meta_blk_ = co_await client.create_meta_blk(name, buf_sz);
+        // Pre-allocate the MetaBlk (not written to disk until write() is called).  Shared ownership: buffer_ is
+        // this wrapper's own copy of the payload, mutated in place between writes under the documented
+        // external-sync contract.
+        m.meta_blk_ = co_await client.create_meta_blk(name, buf_sz, MetaBlkOwnership::Shared);
+
         m.name_ = std::move(name);
         m.client_ = std::move(client);
         m.is_persisted_ = false;

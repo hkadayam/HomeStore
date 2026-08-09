@@ -30,34 +30,60 @@ namespace homestore {
 // ──────────────────────────────────────────────────────────────────────────────
 Async< void > MetaBlk::write_data(const sisl::IoBufShared& data, VirtualDev& vdev) {
     const BlkId old_ovf = header().overflow_bid;
+    const bool overflow = data && (data->size() > max_inline_data_size());
 
-    if (data->size() <= max_inline_data_size()) {
-        // Inline: copy payload into the cached block after the header.
-        std::memcpy(inline_data(), data->cbytes(), data->size());
-        header().overflow_bid = BlkId{};
-        META_LOG(DEBUG, "write_data: name={} inline data_size={} blk_num={}", name(), data->size(),
-                 holder_->blkid.blk_num());
-    } else {
-        // Allocate contiguous overflow blocks for the data.
+    // Overflow payload goes to freshly-allocated blocks straight from the caller's buffer — zero copy; the
+    // caller's freeze-until-return contract keeps those bytes stable.  Done before the header block below so a
+    // crash in between leaves the previous generation fully intact.  The crc over a payload buffer is likewise
+    // computed outside the holder lock: those bytes are the caller's, not the holder's.
+    BlkId ovf_bid{};
+    uint32_t crc = 0;
+    if (overflow) {
         const size_t blk_sz = vdev.block_size();
         const auto n_ovf = static_cast< blk_count_t >((data->size() + blk_sz - 1) / blk_sz);
         blk_alloc_hints hints{};
-        BlkId ovf_bid{};
         BlkAllocStatus st = vdev.alloc_contiguous_blks(n_ovf, hints, ovf_bid);
         if (st != BlkAllocStatus::SUCCESS) {
             throw std::runtime_error{"MetaBlk::write_data: overflow alloc failed"};
         }
         co_await vdev.write(*data, ovf_bid);
-        header().overflow_bid = ovf_bid;
         META_LOG(DEBUG, "write_data: name={} overflow data_size={} ovf_blk_num={} ovf_nblks={}", name(), data->size(),
                  ovf_bid.blk_num(), ovf_bid.blk_count());
     }
+    if (data) {
+        crc = crc32_ieee(0, data->cbytes(), data->size());
+    }
 
-    header().data_size = to_u32(data->size());
-    header().data_crc = crc32_ieee(0, data->cbytes(), data->size());
+    // Stamp under the lock: a mutation lands entirely before or entirely after this moment, never across it.
+    // From here `wbuf` is immutable for the IO duration — a mutate_buf() copy-swaps onto a new generation.
+    sisl::IoBufShared wbuf;
+    {
+        std::lock_guard lk(holder_->mtx); // acquiring it waits out a live mutate guard (µs)
+        HS_DBG_ASSERT(!holder_->io_in_flight, "meta_blk {}: two concurrent writes of one block", name());
+        if (overflow) {
+            header().overflow_bid = ovf_bid;
+            header().data_size = to_u32(data->size());
+        } else if (data) {
+            std::memcpy(mutable_inline_data(), data->cbytes(), data->size());
+            header().overflow_bid = BlkId{};
+            header().data_size = to_u32(data->size());
+        } else {
+            crc = crc32_ieee(0, inline_data(), header().data_size); // payload-less: persist what we hold
+        }
+        header().data_crc = crc;
+        holder_->io_in_flight = true;
+        wbuf = holder_->buffer;
+    }
+    META_LOG(DEBUG, "write_data: name={} data_size={} blk_num={}{}", name(), header().data_size,
+             holder_->blkid.blk_num(), data ? "" : " (payload-less)");
 
     // Write the single cached block (header + inline data) to disk.
-    co_await vdev.write(*holder_->buffer, holder_->blkid);
+    co_await vdev.write(*wbuf, holder_->blkid);
+
+    {
+        std::lock_guard lk(holder_->mtx);
+        holder_->io_in_flight = false;
+    }
 
     // Free the old overflow block now that new data is safely on disk.
     if (old_ovf.is_valid()) {
@@ -105,19 +131,36 @@ Async< void > MetaBlk::free(VirtualDev& vdev) {
 // MetaBlk::update_next_bid  (private — called only by MetaClient)
 // ──────────────────────────────────────────────────────────────────────────────
 Async< void > MetaBlk::update_next_bid(BlkId next, VirtualDev& vdev) {
-    header().next_bid = next;
+    // Chain bookkeeping rewrites this block's header while its consumer may be mutating the payload — same
+    // stamp discipline as write_data: stamp under the lock, write frozen bytes, mutations copy-swap meanwhile.
+    sisl::IoBufShared wbuf;
+    {
+        std::lock_guard lk(holder_->mtx);
+        HS_DBG_ASSERT(!holder_->io_in_flight, "meta_blk {}: two concurrent writes of one block", name());
+        header().next_bid = next;
+        if (!header().overflow_bid.is_valid()) {
+            // An Exclusive block's inline payload may have been guard-mutated since its last write_data — restamp
+            // the crc so this chain rewrite never persists mutated bytes under a stale checksum.
+            header().data_crc = crc32_ieee(0, inline_data(), header().data_size);
+        }
+        holder_->io_in_flight = true;
+        wbuf = holder_->buffer;
+    }
     META_LOG(DEBUG, "update_next_bid: name={} blk_num={} set next_blk_num={}", name(), holder_->blkid.blk_num(),
              next.is_valid() ? next.blk_num() : 0);
-    // Write the cached block back to disk with the updated header.
-    co_await vdev.write(*holder_->buffer, holder_->blkid);
+    co_await vdev.write(*wbuf, holder_->blkid);
+    {
+        std::lock_guard lk(holder_->mtx);
+        holder_->io_in_flight = false;
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // MetaBlkWrapper Public APIs
 // ──────────────────────────────────────────────────────────────────────────────
 Async< MetaBlkWrapper > MetaBlkWrapper::create(shared< MetaClient > client, std::string_view name,
-                                               std::optional< size_t > estimated_data_size) {
-    MetaBlk blk = co_await client->create_meta_blk(name, estimated_data_size);
+                                               std::optional< size_t > estimated_data_size, MetaBlkOwnership owner) {
+    MetaBlk blk = co_await client->create_meta_blk(name, estimated_data_size, owner);
     MetaBlkWrapper w;
     w.meta_blk_ = std::move(blk);
     w.client_ = std::move(client);
@@ -128,6 +171,10 @@ Async< void > MetaBlkWrapper::write(const uint8_t* data, size_t len) {
     auto buf = sisl::make_io_buf_shared(to_u32(len));
     std::memcpy(buf->bytes(), data, len);
     co_await client_->write_meta_blk(meta_blk_, buf);
+}
+
+Async< void > MetaBlkWrapper::write() {
+    co_await client_->write_meta_blk(meta_blk_);
 }
 
 Async< sisl::IoBufView > MetaBlkWrapper::read() {

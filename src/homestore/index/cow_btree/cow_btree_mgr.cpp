@@ -26,6 +26,10 @@ Async< void > COWBtreeManager::create(uint64_t cache_size) {
     mgr->meta_client_ =
         std::make_shared< MetaClient >(co_await meta_mgr().register_client(COW_BTREE_MGR_META_CLIENT_NAME));
     Managers::init_cow_btree_mgr(std::move(mgr));
+
+    // Register CP callbacks only once Managers owns the instance: cp_callbacks_ holds a bare reference to the
+    // manager, so a registration made before this point would outlive the manager if setup failed and freed it.
+    cp_mgr().register_consumer("COWBtreeManager", cow_btree_mgr().cp_callbacks_, kCPRank_COWBtree);
     co_return;
 }
 
@@ -49,6 +53,10 @@ Async< void > COWBtreeManager::load(uint64_t cache_size) {
     });
 
     Managers::init_cow_btree_mgr(std::move(mgr));
+
+    // Same post-ownership registration as create(): a recovery failure above (e.g. a corrupt metablk) frees the
+    // manager, and a constructor-time registration would leave the CP consumer with a dangling reference.
+    cp_mgr().register_consumer("COWBtreeManager", cow_btree_mgr().cp_callbacks_, kCPRank_COWBtree);
     co_return;
 }
 
@@ -92,8 +100,6 @@ COWBtreeManager::COWBtreeManager(uint64_t cache_size) : cp_callbacks_{std::make_
     overflow_cfg.ghost_capacity = ghost_capacity;
     overflow_cache_ = std::make_shared< OverflowCache >(
         overflow_cfg, evictor_, [](OverflowEntry const& entry) -> BlkId { return entry.blkid; });
-
-    cp_mgr().register_consumer("COWBtreeManager", cp_callbacks_, kCPRank_COWBtree);
 }
 
 std::vector< COWBtreeSuperBlock const* > COWBtreeManager::list_persisted_btrees() const {

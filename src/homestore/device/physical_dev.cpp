@@ -118,14 +118,15 @@ Async< void > PhysicalDev::write_first_block(const FirstBlockHeader& fbhdr) {
     fb.hdr = fbhdr;
     fb.this_pdev_hdr = pdev_info_;
 
-    // Compute checksum over the atomic portion of the first block (excluding the checksum field itself).
-    fb.checksum = 0;
-    fb.checksum =
-        crc32_ieee(hs_init_crc_32, reinterpret_cast< const unsigned char* >(&fb), FirstBlock::s_atomic_fb_size);
-
     sisl::IoBufOwn buf{FirstBlock::s_io_fb_size};
     std::memset(buf.bytes(), 0, FirstBlock::s_io_fb_size);
     std::memcpy(buf.bytes(), &fb, sizeof(FirstBlock));
+
+    // Compute checksum over the atomic portion of the first block (excluding the checksum field itself).  The crc
+    // must cover the zero-padded buffer bytes that actually land on disk, not the bare struct — s_atomic_fb_size
+    // extends past sizeof(FirstBlock), and verify_checksum() recomputes over a zero-padded copy.
+    auto* fbp = r_cast< FirstBlock* >(buf.bytes());
+    fbp->checksum = crc32_ieee(hs_init_crc_32, buf.cbytes(), FirstBlock::s_atomic_fb_size);
 
     co_await write_super_block(buf, HSSuperBlk::first_block_offset());
 }

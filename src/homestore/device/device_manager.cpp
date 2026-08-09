@@ -261,6 +261,11 @@ Async< shared< VirtualDev > > DeviceManager::create_vdev(VDevParameters&& params
 
 Async< void > DeviceManager::destroy_vdev(cshared< VirtualDev >& vdev) {
     co_await vdev->destroy();
+    // Crash point: VDevInfo freed and chunks removed, slot bit still set — recovery's stale-slot cleanup
+    // must free the slot (the only window that exercises it).
+    if (crash_if_flip_fired("crash_after_vdev_chunks_remove")) {
+        co_return;
+    }
     const uint32_t vdev_id = vdev->vdev_id();
     {
         std::lock_guard lg{state_mutex_};

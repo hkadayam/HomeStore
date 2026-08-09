@@ -256,7 +256,7 @@ TEST_F(LogStoreMgrTest, DropUnopenedStores) {
     reload_sync();
 
     iomgr().spawn_and_block(ReactorTarget::any(), [this, &sids]() -> Async< void > {
-        EXPECT_EQ(log_store_mgr().log_stores().size(), 2u) <`< "dropped store stays gone across restart";
+        EXPECT_EQ(log_store_mgr().log_stores().size(), 2u) << "dropped store stays gone across restart";
         EXPECT_EQ(log_store_mgr().get_log_store(sids[1]), nullptr);
         co_await shutdown();
     }());

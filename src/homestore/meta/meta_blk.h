@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -52,6 +53,21 @@ static constexpr size_t META_BLK_HEADER_SIZE = 64;
 // On-disk header stored at byte 0 of every meta block. Exactly 64 bytes so
 // that user data always begins at a clean, known offset.
 // ──────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+// MetaBlkOwnership
+//
+// Who guarantees the payload bytes are untouched while a write of this block is in flight.  A birth property:
+// stamped into the on-disk header at creation, read back on recovery, never changed.
+//   Exclusive (default): the layer guarantees it.  The module accesses the payload through buf() (const read)
+//                        and mutate_buf() (RAII mutation window); a mutation colliding with an in-flight write
+//                        copy-swaps the buffer so the IO keeps reading its frozen bytes — mutators never wait
+//                        on IO.  Persist with the payload-less write, or pass a fresh buffer to replace.
+//   Shared:              the caller guarantees it.  The module holds the payload buffer itself, mutates it
+//                        directly, and promises not to touch it between issuing a write and its completion
+//                        (e.g. BlkAllocator's BufferGuard divert protocol).
+// ──────────────────────────────────────────────────────────────────────────────
+enum class MetaBlkOwnership : uint8_t { Exclusive, Shared };
+
 #pragma pack(1)
 struct MetaBlkHeader {
     uint32_t magic{0};     // META_BLK_HEADER_MAGIC
@@ -60,11 +76,12 @@ struct MetaBlkHeader {
     BlkId next_bid{};      // Next block in the client's chain (invalid = last)
     BlkId overflow_bid{};  // Overflow block for large payloads (invalid = inlined)
     char name[32]{};       // Name of this meta block (null-terminated)
-    uint8_t pad[4]{};      // Padding — 4+4+4+8+8+32+4 = 64 bytes total
+    uint8_t ownership{0};  // MetaBlkOwnership — stamped at create, immutable (0 = Exclusive, the default)
+    uint8_t pad[3]{};      // Padding — 4+4+4+8+8+32+1+3 = 64 bytes total
 
     static constexpr size_t SIZE = META_BLK_HEADER_SIZE;
 
-    static MetaBlkHeader make(std::string_view name_sv) {
+    static MetaBlkHeader make(std::string_view name_sv, MetaBlkOwnership owner) {
         // Silent truncation here is a debugging nightmare — multiple metablks end up sharing the same on-disk
         // name, parse_mblk_name fails on every one of them, and recovery surfaces zero metablks with no obvious
         // cause.  Trip in debug builds so callers find this immediately.
@@ -80,6 +97,7 @@ struct MetaBlkHeader {
         size_t copy_len = std::min(name_sv.size(), sizeof(h.name) - 1);
         std::memcpy(h.name, name_sv.data(), copy_len);
         h.name[copy_len] = '\0';
+        h.ownership = s_cast< uint8_t >(owner);
         return h;
     }
 
@@ -113,6 +131,14 @@ struct MetaBlkHolder {
     BlkId prev_bid{};         // Previous block in chain (in-memory only)
     sisl::IoBufShared buffer; // Exactly one block: header (64 B) + inline data (shared ownership)
     bool linked{false};       // false until the first write appends this block into the client's chain
+
+    // Write-vs-mutate coordination.  mtx makes a mutation and a write's stamp-moment atomic with respect to each
+    // other: a MutateGuard holds it for its (microsecond) lifetime, a writer holds it only while stamping the
+    // header — never across device IO.  io_in_flight marks a write in progress: a mutation arriving then
+    // copy-swaps `buffer` so the IO keeps reading its refcounted, now-frozen bytes; a concurrent second write of
+    // the same block is a caller bug (debug assert — callers serialize their own block's writes).
+    std::mutex mtx;
+    bool io_in_flight{false};
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -126,11 +152,12 @@ struct MetaBlkHolder {
 class MetaBlk {
 public:
     // ── Factory ──────────────────────────────────────────────────────────────
-    static MetaBlk create(BlkId blkid, uint32_t blk_sz, std::string_view name) {
+    static MetaBlk create(BlkId blkid, uint32_t blk_sz, std::string_view name,
+                          MetaBlkOwnership owner = MetaBlkOwnership::Exclusive) {
         auto holder = std::make_shared< MetaBlkHolder >();
         holder->blkid = blkid;
         holder->buffer = sisl::make_io_buf_shared(blk_sz);
-        MetaBlkHeader hdr = MetaBlkHeader::make(name);
+        MetaBlkHeader hdr = MetaBlkHeader::make(name, owner);
         std::memcpy(holder->buffer->bytes(), &hdr, MetaBlkHeader::SIZE);
         return MetaBlk{std::move(holder)};
     }
@@ -160,10 +187,59 @@ public:
     std::string name() const { return header().get_name(); }
 
     /// Inline data region: everything after the header in the single cached block.
-    uint8_t* inline_data() { return holder_->buffer->bytes() + MetaBlkHeader::SIZE; }
     const uint8_t* inline_data() const { return holder_->buffer->cbytes() + MetaBlkHeader::SIZE; }
 
     size_t max_inline_data_size() const { return holder_->buffer->size() - MetaBlkHeader::SIZE; }
+
+    // ── Ownership and payload access ─────────────────────────────────────────
+    MetaBlkOwnership ownership() const { return s_cast< MetaBlkOwnership >(header().ownership); }
+
+    /// Steady-state const view of the inline payload as T (Exclusive blocks).  Raw deref — no lock, no crc.
+    /// The pointer is invalidated when the block adopts a new buffer (a payload-carrying write) or a mutation
+    /// collides with an in-flight write; re-take it per access rather than caching it across writes.
+    template < typename T = uint8_t >
+    T const* buf() const {
+        HS_DBG_ASSERT(ownership() == MetaBlkOwnership::Exclusive, "buf() is for Exclusive metablks");
+        return r_cast< T const* >(inline_data());
+    }
+
+    /// RAII in-place mutation window over the inline payload, typed as T (Exclusive blocks).  The guard holds
+    /// the holder's mutex for its lifetime — keep the scope to the mutation itself; concurrent mutators
+    /// serialize on it.  It never waits on IO: a mutation arriving while a write is in flight copy-swaps the
+    /// buffer instead (see MetaBlkHolder).
+    template < typename T = uint8_t >
+    class MutateGuard {
+    public:
+        T* get() { return r_cast< T* >(holder_->buffer->bytes() + MetaBlkHeader::SIZE); }
+        T* operator->() { return get(); }
+        T& operator*() { return *get(); }
+
+        MutateGuard(const MutateGuard&) = delete;
+        MutateGuard& operator=(const MutateGuard&) = delete;
+        MutateGuard(MutateGuard&&) = delete;
+        MutateGuard& operator=(MutateGuard&&) = delete;
+
+    private:
+        friend class MetaBlk;
+        MutateGuard(shared< MetaBlkHolder > holder, std::unique_lock< std::mutex >&& lk) :
+                holder_{std::move(holder)}, lk_{std::move(lk)} {}
+        shared< MetaBlkHolder > holder_;
+        std::unique_lock< std::mutex > lk_; // released on guard destruction
+    };
+
+    template < typename T = uint8_t >
+    MutateGuard< T > mutate_buf() {
+        HS_DBG_ASSERT(ownership() == MetaBlkOwnership::Exclusive, "mutate_buf() is for Exclusive metablks");
+        std::unique_lock lk(holder_->mtx);
+        if (holder_->io_in_flight) {
+            // Copy-swap: the in-flight write keeps reading its refcounted old buffer, frozen by construction;
+            // this mutation and everything after it lands in the new generation.
+            auto fresh = sisl::make_io_buf_shared(to_u32(holder_->buffer->size()));
+            std::memcpy(fresh->bytes(), holder_->buffer->cbytes(), holder_->buffer->size());
+            holder_->buffer = std::move(fresh);
+        }
+        return MutateGuard< T >{holder_, std::move(lk)};
+    }
 
     static uint32_t data_size_to_nblks(size_t data_size, size_t block_size) {
         return to_u32((data_size + MetaBlkHeader::SIZE + block_size - 1) / block_size);
@@ -172,7 +248,9 @@ public:
     // ── Public async I/O ─────────────────────────────────────────────────────
 
     /// Write payload to disk. Stores inline if it fits in one block, allocates overflow blocks otherwise. Updates
-    /// data_size/data_crc in the header, writes the block, then frees any previous overflow block.
+    /// data_size/data_crc in the header, writes the block, then frees any previous overflow block.  A null `data`
+    /// (Exclusive blocks only) persists the inline payload the holder already owns.  The block written to the
+    /// device is frozen for the IO duration: mutations arriving meanwhile copy-swap onto a new buffer generation.
     Async< void > write_data(const sisl::IoBufShared& data, VirtualDev& vdev);
 
     /// Read the payload. Returns a IoBufView into the cached buffer for inline data (zero copy, zero I/O) or reads
@@ -192,6 +270,9 @@ public:
 private:
     friend class MetaClient;
     explicit MetaBlk(shared< MetaBlkHolder > holder) : holder_{std::move(holder)} {}
+
+    /// Mutable inline region — write paths only; modules go through mutate_buf().
+    uint8_t* mutable_inline_data() { return holder_->buffer->bytes() + MetaBlkHeader::SIZE; }
 
     /// Update next_bid in the on-disk header and write the cached block back to disk.
     Async< void > update_next_bid(BlkId next, VirtualDev& vdev);
@@ -213,7 +294,8 @@ class MetaBlkWrapper {
 public:
     /// Allocate a new MetaBlk through the given client.
     static Async< MetaBlkWrapper > create(shared< MetaClient > client, std::string_view name,
-                                          std::optional< size_t > estimated_data_size);
+                                          std::optional< size_t > estimated_data_size,
+                                          MetaBlkOwnership owner = MetaBlkOwnership::Exclusive);
 
     /// Wrap an already-loaded MetaBlk.
     static MetaBlkWrapper load(shared< MetaClient > client, MetaBlk blk) {
@@ -224,6 +306,22 @@ public:
     }
 
     Async< void > write(const uint8_t* data, size_t len);
+
+    /// Payload-less write (Exclusive blocks): persist the inline payload the MetaBlk owns.  data_size must have
+    /// been stamped by an earlier payload-carrying write.
+    Async< void > write();
+
+    /// Typed payload access, forwarded to the MetaBlk (Exclusive blocks) — e.g. `w.buf< MySb >()->field` and
+    /// `w.mutate_buf< MySb >()->field = v;`.
+    template < typename T = uint8_t >
+    T const* buf() const {
+        return meta_blk_.buf< T >();
+    }
+    template < typename T = uint8_t >
+    MetaBlk::MutateGuard< T > mutate_buf() {
+        return meta_blk_.mutate_buf< T >();
+    }
+
     Async< sisl::IoBufView > read();
 
     /// Unlink this MetaBlk from the client's chain and free its blocks on the vdev.  After destroy() the

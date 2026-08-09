@@ -46,7 +46,7 @@
 
 using namespace homestore;
 using namespace iomanager;
-using sisl::IoBuf;
+using sisl::IoBufOwn;
 
 SISL_OPTION_GROUP(test_append_blk_stream,
                   (num_io, "", "num_io", "number of IO operations per test",
@@ -264,7 +264,7 @@ CORO_TEST_F(AppendBlkStreamTest, AppendFlushAndRead) {
     co_await cp_mgr().trigger_cp_flush(true);
 
     for (auto const& [bid, seed] : entries) {
-        IoBuf rbuf(BLK_SIZE, 512);
+        IoBufOwn rbuf(BLK_SIZE, 512);
         auto ec = co_await stream->read(rbuf, bid);
         CO_ASSERT_FALSE(ec);
         EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), BLK_SIZE, seed))
@@ -296,7 +296,7 @@ CORO_TEST_F(AppendBlkStreamTest, MultiSegmentAppend) {
 
     for (auto const& [seg, entries] : by_seg) {
         for (auto const& [bid, seed] : entries) {
-            IoBuf rbuf(BLK_SIZE, 512);
+            IoBufOwn rbuf(BLK_SIZE, 512);
             auto ec = co_await stream->read(rbuf, bid);
             CO_ASSERT_FALSE(ec);
             EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), BLK_SIZE, seed))
@@ -323,7 +323,7 @@ CORO_TEST_F(AppendBlkStreamTest, MultiBlockAppend) {
     EXPECT_EQ(bid.blk_count(), kNblks);
     co_await cp_mgr().trigger_cp_flush(true);
 
-    IoBuf rbuf(kSize, 512);
+    IoBufOwn rbuf(kSize, 512);
     auto ec = co_await stream->read(rbuf, bid);
     CO_ASSERT_FALSE(ec);
     EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), kSize, 0x3A01));
@@ -381,7 +381,7 @@ CORO_TEST_F(AppendBlkStreamTest, CPSwitchoverAndFlush) {
     EXPECT_TRUE(success);
 
     // Read survives the flush.
-    IoBuf rbuf(BLK_SIZE, 512);
+    IoBufOwn rbuf(BLK_SIZE, 512);
     auto ec = co_await stream->read(rbuf, bid);
     CO_ASSERT_FALSE(ec);
     EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), BLK_SIZE, 0x5A01));
@@ -445,7 +445,7 @@ CORO_TEST_F(AppendBlkStreamTest, BulkAppendReadVerify) {
 
     for (auto const& [bid, seed] : entries) {
         uint32_t io_size = bid.blk_count() * BLK_SIZE;
-        IoBuf rbuf(io_size, 512);
+        IoBufOwn rbuf(io_size, 512);
         auto ec = co_await stream->read(rbuf, bid);
         CO_ASSERT_FALSE(ec);
         EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), io_size, seed))
@@ -491,7 +491,7 @@ CORO_TEST_F(AppendBlkStreamTest, ConcurrentAppendsDifferentSegments) {
 
     for (uint16_t seg = 0; seg < kSegments; ++seg) {
         for (auto const& [bid, seed] : per_seg[seg]) {
-            IoBuf rbuf(BLK_SIZE, 512);
+            IoBufOwn rbuf(BLK_SIZE, 512);
             auto ec = co_await stream->read(rbuf, bid);
             CO_ASSERT_FALSE(ec);
             EXPECT_TRUE(self.verify_buf(rbuf.cbytes(), BLK_SIZE, seed));
@@ -532,7 +532,7 @@ TEST_F(AppendBlkStreamTest, RestartRecovery) {
         auto recovered = streams[0];
         EXPECT_EQ(recovered->stream_id(), sid);
         for (auto const& [bid, seed] : entries) {
-            IoBuf rbuf(BLK_SIZE, 512);
+            IoBufOwn rbuf(BLK_SIZE, 512);
             auto ec = co_await recovered->read(rbuf, bid);
             CO_ASSERT_FALSE(ec);
             EXPECT_TRUE(verify_buf(rbuf.cbytes(), BLK_SIZE, seed))
@@ -570,7 +570,7 @@ TEST_F(AppendBlkStreamTest, RestartAfterInvalidate) {
     iomgr().spawn_and_block(ReactorTarget::any(), [this, sid, keep_bid]() -> Async< void > {
         auto recovered = blob_dev_->append_blk_streams().at(0);
         EXPECT_EQ(recovered->stream_id(), sid);
-        IoBuf rbuf(BLK_SIZE, 512);
+        IoBufOwn rbuf(BLK_SIZE, 512);
         auto ec = co_await recovered->read(rbuf, keep_bid);
         CO_ASSERT_FALSE(ec);
         EXPECT_TRUE(verify_buf(rbuf.cbytes(), BLK_SIZE, 0x9A01));
@@ -604,7 +604,7 @@ TEST_F(AppendBlkStreamTest, RestartRecoveryMultipleStreams) {
         auto streams = blob_dev_->append_blk_streams();
         CO_ASSERT_EQ(streams.size(), 2u);
         for (auto const& s : streams) {
-            IoBuf rbuf(BLK_SIZE, 512);
+            IoBufOwn rbuf(BLK_SIZE, 512);
             if (s->stream_id() == sid1) {
                 auto ec = co_await s->read(rbuf, b1);
                 CO_ASSERT_FALSE(ec);
@@ -650,7 +650,7 @@ TEST_F(AppendBlkStreamTest, DoubleRestart) {
 
     iomgr().spawn_and_block(ReactorTarget::any(), [this, b1, b2]() -> Async< void > {
         auto recovered2 = blob_dev_->append_blk_streams().at(0);
-        IoBuf rbuf(BLK_SIZE, 512);
+        IoBufOwn rbuf(BLK_SIZE, 512);
         auto ec = co_await recovered2->read(rbuf, b1);
         CO_ASSERT_FALSE(ec);
         EXPECT_TRUE(verify_buf(rbuf.cbytes(), BLK_SIZE, 0xDA01));

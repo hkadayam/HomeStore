@@ -23,6 +23,7 @@
 #include <fmt/format.h>
 #include "common/async.h"
 
+#include "homestore/base/crash_simulator.h" // crash_if_flip_fired
 #include "homestore/base/homestore_assert.h"
 #include "homestore/base/hs_runtime_config.h" // HS_RUNTIME_CONFIG
 #include "common/defs.h"
@@ -282,6 +283,13 @@ Async< bool > LogStore::rollback(lsn_t to_lsn) {
         rollback_records_.push_back({to_lsn, max_log_id});
         records_.rollback(to_lsn);
         tail_lsn_.store(to_lsn, std::memory_order_release);
+
+        // Crash point: in-memory rollback and tail update are done, but the sb (which persists rollback_records_
+        // and the new tail_lsn) has NOT been written.  Recovery must NOT observe the rollback — replay must
+        // deliver the rolled-back records normally (they were never rejected on disk).
+        if (crash_if_flip_fired("crash_before_logstore_rollback_commit")) {
+            co_return false;
+        }
         co_await persist_sb();
         THIS_LOGSTORE_LOG(INFO, "rollback complete to_lsn={} max_log_id={} new tail_lsn={}", to_lsn, max_log_id,
                           to_lsn);

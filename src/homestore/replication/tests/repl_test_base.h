@@ -23,11 +23,13 @@
 //
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <memory>
 #include <optional>
 #include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include <boost/uuid/uuid_io.hpp>
@@ -84,7 +86,11 @@ protected:
     // two apart.  A non-leader therefore leaves only on proof the batch landed: commit count >= written_ + n.
     // Commit counts are cumulative across in-process restarts (the helper re-binds the same listener on
     // recovery), so the target is absolute on every replica, restarted or not.
-    void write_on_leader(uint64_t n) {
+    // `wait_for_results=false` proposes and returns immediately, asserting nothing: for tests whose proposals are
+    // EXPECTED to die (no quorum, or a crash swallows them).  Such a caller owns reconciling written_ with what
+    // actually landed (typically `written_ -= n` plus a normal rewrite once the cluster settles), and a non-leader
+    // returns at once rather than waiting for commits that will never come.
+    void write_on_leader(uint64_t n, bool wait_for_results = true) {
         uint64_t const start = written_;
         written_ += n;
 
@@ -97,6 +103,9 @@ protected:
             if (rs->get_leader_id() == g_helper->my_replica_id()) {
                 break; // I am the leader — the batch is mine
             }
+            if (!wait_for_results) {
+                return; // the batch may never land; nobody waits on it
+            }
             if (commit_count() >= start + n) {
                 LOGINFO("Replica={} saw the batch of {} land under another leader (count={})",
                         g_helper->replica_num(), n, commit_count());
@@ -108,14 +117,28 @@ protected:
         }
 
         // A freshly elected leader must commit any carried-over entries from prior terms before it can accept new
-        // proposals — gate on is_ready_for_traffic() exactly as the old harness did.
-        while (!rs->is_ready_for_traffic()) {
+        // proposals — gate on is_ready_for_traffic() exactly as the old harness did.  A detached caller skips the
+        // gate: it proposes precisely because the group is NOT healthy (no quorum), so readiness never comes.
+        while (wait_for_results && !rs->is_ready_for_traffic()) {
             LOGINFO("Replica={} leader not yet ready for traffic, waiting", g_helper->replica_num());
             std::this_thread::sleep_for(std::chrono::milliseconds{500});
         }
 
-        LOGINFO("Replica={} is the leader — proposing {} entries [{}, {}) at qdepth {}", g_helper->replica_num(), n,
-                start, start + n, write_qdepth_);
+        LOGINFO("Replica={} is the leader — proposing {} entries [{}, {}) at qdepth {}{}", g_helper->replica_num(), n,
+                start, start + n, write_qdepth_, wait_for_results ? "" : " (detached)");
+        if (!wait_for_results) {
+            for (uint64_t k = 0; k < n; ++k) {
+                iomgr().spawn_detached(iomanager::ReactorTarget::any(), [rs, key = start + k]() -> Async< void > {
+                    uint32_t const val = value_for(key);
+                    sisl::IoBufSpan header{to_cu8ptr(&key), to_u32(sizeof(key)), false};
+                    sisl::IoBufView value{to_u32(sizeof(val))};
+                    std::memcpy(value.bytes(), &val, sizeof(val));
+                    co_await rs->write(header, value);
+                });
+            }
+            return;
+        }
+
         iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [rs, start, n, qd = write_qdepth_]() -> Async< void > {
             // One coroutine per entry, each owning its own key + buffers (key is a by-value coroutine param, so it
             // lives in the frame the header points into).  Issue them with up to `qd` concurrent in-flight proposals
@@ -163,13 +186,22 @@ protected:
         return std::nullopt;
     }
 
-    // Block until a leader is known and return its member index.
-    uint16_t wait_leader_member() {
-        while (true) {
-            if (auto lm = leader_member_idx()) {
+    // Block until this replica's raft view shows an elected leader that satisfies the caller's constraints, and
+    // return its member index.  `allowed` (when non-empty) is the allow-list of members that count as settled;
+    // `denied` is the deny-list — e.g. a just-deposed leader, whose own view still names itself for a while, so
+    // proposing there would be routed to a node about to step down.  Both empty: any elected leader will do.
+    uint16_t wait_till_leader_elected(std::vector< uint16_t > const& allowed = {},
+                                      std::vector< uint16_t > const& denied = {}) {
+        auto const listed = [](std::vector< uint16_t > const& v, uint16_t m) {
+            return std::find(v.begin(), v.end(), m) != v.end();
+        };
+        for (uint32_t waited_ms = 0;; waited_ms += 500) {
+            if (auto const lm = leader_member_idx();
+                lm && (allowed.empty() || listed(allowed, *lm)) && !listed(denied, *lm)) {
                 return *lm;
             }
-            LOGINFO("Replica={} waiting for a leader to be known", g_helper->replica_num());
+            RELEASE_ASSERT(waited_ms < 120000u, "no leader matching the allow/deny lists within 120s");
+            LOGINFO("Replica={} waiting for an acceptable leader to be elected", g_helper->replica_num());
             std::this_thread::sleep_for(std::chrono::milliseconds{500});
         }
     }

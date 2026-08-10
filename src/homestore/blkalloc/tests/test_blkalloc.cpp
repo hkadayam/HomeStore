@@ -414,6 +414,20 @@ struct SlabBlkAllocatorTest : public ::testing::Test, BlkAllocatorTest {
         m_allocator = std::make_unique< SlabBlkAllocator >(cfg, std::nullopt, 0);
     }
 
+    // Create a persistent ExpandedAlloc allocator, optionally seeded with a serialized on-disk bitmap for
+    // recovery.  Passing an existing IoBufShared (from a prior acquire_buffer() call) drives the recovery
+    // path: only committed blocks are restored; uncommitted allocations from the prior lifetime revert to
+    // free.  Caller must call recovery_completed() after seeding to leave recovery mode.
+    void create_persistent_allocator(std::optional< sisl::IoBufShared > buf = std::nullopt,
+                                     uint64_t size = 0) {
+        if (size == 0) {
+            size = to_u64(m_total_count);
+        }
+        SlabBlkAllocConfig cfg{4096, 4096, 4096, size * 4096, /*persistent=*/true, "test_persistent"};
+        cfg.alloc_mode = AllocMode::ExpandedAlloc;
+        m_allocator = std::make_unique< SlabBlkAllocator >(cfg, std::move(buf), 0);
+    }
+
     [[nodiscard]] bool alloc_contiguous_blk(const BlkAllocStatus exp_status, BlkId& bid, bool track_block_group) {
         const auto ret = m_allocator->alloc_contiguous(bid);
         if (ret != exp_status) {
@@ -811,6 +825,133 @@ void alloc_free_scatter_unirandsize(SlabBlkAllocatorTest* const test) {
 TEST_F(SlabBlkAllocatorTest, expanded_scatter_unirandsize_with_slabs) {
     create_expanded_allocator();
     alloc_free_scatter_unirandsize(this);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PersistentBitmapSurvivesUncommittedReverts — dual-purpose test of the crash-durability contract:
+//   1. Committed allocations survive an allocator restart (their bits persisted via ondisk_bm_).
+//   2. Uncommitted allocations revert to free — the "crash contract of all blk data" that upper layers
+//      (metablk chain, log stream, cow_btree) rely on to recover from mid-op crashes.
+// The "restart" is simulated by capturing the ondisk bitmap via acquire_buffer(), destroying the
+// allocator, and reconstructing from that IoBufShared as if the meta service had just handed it back.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_F(SlabBlkAllocatorTest, PersistentBitmapSurvivesUncommittedReverts) {
+    create_persistent_allocator();
+
+    // Alloc + commit A (durable), alloc B without commit (transient).
+    BlkId committed_bid;
+    ASSERT_EQ(m_allocator->alloc_contiguous(committed_bid), BlkAllocStatus::SUCCESS);
+    ASSERT_EQ(m_allocator->commit(committed_bid), BlkAllocStatus::SUCCESS);
+
+    BlkId uncommitted_bid;
+    ASSERT_EQ(m_allocator->alloc_contiguous(uncommitted_bid), BlkAllocStatus::SUCCESS);
+    // No commit() — this simulates the caller crashing after alloc but before the durability step.
+
+    // Serialize the ondisk bitmap — this is what the meta service would persist at CP-flush time.
+    sisl::IoBufShared serialized;
+    {
+        auto guard = m_allocator->acquire_buffer();
+        serialized = guard.buf();
+    }
+    ASSERT_NE(serialized, nullptr);
+
+    // Tear down and reconstruct from the serialized buffer (recovery path).
+    m_allocator.reset();
+    create_persistent_allocator(serialized);
+    m_allocator->recovery_completed();
+
+    // Assert against the ONDISK bitmap only.  is_blk_alloced() ORs in slab-cache reservations (which
+    // recovery_completed's refill has just populated), so post-recovery it reports true for many blocks
+    // that are only "cached-free-for-future-alloc", not durably allocated.  The durability contract is
+    // strictly about ondisk state — is_blk_alloced_on_disk answers that directly.
+    EXPECT_TRUE(m_allocator->is_blk_alloced_on_disk(committed_bid))
+        << "committed alloc must survive restart via the ondisk bitmap";
+    EXPECT_FALSE(m_allocator->is_blk_alloced_on_disk(uncommitted_bid))
+        << "uncommitted alloc must revert to free — the crash contract of all blk data";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NonPersistentReplayedCommitsRebuild — the non-persistent counterpart.  A non-persistent allocator has
+// no ondisk_bm_, so commit() writes into inmem_bm_ (slab_blk_allocator.cpp:313-314) and there's no
+// serialize/deserialize.  Upper layers (e.g. LogStore replaying its log stream) rebuild the in-memory
+// state by iterating their own durable record and calling commit() on each live blk.  Verify that a
+// fresh non-persistent allocator, fed a replayed sequence of commit() calls, ends up with exactly the
+// intended set of allocated blocks.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_F(SlabBlkAllocatorTest, NonPersistentReplayedCommitsRebuild) {
+    create_expanded_allocator(); // persistent=false by default
+
+    // Alloc + commit a handful of blocks (simulate upper-layer's live work).
+    std::vector< BlkId > live_bids;
+    for (int i = 0; i < 5; ++i) {
+        BlkId bid;
+        ASSERT_EQ(m_allocator->alloc_contiguous(bid), BlkAllocStatus::SUCCESS);
+        ASSERT_EQ(m_allocator->commit(bid), BlkAllocStatus::SUCCESS);
+        live_bids.push_back(bid);
+    }
+
+    // Tear down.  Non-persistent means the ondisk bitmap doesn't exist — acquire_buffer would return an
+    // empty guard.  Upper layer keeps its own durable record instead.
+    m_allocator.reset();
+
+    // Fresh empty allocator.  Replay commit() for each previously-live block — this is what LogStore's
+    // replay path does when reconstructing its stream's allocator state.
+    create_expanded_allocator();
+    for (auto const& bid : live_bids) {
+        ASSERT_EQ(m_allocator->commit(bid), BlkAllocStatus::SUCCESS);
+    }
+
+    for (auto const& bid : live_bids) {
+        EXPECT_TRUE(m_allocator->is_blk_alloced(bid))
+            << "replayed commit did not restore blk_num=" << bid.blk_num();
+    }
+    // Sanity: a random other block should still be free.
+    const BlkId control{live_bids.back().blk_num() + live_bids.back().blk_count() + 100u, 1u, 0u};
+    EXPECT_FALSE(m_allocator->is_blk_alloced(control)) << "an unrelated blk should stay free";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SweepServiceRegisterRefillAndDrain — direct exercise of the module-scoped sweep service.
+//   registration: ExpandedAlloc auto-registers with sweep_service on construction (slab_blk_allocator.cpp:69);
+//                 dropping the allocator drops the handle (its destructor spin-waits in_flight_==0).
+//   background refill: init_sweep_service starts a ticker thread that scans every registered allocator's
+//                      portions and enqueues LOW-priority refills for any below refill_threshold_pct.
+//   blocking refill under pressure: allocs that drain the slab past its threshold go through
+//                                   request_refill_blocking (HIGH-priority) so the alloc doesn't fail.
+//                                   Observable indirectly: sustained heavy alloc succeeds without hitting
+//                                   SPACE_FULL until real capacity runs out.
+//   shutdown drain: shutdown_sweep_service (at main-exit) joins all workers + the ticker cleanly; ASAN
+//                   would flag any use-after-free from a worker running past service teardown.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_F(SlabBlkAllocatorTest, SweepServiceRegisterRefillAndDrain) {
+    create_expanded_allocator(); // auto-registers with sweep_service
+
+    // Alloc heavily to force the slab cache below its refill threshold — this is what triggers
+    // request_refill_blocking on the alloc path.  If sweep isn't wired, either an alloc hangs or fails.
+    const uint64_t heavy = m_total_count / 2;
+    std::vector< BlkId > held;
+    held.reserve(heavy);
+    for (uint64_t i = 0; i < heavy; ++i) {
+        BlkId bid;
+        ASSERT_EQ(m_allocator->alloc_contiguous(bid), BlkAllocStatus::SUCCESS)
+            << "alloc " << i << " failed — sweep refill path broken?";
+        held.push_back(bid);
+    }
+    EXPECT_LE(m_allocator->available_blks(), m_total_count - heavy);
+
+    // Free half and re-alloc — exercises alloc/free/refill cycling.
+    for (uint64_t i = 0; i < heavy / 2; ++i) {
+        m_allocator->free(held[i]);
+    }
+    for (uint64_t i = 0; i < heavy / 2; ++i) {
+        BlkId bid;
+        ASSERT_EQ(m_allocator->alloc_contiguous(bid), BlkAllocStatus::SUCCESS);
+    }
+
+    // Drop the allocator — its destructor drops sweep_handle_, which spin-waits in_flight_ workers on
+    // this allocator's portions to complete.  If the wait deadlocks or workers touch freed memory,
+    // this test hangs or ASAN fires.  main's shutdown_sweep_service later joins the whole pool.
+    m_allocator.reset();
 }
 
 template < typename T >

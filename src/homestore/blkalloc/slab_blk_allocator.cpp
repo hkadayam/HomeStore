@@ -71,8 +71,15 @@ SlabBlkAllocator::SlabBlkAllocator(SlabBlkAllocConfig const& cfg, std::optional<
 }
 
 SlabBlkAllocator::~SlabBlkAllocator() {
-    // Drop the handle first — its destructor sets alive_=false and waits for in-flight refill workers
-    // targeting this allocator's portions to drain. Only then is it safe to destroy inmem_bm_/seg_mgr_.
+    // Queued refill tasks hold shared_ptr to sweep_handle_; setting alive_ here (not relying on
+    // ~AllocatorHandle) makes late-firing tasks back out at their alive check before dereferencing
+    // this-> members.
+    if (sweep_handle_) {
+        sweep_handle_->alive_.store(false, std::memory_order_seq_cst);
+        while (sweep_handle_->in_flight_.load(std::memory_order_seq_cst) > 0) {
+            std::this_thread::yield();
+        }
+    }
     sweep_handle_.reset();
     // Clean up in case recovery_completed() was never called (e.g. error path).
     delete recovering_;
@@ -122,7 +129,8 @@ void SlabBlkAllocator::load() {
 // so the bitmap tracks them as in-cache and they won't be double-allocated.
 // Invoked by blkalloc::SweepService workers on this allocator's sweep_handle_.
 void SlabBlkAllocator::fill_cache_for_portion(InmemPortion& portion) {
-    if (!cfg_.use_slab_cache_) return;
+    if (!cfg_.use_slab_cache_)
+        return;
     inmem_bm_->scan_free_blks(portion, [&portion](BlkId const& bid) -> std::pair< bool, blk_count_t > {
         auto [status, remaining] = portion.slab_cache_.try_free(bid);
         const blk_count_t consumed = bid.blk_count() - remaining.blk_count();
@@ -339,7 +347,8 @@ void SlabBlkAllocator::recovery_completed() {
 
     // Trigger immediate refill of every portion below threshold instead of waiting for the next periodic
     // tick. All requests are LOW priority — the periodic ticker would do the same eventually.
-    if (!sweep_handle_) return;
+    if (!sweep_handle_)
+        return;
     for (auto& seg : seg_mgr_.segments()) {
         for (auto& p_ptr : seg.portions_) {
             InmemPortion& portion = *p_ptr;

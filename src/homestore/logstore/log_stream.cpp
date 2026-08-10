@@ -45,8 +45,8 @@ namespace homestore {
 #define LSTREAM_LOG(level, msg, ...) HS_SUBMOD_LOG(level, logstream, , "sid", stream_id(), msg, ##__VA_ARGS__)
 
 // Generate a fresh non-zero 32-bit chain seed.  Non-zero so it's distinguishable from the default-initialized
-// AppendByteStreamSb::chain_seed{0} on the recovery path of a stream that was never created with this code.
-static uint32_t fresh_chain_seed() {
+// AppendByteStreamSb::init_crc{0} on the recovery path of a stream that was never created with this code.
+static uint32_t fresh_init_crc() {
     static thread_local std::mt19937 rng{std::random_device{}()};
     std::uniform_int_distribution< uint32_t > dist{1, std::numeric_limits< uint32_t >::max()};
     return dist(rng);
@@ -73,8 +73,8 @@ Async< shared< LogStream > > LogStream::create(uint64_t stream_id, MetaClient& m
 
     // Seed the chain at a non-zero random value so recovery can distinguish stale on-disk groups (recycled chunk,
     // pre-truncate-all data) from this stream's epoch.  Set BEFORE persist_stream_sb so the initial sb carries it.
-    stream->chain_seed_ = fresh_chain_seed();
-    stream->last_crc_ = stream->chain_seed_;
+    stream->init_crc_ = fresh_init_crc();
+    stream->last_crc_ = stream->init_crc_;
 
     // Allocate the per-stream sb MetaBlk and persist initial empty state.
     stream->sb_mblk_ = co_await meta_client.create_meta_blk(sb_mblk_name(dev_name, stream_id), std::nullopt);
@@ -107,14 +107,14 @@ Async< shared< LogStream > > LogStream::load(uint64_t stream_id, MetaClient& met
         chunk_ids.push_back(s->chunk_ids()[i]);
     }
 
-    LOGINFOMOD(logstream, "load: sid={} dev={} chunk_size={} head_offset={} n_chunks={} chain_seed={:#x}", stream_id,
-               dev_name, chunk_sz, recovered_head, s->n_chunks, s->chain_seed);
+    LOGINFOMOD(logstream, "load: sid={} dev={} chunk_size={} head_offset={} n_chunks={} init_crc={:#x}", stream_id,
+               dev_name, chunk_sz, recovered_head, s->n_chunks, s->init_crc);
     auto stream = shared< LogStream >{new LogStream{stream_id, meta_client, std::string{dev_name}, vdev, chunk_sz}};
     stream->sb_mblk_ = std::move(sb);
     stream->head_offset_ = recovered_head;
     stream->offset_in_first_chunk_ = recovered_head % chunk_sz;
-    stream->chain_seed_ = s->chain_seed;
-    stream->last_crc_ = s->chain_seed; // root the chain at the persisted seed; recover() will advance it
+    stream->init_crc_ = s->init_crc;
+    stream->last_crc_ = s->init_crc; // root the chain at the persisted seed; recover() will advance it
     // tail_offset_, log_id_, last_flush_idx_ are all populated by recover() — called separately by the
     // manager once every LogStore has been opened so on_log_found dispatch can find its target.
 
@@ -251,23 +251,25 @@ Async< void > LogStream::stop() {
 Async< void > LogStream::truncate(const stream_key& key) {
     co_await AppendByteStream::truncate(key.group_stream_offset);
 
-    // Truncate-all path: AppendByteStream collapses head==tail to (0,0).  Bump chain_seed_ so any stale on-disk
+    // Truncate-all path: AppendByteStream collapses head==tail to (0,0).  Bump init_crc_ so any stale on-disk
     // groups left in the anchor chunk fail recovery's first-group prev_crc check.  Reset chain state and persist
-    // the sb again to land the new seed on disk.
+    // the sb again to land the new epoch on disk.  This second persist is what "commits" a truncate-all — anything
+    // before it and a crash puts recovery back into a pre-truncate world.
     if (head_offset_ == 0 && tail_offset_ == 0) {
-        // Crash point: the empty-stream reset is persisted but the chain seed below is still the old one —
-        // stale groups left in the kept anchor chunk must NOT pass recovery's first-group prev_crc check and
-        // resurrect pre-truncate records.
-        if (crash_if_flip_fired("crash_before_logstream_seed_refresh")) {
+        // Crash point: chunks are released and the AppendByteStream sb reflects the empty state, but the LogStream
+        // sb (with the fresh init_crc) has NOT been re-persisted.  Recovery must ensure any stale groups left in
+        // the kept anchor chunk do NOT resurrect pre-truncate records.  The flip fires here so a test can freeze
+        // the disk between the two persists.
+        if (crash_if_flip_fired("crash_before_logstream_truncate_commit")) {
             co_return;
         }
-        const uint32_t old_seed = chain_seed_;
-        chain_seed_ = fresh_chain_seed();
-        last_crc_ = chain_seed_;
+        const uint32_t old_init_crc = init_crc_;
+        init_crc_ = fresh_init_crc();
+        last_crc_ = init_crc_;
         last_flush_idx_ = -1;
         log_id_.store(0, std::memory_order_relaxed);
 
-        LSTREAM_LOG(INFO, "truncate-all: bumped chain_seed {:#x} -> {:#x}", old_seed, chain_seed_);
+        LSTREAM_LOG(INFO, "truncate-all: bumped init_crc {:#x} -> {:#x}", old_init_crc, init_crc_);
         co_await persist_stream_sb();
     }
 }
@@ -353,13 +355,13 @@ Async< void > LogStream::recover(lookup_store_fn lookup) {
     // where the next group would have started.
 
     // First-group prev_crc handling depends on where head is:
-    //   • head == 0 (fresh stream, or after truncate-all): expect prev_crc == chain_seed_.  Stale data from a
+    //   • head == 0 (fresh stream, or after truncate-all): expect prev_crc == init_crc_.  Stale data from a
     //     prior epoch / recycled chunk has a different seed and fails immediately.
     //   • head != 0 (after partial truncate): the new first group's prev_crc was set at flush time to the prior
     //     group's cur_crc, which we no longer have.  Skip the check on iteration 0; subsequent groups still
     //     chain-validate.
     bool skip_prev_crc_check = (head_offset_ != 0);
-    crc32_t expected_prev_crc = chain_seed_;
+    crc32_t expected_prev_crc = init_crc_;
     uint64_t cursor = head_offset_;
     uint32_t groups_recovered = 0;
     uint32_t records_recovered = 0;
@@ -466,7 +468,7 @@ Async< void > LogStream::recover(lookup_store_fn lookup) {
 
     // Torn-write detection: only meaningful if we walked at least one group successfully — i.e. there was a
     // live chain that then broke.  When groups_recovered == 0 the break is at the very first probe (head ==
-    // current cursor), which is the post-truncate-all leftover-data case (chain_seed rejected stale group #0);
+    // current cursor), which is the post-truncate-all leftover-data case (init_crc rejected stale group #0);
     // any downstream "valid" group is stale-from-prior-epoch, not a torn middle write.
     if (groups_recovered > 0) {
         if (auto found = co_await probe_for_torn_write(cursor)) {

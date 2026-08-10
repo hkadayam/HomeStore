@@ -35,6 +35,8 @@
 #include "homestore/base/test_defs.h"
 
 #include "common/defs.h"
+#include "homestore/base/crash_simulator.h"
+#include "homestore/base/hs_runtime_config.h"
 #include "homestore/device/device_manager.h"
 #include "homestore/meta/meta_blk_manager.h"
 #include "homestore/managers.h"
@@ -155,6 +157,13 @@ static Async< void > shutdown_stack() {
 //
 class CowBtreeLocalTest : public ::testing::Test {
 public:
+    // Hooks for subclasses that need a different btree config on a per-test basis.  Base returns the default
+    // NODE_SIZE (== BLK_SIZE, one node = one block).  A subclass overriding test_node_size() to a multiple of BLK_SIZE
+    // exercises the multi-block-node path without disturbing the mainline fixture.  test_user_sb() defaults to an
+    // empty blob; overriding it lets a subclass round-trip a user-superblock payload through create/reload.
+    virtual uint32_t test_node_size() const { return NODE_SIZE; }
+    virtual sisl::Blob test_user_sb() const { return sisl::Blob{}; }
+
     void SetUp() override {
         for (size_t i = 0; i < NUM_DEVS; ++i) {
             auto path = fmt::format("/tmp/hs_test_cow_btree_local_{}_{}", ::getpid(), i);
@@ -403,14 +412,15 @@ private:
 
         cfg_ = BtreeConfig{};
         cfg_.btree_name_ = BTREE_NAME;
-        cfg_.node_size_ = NODE_SIZE;
+        cfg_.node_size_ = test_node_size();
         cfg_.leaf_node_type_ = BtreeNodeType::FIXED;
         cfg_.int_node_type_ = BtreeNodeType::FIXED;
         cfg_.finalize(sizeof(NodeCore::PersistentHeader));
 
         if (first_time_boot) {
+            auto user_sb = test_user_sb();
             bt_ = iomgr().spawn_and_block(ReactorTarget::any(),
-                                          cow_btree_mgr().create_cow_btree< K, V >(cfg_, blob_dev_));
+                                          cow_btree_mgr().create_cow_btree< K, V >(cfg_, blob_dev_, user_sb));
         } else {
             auto sbs = cow_btree_mgr().list_persisted_btrees();
             HS_REL_ASSERT_EQ(sbs.size(), 1u, "Expected exactly one persisted btree on recovery");
@@ -442,6 +452,48 @@ private:
         if (full_map) {
             flip::Flip::instance().remove("force_full_map_flush");
         }
+    }
+
+public:
+    // Install a fresh CrashSimulator with a no-op restart callback.  Nop cb keeps the process alive after crash_now
+    // (nullptr would raise(SIGKILL)); the fresh instance's crashed_ flag defaults false, so writes are unblocked
+    // until the next crash fires.  Call this to (a) prepare for a crash-flip test and (b) reset crashed_ so the
+    // post-crash restart's writes go through.
+    void install_fresh_crash_sim() {
+        Managers::init_crash_simulator(std::make_shared< CrashSimulator >([]() {}));
+    }
+
+    // Arm force_full_map_flush AND the target crash flip, trigger one CP.  The CP flush hits the crash flip and
+    // co_returns early from cow_btree_mgr's full_cp_flush — from CPManager's perspective the flush "succeeded"
+    // (cp_flush returns true), so trigger_cp_flush's future resolves normally; is_crash_simulated() is true and
+    // gates every subsequent PhysicalDev write (incl. CPManager's own SB write) to a no-op.  On return, the
+    // caller should install another fresh crash sim (resetting crashed_) before restart(), which needs to write.
+    void trigger_full_cp_with_crash_flip(const std::string& crash_flip_name) {
+        install_fresh_crash_sim();
+        auto inject = [](const std::string& name) {
+            flip::FlipFrequencyT freq;
+            freq.count = 1;
+            flip::PercentFrequencyT pf;
+            pf.v = 100;
+            freq.kind.Set(pf);
+            flip::FlipClient::instance().inject_noreturn_flip(name, {}, freq);
+        };
+        inject("force_full_map_flush");
+        inject(crash_flip_name);
+
+        iomgr().spawn_and_block(ReactorTarget::any(), []() -> Async< void > {
+            auto fut = cp_mgr().trigger_cp_flush(/*force=*/true, CPTriggerReason::UserDriven);
+            co_await std::move(fut).via(co_await folly::coro::co_current_executor);
+            co_return;
+        }());
+        EXPECT_TRUE(is_crash_simulated()) << "crash flip '" << crash_flip_name << "' never fired";
+
+        // count=1 means the flips self-cleared after firing, but be defensive in case the crash path skipped one.
+        flip::Flip::instance().remove("force_full_map_flush");
+        flip::Flip::instance().remove(crash_flip_name);
+
+        // Reset crashed_ so restart() (shutdown + reload) can actually write to disk again.
+        install_fresh_crash_sim();
     }
 
     /// Insert random monotonically-increasing K/V pairs into the SimpleNode and capture them in `pairs`.  Keys
@@ -1225,6 +1277,228 @@ TEST_F(CowBtreeLocalTest, GenericPutRestartLoop) {
 }
 
 // ──────────────────────────────────────────── main ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// User-superblock payload round-trip.  create_cow_btree accepts an optional sisl::Blob whose bytes get stashed in the
+// per-btree MetaBlk after the COWBtreeSuperBlock struct.  On recovery, list_persisted_btrees() returns the SB pointer
+// into the metablk's buffer, so super_blk().user_sb_data() / user_sb_size expose the persisted bytes unchanged.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+class CowBtreeLocalUserSbTest : public CowBtreeLocalTest {
+public:
+    // Deterministic pattern, kept alive as a member so the sisl::Blob view test_user_sb() returns stays valid across
+    // the whole create call chain (Blob is a non-owning view).  Size is capped at 100 bytes because the meta_vdev
+    // uses 512-byte blocks (see MetaBlkManager::create), the MetaBlkHeader eats 64, and sizeof(COWBtreeSuperBlock)
+    // eats ~164 more — leaving ~284 bytes for the user payload inline.  See product-follow-up note in the test body:
+    // MetaClient::create_meta_blk ignores its estimated_data_size arg and always allocates exactly one block.
+    static constexpr uint32_t kUserSbSize = 100;
+    std::vector< uint8_t > user_sb_bytes_ = [] {
+        std::vector< uint8_t > v(kUserSbSize);
+        for (uint32_t i = 0; i < kUserSbSize; ++i) {
+            v[i] = static_cast< uint8_t >((i * 31 + 7) & 0xFF);
+        }
+        return v;
+    }();
+
+    sisl::Blob test_user_sb() const override { return sisl::Blob{user_sb_bytes_.data(), to_u32(user_sb_bytes_.size())}; }
+};
+
+TEST_F(CowBtreeLocalUserSbTest, UserSuperBlockPayloadRoundtrip) {
+    // Immediately after first-time create, the loaded btree's SB should carry our payload.
+    {
+        auto const& sb = COWBtree::cast_to(bt_.get())->super_blk();
+        EXPECT_EQ(sb.user_sb_size, kUserSbSize);
+        EXPECT_EQ(std::memcmp(sb.user_sb_data(), user_sb_bytes_.data(), kUserSbSize), 0);
+    }
+
+    // Some real activity, then a CP so the SB gets exercised through a normal flush cycle.
+    for (uint32_t i = 0; i < 20; ++i) {
+        create_leaf(25);
+    }
+    flush_incremental();
+
+    // Restart — recovery calls list_persisted_btrees(), then load_cow_btree which keeps the SB in the loaded COWBtree.
+    restart();
+
+    auto const& sb = COWBtree::cast_to(bt_.get())->super_blk();
+    EXPECT_EQ(sb.user_sb_size, kUserSbSize);
+    EXPECT_EQ(std::memcmp(sb.user_sb_data(), user_sb_bytes_.data(), kUserSbSize), 0);
+    verify_all();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Overflow (multi-block) node coverage.  The mainline tests use NODE_SIZE == BLK_SIZE (one node = one block).  This
+// subclass pushes node_size to 4× BLK_SIZE so every node write spans multiple disk blocks — the "overflow" node path
+// used by btrees whose fanout requires larger nodes than a single block can hold.  Exercises insert / RMW / restart
+// against the multi-block layout without duplicating other coverage.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+class CowBtreeLocalOverflowNodeTest : public CowBtreeLocalTest {
+public:
+    uint32_t test_node_size() const override { return BLK_SIZE * 4; }
+};
+
+TEST_F(CowBtreeLocalOverflowNodeTest, MultiBlockNodeRoundtrip) {
+    constexpr uint32_t N = 30;
+    std::vector< bnodeid_t > ids;
+    ids.reserve(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        // With 16 KB nodes there is room for many more slots — 80 keeps the shadow reasonable and stays well within
+        // the leaf capacity for FIXED-value SimpleNode<TestFixedKey, TestFixedValue>.
+        ids.push_back(create_leaf(80));
+    }
+    flush_incremental();
+
+    // RMW a slot in each — exercises write_node on a multi-block node twice (create + rmw) in one CP cycle.
+    for (auto id : ids) {
+        rmw(id, 0);
+    }
+    flush_full();
+
+    restart();
+    verify_all();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Full-map flush threshold: when total incr_map bytes across live btrees exceed cow_incr_map_max_size_pct % of fast
+// (or data) capacity, should_force_full_flush() returns true and the next CP is promoted from incremental to full,
+// advancing super_blk().last_full_map_cp_id.  Lower the pct to a tiny value so a single incremental CP crosses it.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+TEST_F(CowBtreeLocalTest, FullMapFlushThresholdTrigger) {
+    // Baseline batch so the first full flush has content and actually advances last_full_map_cp_id (a no-op
+    // flush_full over an empty btree hits full_cp_flush's updates_since_last_flush==0 early-return and leaves the
+    // SB unchanged).
+    for (uint32_t i = 0; i < 20; ++i) {
+        create_leaf(20);
+    }
+    flush_full();
+    auto const initial_last_full = COWBtree::cast_to(bt_.get())->super_blk().last_full_map_cp_id;
+
+    // Shrink the threshold aggressively so a modest incr_map growth crosses it.  With 2 GB Data capacity, pct =
+    // 0.00001 % → limit ≈ 21 bytes.  Setting is hotswap; takes effect on the next should_force_full_flush() call.
+    HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.btree.cow_incr_map_max_size_pct = 0.00001; });
+    HS_SETTINGS_FACTORY().save();
+
+    // Push a healthy amount of delta into the incr_map, then confirm the counter is over the tiny limit.
+    for (uint32_t i = 0; i < 100; ++i) {
+        create_leaf(20);
+    }
+    flush_incremental();
+    ASSERT_GT(cow_btree_mgr().incr_map_total_bytes(), 0u)
+        << "incremental flush did not append any bytes to the incr_map stream";
+
+    // A subsequent normal CP must be promoted to full by the threshold, NOT by the force_full_map_flush flip.
+    iomgr().spawn_and_block(ReactorTarget::any(), []() -> Async< void > {
+        auto fut = cp_mgr().trigger_cp_flush(/*force=*/true, CPTriggerReason::UserDriven);
+        co_await std::move(fut).via(co_await folly::coro::co_current_executor);
+        co_return;
+    }());
+
+    auto const after_last_full = COWBtree::cast_to(bt_.get())->super_blk().last_full_map_cp_id;
+    EXPECT_GT(after_last_full, initial_last_full)
+        << "threshold-driven full-map promotion did not advance last_full_map_cp_id";
+
+    // Restore the default so subsequent tests aren't affected.
+    HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.btree.cow_incr_map_max_size_pct = 1.0; });
+    HS_SETTINGS_FACTORY().save();
+
+    verify_all();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Crash-window tests for full_cp_flush (cow_btree.cpp).  Each of the three flip points is exercised in turn:
+//
+//   CP1: crash_after_full_map_flush        — full-map bytes durable in the new stream, SB not yet advanced.
+//                                            Recovery uses the previous-generation stream (matches SB) and replays
+//                                            the incr journal on top.
+//   CP2: crash_after_full_map_sb_write     — SB advanced, but the previous-generation stream is still on disk.
+//                                            Recovery loads the new full map and recover_full_map's stale-stream
+//                                            sweep truncates the old stream on the boot path.
+//   CP3: crash_before_incr_map_truncate    — SB advanced, passive stream truncated, but the incr journal still
+//                                            holds all pre-CP records.  Recovery walks and skips those records
+//                                            (hdr.cp_id < last_full_cp); the next successful full CP reclaims them.
+//
+// Each test sets up: baseline batch → full flush → second batch → incr flush → arm crash flip → force full CP →
+// restart → validate.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+TEST_F(CowBtreeLocalTest, CrashAfterFullMapFlush) {
+    for (uint32_t i = 0; i < 20; ++i) {
+        create_leaf(20);
+    }
+    flush_full();
+    auto const pre_last_full = COWBtree::cast_to(bt_.get())->super_blk().last_full_map_cp_id;
+
+    for (uint32_t i = 0; i < 20; ++i) {
+        create_leaf(20);
+    }
+    flush_incremental();
+
+    trigger_full_cp_with_crash_flip("crash_after_full_map_flush");
+    restart();
+
+    // SB never advanced past pre-crash last_full — recovery replayed the incr journal atop the old generation.
+    auto const post_last_full = COWBtree::cast_to(bt_.get())->super_blk().last_full_map_cp_id;
+    EXPECT_EQ(post_last_full, pre_last_full);
+    verify_all();
+}
+
+TEST_F(CowBtreeLocalTest, CrashAfterFullMapSbWrite) {
+    for (uint32_t i = 0; i < 20; ++i) {
+        create_leaf(20);
+    }
+    flush_full();
+    auto const pre_last_full = COWBtree::cast_to(bt_.get())->super_blk().last_full_map_cp_id;
+
+    for (uint32_t i = 0; i < 20; ++i) {
+        create_leaf(20);
+    }
+    flush_incremental();
+
+    trigger_full_cp_with_crash_flip("crash_after_full_map_sb_write");
+    restart();
+
+    // SB advanced to the crashed CP's id — recovery loaded the new full map; recover_full_map's stale-stream sweep
+    // truncated the old one.  (We can't easily assert the stream tail_offset from outside the class, but K/V
+    // correctness plus the SB advance are the observable recovery contract.)
+    auto const post_last_full = COWBtree::cast_to(bt_.get())->super_blk().last_full_map_cp_id;
+    EXPECT_GT(post_last_full, pre_last_full);
+    verify_all();
+}
+
+TEST_F(CowBtreeLocalTest, CrashBeforeIncrMapTruncate) {
+    for (uint32_t i = 0; i < 20; ++i) {
+        create_leaf(20);
+    }
+    flush_full();
+    auto const pre_last_full = COWBtree::cast_to(bt_.get())->super_blk().last_full_map_cp_id;
+
+    for (uint32_t i = 0; i < 20; ++i) {
+        create_leaf(20);
+    }
+    flush_incremental();
+
+    trigger_full_cp_with_crash_flip("crash_before_incr_map_truncate");
+    restart();
+
+    // SB advanced; incr journal preserved (not truncated) — the manager's counter is reseeded from tail_offset on
+    // load, so incr_map_total_bytes() reports the stale bytes still on disk.
+    auto const post_last_full = COWBtree::cast_to(bt_.get())->super_blk().last_full_map_cp_id;
+    EXPECT_GT(post_last_full, pre_last_full);
+    EXPECT_GT(cow_btree_mgr().incr_map_total_bytes(), 0u)
+        << "stale incr journal should still be present after crash before incr_map truncate";
+    verify_all();
+
+    // Insert some new data so the follow-up full flush isn't a no-op — updates_since_last_full_flush_ resets to 0
+    // on load (it is not persisted), so a follow-up flush_full over zero writes would hit full_cp_flush's early
+    // return and skip the incr_map truncate.  Feeding a small batch of new writes lets the flush proceed all the
+    // way through to the incr_map_stream_->truncate() call that reclaims the stale journal.
+    for (uint32_t i = 0; i < 5; ++i) {
+        create_leaf(20);
+    }
+    flush_full();
+    EXPECT_EQ(cow_btree_mgr().incr_map_total_bytes(), 0u)
+        << "next full CP failed to reclaim stale incr journal";
+    verify_all();
+}
+
 int main(int argc, char* argv[]) {
     ::testing::InitGoogleTest(&argc, argv);
     SISL_OPTIONS_LOAD(argc, argv);

@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include <folly/coro/Baton.h>
+
 #include <gtest/gtest.h>
 
 #include "sisl/logging/logging.h"
@@ -31,6 +33,7 @@
 #include "homestore/base/test_defs.h"
 
 #include "common/defs.h"
+#include "homestore/base/hs_runtime_config.h"
 #include "homestore/device/device_manager.h"
 #include "homestore/meta/meta_blk_manager.h"
 #include "homestore/managers.h"
@@ -358,6 +361,85 @@ CORO_TEST_F(CPMgrTest, IOParallelToFlush) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Test 9: Consumer rank ordering — register three consumers with non-monotonic ranks and verify the CP switchover and
+// flush walks visit them in ascending rank order regardless of registration order.  Duplicate ranks are a debug
+// assert (HS_DBG_ASSERT in register_consumer, aborting in debug builds); the release-mode adjacent-after fallback is
+// documented in CPRank's header and not exercised here (no death-test pattern in this repo).
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+namespace {
+class OrderRecordingCallbacks : public CPCallbacks {
+public:
+    OrderRecordingCallbacks(uint32_t my_rank, std::vector< uint32_t >* switch_order,
+                            std::vector< uint32_t >* flush_order, std::mutex* order_mtx) :
+            rank_{my_rank}, switch_order_{switch_order}, flush_order_{flush_order}, order_mtx_{order_mtx} {}
+
+    void on_switchover_cp(CP* /*cur_cp*/, CP* /*new_cp*/) override {
+        std::lock_guard lg{*order_mtx_};
+        switch_order_->push_back(rank_);
+    }
+
+    Async< bool > cp_flush(CP* /*cp*/) override {
+        {
+            std::lock_guard lg{*order_mtx_};
+            flush_order_->push_back(rank_);
+        }
+        co_return true;
+    }
+
+    void cp_cleanup(CP* /*cp*/) override {}
+
+    int cp_progress_percent() override { return 100; }
+
+private:
+    uint32_t rank_;
+    std::vector< uint32_t >* switch_order_;
+    std::vector< uint32_t >* flush_order_;
+    std::mutex* order_mtx_;
+};
+} // namespace
+
+CORO_TEST_F(CPMgrTest, ConsumerRankOrderingEnforced) {
+    auto dm = co_await self.format_and_start_cp();
+
+    std::vector< uint32_t > switch_order;
+    std::vector< uint32_t > flush_order;
+    std::mutex order_mtx;
+
+    auto cb_high = std::make_shared< OrderRecordingCallbacks >(300u, &switch_order, &flush_order, &order_mtx);
+    auto cb_low = std::make_shared< OrderRecordingCallbacks >(50u, &switch_order, &flush_order, &order_mtx);
+    auto cb_mid = std::make_shared< OrderRecordingCallbacks >(200u, &switch_order, &flush_order, &order_mtx);
+
+    // Registration order deliberately non-monotonic: high(300), low(50), mid(200).
+    cp_mgr().register_consumer("high", cb_high, 300u);
+    cp_mgr().register_consumer("low", cb_low, 50u);
+    cp_mgr().register_consumer("mid", cb_mid, 200u);
+
+    // register_consumer invokes on_switchover_cp(nullptr, cur_cp) once per call, so switch_order at this point simply
+    // mirrors registration order.  Clear it and drive the next switchover via trigger_cp_flush; that path walks the
+    // rank-sorted consumers_ list in one pass, which is the ordering under test.
+    {
+        std::lock_guard lg{order_mtx};
+        switch_order.clear();
+    }
+
+    auto success = co_await cp_mgr().trigger_cp_flush(true /* force */);
+    EXPECT_TRUE(success);
+
+    {
+        std::lock_guard lg{order_mtx};
+        // format_and_start_cp registered its own test_consumer at rank kCPRank_Test (=100) using TestCPCallbacks, which
+        // does not push to our tracking vectors — so we see just the three OrderRecordingCallbacks ranks in ascending
+        // order, with rank 100 firing between 50 and 200 unobserved.
+        std::vector< uint32_t > expected = {50u, 200u, 300u};
+        EXPECT_EQ(switch_order, expected);
+        EXPECT_EQ(flush_order, expected);
+    }
+
+    co_await cp_mgr().shutdown();
+    co_await dm->close_devices();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 // Test 8: has_cp_flushed returns correct results.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 CORO_TEST_F(CPMgrTest, HasCPFlushed) {
@@ -380,6 +462,73 @@ CORO_TEST_F(CPMgrTest, HasCPFlushed) {
 
     co_await cp_mgr().shutdown();
     co_await dm->close_devices();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Test 10: Watchdog detects a stalled CP.  A consumer's cp_flush blocks on a baton and its cp_progress_percent reports
+// a value that never advances; the watchdog must observe the stall (progress not advancing beyond the recorded
+// watermark) and invoke repair_slow_cp on the lagging consumer.  The panic branch (elapsed past the 12x-timer
+// tolerance) is a HS_REL_ASSERT and is not exercised here — asserting on a stuck CP would kill the test process, and
+// there is no death-test pattern in this repo.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+namespace {
+class StallableCallbacks : public CPCallbacks {
+public:
+    void on_switchover_cp(CP* /*cur_cp*/, CP* /*new_cp*/) override {}
+
+    Async< bool > cp_flush(CP* /*cp*/) override {
+        co_await stall_baton_;
+        co_return true;
+    }
+
+    void cp_cleanup(CP* /*cp*/) override {}
+
+    int cp_progress_percent() override { return progress_.load(); }
+
+    void repair_slow_cp() override { repair_count_.fetch_add(1); }
+
+    void release() { stall_baton_.post(); }
+
+    folly::coro::Baton stall_baton_;
+    std::atomic< uint32_t > progress_{50};
+    std::atomic< uint32_t > repair_count_{0};
+};
+} // namespace
+
+CORO_TEST_F(CPMgrTest, WatchdogDetectsStalledCP) {
+    // Shrink the watchdog tick so the test observes stall detection in a few seconds instead of ~2 min at the 10s
+    // default.  Captured at CPWatchdog construction (a member of CPManager), so must land before format_and_start_cp.
+    HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.checkpoint.cp_watchdog_timer_sec = 1; });
+    HS_SETTINGS_FACTORY().save();
+
+    auto dm = co_await self.format_and_start_cp();
+
+    auto stall_cb = std::make_shared< StallableCallbacks >();
+    cp_mgr().register_consumer("stallable", stall_cb, 500u);
+
+    // Fire and forget: the flush stalls on the baton, so we cannot co_await its completion here.  The consumer's
+    // cp_progress_percent stays at 50, so the watchdog sees progress plateau after its first advance-record and
+    // starts nudging repair_slow_cp on subsequent ticks.
+    auto fut = cp_mgr().trigger_cp_flush(true /* force */);
+
+    // Sleep past several watchdog ticks (1s each) but well short of the 12x tolerance panic window (12s).
+    co_await iomgr().sleep(std::chrono::milliseconds{4000});
+
+    EXPECT_GT(stall_cb->repair_count_.load(), 0u);
+
+    // Release the stall so the flush completes; then drain the future before shutdown, which would otherwise wedge
+    // waiting for the inflight CP to finish.
+    stall_cb->progress_.store(100);
+    stall_cb->release();
+    auto success = co_await std::move(fut);
+    EXPECT_TRUE(success);
+
+    co_await cp_mgr().shutdown();
+    co_await dm->close_devices();
+
+    // Restore watchdog default so subsequent tests in the binary aren't affected.
+    HS_SETTINGS_FACTORY().modifiable_settings([](auto& s) { s.checkpoint.cp_watchdog_timer_sec = 10; });
+    HS_SETTINGS_FACTORY().save();
 }
 
 int main(int argc, char* argv[]) {

@@ -211,7 +211,7 @@ public:
     /// Advance the stream's head to key.group_stream_offset (must be a LogGroup boundary — only stream_keys handed
     /// out by on_write_completion / on_log_found satisfy this) and persist the sb.  Releases any chunks fully before
     /// the new head.  Inherited semantics: head==tail keeps one chunk as anchor and resets positions to 0.
-    /// When the truncate collapses the stream to empty, bumps chain_seed_ and re-persists the sb so any stale
+    /// When the truncate collapses the stream to empty, bumps init_crc_ and re-persists the sb so any stale
     /// on-disk groups left in the anchor chunk fail recovery's first-group prev_crc check on next restart.
     Async< void > truncate(const stream_key& key);
 

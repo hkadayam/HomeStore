@@ -32,6 +32,12 @@
 #include "iomanager/iomanager.h"
 #include "homestore/base/test_defs.h"
 
+#ifdef SISL_FLIP_ENABLED
+#include "sisl/flip/flip.h"
+#include "sisl/flip/flip_client.h"
+#include "homestore/base/crash_simulator.h"
+#endif
+
 #include "common/defs.h"
 #include "homestore/base/blk.h"
 #include "homestore/base/crc.h"
@@ -821,6 +827,261 @@ CORO_TEST_F(MetaBlkMgrTest, CrcIntegrity) {
 
     co_await dm->close_devices();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Test 13: Client-slot exhaustion and client-name length behave predictably.
+//
+// Two guarantees, verified in one boot:
+//   1. All MAX_META_CLIENTS (255) slots can be reserved by distinct clients; the 256th register throws
+//      std::runtime_error from reserve_slot_internal.  Deregistering one frees exactly one slot so the next
+//      register succeeds.
+//   2. Client names longer than MAX_CLIENT_NAME_LEN-1 (231) chars are silently truncated to 231 chars in the
+//      stored MetaClientInfo — MetaClient::client_name() returns the truncated form.
+//
+// The MetaBlk name limit (31 chars) is a separate HS_DBG_ASSERT in MetaBlkHeader::make (meta_blk.h) — debug-abort,
+// no death-test pattern here — so it is not exercised.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+CORO_TEST_F(MetaBlkMgrTest, ClientSlotExhaustionAndNameLimits) {
+    auto dm = co_await self.format_and_create_meta();
+
+    // Reserve every one of the 255 slots.  Clients are stashed in a vector so they stay alive (and their slots
+    // stay occupied) until we test exhaustion.
+    std::vector< MetaClient > clients;
+    clients.reserve(MAX_META_CLIENTS);
+    for (size_t i = 0; i < MAX_META_CLIENTS; ++i) {
+        clients.emplace_back(co_await meta_mgr().register_client(fmt::format("exhaust_client_{}", i)));
+    }
+
+    // 256th registration must throw std::runtime_error from reserve_slot_internal.
+    bool threw_on_overflow = false;
+    try {
+        auto extra = co_await meta_mgr().register_client("one_too_many");
+        (void)extra;
+    } catch (const std::runtime_error&) {
+        threw_on_overflow = true;
+    }
+    EXPECT_TRUE(threw_on_overflow);
+
+    // Freeing one slot must let exactly one more registration succeed.
+    co_await meta_mgr().deregister_client(clients[0]);
+    clients.erase(clients.begin());
+    clients.emplace_back(co_await meta_mgr().register_client("after_deregister"));
+
+    // And now full again — the 256th must throw once more.
+    bool threw_after_refill = false;
+    try {
+        auto extra = co_await meta_mgr().register_client("again_too_many");
+        (void)extra;
+    } catch (const std::runtime_error&) {
+        threw_after_refill = true;
+    }
+    EXPECT_TRUE(threw_after_refill);
+
+    // Drop every reservation so the name-length client has a slot.
+    for (auto& c : clients) {
+        co_await meta_mgr().deregister_client(c);
+    }
+    clients.clear();
+
+    // Client name silently truncates to MAX_CLIENT_NAME_LEN - 1 = 231 chars.  Pass a 300-char string of 'x's and
+    // read back the stored name.
+    const std::string overlong(300, 'x');
+    auto trunc_client = co_await meta_mgr().register_client(overlong);
+    auto stored = co_await trunc_client.client_name();
+    EXPECT_EQ(stored.size(), MAX_CLIENT_NAME_LEN - 1);
+    EXPECT_EQ(stored, std::string(MAX_CLIENT_NAME_LEN - 1, 'x'));
+    co_await meta_mgr().deregister_client(trunc_client);
+
+    co_await dm->close_devices();
+}
+
+#ifdef SISL_FLIP_ENABLED
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Crash-window tests for the three deliberately-wired flips in MetaClient (meta_client.cpp: crash_before_sb_write at
+// :169, crash_before_sb_linked at :187, crash_during_sb_remove at :283).  Each flip is armed with (client_name,
+// mblk.name()) conditioning so it fires exactly on the target op.  A fresh CrashSimulator with a no-op restart cb is
+// installed before the crash — crash_now() then sets crashed_=true (freezing every PhysicalDev write to a no-op via
+// the is_crash_simulated() gate) and dispatches the nop cb on a detached thread instead of raising SIGKILL, so the
+// test process survives.  After the crash we install another fresh CrashSimulator (crashed_ resets to false),
+// close+reload devices, and validate recovery from the disk state frozen at the crash instant.
+//
+// Space-recovery caveat: for CrashBeforeSbLinked and CrashDuringSbRemove the orphan header (and any overflow) is
+// reclaimed via blkalloc's uncommitted-allocations-revert-to-free contract (see §2 bullet 2 in FUNCTIONALITY_TESTS).
+// MetaClient::load commits blk bits during its chain walk (meta_client.cpp:91-95); the crash tests here write once
+// and crash without an intervening reload, so the orphan's bit is never committed and reverts naturally on the next
+// boot.  A CrashDuringSbRemove issued AFTER a prior reload would leave the bit committed — reclaim then requires an
+// explicit sweep that does not exist in the current product.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+namespace {
+
+void install_fresh_crash_sim() {
+    // Nop restart callback keeps the process alive after crash_now() (nullptr would raise(SIGKILL)); the crashed_
+    // flag on the fresh instance defaults false, so writes are unblocked until the next crash fires.
+    Managers::init_crash_simulator(std::make_shared< CrashSimulator >([]() {}));
+}
+
+void arm_crash_flip(const std::string& flip_name, const std::string& client_name, const std::string& blk_name) {
+    auto& fc = flip::FlipClient::instance();
+    // meta_client.cpp passes (client_name, blk_name) positionally; arg names below are documentation only.
+    auto c1 = fc.create_condition("client", flip::Operator::EQUAL, client_name);
+    auto c2 = fc.create_condition("blk", flip::Operator::EQUAL, blk_name);
+    flip::FlipFrequencyT freq;
+    freq.count = 1;
+    flip::PercentFrequencyT pf;
+    pf.v = 100;
+    freq.kind.Set(pf);
+    fc.inject_noreturn_flip(flip_name, {c1, c2}, freq);
+}
+
+void remove_flip(const std::string& flip_name) {
+    flip::Flip::instance().remove(flip_name);
+}
+
+// Run one crash_before_sb_write scenario at the given payload size.  Payload sizes above one block force the
+// overflow path — the flip fires BEFORE any data is written either way, so the overflow variant validates that the
+// prior generation's overflow blocks are still intact through the failed overwrite.
+Async< void > run_crash_before_sb_write(MetaBlkMgrTest& self, size_t data_sz) {
+    auto dm = co_await self.format_and_create_meta();
+
+    // Baseline: write initial contents.  This block's cached MetaBlk handle is what we reuse to attempt the
+    // overwrite, so we hold it in a value-typed variable (MetaBlk is movable but the handle shares state via a
+    // shared holder — moving it does not break the cache).
+    {
+        install_fresh_crash_sim();
+        auto client = co_await meta_mgr().register_client("crasher");
+        auto blk = co_await client.create_meta_blk("target", data_sz);
+        co_await client.write_meta_blk(blk, make_pattern_buf(1, data_sz));
+
+        // Arm the flip and attempt to overwrite with pattern 2.  crash_before_sb_write fires BEFORE
+        // mblk.write_data, so nothing is written; is_crash_simulated becomes true and gates all future writes.
+        arm_crash_flip("crash_before_sb_write", "crasher", "target");
+        co_await client.write_meta_blk(blk, make_pattern_buf(2, data_sz));
+        EXPECT_TRUE(is_crash_simulated());
+
+        remove_flip("crash_before_sb_write");
+        install_fresh_crash_sim(); // resets crashed_ so close_devices' writes go through (though they no-op safely too)
+        co_await dm->close_devices();
+    }
+
+    // Reload — the block must still read back pattern 1.
+    {
+        auto dm2 = co_await self.reload_meta();
+        auto client = co_await meta_mgr().register_client("crasher");
+        EXPECT_EQ(co_await client.num_meta_blks(), 1u);
+        auto opt_blk = co_await client.get_meta_blk("target");
+        CO_ASSERT_TRUE(opt_blk.has_value());
+        auto data = co_await client.read_meta_blk(*opt_blk);
+        EXPECT_TRUE(verify_pattern(data, 1, data_sz));
+        co_await dm2->close_devices();
+    }
+}
+
+// Run one crash_before_sb_linked scenario at the given payload size.  Payload is written to disk (and, for overflow
+// sizes, so are the overflow blocks) but the chain link never persists — recovery's chain walk must not surface the
+// orphan.
+Async< void > run_crash_before_sb_linked(MetaBlkMgrTest& self, size_t data_sz) {
+    auto dm = co_await self.format_and_create_meta();
+
+    {
+        install_fresh_crash_sim();
+        auto client = co_await meta_mgr().register_client("crasher");
+
+        // Pre-existing block that WILL survive (validates chain walk still sees legitimate content).
+        auto anchor = co_await client.create_meta_blk("anchor", data_sz);
+        co_await client.write_meta_blk(anchor, make_pattern_buf(1, data_sz));
+
+        // Now attempt a second block whose link crash-fires — payload lands on disk, chain never learns about it.
+        auto orphan = co_await client.create_meta_blk("orphan", data_sz);
+        arm_crash_flip("crash_before_sb_linked", "crasher", "orphan");
+        co_await client.write_meta_blk(orphan, make_pattern_buf(2, data_sz));
+        EXPECT_TRUE(is_crash_simulated());
+
+        remove_flip("crash_before_sb_linked");
+        install_fresh_crash_sim();
+        co_await dm->close_devices();
+    }
+
+    // Reload — chain must contain exactly the anchor, orphan invisible.
+    {
+        auto dm2 = co_await self.reload_meta();
+        auto client = co_await meta_mgr().register_client("crasher");
+        EXPECT_EQ(co_await client.num_meta_blks(), 1u);
+        auto opt_anchor = co_await client.get_meta_blk("anchor");
+        CO_ASSERT_TRUE(opt_anchor.has_value());
+        auto anchor_data = co_await client.read_meta_blk(*opt_anchor);
+        EXPECT_TRUE(verify_pattern(anchor_data, 1, data_sz));
+        auto opt_orphan = co_await client.get_meta_blk("orphan");
+        EXPECT_FALSE(opt_orphan.has_value());
+        co_await dm2->close_devices();
+    }
+}
+
+// Run one crash_during_sb_remove scenario at the given payload size.  Block is unlinked from the chain on disk but
+// storage is never freed — recovery's chain walk must not surface the ghost.
+Async< void > run_crash_during_sb_remove(MetaBlkMgrTest& self, size_t data_sz) {
+    auto dm = co_await self.format_and_create_meta();
+
+    {
+        install_fresh_crash_sim();
+        auto client = co_await meta_mgr().register_client("crasher");
+
+        // Two blocks — remove the head, keep the tail.  Head removal exercises the write_client_info branch (first
+        // block in chain), which is the persist step that must land before the crash fires.
+        auto victim = co_await client.create_meta_blk("victim", data_sz);
+        co_await client.write_meta_blk(victim, make_pattern_buf(1, data_sz));
+        auto survivor = co_await client.create_meta_blk("survivor", data_sz);
+        co_await client.write_meta_blk(survivor, make_pattern_buf(2, data_sz));
+        EXPECT_EQ(co_await client.num_meta_blks(), 2u);
+
+        arm_crash_flip("crash_during_sb_remove", "crasher", "victim");
+        co_await client.remove_meta_blk(victim);
+        EXPECT_TRUE(is_crash_simulated());
+
+        remove_flip("crash_during_sb_remove");
+        install_fresh_crash_sim();
+        co_await dm->close_devices();
+    }
+
+    // Reload — chain must contain exactly survivor, victim gone.
+    {
+        auto dm2 = co_await self.reload_meta();
+        auto client = co_await meta_mgr().register_client("crasher");
+        EXPECT_EQ(co_await client.num_meta_blks(), 1u);
+        auto opt_victim = co_await client.get_meta_blk("victim");
+        EXPECT_FALSE(opt_victim.has_value());
+        auto opt_survivor = co_await client.get_meta_blk("survivor");
+        CO_ASSERT_TRUE(opt_survivor.has_value());
+        auto sdata = co_await client.read_meta_blk(*opt_survivor);
+        EXPECT_TRUE(verify_pattern(sdata, 2, data_sz));
+        co_await dm2->close_devices();
+    }
+}
+
+} // namespace
+
+// Inline payload (fits in one meta block).
+CORO_TEST_F(MetaBlkMgrTest, CrashBeforeSbWriteInline) {
+    co_await run_crash_before_sb_write(self, 128);
+}
+CORO_TEST_F(MetaBlkMgrTest, CrashBeforeSbLinkedInline) {
+    co_await run_crash_before_sb_linked(self, 128);
+}
+CORO_TEST_F(MetaBlkMgrTest, CrashDuringSbRemoveInline) {
+    co_await run_crash_during_sb_remove(self, 128);
+}
+
+// Overflow payload (512 KB — well past one block, forces overflow-block allocation, matching Test 7's threshold).
+CORO_TEST_F(MetaBlkMgrTest, CrashBeforeSbWriteOverflow) {
+    co_await run_crash_before_sb_write(self, 512 * 1024);
+}
+CORO_TEST_F(MetaBlkMgrTest, CrashBeforeSbLinkedOverflow) {
+    co_await run_crash_before_sb_linked(self, 512 * 1024);
+}
+CORO_TEST_F(MetaBlkMgrTest, CrashDuringSbRemoveOverflow) {
+    co_await run_crash_during_sb_remove(self, 512 * 1024);
+}
+
+#endif // SISL_FLIP_ENABLED
 
 int main(int argc, char* argv[]) {
     SISL_OPTIONS_LOAD(argc, argv);

@@ -13,6 +13,7 @@ set(LOGSTREAM_TEST_LIBS
     sisl_metrics
     sisl_settings
     sisl_logging
+    sisl_flip
     ${COMMON_DEPS}
     GTest::gtest
 )

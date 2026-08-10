@@ -1025,6 +1025,194 @@ TEST_F(RawBlkStreamTest, BlockSizeMultiplierRestart) {
     }());
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Stream isolation under one shared vdev.  Two streams share the same BlobDev + VDev.  StreamBase::expand_to grabs
+// chunks via vdev.expand(), so each stream owns a distinct set.  RawBlkStream::alloc_blk walks its own chunk list
+// only (chunk_id_hint per iteration, raw_blk_stream.cpp:75-84), so allocation must never cross into the other
+// stream's chunks — assert the chunk-id sets are disjoint and that every alloc lands in the calling stream's set.
+// ─────────────────────────────────────────────────────────────────────────────
+CORO_TEST_F(RawBlkStreamTest, StreamIsolationSharedVdev) {
+    co_await self.bootstrap();
+
+    auto s1 = co_await self.blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
+    auto s2 = co_await self.blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
+
+    // Each stream starts with 1 chunk from bootstrap; expand_to(1) ensures at least n+1=2 chunks so both hold
+    // distinct sets of 2.  Any higher and the SingleFirstPDev vdev runs out of room (pdev is 256 MB, meta_vdev
+    // already claimed 64 MB, chunk size is 32 MB → only ~5 BlobDev chunks fit).
+    co_await s1->expand_to(1);
+    co_await s2->expand_to(1);
+
+    std::unordered_set< uint32_t > s1_ids, s2_ids;
+    {
+        auto acc = s1->chunks();
+        for (auto& c : *acc) {
+            s1_ids.insert(c->chunk_id());
+        }
+    }
+    {
+        auto acc = s2->chunks();
+        for (auto& c : *acc) {
+            s2_ids.insert(c->chunk_id());
+        }
+    }
+    EXPECT_EQ(s1_ids.size(), 2u);
+    EXPECT_EQ(s2_ids.size(), 2u);
+    for (auto id : s1_ids) {
+        EXPECT_EQ(s2_ids.count(id), 0u) << "chunk_id " << id << " appears in both streams";
+    }
+
+    // 50 single-block allocs on each stream — every allocated bid's chunk_num must be in the calling stream's set.
+    for (int i = 0; i < 50; ++i) {
+        BlkId bid;
+        blk_alloc_hints h;
+        auto st = s1->alloc_blk(1, h, bid);
+        CO_ASSERT_EQ(st, BlkAllocStatus::SUCCESS);
+        EXPECT_EQ(s1_ids.count(bid.chunk_num()), 1u) << "s1 alloc landed on chunk " << bid.chunk_num()
+                                                     << " which is not in s1's chunk set";
+    }
+    for (int i = 0; i < 50; ++i) {
+        BlkId bid;
+        blk_alloc_hints h;
+        auto st = s2->alloc_blk(1, h, bid);
+        CO_ASSERT_EQ(st, BlkAllocStatus::SUCCESS);
+        EXPECT_EQ(s2_ids.count(bid.chunk_num()), 1u) << "s2 alloc landed on chunk " << bid.chunk_num()
+                                                     << " which is not in s2's chunk set";
+    }
+
+    co_await self.shutdown();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// reconcile_chunks after an unclean stop.  A crash between vdev.expand() (chunk durable on disk) and
+// StreamBase::init_chunk_mblk (per-chunk MetaBlk not yet written) leaves an orphan chunk that no stream claims.
+// BlobDev::load unions every stream's chunk set and calls reconcile_chunks (blob_dev.cpp:305-334), which shrinks
+// any vdev chunk not in that union.  We simulate the crash window here by calling vdev.expand() directly, bypassing
+// the stream's mblk-write path — no need for a real crash simulator.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_F(RawBlkStreamTest, ReconcileChunksAfterUncleanStop) {
+    uint64_t sid{};
+    uint32_t orphan_chunk_id{};
+    size_t stream_chunk_count{};
+
+    iomgr().spawn_and_block(ReactorTarget::any(),
+                            [this, &sid, &orphan_chunk_id, &stream_chunk_count]() -> Async< void > {
+                                co_await bootstrap();
+                                auto stream = co_await blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
+                                sid = stream->stream_id();
+                                {
+                                    auto acc = stream->chunks();
+                                    stream_chunk_count = acc->size();
+                                }
+
+                                // Simulate the crash window: add a chunk directly to the vdev.  StreamBase never
+                                // learns about it, so no MetaBlk is created — the chunk is a genuine orphan on disk.
+                                auto orphan = co_await blob_dev_->vdev().expand(CHUNK_SIZE);
+                                orphan_chunk_id = orphan->chunk_id();
+
+                                // Sanity: the vdev now holds stream_chunk_count + 1 chunks.
+                                EXPECT_EQ(blob_dev_->vdev().get_chunks().size(), stream_chunk_count + 1);
+                                // No shutdown() here — reload_sync() handles the phase-1 teardown internally
+                                // (following the pattern of RestartRecoveryMultiChunk etc.).
+                            }());
+
+    reload_sync();
+
+    iomgr().spawn_and_block(
+        ReactorTarget::any(), [this, sid, orphan_chunk_id, stream_chunk_count]() -> Async< void > {
+            // Stream recovered with its legitimate chunks.
+            auto stream = blob_dev_->get_raw_blk_stream(sid);
+            CO_ASSERT_NE(stream, nullptr);
+            {
+                auto acc = stream->chunks();
+                EXPECT_EQ(acc->size(), stream_chunk_count);
+            }
+            // reconcile_chunks removed the orphan — vdev now holds only the stream's chunks.
+            auto all = blob_dev_->vdev().get_chunks();
+            EXPECT_EQ(all.size(), stream_chunk_count);
+            for (auto& c : all) {
+                EXPECT_NE(c->chunk_id(), orphan_chunk_id) << "orphan chunk survived reconcile_chunks";
+            }
+            co_await shutdown();
+        }());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multiple BlobDevs side by side.  BlobDevManager can host more than one BlobDev (each backed by its own VDev, each
+// with its own stream namespace and MetaBlk names disambiguated by "<dev>_<type>_<sid>_<cid>_<blksz>").  Verify two
+// coexist during writes AND both recover independently across restart.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST_F(RawBlkStreamTest, MultipleBlobDevsSideBySide) {
+    uint64_t sid1{}, sid2{};
+    BlkId bid1, bid2;
+
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, &sid1, &sid2, &bid1, &bid2]() -> Async< void > {
+        co_await bootstrap(); // creates blob_dev_ "test_blob_dev"
+
+        VDevParameters p2;
+        p2.initial_chunk_size = CHUNK_SIZE;
+        p2.blk_size = BLK_SIZE;
+        p2.dev_type = HSDevType::Data;
+        p2.alloc_type = BlkAllocatorType::SlabCompact;
+        p2.chunk_sel_type = ChunkSelectorType::RoundRobin;
+
+        auto bd2 = co_await blob_dev_mgr().create_blob_dev("test_blob_dev_2", std::move(p2));
+        CO_ASSERT_NE(bd2, nullptr);
+
+        auto s1 = co_await blob_dev_->create_raw_blk_stream(CHUNK_SIZE);
+        auto s2 = co_await bd2->create_raw_blk_stream(CHUNK_SIZE);
+        sid1 = s1->stream_id();
+        sid2 = s2->stream_id();
+
+        blk_alloc_hints h;
+        CO_ASSERT_EQ(s1->alloc_blk(1, h, bid1), BlkAllocStatus::SUCCESS);
+        CO_ASSERT_EQ(s2->alloc_blk(1, h, bid2), BlkAllocStatus::SUCCESS);
+        {
+            auto guard = cp_mgr().cp_guard();
+            s1->commit_blk(guard.get(), bid1);
+            s2->commit_blk(guard.get(), bid2);
+        }
+
+        IoBufOwn w1(BLK_SIZE, 512);
+        fill_buf(w1.bytes(), BLK_SIZE, 0xAAAA);
+        co_await s1->write(bid1, w1);
+        IoBufOwn w2(BLK_SIZE, 512);
+        fill_buf(w2.bytes(), BLK_SIZE, 0xBBBB);
+        co_await s2->write(bid2, w2);
+
+        auto ok = co_await cp_mgr().trigger_cp_flush(true /* force */);
+        CO_ASSERT_TRUE(ok);
+        // No shutdown() here — reload_sync() handles the phase-1 teardown internally.
+    }());
+
+    reload_sync();
+
+    iomgr().spawn_and_block(ReactorTarget::any(), [this, sid1, sid2, bid1, bid2]() -> Async< void > {
+        // Both BlobDevs came back.
+        auto bd1 = blob_dev_mgr().get_blob_dev("test_blob_dev");
+        auto bd2 = blob_dev_mgr().get_blob_dev("test_blob_dev_2");
+        CO_ASSERT_NE(bd1, nullptr);
+        CO_ASSERT_NE(bd2, nullptr);
+
+        auto s1 = bd1->get_raw_blk_stream(sid1);
+        auto s2 = bd2->get_raw_blk_stream(sid2);
+        CO_ASSERT_NE(s1, nullptr);
+        CO_ASSERT_NE(s2, nullptr);
+
+        IoBufOwn r1(BLK_SIZE, 512);
+        auto ec1 = co_await s1->read(r1, bid1);
+        CO_ASSERT_FALSE(ec1);
+        EXPECT_TRUE(verify_buf(r1.cbytes(), BLK_SIZE, 0xAAAA));
+
+        IoBufOwn r2(BLK_SIZE, 512);
+        auto ec2 = co_await s2->read(r2, bid2);
+        CO_ASSERT_FALSE(ec2);
+        EXPECT_TRUE(verify_buf(r2.cbytes(), BLK_SIZE, 0xBBBB));
+
+        co_await shutdown();
+    }());
+}
+
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);

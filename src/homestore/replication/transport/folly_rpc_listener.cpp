@@ -13,6 +13,7 @@
 #include <libnuraft/resp_msg.hxx>
 
 #include "iomanager/iomanager.h"
+#include "sisl/flip/flip.h"
 #include "homestore/replication/repl_manager.h"
 
 namespace homestore::replication {
@@ -208,6 +209,18 @@ void FollyRpcListener::InboundConnection::readDataAvailable(size_t len) noexcept
         uint8_t const msg_type = rx_body_->size() >= 2 ? rx_body_->data_begin()[1] : 0;
         HS_LOG(TRACE, replication, "rpc rx request type={} req_id={} len={}", int(msg_type), rx_hdr_.req_id,
                rx_body_->size());
+
+        // Fault point: drop this request on the floor — no dispatch, no response, the wire simply loses it.
+        // Arg is the nuraft msg_type, so a test can eat exactly one message class (votes, join invitations).
+        if (flip::is_fired("simulate_drop_repl_rpc", int(msg_type))) {
+            HS_LOG(INFO, replication, "rpc rx request type={} req_id={} DROPPED by simulate_drop_repl_rpc flip",
+                   int(msg_type), rx_hdr_.req_id);
+            rx_body_.reset();
+            rx_body_filled_ = 0;
+            rx_hdr_filled_ = 0;
+            rx_state_ = RxState::Header;
+            return;
+        }
         if (is_cpu_intensive_rpc(msg_type) && mgr_->cpu_executor() != nullptr) {
             // Slow path: route to the CPU thread pool so the Task body (which may blocking-wait on log_store
             // reads via HomeRaftLogStore's sync API) does not stall any reactor.

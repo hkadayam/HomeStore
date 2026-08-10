@@ -108,7 +108,7 @@ TEST_F(ReplicaSetTest, LeaderQuickRestart) {
     uint64_t expected = 0;
     for (uint32_t r = 0; r < rounds; ++r) {
         g_helper->sync_for_test_start();
-        auto const lm = wait_leader_member();
+        auto const lm = wait_till_leader_elected();
         if (g_helper->replica_num() == lm) {
             LOGINFO("Replica={} leader quick-restarting (round {})", g_helper->replica_num(), r);
             g_helper->restart(0);
@@ -136,7 +136,7 @@ TEST_F(ReplicaSetTest, LeaderSlowRestart) {
     uint64_t expected = 0;
     for (uint32_t r = 0; r < rounds; ++r) {
         g_helper->sync_for_test_start();
-        auto const lm = wait_leader_member();
+        auto const lm = wait_till_leader_elected();
         if (g_helper->replica_num() == lm) {
             LOGINFO("Replica={} leader slow-restarting (round {})", g_helper->replica_num(), r);
             g_helper->restart(restart_sleep_secs);
@@ -241,7 +241,7 @@ TEST_F(ReplicaSetTest, TrafficInflightFollowerRestart) {
     auto const replicas = SISL_OPTIONS["replicas"].as< uint32_t >();
     g_helper->sync_for_test_start();
 
-    auto const lm = wait_leader_member();
+    auto const lm = wait_till_leader_elected();
     auto const victim = (lm + 1) % replicas;
     if (g_helper->replica_num() == victim) {
         while (commit_count() == 0) { // restart mid-stream, not before traffic reaches this replica
@@ -265,7 +265,7 @@ TEST_F(ReplicaSetTest, TwoFollowersSimultaneousRestart) {
     auto const n = SISL_OPTIONS["num_io"].as< uint64_t >();
     g_helper->sync_for_test_start();
 
-    auto const lm = wait_leader_member();
+    auto const lm = wait_till_leader_elected();
     if (g_helper->replica_num() != lm) {
         g_helper->restart(5); // both followers down together
     }
@@ -315,6 +315,73 @@ TEST_F(ReplicaSetTest, ZeroWriteRestartChurn) {
         g_helper->restart(0);
         g_helper->sync_for_test_start();
     }
+    write_on_leader(n);
+    wait_for_commits(n);
+
+    g_helper->sync_for_verify_start();
+    validate_all_data();
+    g_helper->sync_for_cleanup_start();
+}
+
+// Scenario: election messages get lost.
+//   1. Three replicas, healthy, baseline data committed.
+//   2. The leader goes away, forcing an election — but the vote messages themselves get eaten by the network:
+//      candidates ask for votes and hear nothing, so rounds of elections fail.
+//   3. The network heals (the drop budget runs out); the very next round elects exactly one leader.
+//   4. Writes resume and all replicas converge — the failed rounds did no damage, and at no point did two
+//      nodes act as leader for the same term (divergence would fail the exact-state validation).
+TEST_F(ReplicaSetTest, DroppedVotesElection) {
+    auto const n = SISL_OPTIONS["num_io"].as< uint64_t >();
+    constexpr int kRequestVoteMsgType = 1; // nuraft::msg_type::request_vote_request
+    g_helper->sync_for_test_start();
+
+    write_on_leader(n);
+    wait_for_commits(n);
+    g_helper->sync_for_test_start();
+
+    auto const lm = wait_till_leader_elected();
+    // Every replica eats its first few inbound vote requests — several election rounds die on the wire.
+    g_helper->set_flip("simulate_drop_repl_rpc", 4, 100, {{"msg_type", flip::Operator::EQUAL, kRequestVoteMsgType}});
+    g_helper->sync_for_test_start();
+
+    if (g_helper->replica_num() == lm) {
+        g_helper->restart(8); // leader away past the election window; survivors campaign into the drop window
+    }
+    write_on_leader(n); // blocks on every replica until a leader finally emerges, then lands the batch
+    wait_for_commits(2 * n);
+
+    g_helper->sync_for_verify_start();
+    validate_all_data();
+    g_helper->sync_for_cleanup_start();
+}
+
+// Scenario: a node reboots while being invited into a group.
+//   1. A replica set is being formed: the creator sends each member an invitation to join.
+//   2. One member's invitation is lost — the member is rebooting at that moment and never processes it.
+//   3. The creator does not give up: it keeps re-inviting while the member boots back up.
+//   4. The re-invitation lands after the reboot; the member joins normally; the final membership is complete
+//      and writes across the full group prove it — the group never forms half-made.
+TEST_F(ReplicaSetTest, JoinInvitationInFlightRestart) {
+    auto const n = SISL_OPTIONS["num_io"].as< uint64_t >();
+    constexpr int kJoinClusterMsgType = 12; // nuraft::msg_type::join_cluster_request
+    g_helper->sync_for_test_start();
+
+    // The fixture's group is already formed; rebuild it with the fault armed so the JOIN itself is the thing
+    // under test.
+    g_helper->destroy_replica_set(/*wait_for_destroy=*/true);
+    g_helper->sync_for_test_start();
+
+    auto const victim = 1u; // any non-creator member
+    if (g_helper->replica_num() == victim) {
+        // Eat the first invitation, and reboot so the retry lands on the fresh incarnation.
+        g_helper->set_flip("simulate_drop_repl_rpc", 1, 100,
+                           {{"msg_type", flip::Operator::EQUAL, kJoinClusterMsgType}});
+        g_helper->restart(0);
+    }
+    g_helper->register_replica_set(store_); // creator re-creates the group; its add-member retries ride out both
+                                            // the eaten invitation and the victim's reboot window
+    g_helper->sync_for_test_start();
+
     write_on_leader(n);
     wait_for_commits(n);
 

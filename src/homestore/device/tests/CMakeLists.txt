@@ -38,6 +38,7 @@ target_link_libraries(test_dev_mgr PRIVATE
     sisl_metrics
     sisl_settings
     sisl_logging
+    sisl_flip
     ${COMMON_DEPS}
     GTest::gtest
 )

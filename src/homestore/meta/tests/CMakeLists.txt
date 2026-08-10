@@ -13,6 +13,7 @@ target_link_libraries(test_meta_blk_mgr PRIVATE
     sisl_metrics
     sisl_settings
     sisl_logging
+    sisl_flip
     ${COMMON_DEPS}
     GTest::gtest
 )

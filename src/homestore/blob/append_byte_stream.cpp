@@ -100,7 +100,7 @@ Async< shared< AppendByteStream > > AppendByteStream::load(uint64_t stream_id, M
     stream->sb_mblk_ = std::move(sb);
     stream->head_offset_ = recovered_head;
     stream->offset_in_first_chunk_ = recovered_head % chunk_sz;
-    stream->chain_seed_ = s->chain_seed;
+    stream->init_crc_ = s->init_crc;
 
     // Look up chunks from the vdev by their ids and install into the stream.  StreamBase::install_chunks sorts
     // them by vdev_order before publishing.
@@ -417,7 +417,7 @@ Async< void > AppendByteStream::persist_stream_sb() {
     sb->head_offset = head_offset_;
     sb->tail_offset = tail_offset_;
     sb->n_chunks = to_u32(cids.size());
-    sb->chain_seed = chain_seed_;
+    sb->init_crc = init_crc_;
     // Guard against memcpy(dst, nullptr, 0): an empty stream has no chunk_ids and cids.data() is null, which is UB
     // (memcpy's src is declared nonnull) even for a zero byte count.
     if (!cids.empty()) {

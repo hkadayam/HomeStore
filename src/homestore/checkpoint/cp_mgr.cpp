@@ -468,21 +468,23 @@ void CPWatchdog::watch_cp() {
         return;
     }
     const auto status = cp_->get_status();
-    if ((status != cp_status_t::cp_flush_prepare) || (status != cp_status_t::cp_flushing)) {
+    if ((status != cp_status_t::cp_flush_prepare) && (status != cp_status_t::cp_flushing)) {
         return;
     }
 
     uint32_t cum_pct{0};
     uint32_t count{0};
     {
-        std::shared_lock lk(cp_mgr_->consumers_mtx_);
+        std::shared_lock consumer_lk(cp_mgr_->consumers_mtx_);
         for (auto& e : cp_mgr_->consumers_) {
             ++count;
             cum_pct += e.cb->cp_progress_percent();
         }
     }
-    if (progress_pct_ > cum_pct / count) {
+    if (cum_pct / count > progress_pct_) {
+        // Progress advanced since the last tick — record the new watermark and reset the stall timer.
         progress_pct_ = cum_pct / count;
+        last_state_ch_time_ = Clock::now();
         return;
     }
 
@@ -491,21 +493,17 @@ void CPWatchdog::watch_cp() {
                 get_elapsed_time_ms(last_state_ch_time_), cp_->to_string());
     }
 
-    uint32_t max_time_multiplier = 12;
+    constexpr uint32_t max_time_multiplier = 12;
     if (get_elapsed_time_ms(last_state_ch_time_) < max_time_multiplier * timer_sec_ * 1000) {
-        uint32_t repair_attempted{0};
-        std::shared_lock lk2(cp_mgr_->consumers_mtx_);
+        // Within stall-tolerance — nudge the first lagging consumer to push harder and give it a tick to react.
+        std::shared_lock consumer_lk(cp_mgr_->consumers_mtx_);
         for (auto& e : cp_mgr_->consumers_) {
-            const auto pct = e.cb->cp_progress_percent();
-            if (pct != 100) {
+            if (e.cb->cp_progress_percent() != 100) {
                 e.cb->repair_slow_cp();
-                ++repair_attempted;
-            }
-            if (repair_attempted) {
                 return;
             }
         }
-
+    } else {
         HS_REL_ASSERT(0, "cp seems to be stuck. CP State={} total time elapsed {}", cp_->to_string(),
                       get_elapsed_time_ms(last_state_ch_time_));
     }

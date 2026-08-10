@@ -7,6 +7,7 @@
 #include "homestore/index/btree/detail/btree_node.h"
 #include "homestore/index/btree/btree_base.h"
 
+#include "homestore/base/crash_simulator.h"
 #include "homestore/base/hs_runtime_config.h"
 #include "homestore/base/homestore_utils.h"
 #include "homestore/blob/append_blk_stream.h"
@@ -729,14 +730,37 @@ Async< void > COWBtree::full_cp_flush(CP* cp) {
     bnodeid_map_.serialize(cp->id(), [&active_stream](sisl::Blob blob) { active_stream.append(blob); });
     co_await active_stream.flush();
 
+    // Crash point: full-map bytes durable in active_stream; SB has not been advanced.  Recovery reads SB's still-OLD
+    // last_full_map_cp_id, picks the previous-generation stream (whose hdr.cp_id matches), truncates the new-gen
+    // stream as mismatched, then replays the incr journal on top.
+    if (crash_if_flip_fired("crash_after_full_map_flush")) {
+        co_return;
+    }
+
     // Update and persist the superblk with this CP's id as the last full map cp.
     mblk_.mutate_buf< COWBtreeSuperBlock >()->last_full_map_cp_id = cp->id();
     co_await mblk_.write();
+
+    // Crash point: SB advanced to the new generation; the previously-active stream (now passive, holding the OLD
+    // generation) has not been truncated yet.  Recovery loads the new-gen full map from the SB-matching stream, and
+    // recover_full_map's stale-stream sweep truncates the OLD stream on the boot path.
+    if (crash_if_flip_fired("crash_after_full_map_sb_write")) {
+        co_return;
+    }
 
     // Swap: the passive stream is now stale; truncate up to its tail so all chunks get released (head==tail triggers
     // the fresh-start reset inside truncate).
     active_full_map_.store(active_idx ^ 1, std::memory_order_release);
     co_await passive_stream.truncate(passive_stream.tail_offset());
+
+    // Crash point: passive stream truncated; the incr journal still holds all pre-CP records.  Recovery loads the
+    // new full map from SB, walks the incr journal — every record has hdr.cp_id < last_full_cp so all get skipped
+    // (see recover_one_incr_cp).  The stale journal stays on disk until the next successful full CP truncates it.
+    // The manager's incr_map_total_bytes_ counter is reseeded from tail_offset() at load (COWBtree::load) so there
+    // is no phantom threshold trip.
+    if (crash_if_flip_fired("crash_before_incr_map_truncate")) {
+        co_return;
+    }
 
     // Truncate the incremental map stream — all deltas are covered by the full map.
     auto const incr_map_truncated_bytes = incr_map_stream_->tail_offset();

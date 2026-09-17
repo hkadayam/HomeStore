@@ -52,8 +52,6 @@
 SISL_OPTION_GROUP(test_repl_common_setup,
                   (replicas, "", "replicas", "Total number of replicas in the group",
                    ::cxxopts::value< uint32_t >()->default_value("3"), "number"),
-                  (spare_replicas, "", "spare_replicas", "Additional spare replicas not part of the group at bootstrap",
-                   ::cxxopts::value< uint32_t >()->default_value("1"), "number"),
                   (base_port, "", "base_port", "Port number of the first replica",
                    ::cxxopts::value< uint16_t >()->default_value("4000"), "number"),
                   (replica_num, "", "replica_num",
@@ -130,9 +128,8 @@ public:
         void destroy_replica_set_listener(GroupId /*group_id*/) override {}
 
         std::pair< std::string, uint16_t > lookup_peer(ReplicaId uuid, GroupId /*group_id*/) const override {
-            auto const it = helper_.members_.find(uuid);
-            RELEASE_ASSERT(it != helper_.members_.end(), "lookup_peer for a non-member replica");
-            return {std::string{"127.0.0.1"}, uint16_t(SISL_OPTIONS["base_port"].as< uint16_t >() + it->second)};
+            return {std::string{"127.0.0.1"},
+                    to_u16(SISL_OPTIONS["base_port"].as< uint16_t >() + HSReplTestHelper::member_idx(uuid))};
         }
 
         ReplicaId get_my_repl_id() const override { return helper_.my_replica_id_; }
@@ -163,12 +160,37 @@ public:
         bool on_pre_commit(int64_t, sisl::Blob const&) override { return true; }
         Async< void > on_rollback(int64_t, sisl::Blob const&) override { co_return; }
         void on_config_rollback(int64_t) override {}
-        void on_change_in_role(ReplicaRole role) override { role_ = role; }
         void on_destroy(GroupId const&) override {}
-        void on_start_replace_member(ReplicaMemberInfo const&, ReplicaMemberInfo const&, std::string_view) override {}
-        void on_complete_replace_member(ReplicaMemberInfo const&, ReplicaMemberInfo const&, std::string_view) override {
+
+        // Membership / role notifications.  Recorded rather than ignored so a test can assert that the product
+        // fired them, on which replica, with which task id, and in which order.
+        void on_change_in_role(ReplicaRole role) override {
+            std::lock_guard lg{mtx_};
+            role_ = role;
+            role_history_.push_back(role);
         }
-        void on_membership_change(std::set< ReplicaId > const&, std::set< ReplicaId > const&) override {}
+
+        void on_start_replace_member(ReplicaMemberInfo const& out, ReplicaMemberInfo const& in,
+                                     std::string_view task_id) override {
+            std::lock_guard lg{mtx_};
+            replace_started_.push_back(ReplaceEvent{out.id, in.id, std::string{task_id}});
+        }
+
+        void on_complete_replace_member(ReplicaMemberInfo const& out, ReplicaMemberInfo const& in,
+                                        std::string_view task_id) override {
+            std::lock_guard lg{mtx_};
+            replace_completed_.push_back(ReplaceEvent{out.id, in.id, std::string{task_id}});
+        }
+
+        void on_membership_change(std::set< ReplicaId > const& added, std::set< ReplicaId > const& removed) override {
+            std::lock_guard lg{mtx_};
+            for (auto const& id : added) {
+                members_added_.push_back(id);
+            }
+            for (auto const& id : removed) {
+                members_removed_.push_back(id);
+            }
+        }
 
         AsyncReplResult< shared< ReplSnapshot > > take_snapshot(lsn_t) override {
             co_return folly::makeUnexpected(ReplError::BAD_REQUEST);
@@ -185,12 +207,53 @@ public:
         int64_t last_committed_lsn() const { return last_committed_lsn_.load(std::memory_order_acquire); }
         shared< TestStore > const& store() const { return store_; }
 
+        // ── Recorded membership / role notifications ─────────────────────────────────────────────────────────
+        // One record per firing, in order, so a test can assert both that a notification happened and what it
+        // carried (which members, which replace task id).
+        struct ReplaceEvent {
+            ReplicaId out;
+            ReplicaId in;
+            std::string task_id;
+        };
+
+        std::vector< ReplaceEvent > replace_started() const {
+            std::lock_guard lg{mtx_};
+            return replace_started_;
+        }
+        std::vector< ReplaceEvent > replace_completed() const {
+            std::lock_guard lg{mtx_};
+            return replace_completed_;
+        }
+        std::vector< ReplicaId > members_added() const {
+            std::lock_guard lg{mtx_};
+            return members_added_;
+        }
+        std::vector< ReplicaId > members_removed() const {
+            std::lock_guard lg{mtx_};
+            return members_removed_;
+        }
+        std::vector< ReplicaRole > role_history() const {
+            std::lock_guard lg{mtx_};
+            return role_history_;
+        }
+        ReplicaRole role() const {
+            std::lock_guard lg{mtx_};
+            return role_;
+        }
+
     private:
         shared< TestStore > store_;
         ReplicaSetOptions options_;
-        ReplicaRole role_{ReplicaRole::FOLLOWER};
         std::atomic< uint64_t > commit_count_{0};
         std::atomic< int64_t > last_committed_lsn_{-1};
+
+        mutable std::mutex mtx_; // guards the notification records below
+        ReplicaRole role_{ReplicaRole::FOLLOWER};
+        std::vector< ReplicaRole > role_history_;
+        std::vector< ReplaceEvent > replace_started_;
+        std::vector< ReplaceEvent > replace_completed_;
+        std::vector< ReplicaId > members_added_;
+        std::vector< ReplicaId > members_removed_;
     };
 
     HSReplTestHelper(std::string name, std::vector< std::string > args, char** argv) :
@@ -204,7 +267,7 @@ public:
         sisl::logging::SetLogger(name_ + "_replica_" + std::to_string(replica_num_));
         sisl::logging::SetLogPattern("[%D %T%z] [%^%L%$] [%n] [%t] %v");
 
-        assign_replica_ids(num_replicas);
+        my_replica_id_ = replica_id(replica_num_);
         slice_devices(num_replicas);
         rendezvous_processes(num_replicas);
 
@@ -294,18 +357,23 @@ public:
         store_ = std::move(store);
         listener_.reset(); // created on demand by get_listener() when repl brings the group up
 
+        // A member that joins mid-test stays out of the member-start barrier — the sitting members crossed it
+        // before this process existed.
+        if (!joined_at_bootstrap()) {
+            return;
+        }
+
         ipc_data_->sync_for_member_start();
 
         if (replica_num_ != 0) {
             return;
         }
 
-        // Leader path: the first --replicas members join at bootstrap; spares are added later by the test.
+        // Leader path: members [0, --replicas) form the group at bootstrap.  Anything beyond that is a member a
+        // test invites later, whose process it forks at that point.
         std::set< ReplicaId > members;
-        for (auto const& [id, idx] : members_) {
-            if (idx < SISL_OPTIONS["replicas"].as< uint32_t >()) {
-                members.insert(id);
-            }
+        for (uint16_t i{0}; i < to_u16(num_replicas_); ++i) {
+            members.insert(replica_id(i));
         }
 
         GroupId const group_id = hs_utils::gen_random_uuid();
@@ -358,8 +426,7 @@ public:
             if (!wait_for_destroy && rs.value()->is_destroy_pending()) {
                 break; // destroy committed; leave the erase to the background reaper
             }
-            RELEASE_ASSERT(waited_ms < 60000u, "replica set {} not destroyed within 60s",
-                           boost::uuids::to_string(gid));
+            RELEASE_ASSERT(waited_ms < 60000u, "replica set {} not destroyed within 60s", boost::uuids::to_string(gid));
             std::this_thread::sleep_for(std::chrono::milliseconds{200});
         }
 
@@ -404,21 +471,55 @@ public:
         return repl_groups_.size();
     }
 
+    // ── Members added mid-test ───────────────────────────────────────────────────────────────────────────────────
+    // Indices [0, --replicas) form the group at bootstrap; a test that wants another member picks the next index,
+    // forks its process here, and invites it.  Nothing is declared in advance.
+    bool joined_at_bootstrap() const { return replica_num_ < to_u16(num_replicas_); }
+
+    /// Fork the process for member `idx`, running only the tests matching `gtest_filter`.  Its boot is absorbed by
+    /// whatever barrier the caller shares with it — it arrives when ready and the sitting members wait there.
+    /// Driver-only; a no-op elsewhere.
+    void spawn_member(uint16_t idx, std::string const& gtest_filter) {
+        if (replica_num_ != 0) {
+            return;
+        }
+        RELEASE_ASSERT(can_add_members(), "adding a member needs auto-generated devices");
+
+        check_and_kill(SISL_OPTIONS["base_port"].as< uint16_t >() + idx);
+        std::string cmd;
+        fmt::format_to(std::back_inserter(cmd), "{} --replica_num {}", args_[0], idx);
+        for (size_t j{1}; j < args_.size(); ++j) {
+            fmt::format_to(std::back_inserter(cmd), " {}", args_[j]);
+        }
+        // Trailing filter wins over any inherited one (gtest keeps the last occurrence), so the new member runs
+        // only the membership cases and never touches the barriers of tests it was absent for.
+        fmt::format_to(std::back_inserter(cmd), " --gtest_filter={}", gtest_filter);
+        LOGINFO("Forking member replica={} instance: {}", idx, cmd);
+        peers_.emplace_back(bproc::cmd = cmd, proc_grp_);
+    }
+
+    /// False when the run supplies devices explicitly: that list is sliced across the bootstrap members, so a
+    /// member added at runtime has no devices and HomeStore cannot attach one to a live instance.
+    static bool can_add_members() { return SISL_OPTIONS.count("replica_dev_list") == 0; }
+
     // ── Identity / topology accessors ────────────────────────────────────────────────────────────────────────────
     uint16_t replica_num() const { return replica_num_; }
     ReplicaId my_replica_id() const { return my_replica_id_; }
-    ReplicaId replica_id(uint16_t member_idx) const {
-        for (auto const& [id, idx] : members_) {
-            if (idx == member_idx) {
-                return id;
-            }
-        }
-        return boost::uuids::nil_uuid();
+    // A member's identity is derived from its index alone — no registry, no declared roster size.  Every process
+    // can therefore name and reach a member that does not exist yet, which is what lets a test invite one and
+    // fork its process on the spot.
+    static ReplicaId replica_id(uint16_t member_idx) {
+        boost::uuids::string_generator gen;
+        return gen(fmt::format("{:04}", member_idx) + std::string{"0123456789abcdef0123456789ab"});
     }
 
-    uint16_t member_idx(ReplicaId id) const {
-        auto const it = members_.find(id);
-        return (it != members_.end()) ? it->second : uint16_t(members_.size());
+    /// Inverse of replica_id(): the index is the leading field of the id.  Round-trips the decode so an id that
+    /// was not minted this way is caught rather than silently decoded into a wrong member.
+    static uint16_t member_idx(ReplicaId id) {
+        auto const idx = to_u16(std::stoul(boost::uuids::to_string(id).substr(0, 4)));
+        RELEASE_ASSERT(replica_id(idx) == id, "replica id {} was not derived from a member index",
+                       boost::uuids::to_string(id));
+        return idx;
     }
 
     // ── Cross-process barriers ───────────────────────────────────────────────────────────────────────────────────
@@ -435,17 +536,6 @@ public:
     }
 
 private:
-    void assign_replica_ids(uint32_t num_replicas) {
-        boost::uuids::string_generator gen;
-        for (uint32_t i{0}; i < num_replicas; ++i) {
-            auto const id = gen(fmt::format("{:04}", i) + std::string{"0123456789abcdef0123456789ab"});
-            if (i == replica_num_) {
-                my_replica_id_ = id;
-            }
-            members_.emplace(id, i);
-        }
-    }
-
     // Carve this replica's slice out of the flattened --replica_dev_list (if given); otherwise dev_list_ stays
     // empty and HSTestHelper generates per-replica files.
     void slice_devices(uint32_t num_replicas) {
@@ -516,7 +606,6 @@ private:
 
     mutable std::mutex groups_mtx_;
     std::map< GroupId, shared< ReplicaSetListener > > repl_groups_;
-    std::map< ReplicaId, uint16_t > members_;
     ReplicaId my_replica_id_;
 
     // The standard listener/store this replica set up via register_replica_set() (single group per test for now).

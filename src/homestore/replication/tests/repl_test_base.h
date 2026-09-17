@@ -186,6 +186,148 @@ protected:
         return std::nullopt;
     }
 
+    // ── Membership helpers ────────────────────────────────────────────────────────────────────────────────────────
+    static ReplicaMemberInfo member_info(uint16_t idx) {
+        ReplicaMemberInfo m{};
+        m.id = HSReplTestHelper::replica_id(idx);
+        std::snprintf(m.name, sizeof(m.name), "replica_%u", unsigned(idx));
+        return m;
+    }
+
+    bool i_am_leader() {
+        auto rs = repl_set();
+        return rs && (rs->get_leader_id() == g_helper->my_replica_id());
+    }
+
+    /// The group as this replica's engine reports it.  The engine populates per-peer status only on the leader
+    /// (nuraft's peer table is the leader's own bookkeeping), so this is empty on a follower by contract.
+    std::set< ReplicaId > current_members() {
+        auto rs = repl_set();
+        if (!rs) {
+            return {};
+        }
+        auto const peers =
+            iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [rs]() -> Async< std::vector< PeerInfo > > {
+                co_return co_await rs->get_replication_status();
+            }());
+        std::set< ReplicaId > ids;
+        for (auto const& p : peers) {
+            ids.insert(p.id_);
+        }
+        return ids;
+    }
+
+    /// Block until the group has exactly `expected` members, counting this replica.  Leader-only by contract
+    /// (see current_members, whose peer table excludes self); a non-leader returns at once and asserts its own
+    /// view through the notifications it receives instead.
+    void wait_for_member_count(size_t expected) {
+        if (!i_am_leader()) {
+            return;
+        }
+        for (uint32_t waited_ms = 0;; waited_ms += 500) {
+            auto const n = current_members().size() + 1; // peers + me
+            if (n == expected) {
+                return;
+            }
+            RELEASE_ASSERT(waited_ms < 120000u, "member count settled at {} not {} within 120s", n, expected);
+            LOGINFO("Replica={} sees {} members, waiting for {}", g_helper->replica_num(), n, expected);
+            std::this_thread::sleep_for(std::chrono::milliseconds{500});
+        }
+    }
+
+    /// Invite member `idx` into the group, retrying until it takes.  A just-forked member needs a few seconds
+    /// to boot HomeStore and start listening, and an invitation that arrives before then simply fails — the
+    /// same reason create_replica_set retries its own invitations.  No-op on a non-leader.
+    void add_member_with_retry(uint16_t idx, bool learner = false) {
+        if (!i_am_leader()) {
+            return;
+        }
+        auto const id = HSReplTestHelper::replica_id(idx);
+        // A successful call only means the invitation was dispatched — the config entry lands after the joiner
+        // answers, so an invitation sent while it is still booting is simply lost.  Re-invite until the member
+        // actually appears in the group.
+        for (uint32_t waited_ms = 0; waited_ms < 180000u; waited_ms += 2000) {
+            auto rs = repl_set();
+            (void)iomgr().spawn_and_block(iomanager::ReactorTarget::any(),
+                                          [rs, idx, learner]() -> Async< ReplResult<> > {
+                                              co_return co_await rs->add_member(member_info(idx), learner);
+                                          }());
+            for (uint32_t i{0}; i < 10; ++i) {
+                if (current_members().count(id) != 0) {
+                    LOGINFO("Replica={} added member {} (learner={})", g_helper->replica_num(), idx, learner);
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds{200});
+            }
+        }
+        RELEASE_ASSERT(false, "member {} never joined the group within 180s", idx);
+    }
+
+    /// True when the group reports `id` as a voting member.  Leader-only view, like current_members().
+    bool peer_can_vote(ReplicaId id) {
+        auto rs = repl_set();
+        if (!rs) {
+            return false;
+        }
+        auto const status =
+            iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [rs]() -> Async< std::vector< PeerInfo > > {
+                co_return co_await rs->get_replication_status();
+            }());
+        for (auto const& p : status) {
+            if (p.id_ == id) {
+                return p.can_vote;
+            }
+        }
+        return false;
+    }
+
+    /// Promote a learner to a voter, retrying until the group reports it as one.  Config changes are
+    /// serialized, so a promotion issued while the preceding add is still committing is simply rejected.
+    void promote_learner_with_retry(uint16_t idx) {
+        if (!i_am_leader()) {
+            return;
+        }
+        auto const id = HSReplTestHelper::replica_id(idx);
+        for (uint32_t waited_ms = 0; waited_ms < 120000u; waited_ms += 2000) {
+            auto rs = repl_set();
+            (void)iomgr().spawn_and_block(iomanager::ReactorTarget::any(), [rs, idx]() -> Async< ReplResult<> > {
+                co_return co_await rs->flip_learner_flag(member_info(idx), /*target=*/false);
+            }());
+            for (uint32_t i{0}; i < 10; ++i) {
+                if (peer_can_vote(id)) {
+                    LOGINFO("Replica={} promoted learner {} to voter", g_helper->replica_num(), idx);
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds{200});
+            }
+        }
+        RELEASE_ASSERT(false, "learner {} was never promoted to a voter within 120s", idx);
+    }
+
+    /// Block until this replica has been told `id` joined the group.  Unlike the status query this works on
+    /// every replica: the engine fires on_membership_change on all of them and the test listener records it.
+    void wait_for_member_added(ReplicaId id) {
+        for (uint32_t waited_ms = 0;; waited_ms += 500) {
+            if (auto const l = g_helper->listener(); l) {
+                auto const added = l->members_added();
+                if (std::find(added.begin(), added.end(), id) != added.end()) {
+                    return;
+                }
+            }
+            RELEASE_ASSERT(waited_ms < 120000u, "replica {} was never notified that {} joined",
+                           g_helper->replica_num(), boost::uuids::to_string(id));
+            std::this_thread::sleep_for(std::chrono::milliseconds{500});
+        }
+    }
+
+    /// Block until this replica has been bound into a group (a member added mid-test starts with none).
+    void wait_for_group_bound() {
+        for (uint32_t waited_ms = 0; !repl_set(); waited_ms += 500) {
+            RELEASE_ASSERT(waited_ms < 120000u, "replica {} was never bound into the group", g_helper->replica_num());
+            std::this_thread::sleep_for(std::chrono::milliseconds{500});
+        }
+    }
+
     // Block until this replica's raft view shows an elected leader that satisfies the caller's constraints, and
     // return its member index.  `allowed` (when non-empty) is the allow-list of members that count as settled;
     // `denied` is the deny-list — e.g. a just-deposed leader, whose own view still names itself for a while, so
